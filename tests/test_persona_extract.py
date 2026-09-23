@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 
+from conversation_corpus_engine.cli import main
 from conversation_corpus_engine.persona_extract import (
     extract_persona_lexicon,
     render_persona_extract_markdown,
@@ -170,6 +173,54 @@ class PersonaExtractTests(unittest.TestCase):
         self.assertIn("lattice", markdown)
         self.assertIn("## Forbidden Terms", markdown)
         self.assertIn("proceed", markdown)
+
+    def test_cli_corpus_persona_extract_integration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "transcripts"
+            source.mkdir()
+            _write_transcript(
+                source,
+                "session.json",
+                [
+                    {"role": "user", "text": "Autopoietic loop recursion."},
+                    {"role": "assistant", "text": "Understood autopoietic resonance."},
+                ],
+            )
+            old_argv = sys.argv
+            sys.argv = [
+                "cce",
+                "corpus",
+                "persona-extract",
+                "--persona",
+                "rob",
+                "--source-corpus",
+                str(source),
+                "--project-root",
+                tmp,
+                "--json",
+            ]
+            buf = StringIO()
+            try:
+                old_stdout = sys.stdout
+                sys.stdout = buf
+                main()
+            finally:
+                sys.stdout = old_stdout
+                sys.argv = old_argv
+
+            payload = json.loads(buf.getvalue())
+            self.assertEqual(payload["persona_id"], "rob")
+            self.assertEqual(payload["status"], "EXTRACTED")
+            terms = {entry["term"] for entry in payload["vocabulary"]}
+            self.assertIn("autopoietic", terms)
+
+    def test_empty_turns_source_returns_vacuum(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "transcripts"
+            source.mkdir()
+            _write_transcript(source, "empty.json", [])
+            payload = extract_persona_lexicon(Path(tmp), "rob", source_corpus=source)
+        self.assertEqual(payload["status"], "VACUUM (NO PERSONA TURNS)")
 
 
 if __name__ == "__main__":
