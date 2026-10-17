@@ -19,6 +19,7 @@ from .archive_ingest import (
     load_manifest,
 )
 from .archive_kb import build_kb, open_kb, search, search_titles, verify_kb
+from .archive_naming import names_payload, render_names_text, verify_names
 from .archive_serve import serve
 from .archive_site import build_site
 from .archive_topics import build_analysis
@@ -198,6 +199,15 @@ def add_archive_parser(subparsers: Any) -> None:
     common(serve_parser)
     serve_parser.add_argument("--port", type=int, default=8765)
 
+    names_parser = sub.add_parser("names", help="Print the naming contract: kinds, scopes, version")
+    names_parser.add_argument("--json", action="store_true")
+
+    verify_names_parser = sub.add_parser(
+        "verify-names",
+        help="Check every file and directory name under an archive root against the contract",
+    )
+    verify_names_parser.add_argument("--root", type=Path, required=True)
+
 
 def _overrides(raw: list[str]) -> dict[str, Path]:
     out: dict[str, Path] = {}
@@ -211,6 +221,23 @@ def _overrides(raw: list[str]) -> dict[str, Path]:
 
 def handle_archive(args: argparse.Namespace) -> int:
     action = args.action
+
+    # Naming commands read no store and need no custody, so they run before it is opened.
+    if action == "names":
+        if args.json:
+            print(json.dumps(names_payload(), indent=2, sort_keys=True))
+        else:
+            print(render_names_text())
+        return 0
+    if action == "verify-names":
+        try:
+            report = verify_names(args.root)
+        except (NotADirectoryError, FileNotFoundError):
+            print(f"archive root not found: {args.root}", file=sys.stderr)
+            return 2
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report["ok"] else 1
+
     export_root = getattr(args, "export_root", None)
     try:
         context = open_context(
