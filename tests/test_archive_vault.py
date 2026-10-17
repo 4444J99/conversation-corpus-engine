@@ -13,6 +13,7 @@ from conversation_corpus_engine.archive_vault import (
     build_vault,
     link_targets,
     neutralize,
+    plain_title,
     render_conversation,
     verify_vault,
 )
@@ -224,6 +225,48 @@ def test_inline_code_passes_through_and_link_targets_skip_all_code() -> None:
         "`[[ w ]]` [[real]] [[other|label]] [[tbl\\|label]]"
     )
     assert link_targets(sample) == ["real", "other", "tbl"]
+
+
+def test_nested_and_unterminated_fences_cannot_leak_links_or_swallow_the_note() -> None:
+    nested = "````markdown\n```py\n[[inner]]\n```\n[[still code]]\n````\n[[outside]]"
+    cleaned = neutralize(nested)
+    assert "[[inner]]" in cleaned and "[[still code]]" in cleaned
+    assert "\\[\\[outside\\]\\]" in cleaned
+    assert link_targets(cleaned) == []
+    open_ended = neutralize("```py\nprint(1)\n[[x]]")
+    assert open_ended.endswith("\n```"), "an open fence is closed so later messages render"
+    assert link_targets(open_ended + "\n[[after]]") == ["after"]
+    truncated, _ = render_conversation(
+        conv(
+            "chatgpt",
+            "cut",
+            "Cut",
+            [("user", "```\n" + "line\n" * 50), ("assistant", "[[next]] ok")],
+        ),
+        related=[],
+        topics=[],
+        titles={},
+        collection_link="",
+        message_limit=40,
+    )
+    assert "\\[\\[next\\]\\]" in truncated, (
+        "a fence cut by truncation must not swallow the next turn"
+    )
+
+
+def test_bracketed_titles_cannot_mint_links() -> None:
+    assert plain_title("  [[AI Prompt]]   template \n") == "((AI Prompt)) template"
+    assert plain_title("[]") == "()"
+    assert plain_title("   ") == "Untitled"
+    note, _ = render_conversation(
+        conv("grok", "t", "[[Decision: Adopt X]]"),
+        related=[],
+        topics=[],
+        titles={},
+        collection_link="",
+    )
+    assert link_targets(note) == ["provider-grok", "month-2025-01"]
+    assert 'title: "((Decision: Adopt X))"' in note
 
 
 def test_shell_conditionals_in_messages_do_not_break_vault_verification(archive_env) -> None:

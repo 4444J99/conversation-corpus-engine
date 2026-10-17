@@ -15,6 +15,7 @@ from .archive_ingest import (
     require_inside,
 )
 from .archive_model import Conversation, Message, write_json_atomic, write_text_atomic
+from .archive_text import FenceTracker
 from .archive_topics import load_enrichment
 from .corpus_store import CorpusWriteAuthorization
 
@@ -31,7 +32,6 @@ PALETTE = {
     "grok": 0x7A7A7A,
     "perplexity": 0x20B8CD,
 }
-FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
 INLINE_CODE_RE = re.compile(r"(`[^`\n]+`)")
 TAG_RE = re.compile(r"(?<![\w&\\/])#(?=[\w/-])")
 UNSAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -42,6 +42,11 @@ READING_NOTE = (
 
 def yaml_text(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False)
+
+
+def plain_title(title: str) -> str:
+    """A note title with no bracket characters, so a pasted `[[Template]]` cannot mint a link."""
+    return " ".join(title.split()).replace("[", "(").replace("]", ")") or "Untitled"
 
 
 def link_label(text: str) -> str:
@@ -56,15 +61,9 @@ def safe_name(text: str, limit: int = 80) -> str:
 def neutralize(text: str) -> str:
     """Stop message text from creating wikilinks, embeds, tags or headings in the vault."""
     lines: list[str] = []
-    fence = ""
+    tracker = FenceTracker()
     for raw in text.splitlines():
-        marker = FENCE_RE.match(raw)
-        if marker:
-            opener = marker.group(1)[0]
-            fence = "" if fence == opener else (fence or opener)
-            lines.append(raw)
-            continue
-        if fence:
+        if tracker.feed(raw):
             lines.append(raw)
             continue
         pieces = INLINE_CODE_RE.split(raw)
@@ -76,6 +75,8 @@ def neutralize(text: str) -> str:
         if safe.lstrip().startswith("#"):
             safe = "\\" + safe.lstrip()
         lines.append(safe)
+    if tracker.opener:
+        lines.append(tracker.opener)
     return "\n".join(lines)
 
 
@@ -125,8 +126,8 @@ def render_conversation(
         f"uid: {yaml_text(conversation.uid)}",
         f"provider: {conversation.provider}",
         f"kind: {conversation.kind}",
-        f"title: {yaml_text(conversation.title)}",
-        f"aliases: [{yaml_text(conversation.title)}]",
+        f"title: {yaml_text(plain_title(conversation.title))}",
+        f"aliases: [{yaml_text(plain_title(conversation.title))}]",
         f"created: {conversation.created or 'null'}",
         f"last_activity: {conversation.last_activity or 'null'}",
         f"messages: {conversation.message_count}",
@@ -141,7 +142,7 @@ def render_conversation(
     ]
     month = (created or "")[:7] or "undated"
     header = [
-        f"# {' '.join(conversation.title.split()) or 'Untitled'}",
+        f"# {plain_title(conversation.title)}",
         "",
         READING_NOTE,
         "",
@@ -319,16 +320,8 @@ WIKILINK_RE = re.compile(r"(?<!\\)\[\[([^\]|\\]+)(?:\\?\|[^\]]*)?\]\]")
 def link_targets(markdown: str) -> list[str]:
     """Wikilink targets Obsidian would resolve: code fences (also inside callouts) and inline
     code are not parsed for links, so they are excluded."""
-    kept: list[str] = []
-    fence = ""
-    for raw in markdown.splitlines():
-        marker = FENCE_RE.match(raw.lstrip("> "))
-        if marker:
-            opener = marker.group(1)[0]
-            fence = "" if fence == opener else (fence or opener)
-            continue
-        if not fence:
-            kept.append(raw)
+    tracker = FenceTracker()
+    kept = [raw for raw in markdown.splitlines() if not tracker.feed(raw.lstrip("> "))]
     return WIKILINK_RE.findall(INLINE_CODE_RE.sub(" ", "\n".join(kept)))
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from conversation_corpus_engine.archive_text import (
+    FenceTracker,
     html_to_text,
     render_markdown_html,
     term_counts,
@@ -69,6 +70,40 @@ def test_term_counts_ignore_code_urls_stopwords_and_noise() -> None:
     assert counts["cluster"] == 1
     for banned in ("secretcodeword", "inlinecodeword", "the", "12345", "deadbeefcafe0123", "abc"):
         assert banned not in counts
+
+
+def test_fence_tracker_follows_commonmark_closing_rules() -> None:
+    tracker = FenceTracker()
+    states = [
+        tracker.feed(line)
+        for line in (
+            "prose",
+            "````md",
+            "```py",  # shorter fence inside a longer one is content
+            "x = 1",
+            "```",
+            "````ignored",  # a closer may not carry an info string
+            "````",
+            "after",
+        )
+    ]
+    assert states == ["", "open", "inside", "inside", "inside", "inside", "close", ""]
+    tilde = FenceTracker()
+    assert [tilde.feed(x) for x in ("~~~", "```", "~~~", "out")] == ["open", "inside", "close", ""]
+    inline = FenceTracker()
+    assert inline.feed("```not a fence```") == "" and inline.opener == ""
+    unterminated = FenceTracker()
+    unterminated.feed("```")
+    assert unterminated.feed("still inside") == "inside" and unterminated.opener == "```"
+
+
+def test_nested_fences_survive_term_extraction_and_markdown_rendering() -> None:
+    text = "````markdown\n```py\nhiddenword hiddenword\n```\nalsohidden alsohidden\n````\nvisible visible"
+    assert set(term_counts(text)) == {"visible"}
+    rendered = render_markdown_html(text)
+    assert rendered.count("<pre>") == 1
+    assert "```py" in rendered and "hiddenword" in rendered
+    assert rendered.endswith("<p>visible visible</p>")
 
 
 def test_term_counts_drop_identifiers_and_code_keywords_but_keep_hyphenated_words() -> None:

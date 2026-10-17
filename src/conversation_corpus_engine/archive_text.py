@@ -7,7 +7,7 @@ from html.parser import HTMLParser
 
 from .answering import tokenize
 
-FENCE_RE = re.compile(r"^(\s*)(`{3,}|~{3,})\s*([\w+#.-]*)\s*$")
+FENCE_OPEN_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 URL_RE = re.compile(r"https?://\S+")
 INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 BOLD_RE = re.compile(r"\*\*([^*\n]+)\*\*")
@@ -128,20 +128,35 @@ def html_to_text(markup: str) -> str:
     return text.strip()
 
 
+class FenceTracker:
+    """CommonMark fenced code: a fence closes only on the same character, at least as long as
+    the opener, with nothing after it. A 4-backtick wrapper therefore holds 3-backtick blocks."""
+
+    def __init__(self) -> None:
+        self.opener = ""
+
+    def feed(self, line: str) -> str:
+        """Classify a line: "" outside code, "open", "inside" or "close"."""
+        match = FENCE_OPEN_RE.match(line)
+        if self.opener:
+            if (
+                match
+                and match.group(1)[0] == self.opener[0]
+                and len(match.group(1)) >= len(self.opener)
+                and not match.group(2).strip()
+            ):
+                self.opener = ""
+                return "close"
+            return "inside"
+        if match and not (match.group(1)[0] == "`" and "`" in match.group(2)):
+            self.opener = match.group(1)
+            return "open"
+        return ""
+
+
 def strip_code_and_urls(text: str) -> str:
-    lines: list[str] = []
-    fence = ""
-    for line in (text or "").splitlines():
-        marker = FENCE_RE.match(line)
-        if marker:
-            opener = marker.group(2)[0]
-            if not fence:
-                fence = opener
-            elif fence == opener:
-                fence = ""
-            continue
-        if not fence:
-            lines.append(line)
+    tracker = FenceTracker()
+    lines = [line for line in (text or "").splitlines() if not tracker.feed(line)]
     return URL_RE.sub(" ", INLINE_CODE_RE.sub(" ", "\n".join(lines)))
 
 
@@ -174,7 +189,7 @@ def render_markdown_html(text: str) -> str:
     out: list[str] = []
     paragraph: list[str] = []
     list_kind = ""
-    fence = ""
+    tracker = FenceTracker()
     code: list[str] = []
 
     def flush_paragraph() -> None:
@@ -191,19 +206,17 @@ def render_markdown_html(text: str) -> str:
             list_kind = ""
 
     for line in (text or "").splitlines():
-        marker = FENCE_RE.match(line)
-        if fence:
-            if marker and marker.group(2)[0] == fence:
-                out.append("<pre><code>" + html.escape("\n".join(code)) + "</code></pre>")
-                code.clear()
-                fence = ""
-            else:
-                code.append(line)
+        state = tracker.feed(line)
+        if state == "inside":
+            code.append(line)
             continue
-        if marker:
+        if state == "close":
+            out.append("<pre><code>" + html.escape("\n".join(code)) + "</code></pre>")
+            code.clear()
+            continue
+        if state == "open":
             flush_paragraph()
             close_list()
-            fence = marker.group(2)[0]
             continue
         if not line.strip():
             flush_paragraph()
@@ -228,7 +241,7 @@ def render_markdown_html(text: str) -> str:
         else:
             close_list()
             paragraph.append(line)
-    if fence:
+    if tracker.opener:
         out.append("<pre><code>" + html.escape("\n".join(code)) + "</code></pre>")
     flush_paragraph()
     close_list()
