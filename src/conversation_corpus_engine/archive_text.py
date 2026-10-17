@@ -33,7 +33,7 @@ STOP_WORDS = frozenset(
     another anything anyone around back based better big
     help provide include includes including following example examples sure okay thanks
     thank hello hey great good best question answer respond response
-    prompt user assistant model chat conversation message messages
+    prompt user assistant model chat conversation message messages untitled
     """.split()  # noqa: SIM905 - one readable block beats 200 quoted literals
 )
 

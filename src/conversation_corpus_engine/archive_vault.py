@@ -32,6 +32,7 @@ PALETTE = {
     "perplexity": 0x20B8CD,
 }
 FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+INLINE_CODE_RE = re.compile(r"(`[^`\n]+`)")
 TAG_RE = re.compile(r"(?<![\w&\\/])#(?=[\w/-])")
 UNSAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 READING_NOTE = (
@@ -66,7 +67,12 @@ def neutralize(text: str) -> str:
         if fence:
             lines.append(raw)
             continue
-        safe = TAG_RE.sub("\\#", raw.replace("[[", "\\[\\[").replace("]]", "\\]\\]"))
+        pieces = INLINE_CODE_RE.split(raw)
+        for index in range(0, len(pieces), 2):
+            pieces[index] = TAG_RE.sub(
+                "\\#", pieces[index].replace("[[", "\\[\\[").replace("]]", "\\]\\]")
+            )
+        safe = "".join(pieces)
         if safe.lstrip().startswith("#"):
             safe = "\\" + safe.lstrip()
         lines.append(safe)
@@ -310,6 +316,22 @@ def _sync_manifest(root: Path, written: set[str]) -> int:
 WIKILINK_RE = re.compile(r"(?<!\\)\[\[([^\]|\\]+)(?:\\?\|[^\]]*)?\]\]")
 
 
+def link_targets(markdown: str) -> list[str]:
+    """Wikilink targets Obsidian would resolve: code fences (also inside callouts) and inline
+    code are not parsed for links, so they are excluded."""
+    kept: list[str] = []
+    fence = ""
+    for raw in markdown.splitlines():
+        marker = FENCE_RE.match(raw.lstrip("> "))
+        if marker:
+            opener = marker.group(1)[0]
+            fence = "" if fence == opener else (fence or opener)
+            continue
+        if not fence:
+            kept.append(raw)
+    return WIKILINK_RE.findall(INLINE_CODE_RE.sub(" ", "\n".join(kept)))
+
+
 def verify_vault(paths: ArchivePaths) -> list[str]:
     """Check that every generated file exists and every wikilink resolves to a note."""
     root = paths.vault
@@ -324,7 +346,7 @@ def verify_vault(paths: ArchivePaths) -> list[str]:
         target_file = root / rel
         if not rel.endswith(".md") or not target_file.is_file():
             continue
-        for target in WIKILINK_RE.findall(target_file.read_text(encoding="utf-8")):
+        for target in link_targets(target_file.read_text(encoding="utf-8")):
             if target not in names:
                 dangling[target] += 1
     problems += [f"dangling wikilink [[{t}]] x{n}" for t, n in sorted(dangling.items())[:20]]

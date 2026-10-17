@@ -11,8 +11,10 @@ from conversation_corpus_engine.archive_model import Message
 from conversation_corpus_engine.archive_topics import build_analysis
 from conversation_corpus_engine.archive_vault import (
     build_vault,
+    link_targets,
     neutralize,
     render_conversation,
+    verify_vault,
 )
 
 LINK_RE = re.compile(r"(?<!\\)\[\[([^\]|\\]+)(?:\\?\|[^\]]*)?\]\]")
@@ -211,3 +213,43 @@ def test_topic_hubs_bridge_providers(archive_env) -> None:
     hub = (archive_env.paths.vault / "Hubs" / "topic-kubernetes.md").read_text(encoding="utf-8")
     assert "across 4 provider(s)" in hub
     assert hub.count("[[") == 4
+
+
+def test_inline_code_passes_through_and_link_targets_skip_all_code() -> None:
+    cleaned = neutralize("use `[[ -f x ]]` and [[real]] and `#tag` plus #tag")
+    assert "`[[ -f x ]]`" in cleaned and "`#tag`" in cleaned
+    assert "\\[\\[real\\]\\]" in cleaned and "plus \\#tag" in cleaned
+    sample = (
+        "```bash\n[[ -f x ]]\n```\n> ```\n> [[ -d y ]]\n> ```\n~~~\n[[ z ]]\n~~~\n"
+        "`[[ w ]]` [[real]] [[other|label]] [[tbl\\|label]]"
+    )
+    assert link_targets(sample) == ["real", "other", "tbl"]
+
+
+def test_shell_conditionals_in_messages_do_not_break_vault_verification(archive_env) -> None:
+    script = "run:\n```bash\nif [[ -f x ]]; then echo ok; fi\n```\ninline `[[ -d y ]]` too"
+    conversation = conv("chatgpt", "shell", "Shell help", [("user", script), ("assistant", "ok")])
+    conversation.messages.append(
+        Message(
+            role="assistant",
+            text='```sh\n[[ "$a" == b ]]\n```',
+            ts="2025-01-01T00:00:00Z",
+            meta={"kind": "reasoning"},
+        )
+    )
+    write_store(archive_env.paths, [conversation])
+    (archive_env.paths.root / "manifest.json").write_text(
+        json.dumps(
+            {
+                "source_fingerprint": "c" * 64,
+                "totals": {"conversations": 1, "messages": 3, "words": 10},
+                "providers": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    build_analysis(archive_env.paths)
+    build_vault(archive_env.paths, archive_env.auth)
+    note = next(archive_env.paths.vault.rglob("chatgpt-shell.md")).read_text(encoding="utf-8")
+    assert "[[ -f x ]]" in note and "`[[ -d y ]]`" in note
+    assert verify_vault(archive_env.paths) == []
