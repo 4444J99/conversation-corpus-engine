@@ -16,6 +16,7 @@ from archive_support import (
 )
 
 from conversation_corpus_engine.archive_ingest import (
+    DEFAULT_ARCHIVE_DIRNAME,
     PROVIDER_SPECS,
     ArchivePaths,
     authorize_archive,
@@ -70,15 +71,16 @@ def test_ingest_is_byte_identical_on_rerun(archive_env) -> None:
     snapshot = {
         p.relative_to(archive_env.paths.root): p.read_bytes()
         for p in archive_env.paths.root.rglob("*")
-        if p.is_file() and p.name != "run.json"
+        if p.is_file()
     }
     ingest(**kwargs)
     again = {
         p.relative_to(archive_env.paths.root): p.read_bytes()
         for p in archive_env.paths.root.rglob("*")
-        if p.is_file() and p.name != "run.json"
+        if p.is_file()
     }
     assert snapshot == again
+    assert snapshot, "the second run compared something"
 
 
 def test_ingest_isolates_a_failing_provider(archive_env) -> None:
@@ -246,16 +248,16 @@ def test_custody_refuses_unregistered_overlapping_and_escaping_destinations(
     with pytest.raises(CorpusStoreError):
         authorize_archive(
             project_root=archive_env.project,
-            archive_root=archive_env.store / "_archive",
+            archive_root=archive_env.store / DEFAULT_ARCHIVE_DIRNAME,
             corpus_store_root=archive_env.store,
-            source_roots=(archive_env.store / "_archive" / "inside",),
+            source_roots=(archive_env.store / DEFAULT_ARCHIVE_DIRNAME / "inside",),
         )
     other = tmp_path / "other-store"
     other.mkdir()
     with pytest.raises(CorpusStoreError):
         authorize_archive(
             project_root=archive_env.project,
-            archive_root=other / "_archive",
+            archive_root=other / DEFAULT_ARCHIVE_DIRNAME,
             corpus_store_root=other,
         )
     with pytest.raises(CorpusStoreError):
@@ -277,7 +279,7 @@ def test_topics_connect_documents_across_providers(archive_env) -> None:
     write_store(archive_env.paths, topical_corpus())
     summary = build_analysis(archive_env.paths)
     assert summary["documents"] == 12
-    topics = json.loads((archive_env.paths.analysis / "topics.json").read_text(encoding="utf-8"))
+    topics = json.loads(archive_env.paths.topics.read_text(encoding="utf-8"))
     hubs = topics["hubs"]
     assert hubs["kubernetes"]["documents"] == 4
     assert set(hubs["kubernetes"]["providers"]) == {"chatgpt", "claude", "gemini", "grok"}
@@ -293,9 +295,9 @@ def test_topics_connect_documents_across_providers(archive_env) -> None:
 def test_topics_are_deterministic(archive_env) -> None:
     write_store(archive_env.paths, topical_corpus())
     build_analysis(archive_env.paths)
-    first = (archive_env.paths.analysis / "enrichment.jsonl").read_bytes()
+    first = archive_env.paths.enrichment.read_bytes()
     build_analysis(archive_env.paths)
-    assert (archive_env.paths.analysis / "enrichment.jsonl").read_bytes() == first
+    assert archive_env.paths.enrichment.read_bytes() == first
 
 
 def test_topics_handle_an_empty_store(archive_env) -> None:

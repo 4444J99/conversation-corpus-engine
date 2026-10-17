@@ -41,10 +41,10 @@ def test_build_runs_every_stage_and_verifies(cli_env) -> None:
     env, _, code, out, err = cli_env
     payload = json.loads(out)
     assert code == 0 and payload["ok"] is True and payload["problems"] == []
-    assert set(payload["stages"]) == {"ingest", "analyze", "vault", "kb", "graph", "site"}
+    assert set(payload["stages"]) == {"ingest", "analyze", "vault", "database", "graph", "site"}
     assert payload["stages"]["ingest"]["totals"]["conversations"] == 24
     assert payload["stages"]["site"]["pages"] == 24
-    for stage in ("ingest", "analyze", "vault", "kb", "graph", "site"):
+    for stage in ("ingest", "analyze", "vault", "database", "graph", "site"):
         assert f"[archive] {stage} done" in err
     assert verify_archive(env.paths) == []
 
@@ -68,8 +68,8 @@ def test_verify_search_and_titles_commands(cli_env, monkeypatch, capsys) -> None
 
 def test_verify_detects_tampering_across_surfaces(cli_env, monkeypatch, capsys) -> None:
     env, common, _, _, _ = cli_env
-    next(env.paths.vault.rglob("chatgpt-aaaa1111.md")).unlink()
-    next((env.paths.site / "c" / "grok").glob("*.html")).unlink()
+    next(env.paths.vault.rglob("conversation-chatgpt-aaaa1111.md")).unlink()
+    next(env.paths.site_pages.glob("conversation-grok-*.html")).unlink()
     code, out, _ = _cce(monkeypatch, capsys, "archive", "verify", *common)
     problems = json.loads(out)["problems"]
     assert code == 1
@@ -104,7 +104,7 @@ def test_single_stage_commands_and_provider_filter(archive_env, monkeypatch, cap
     stages = json.loads(out)["stages"]["ingest"]
     assert code == 0 and set(stages["providers"]) == {"grok", "perplexity"}
     assert stages["totals"]["conversations"] == 8
-    for stage in ("analyze", "vault", "kb", "graph", "site"):
+    for stage in ("analyze", "vault", "database", "graph", "site"):
         code, out, _ = _cce(monkeypatch, capsys, "archive", stage, *common)
         assert code == 0, stage
     code, out, _ = _cce(monkeypatch, capsys, "archive", "verify", *common)

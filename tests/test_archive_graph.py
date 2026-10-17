@@ -45,12 +45,18 @@ def test_graph_files_summary_and_graphml_are_valid(archive_env) -> None:
     degrees = [hub["degree"] for hub in summary["top_hubs"]]
     assert degrees == sorted(degrees, reverse=True) and degrees[0] > 1
     assert not any(hub["id"].startswith("provider:") for hub in summary["top_hubs"])
-    tree = ET.parse(root / "archive.graphml")
+    assert sorted(path.name for path in root.iterdir()) == [
+        "graph-all.graphml",
+        "index-all-edges.jsonl",
+        "index-all-nodes.jsonl",
+        "report-all-graph.json",
+    ]
+    tree = ET.parse(archive_env.paths.graph_graphml)
     ns = {"g": "http://graphml.graphdrawing.org/xmlns"}
     assert len(tree.findall(".//g:node", ns)) == summary["nodes"]
     assert len(tree.findall(".//g:edge", ns)) == summary["edges"]
-    assert sum(1 for _ in iter_jsonl(root / "nodes.jsonl")) == summary["nodes"]
-    assert json.loads((root / "summary.json").read_text(encoding="utf-8")) == summary
+    assert sum(1 for _ in iter_jsonl(archive_env.paths.graph_nodes)) == summary["nodes"]
+    assert json.loads(archive_env.paths.graph_summary.read_text(encoding="utf-8")) == summary
 
 
 def test_graphml_survives_hostile_labels() -> None:

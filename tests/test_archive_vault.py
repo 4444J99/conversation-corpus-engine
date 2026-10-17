@@ -7,7 +7,7 @@ from pathlib import Path
 from archive_support import conv, topical_corpus, write_store
 
 from conversation_corpus_engine.archive_ingest import ingest
-from conversation_corpus_engine.archive_model import Message
+from conversation_corpus_engine.archive_model import Message, write_jsonl_atomic
 from conversation_corpus_engine.archive_topics import build_analysis
 from conversation_corpus_engine.archive_vault import (
     build_vault,
@@ -48,10 +48,10 @@ def test_vault_from_synthetic_export_has_resolvable_links(archive_env) -> None:
     summary = _full_build(archive_env)
     root = archive_env.paths.vault
     assert summary["notes"] == 24
-    assert (root / "Home.md").is_file()
-    assert (root / "Meta" / "coverage.md").is_file()
-    assert (root / "Hubs" / "provider-chatgpt.md").is_file()
-    assert (root / "Conversations" / "chatgpt" / "2023" / "chatgpt-aaaa1111.md").is_file()
+    assert (root / "home-all.md").is_file()
+    assert (root / "meta" / "coverage-all.md").is_file()
+    assert (root / "hubs" / "provider-chatgpt.md").is_file()
+    assert (root / "conversations" / "conversation-chatgpt-aaaa1111.md").is_file()
     assert _assert_links_resolve(root) > 30
     graph = json.loads((root / ".obsidian" / "graph.json").read_text(encoding="utf-8"))
     assert {g["query"] for g in graph["colorGroups"]} >= {
@@ -62,9 +62,9 @@ def test_vault_from_synthetic_export_has_resolvable_links(archive_env) -> None:
 
 def test_vault_note_content_and_frontmatter(archive_env) -> None:
     _full_build(archive_env)
-    note = (
-        archive_env.paths.vault / "Conversations" / "chatgpt" / "2023" / "chatgpt-aaaa1111.md"
-    ).read_text(encoding="utf-8")
+    note = (archive_env.paths.vault_conversations / "conversation-chatgpt-aaaa1111.md").read_text(
+        encoding="utf-8"
+    )
     head, _, body = note.partition("\n---\n")
     assert head.startswith('---\nuid: "chatgpt-aaaa1111"')
     assert 'title: "Kubernetes rollout planning"' in head
@@ -76,9 +76,9 @@ def test_vault_note_content_and_frontmatter(archive_env) -> None:
     assert "### Assistant ·" in body
     assert "*Attachments (names only):* `diagram.png`" in body
     assert "```py" in body
-    home = (archive_env.paths.vault / "Home.md").read_text(encoding="utf-8")
+    home = (archive_env.paths.vault / "home-all.md").read_text(encoding="utf-8")
     assert "[[provider-chatgpt\\|ChatGPT]]" in home
-    coverage = (archive_env.paths.vault / "Meta" / "coverage.md").read_text(encoding="utf-8")
+    coverage = (archive_env.paths.vault / "meta" / "coverage-all.md").read_text(encoding="utf-8")
     assert "Channels not read" in coverage and "user.json" in coverage
 
 
@@ -111,7 +111,7 @@ def test_hostile_conversation_keeps_the_graph_clean(archive_env) -> None:
                 "words": 4,
                 "created_min": "2025-01-01T00:00:00Z",
                 "last_activity_max": "2025-01-01T00:00:00Z",
-                "duplicates_skipped": 0,
+                "duplicates_folded": 0,
                 "roles": {},
                 "kinds": {},
                 "reader": "t",
@@ -120,9 +120,7 @@ def test_hostile_conversation_keeps_the_graph_clean(archive_env) -> None:
             }
         },
     }
-    (archive_env.paths.root / "manifest.json").write_text(
-        json.dumps(ingest_manifest), encoding="utf-8"
-    )
+    archive_env.paths.manifest.write_text(json.dumps(ingest_manifest), encoding="utf-8")
     build_analysis(archive_env.paths)
     build_vault(archive_env.paths, archive_env.auth)
     names = {Path(rel).stem for rel in _vault_files(archive_env.paths.vault)}
@@ -160,7 +158,7 @@ def test_large_messages_and_notes_are_capped_with_a_marker() -> None:
 
 def test_rebuild_is_stable_prunes_stale_notes_and_keeps_user_notes(archive_env) -> None:
     write_store(archive_env.paths, topical_corpus())
-    (archive_env.paths.root / "manifest.json").write_text(
+    archive_env.paths.manifest.write_text(
         json.dumps(
             {
                 "source_fingerprint": "a" * 64,
@@ -192,14 +190,14 @@ def test_rebuild_is_stable_prunes_stale_notes_and_keeps_user_notes(archive_env) 
     build_analysis(archive_env.paths)
     pruned = build_vault(archive_env.paths, archive_env.auth)
     assert pruned["removed_stale"] >= 1
-    assert not list(root.rglob("chatgpt-o0.md"))
+    assert not list(root.rglob("conversation-chatgpt-o0.md"))
     assert mine.is_file()
     _assert_links_resolve(root)
 
 
 def test_topic_hubs_bridge_providers(archive_env) -> None:
     write_store(archive_env.paths, topical_corpus())
-    (archive_env.paths.root / "manifest.json").write_text(
+    archive_env.paths.manifest.write_text(
         json.dumps(
             {
                 "source_fingerprint": "b" * 64,
@@ -211,7 +209,7 @@ def test_topic_hubs_bridge_providers(archive_env) -> None:
     )
     build_analysis(archive_env.paths)
     build_vault(archive_env.paths, archive_env.auth)
-    hub = (archive_env.paths.vault / "Hubs" / "topic-kubernetes.md").read_text(encoding="utf-8")
+    hub = (archive_env.paths.vault / "hubs" / "topic-all-kubernetes.md").read_text(encoding="utf-8")
     assert "across 4 provider(s)" in hub
     assert hub.count("[[") == 4
 
@@ -265,7 +263,7 @@ def test_bracketed_titles_cannot_mint_links() -> None:
         titles={},
         collection_link="",
     )
-    assert link_targets(note) == ["provider-grok", "month-2025-01"]
+    assert link_targets(note) == ["provider-grok", "month-all-202501"]
     assert 'title: "((Decision: Adopt X))"' in note
 
 
@@ -281,7 +279,7 @@ def test_shell_conditionals_in_messages_do_not_break_vault_verification(archive_
         )
     )
     write_store(archive_env.paths, [conversation])
-    (archive_env.paths.root / "manifest.json").write_text(
+    archive_env.paths.manifest.write_text(
         json.dumps(
             {
                 "source_fingerprint": "c" * 64,
@@ -293,6 +291,60 @@ def test_shell_conditionals_in_messages_do_not_break_vault_verification(archive_
     )
     build_analysis(archive_env.paths)
     build_vault(archive_env.paths, archive_env.auth)
-    note = next(archive_env.paths.vault.rglob("chatgpt-shell.md")).read_text(encoding="utf-8")
+    note = next(archive_env.paths.vault.rglob("conversation-chatgpt-shell.md")).read_text(
+        encoding="utf-8"
+    )
     assert "[[ -f x ]]" in note and "`[[ -d y ]]`" in note
     assert verify_vault(archive_env.paths) == []
+
+
+def test_undated_conversations_get_no_month_link_and_unnameable_topics_stay_plain(
+    archive_env,
+) -> None:
+    write_store(
+        archive_env.paths,
+        [conv("grok", "u1", "Undated", created=""), conv("grok", "u2", "Dated")],
+    )
+    archive_env.paths.manifest.write_text(
+        json.dumps(
+            {
+                "source_fingerprint": "d" * 64,
+                "totals": {"conversations": 2, "messages": 4, "words": 8},
+                "providers": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    rows = [
+        {"uid": "grok-u1", "topics": ["well-known", "kubernetes"], "terms": [], "similar": []},
+        {"uid": "grok-u2", "topics": ["kubernetes"], "terms": [], "similar": []},
+    ]
+    write_jsonl_atomic(archive_env.paths.enrichment, rows)
+    summary = build_vault(archive_env.paths, archive_env.auth)
+    undated = (archive_env.paths.vault_conversations / "conversation-grok-u1.md").read_text(
+        encoding="utf-8"
+    )
+    assert "**Month**" not in undated and "month-all" not in undated
+    assert "[[topic-all-kubernetes|kubernetes]]" in undated
+    assert "well-known" in undated and "topic-all-well-known" not in undated
+    assert "topic/kubernetes" in undated and "topic/well-known" not in undated
+    assert summary["topics_without_hub"] == 1
+    hubs = {p.name for p in archive_env.paths.vault_hubs.iterdir()}
+    assert hubs == {
+        "provider-grok.md",
+        "month-all-202501.md",
+        "topic-all-kubernetes.md",
+    }
+    assert verify_vault(archive_env.paths) == []
+
+
+def test_every_link_in_the_vault_comes_from_the_one_wikilink_function(archive_env) -> None:
+    source = (
+        Path(__file__).resolve().parent.parent
+        / "src"
+        / "conversation_corpus_engine"
+        / "archive_vault.py"
+    ).read_text(encoding="utf-8")
+    by_hand = [line for line in source.splitlines() if "[[{" in line]
+    assert all("dangling wikilink" in line for line in by_hand), by_hand
+    assert 'f"[[' not in source and "f'[[" not in source

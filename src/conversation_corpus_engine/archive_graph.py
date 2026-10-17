@@ -149,11 +149,11 @@ def render_graphml(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> 
 
 
 def build_graph(paths: ArchivePaths, authorization: CorpusWriteAuthorization) -> dict[str, Any]:
-    root = require_inside(authorization, paths.graph)
+    require_inside(authorization, paths.graph)
     nodes, edges = build_graph_tables(paths)
-    write_jsonl_atomic(root / "nodes.jsonl", nodes)
-    write_jsonl_atomic(root / "edges.jsonl", edges)
-    write_text_atomic(root / "archive.graphml", render_graphml(nodes, edges))
+    write_jsonl_atomic(paths.graph_nodes, nodes)
+    write_jsonl_atomic(paths.graph_edges, edges)
+    write_text_atomic(paths.graph_graphml, render_graphml(nodes, edges))
     by_id = {node["id"]: node for node in nodes}
     degree: Counter[str] = Counter()
     for edge in edges:
@@ -192,5 +192,5 @@ def build_graph(paths: ArchivePaths, authorization: CorpusWriteAuthorization) ->
             if by_id[key]["kind"] != "provider"
         ][:15],
     }
-    write_json_atomic(root / "summary.json", summary)
+    write_json_atomic(paths.graph_summary, summary)
     return summary
