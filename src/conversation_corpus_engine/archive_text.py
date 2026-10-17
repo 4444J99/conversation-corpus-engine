@@ -38,6 +38,15 @@ STOP_WORDS = frozenset(
 )
 
 
+CODE_WORDS = frozenset(
+    """
+    const classname function return import export default class true false null undefined href
+    https http html css div span style script width height color background rgba void async await
+    string number boolean object array props state render
+    """.split()  # noqa: SIM905 - one readable block beats a column of quoted literals
+)
+
+
 class _HtmlToText(HTMLParser):
     BLOCK = {"p", "div", "section", "article", "table", "tr", "blockquote"}
 
@@ -140,7 +149,9 @@ def term_counts(text: str) -> Counter[str]:
     counts: Counter[str] = Counter()
     for raw in tokenize(strip_code_and_urls(text)):
         word = raw.strip("-_")
-        if len(word) < 4 or len(word) > 24 or word in STOP_WORDS:
+        if len(word) < 4 or len(word) > 24 or word in STOP_WORDS or word in CODE_WORDS:
+            continue
+        if "_" in word:
             continue
         if word.isdigit() or HEX_RE.match(word) or sum(ch.isdigit() for ch in word) > 2:
             continue

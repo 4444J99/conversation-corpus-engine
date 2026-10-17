@@ -69,3 +69,10 @@ def test_term_counts_ignore_code_urls_stopwords_and_noise() -> None:
     assert counts["cluster"] == 1
     for banned in ("secretcodeword", "inlinecodeword", "the", "12345", "deadbeefcafe0123", "abc"):
         assert banned not in counts
+
+
+def test_term_counts_drop_identifiers_and_code_keywords_but_keep_hyphenated_words() -> None:
+    counts = term_counts(
+        "render_inline_citation card_id const classname untitled self-evolving systems systems"
+    )
+    assert set(counts) == {"self-evolving", "systems"}
