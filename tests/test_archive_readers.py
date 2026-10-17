@@ -13,7 +13,11 @@ from conversation_corpus_engine import (
     archive_read_notebooklm,
     archive_read_perplexity,
 )
-from conversation_corpus_engine.archive_model import Conversation, SourceTracker
+from conversation_corpus_engine.archive_model import (
+    Conversation,
+    SourceTracker,
+    finalize_conversation,
+)
 
 
 def _read(module, root: Path, **kwargs) -> tuple[dict[str, Conversation], SourceTracker]:
@@ -41,6 +45,56 @@ def test_chatgpt_linearizes_current_branch_and_hides_scaffolding(archive_env) ->
     empty = items["cccc3333p"]
     assert empty.messages == [] and empty.collection == "g-p-proj"
     assert tracker.files_read == ["conversations-000.json"]
+
+
+def test_chatgpt_ids_are_node_ids_and_off_branch_messages_are_kept_beside_the_chain(
+    archive_env,
+) -> None:
+    items, tracker = _read(archive_read_chatgpt, archive_env.export / "chatgpt")
+    first = items["aaaa1111"]
+    assert [m.id for m in first.messages] == ["aaaa1111-0", "aaaa1111-1"]
+    (alternate,) = first.extra["alternate_messages"]
+    assert alternate["id"] == "aaaa1111-stray" and alternate["branch"] == "alternate"
+    assert alternate["parent_id"] == "aaaa1111-0"
+    assert (alternate["role"], alternate["channel"]) == ("assistant", "reply")
+    assert alternate["text"] == "abandoned regeneration"
+    assert alternate["typed_chars"] == len("abandoned regeneration")
+    assert alternate["id"] not in {m.id for m in first.messages}
+    assert first.extra["off_branch_messages"] == 1, "the main accounting does not move"
+    assert items["bbbb2222"].extra["alternate_messages"] == []
+    assert tracker.counters["alternate_messages_kept"] == 1
+
+
+def test_chatgpt_alternates_skip_hidden_and_empty_nodes_but_stay_counted(tmp_path: Path) -> None:
+    def node(identifier: str, parent: str, role: str, text: str, hidden: bool = False) -> dict:
+        return {
+            "id": identifier,
+            "parent": parent,
+            "children": [],
+            "message": {
+                "id": identifier,
+                "author": {"role": role},
+                "create_time": 10.0,
+                "content": {"content_type": "text", "parts": [text]},
+                "metadata": {"is_visually_hidden_from_conversation": hidden},
+            },
+        }
+
+    mapping = {
+        "root": {"id": "root", "parent": None, "children": ["a", "b", "c", "d"], "message": None},
+        "a": node("a", "root", "user", "main"),
+        "b": node("b", "root", "user", "kept elsewhere"),
+        "c": node("c", "root", "user", "hidden elsewhere", hidden=True),
+        "d": node("d", "root", "user", "   "),
+    }
+    raw = {"conversation_id": "x1", "current_node": "a", "mapping": mapping}
+    source = tmp_path / "c.json"
+    source.write_text("[]", encoding="utf-8")
+    tracker = SourceTracker(tmp_path, "t")
+    conversation = archive_read_chatgpt._conversation(raw, {}, tracker, source)
+    assert [row["id"] for row in conversation.extra["alternate_messages"]] == ["b"]
+    assert conversation.extra["off_branch_messages"] == 3
+    assert [m.id for m in conversation.messages] == ["a"]
 
 
 def test_chatgpt_message_accounting_reconciles_exactly(archive_env) -> None:
@@ -108,6 +162,33 @@ def test_claude_reads_chats_projects_memory_and_design(archive_env) -> None:
     assert memory.kind == "memory"
     assert [m.meta["kind"] for m in memory.messages] == ["summary", "project-memory", "memory-file"]
     assert items["design-dd"].messages == []
+
+
+def test_claude_turns_carry_the_message_uuid_and_the_rest_are_minted_later(archive_env) -> None:
+    items, _ = _read(archive_read_claude, archive_env.export / "claude")
+    chat = items["c1c1c1c1"]
+    assert [m.id for m in chat.messages] == ["m1", "", "m2", ""]
+    finalize_conversation(chat)
+    ids = [m.id for m in chat.messages]
+    assert ids[0] == "m1" and ids[2] == "m2" and len(set(ids)) == 4
+    assert [m.channel for m in chat.messages] == ["typed", "thinking", "reply", "tool"]
+    project = items["project-p1"]
+    finalize_conversation(project)
+    assert {m.channel for m in project.messages} == {"project"}
+    memory = items["memories"]
+    finalize_conversation(memory)
+    assert {m.channel for m in memory.messages} == {"memory"}
+
+
+def test_claude_typed_characters_exclude_appended_attachment_text(archive_env) -> None:
+    root = archive_env.export / "claude"
+    plain, _ = _read(archive_read_claude, root)
+    appended, _ = _read(archive_read_claude, root, include_attachment_text=True)
+    typed = "Review kubernetes cluster costs"
+    before, after = plain["c1c1c1c1"].messages[0], appended["c1c1c1c1"].messages[0]
+    assert before.typed_chars == len(before.text) == len(typed)
+    assert after.typed_chars == len(typed) and len(after.text) > len(typed)
+    assert after.text[: after.typed_chars] == typed
 
 
 def test_claude_tool_only_turns_are_preserved_not_dropped() -> None:

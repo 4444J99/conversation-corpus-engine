@@ -1,14 +1,22 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
-from archive_support import conv, gpt_conversation, topical_corpus, write_store
+from archive_support import (
+    add_idless_chatgpt_shard,
+    conv,
+    gpt_conversation,
+    topical_corpus,
+    write_store,
+)
 
 from conversation_corpus_engine.archive_ingest import (
+    PROVIDER_SPECS,
     ArchivePaths,
     authorize_archive,
     failed_providers,
@@ -18,6 +26,12 @@ from conversation_corpus_engine.archive_ingest import (
     load_manifest,
     require_inside,
     resolve_sources,
+    source_fingerprint,
+)
+from conversation_corpus_engine.archive_naming import (
+    NAMING_VERSION,
+    conversation_name,
+    validate_name,
 )
 from conversation_corpus_engine.archive_topics import build_analysis, load_enrichment
 from conversation_corpus_engine.corpus_store import CorpusStoreError, register_corpus_store
@@ -110,8 +124,107 @@ def test_ingest_dedupes_by_uid_keeping_first(archive_env, tmp_path: Path) -> Non
         providers=["chatgpt"],
         overrides={"chatgpt": tmp_path / "gpt"},
     )
-    assert manifest["providers"]["chatgpt"]["duplicates_skipped"] == 1
+    assert manifest["providers"]["chatgpt"]["duplicates_folded"] == 1
     assert manifest["providers"]["chatgpt"]["conversations"] == 3
+    assert "duplicates_skipped" not in manifest["providers"]["chatgpt"]
+
+
+def test_manifest_records_versions_and_per_provider_counters(archive_env) -> None:
+    manifest = ingest(
+        export_root=archive_env.export, paths=archive_env.paths, authorization=archive_env.auth
+    )
+    assert manifest["schema"] == "archive-manifest.v2"
+    assert manifest["conversation_schema"] == "archive-conversation.v2"
+    assert manifest["schema_version"] == 2
+    assert manifest["naming_version"] == NAMING_VERSION
+    assert manifest["reader_versions"] == {
+        name: spec.module.READER for name, spec in PROVIDER_SPECS.items()
+    }
+    for info in manifest["providers"].values():
+        assert info["derived_ids"] == 0 and info["duplicates_folded"] == 0
+    assert len(manifest["source_fingerprint"]) == 64
+
+
+def test_id_less_conversations_each_get_their_own_derived_id(archive_env) -> None:
+    add_idless_chatgpt_shard(archive_env.export)
+    manifest = ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["chatgpt"],
+    )
+    info = manifest["providers"]["chatgpt"]
+    assert info["conversations"] == 5
+    assert info["derived_ids"] == 2 and info["duplicates_folded"] == 0
+    derived = [c for c in iter_store(archive_env.paths) if c.source_id.startswith("derived-")]
+    assert len(derived) == 2
+    assert len({c.uid for c in derived}) == 2
+    for conversation in derived:
+        assert re.fullmatch(r"derived-[0-9a-f]{16}", conversation.source_id)
+        assert conversation.extra["source_id_derived"] == "empty"
+        assert conversation.messages and all(m.id for m in conversation.messages)
+        assert not validate_name(conversation_name("chatgpt", conversation.uid))
+
+
+def test_identical_id_less_conversations_fold_into_one(archive_env, tmp_path: Path) -> None:
+    twin = gpt_conversation("", "Same", [("user", "same question"), ("assistant", "same")])
+    shard = tmp_path / "gpt"
+    shard.mkdir()
+    (shard / "conversations-000.json").write_text(json.dumps([twin, twin]), encoding="utf-8")
+    manifest = ingest(
+        export_root=tmp_path,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["chatgpt"],
+        overrides={"chatgpt": shard},
+    )
+    info = manifest["providers"]["chatgpt"]
+    assert (info["conversations"], info["derived_ids"], info["duplicates_folded"]) == (1, 1, 1)
+
+
+def test_fingerprint_is_the_same_on_two_hosts_and_moves_with_the_source(
+    archive_env, tmp_path: Path
+) -> None:
+    first = ingest(
+        export_root=archive_env.export, paths=archive_env.paths, authorization=archive_env.auth
+    )
+    elsewhere = tmp_path / "second-host" / "deeper" / "export"
+    shutil.copytree(archive_env.export, elsewhere)
+    second = ingest(export_root=elsewhere, paths=archive_env.paths, authorization=archive_env.auth)
+    assert (
+        first["providers"]["chatgpt"]["source_root"]
+        != second["providers"]["chatgpt"]["source_root"]
+    )
+    assert first["source_fingerprint"] == second["source_fingerprint"]
+    (elsewhere / "perplexity" / "conversations-20250101.json").write_text("{}", encoding="utf-8")
+    third = ingest(export_root=elsewhere, paths=archive_env.paths, authorization=archive_env.auth)
+    assert third["source_fingerprint"] != first["source_fingerprint"]
+
+
+def test_fingerprint_ignores_paths_and_errors_but_not_versions() -> None:
+    providers = {"grok": {"status": "ok", "conversations": 1, "source_root": "/a/b"}}
+    moved = {"grok": {"status": "ok", "conversations": 1, "source_root": "/other/place"}}
+    versions = {"grok": "archive_read_grok@1"}
+    base = source_fingerprint(providers, reader_versions=versions, naming_version=1)
+    assert base == source_fingerprint(moved, reader_versions=versions, naming_version=1)
+    failed = {"grok": {"status": "ok", "conversations": 1, "error": "x at /home/someone"}}
+    assert base == source_fingerprint(failed, reader_versions=versions, naming_version=1)
+    assert base != source_fingerprint(
+        providers, reader_versions={"grok": "archive_read_grok@2"}, naming_version=1
+    )
+    assert base != source_fingerprint(providers, reader_versions=versions, naming_version=2)
+
+
+def test_manifest_accepts_the_previous_schema_and_refuses_unknown_ones(archive_env) -> None:
+    ingest(export_root=archive_env.export, paths=archive_env.paths, authorization=archive_env.auth)
+    manifest = json.loads(archive_env.paths.manifest.read_text(encoding="utf-8"))
+    manifest["schema"] = "cce.archive.manifest.v1"
+    archive_env.paths.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    assert load_manifest(archive_env.paths)["schema"] == "cce.archive.manifest.v1"
+    manifest["schema"] = "archive-manifest.v9"
+    archive_env.paths.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(ValueError, match="unsupported archive manifest schema"):
+        load_manifest(archive_env.paths)
 
 
 def test_resolve_sources_rejects_unknown_provider(tmp_path: Path) -> None:

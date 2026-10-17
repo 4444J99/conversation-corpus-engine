@@ -11,11 +11,24 @@ from pathlib import Path
 from typing import Any
 
 from .answering import shorten, slugify
+from .archive_naming import (
+    PROVIDER_SCOPES,
+    InvalidName,
+    conversation_name,
+    derive_name,
+    hash_identity,
+    parse_name,
+    validate_name,
+)
 
-SCHEMA = "cce.archive.conversation.v1"
+SCHEMA = "archive-conversation.v2"
+LEGACY_SCHEMA = "cce.archive.conversation.v1"
+ACCEPTED_SCHEMAS = frozenset({SCHEMA, LEGACY_SCHEMA})
 ROLES = ("user", "assistant", "system", "tool")
 KINDS = ("chat", "search", "activity", "notebook", "memory")
+CHANNELS = ("typed", "reply", "thinking", "tool", "system", "memory", "project")
 SNIPPET_LIMIT = 240
+DERIVED_ID_PREFIX = "derived"
 _PLAIN_ID_RE = re.compile(r"[a-z0-9-]{1,64}")
 
 
@@ -41,29 +54,52 @@ class Attachment:
 
 @dataclass
 class Message:
+    """One message of a normalized conversation.
+
+    `id` is the vendor message id when the export carries one and a minted
+    `message-<provider>-<16hex>` name otherwise (see `assign_message_fields`). `channel` says where
+    the message came from (one of CHANNELS). `typed_chars` is the number of characters the person
+    typed, before any attachment text a reader appended; it equals `len(text)` unless a reader
+    says otherwise.
+    """
+
     role: str
     text: str
     ts: str = ""
     attachments: list[Attachment] = field(default_factory=list)
     meta: dict[str, Any] = field(default_factory=dict)
+    id: str = ""
+    channel: str = ""
+    typed_chars: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.typed_chars is None:
+            self.typed_chars = len(self.text)
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "id": self.id,
             "role": self.role,
+            "channel": self.channel,
             "ts": self.ts,
             "text": self.text,
+            "typed_chars": self.typed_chars,
             "attachments": [item.to_dict() for item in self.attachments],
             "meta": self.meta,
         }
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> Message:
+        typed = payload.get("typed_chars")
         return cls(
             role=str(payload.get("role", "user")),
             text=str(payload.get("text", "")),
             ts=str(payload.get("ts", "")),
             attachments=[Attachment.from_dict(item) for item in payload.get("attachments", [])],
             meta=dict(payload.get("meta", {})),
+            id=str(payload.get("id", "")),
+            channel=str(payload.get("channel", "")),
+            typed_chars=typed if isinstance(typed, int) and not isinstance(typed, bool) else None,
         )
 
 
@@ -148,7 +184,16 @@ class Conversation:
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> Conversation:
-        return cls(
+        """Load a normalized conversation.
+
+        A version 2 row is taken as written. A version 1 row (or one with no schema string) is
+        upgraded: missing message ids, channels and typed character counts are filled in. Any
+        other schema string is refused.
+        """
+        schema = payload.get("schema")
+        if schema is not None and schema not in ACCEPTED_SCHEMAS:
+            raise ValueError(f"unsupported conversation schema: {schema!r}")
+        conversation = cls(
             provider=str(payload["provider"]),
             source_id=str(payload["source_id"]),
             title=str(payload.get("title", "")),
@@ -162,6 +207,9 @@ class Conversation:
             provenance=dict(payload.get("provenance", {})),
             extra=dict(payload.get("extra", {})),
         )
+        if schema != SCHEMA:
+            assign_message_fields(conversation)
+        return conversation
 
 
 def stable_uid(provider: str, source_id: str) -> str:
@@ -170,6 +218,123 @@ def stable_uid(provider: str, source_id: str) -> str:
         return f"{provider}-{raw}"
     digest = hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()[:10]
     return f"{provider}-{slugify(raw, limit=32)}-{digest}"
+
+
+def derived_source_id(provider: str, created: str, messages: list[Message]) -> str:
+    """Identity for a conversation the export gave no usable id: `derived-<16hex>` over the
+    provider, the creation stamp and the text of the first three messages."""
+    parts = [provider, created, *(message.text for message in messages[:3])]
+    return f"{DERIVED_ID_PREFIX}-{hash_identity(chr(0).join(parts))}"
+
+
+def resolve_source_id(conversation: Conversation) -> str:
+    """Give an id-less or unnameable conversation a derived id. Returns why ("" when untouched).
+
+    "empty": the export carried no vendor id (before this, every id-less conversation collapsed
+    into one uid). "unnameable": the vendor id is valid for `stable_uid` but cannot be expressed
+    as a contract name (an edge or doubled hyphen, or a name over 80 characters); the original is
+    kept in `extra["vendor_id"]`. The frozen `stable_uid` is never changed for any other id.
+    """
+    if conversation.provider not in PROVIDER_SCOPES:
+        raise InvalidName(repr(conversation.provider), ["not a known provider word"])
+    reason = ""
+    if not str(conversation.source_id).strip():
+        reason = "empty"
+    else:
+        try:
+            conversation_name(conversation.provider, conversation.uid)
+        except InvalidName:
+            reason = "unnameable"
+    if not reason:
+        return ""
+    if reason == "unnameable":
+        conversation.extra["vendor_id"] = conversation.source_id
+    conversation.source_id = derived_source_id(
+        conversation.provider, conversation.created, conversation.messages
+    )
+    conversation.extra["source_id_derived"] = reason
+    return reason
+
+
+def channel_for(message: Message, conversation_kind: str) -> str:
+    """Which of CHANNELS a message belongs to, from its role, kind and conversation kind."""
+    if conversation_kind == "memory":
+        return "memory"
+    if conversation_kind == "notebook":
+        return "project"
+    kind = str(message.meta.get("kind") or "text")
+    if message.role == "tool" or kind == "tool":
+        return "tool"
+    if kind == "reasoning":
+        return "thinking"
+    if message.role == "user":
+        return "typed"
+    if message.role == "assistant":
+        return "reply"
+    return "system"
+
+
+def message_id_fallback(
+    provider: str, uid: str, role: str, ts: str, text: str, ordinal: int = 0
+) -> str:
+    """Stable id for a message with no vendor id: `message-<provider>-<16hex>` over provider,
+    conversation uid, role, timestamp and text. A repeat of the same role, stamp and text inside
+    one conversation carries its ordinal inside the hashed string, so repeats stay distinct."""
+    parts = [provider, uid, role, ts, text]
+    if ordinal:
+        parts.append(str(ordinal))
+    return derive_name("message", scope=provider, identity=hash_identity("\0".join(parts)))
+
+
+def assign_message_fields(conversation: Conversation) -> None:
+    """Fill every blank message id, channel and typed character count; keep what readers set.
+
+    A vendor id that repeats inside the conversation keeps its first holder; later holders are
+    re-minted rather than failing the whole provider. Idempotent.
+    """
+    provider, uid = conversation.provider, conversation.uid
+    used: set[str] = set()
+    repeats: Counter[tuple[str, str, str]] = Counter()
+    for message in conversation.messages:
+        if message.id and message.id not in used:
+            used.add(message.id)
+        else:
+            key = (message.role, message.ts, message.text)
+            minted = message_id_fallback(
+                provider, uid, message.role, message.ts, message.text, repeats[key]
+            )
+            while minted in used:
+                repeats[key] += 1
+                minted = message_id_fallback(
+                    provider, uid, message.role, message.ts, message.text, repeats[key]
+                )
+            repeats[key] += 1
+            message.id = minted
+            used.add(minted)
+        if not message.channel:
+            message.channel = channel_for(message, conversation.kind)
+        if message.typed_chars is None:
+            message.typed_chars = len(message.text)
+
+
+def finalize_conversation(conversation: Conversation) -> str:
+    """Resolve the conversation id, then every message field. Returns the derived-id reason."""
+    reason = resolve_source_id(conversation)
+    assign_message_fields(conversation)
+    return reason
+
+
+def message_reference(provider: str, uid: str, message_id: str) -> str:
+    """The stable `message-<provider>-<16hex>` reference for a message.
+
+    A minted id is already that name. A vendor id is hashed together with the conversation uid
+    (separated by a NUL), so the same vendor id in two conversations stays distinct.
+    """
+    if not validate_name(message_id):
+        parts = parse_name(message_id)
+        if parts.kind == "message" and parts.scope == provider:
+            return message_id
+    return derive_name("message", scope=provider, identity=hash_identity(f"{uid}\0{message_id}"))
 
 
 def to_iso(value: Any) -> str:
