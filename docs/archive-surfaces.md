@@ -1,7 +1,7 @@
 # Archive surfaces
 
 One normalized layer, five ways to read it: an **Obsidian vault** (which is also the wiki), a
-**static archive site** with an optional local full-text server, a **SQLite FTS5 knowledge base**,
+**static archive site** with an optional local full-text server, a **SQLite FTS5 search database**,
 a **graph** (JSONL + GraphML) and an **MCP search tool**. Everything is derived from raw
 provider exports, regenerable at any time, and written only into a private corpus store.
 
@@ -10,10 +10,12 @@ raw export (read-only)
   └─ archive_read_<provider>.py    streaming readers -> Conversation
        └─ archive_ingest.py        normalized JSONL store + manifest (denominators, hashes)
             └─ archive_topics.py   TF-IDF topic hubs + cosine neighbours (cross-provider)
-                 ├─ archive_vault.py   Obsidian vault / wiki
-                 ├─ archive_kb.py      SQLite FTS5 knowledge base
-                 ├─ archive_graph.py   nodes.jsonl, edges.jsonl, archive.graphml
-                 └─ archive_site.py    static site  (+ archive_serve.py, loopback only)
+                 ├─ archive_vault.py     Obsidian vault / wiki
+                 ├─ archive_database.py  SQLite FTS5 search database
+                 ├─ archive_graph.py     graph nodes, edges and GraphML
+                 └─ archive_site.py      static site  (+ archive_serve.py, loopback only)
+
+archive_layout.py mints every file, folder and note name (and every wikilink) with derive_name.
 ```
 
 ## Privacy model
@@ -37,7 +39,7 @@ raw export (read-only)
 mkdir -m 700 /path/to/cce-corpus-store /path/to/cce-site
 cce corpus-store register --root /path/to/cce-corpus-store --project-root /path/to/cce-site
 
-# everything: ingest -> analyze -> vault -> kb -> graph -> site -> verify
+# everything: ingest -> analyze -> vault -> database -> graph -> site -> verify
 cce archive build --export-root /path/to/ai-exports \
   --project-root /path/to/cce-site --corpus-store-root /path/to/cce-corpus-store
 
@@ -48,17 +50,39 @@ cce archive serve --project-root … --corpus-store-root …      # http://127.0
 `--export-root` expects one folder per provider: `chatgpt/`, `claude/`, `gemini/` (including
 `NotebookLM/`), `grok/`, `perplexity/`. Override any with `--source provider=PATH`. A ChatGPT
 account export is a snapshot; pass the live delta with `--chatgpt-extra delta.json` (it wins over
-the same conversation in the export). Output defaults to `<store>/_archive/`:
+the same conversation in the export). Output defaults to `<store>/archive-all/`. Every name below
+is minted by `derive_name` (see *Naming contract*), so `cce archive verify-names` accepts a whole
+build:
 
 | Path | What |
 |---|---|
-| `manifest.json` | per-provider counts, denominators, channels read / not read, source sha256 |
-| `normalized/<provider>/{conversations,index}.jsonl` | the provider-neutral store |
-| `analysis/` | `enrichment.jsonl` (topics, neighbours per conversation), `topics.json` |
-| `vault/` | open this folder in Obsidian |
-| `kb/archive.sqlite` | FTS5 knowledge base |
-| `graph/` | `nodes.jsonl`, `edges.jsonl`, `archive.graphml`, `summary.json` |
-| `site/` | open `index.html` directly, or use `cce archive serve` |
+| `manifest-all.json` | per-provider counts, denominators (`derived_ids`, `duplicates_folded`), channels read / not read, source sha256, naming / schema / reader versions, source fingerprint |
+| `provider-<p>/collection-<p>-conversations.jsonl`, `provider-<p>/index-<p>-conversations.jsonl` | the provider-neutral store: full conversations, and one light summary row each |
+| `index-all-enrichment.jsonl`, `report-all-topics.json` | topics and nearest neighbours per conversation; the topic hub table |
+| `vault-all/` | open this folder in Obsidian |
+| `database-all-search.sqlite` | FTS5 search database |
+| `graph-all/` | `index-all-nodes.jsonl`, `index-all-edges.jsonl`, `graph-all.graphml`, `report-all-graph.json` |
+| `site-all/` | open `home-all.html` directly, or use `cce archive serve` |
+| `feed-<p>-prompts.jsonl`, `receipt-<p>-prompts-<16hex>-<yyyymmdd>.json` | the prompt feed and its receipt (names reserved here, written by the feed projector) |
+
+### The normalized layer (version 2)
+
+Conversations carry the schema string `archive-conversation.v2`; the manifest carries
+`archive-manifest.v2`. Version 1 files still load (missing message fields are filled in on read).
+
+- Each **message** has an `id`: the vendor message id where the export has one (the ChatGPT node
+  id, the Claude message uuid), otherwise `message-<provider>-<16hex>` over provider, conversation
+  uid, role, timestamp and text, with an ordinal inside the hashed string for exact repeats. It
+  also has a `channel` (`typed`, `reply`, `thinking`, `tool`, `system`, `memory` or `project`) and
+  `typed_chars`, the characters the person typed before any appended attachment text.
+- A conversation with **no vendor id** (or one the naming contract cannot express) gets
+  `derived-<16hex>` over provider, creation stamp and the first three messages' text. The manifest
+  counts `derived_ids`; an exact repeat is counted in `duplicates_folded`.
+- ChatGPT messages on abandoned branches are kept in `extra.alternate_messages` (own id, a
+  `branch: alternate` flag, the id of the node they hang from); the message list itself remains the
+  `current_node` chain, so the counts do not move.
+- The **source fingerprint** hashes a canonical copy of the ingest result without absolute paths or
+  error text, so the same export read on two hosts gives the same fingerprint.
 
 ## Commands
 
@@ -66,7 +90,7 @@ the same conversation in the export). Output defaults to `<store>/_archive/`:
 |---|---|
 | `cce archive ingest` | read raw exports into the normalized store and write the manifest |
 | `cce archive analyze` | topic hubs and similarity |
-| `cce archive vault / kb / graph / site` | one emitter each |
+| `cce archive vault / database / graph / site` | one emitter each |
 | `cce archive build` | every stage, then `verify` |
 | `cce archive verify` | cross-check every surface against the manifest denominators |
 | `cce archive search QUERY` | FTS5 search (`--provider`, `--kind`, `--limit`, `--titles`, `--json`) |
@@ -85,17 +109,28 @@ vendor identifier used as-is or the first 16 hex characters of SHA-256 over the 
 string; the date is a real calendar day taken from the data and appears only on kinds that require
 it. The conversation name is `conversation-` plus today's `stable_uid`, so existing uids are
 reproduced byte for byte. `NAMING_VERSION` is recorded in every receipt; adding a kind bumps it.
-`cce archive names --json` prints the full table and `cce archive verify-names` checks a tree.
+`cce archive names --json` prints the full table and `cce archive verify-names` checks a tree. Only
+three plain folder words are outside the grammar (`conversations`, `hubs`, `meta`); everything
+else a build writes is a minted name, which `verify-names` confirms on a whole archive folder.
 
 `build` and `verify` exit non-zero if a provider failed to read, a vault wikilink dangles, the
-knowledge base disagrees with the manifest, or the site has a different number of conversation
+search database disagrees with the manifest, or the site has a different number of conversation
 pages than the manifest has conversations. A failing provider never stops the others.
 
 ## The vault is the wiki
 
-`Home.md` states the denominators. `Hubs/` holds one note per provider, month, topic and
-collection (project / notebook / GPT), so Obsidian's backlinks, graph and search work out of the
-box; the graph is coloured by provider via `.obsidian/graph.json`. Each conversation note has
+The vault layout is lowercase throughout: `conversations/` (one `conversation-<uid>.md` per
+conversation), `hubs/`, `meta/`, and `home-all.md` at the top. `home-all.md` states the
+denominators. `hubs/` holds one note per provider (`provider-chatgpt`), month
+(`month-all-202506`), topic (`topic-all-<term>`) and collection (`collection-<provider>-<subject>`;
+a project, notebook or GPT whose identifier is not a valid subject word is named by its 16 hex
+character digest), so Obsidian's backlinks, graph and search work out of the box; the graph is
+coloured by provider via `.obsidian/graph.json`. `meta/` holds `coverage-all.md` and
+`guide-all.md`. An undated conversation has no month note, and a topic term that is not one plain
+lowercase word has no hub (it stays a plain label; the build reports `topics_without_hub`).
+Titles are validated against the naming contract, never derived from a conversation title.
+Every `[[wikilink]]` is written by one function, `archive_layout.wikilink`, from the same name the
+target file is given. Each conversation note has
 frontmatter (`uid`, `provider`, `kind`, `created`, `tags`, `source_sha256`, …), a *Related* line
 of nearest neighbours and the transcript, with reasoning / tool / source messages collapsed.
 
@@ -106,7 +141,7 @@ stale ones, and never touch notes you add yourself.
 ## Data-grounding rules the surfaces follow
 
 - Scope is stated, not implied: every provider reports discovered / empty / duplicate / skipped
-  counts and which export channels were and were not read (`Meta/coverage.md`, site *Coverage*).
+  counts and which export channels were and were not read (`meta/coverage-all.md`, site *Coverage*).
 - A ChatGPT conversation is linearised along `current_node`; hidden scaffolding, abandoned
   regenerations and empty nodes are dropped and **counted**, with the identity
   `message_nodes = kept + hidden + dropped + off_branch` recorded in the manifest.

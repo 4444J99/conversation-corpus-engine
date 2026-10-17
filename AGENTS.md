@@ -27,7 +27,7 @@ Global policy: `/Users/4jp/AGENTS.md` applies and cannot be overridden.
 - `cce candidate promote --project-root /path/to/project --candidate-id latest`: swap the live registry root to an approved candidate and rebuild federation.
 - `cce evaluation run --root /path/to/corpus --seed`: seed fixtures and write evaluation scorecards/gates for a corpus.
 - `cce review queue --project-root /path/to/project`: inspect open federated review items.
-- `cce archive build --export-root /path/to/ai-exports --project-root /path/to/project --corpus-store-root /path/to/store`: ingest raw provider exports and build the vault/wiki, knowledge base, graph and site, then verify them against the manifest (see `docs/archive-surfaces.md`). Archive outputs hold private conversation text and live only in the registered store; tests use synthetic fixtures only.
+- `cce archive build --export-root /path/to/ai-exports --project-root /path/to/project --corpus-store-root /path/to/store`: ingest raw provider exports and build the vault/wiki, search database, graph and site, then verify them against the manifest (see `docs/archive-surfaces.md`). Archive outputs hold private conversation text and live only in the registered store; tests use synthetic fixtures only.
 
 ## Coding Style & Naming Conventions
 Use Python 3.11+, 4-space indentation, type hints, `snake_case` modules/functions, and `UPPER_SNAKE_CASE` constants. Prefer `Path` over string paths and keep filesystem writes centralized through helper functions where possible. Avoid hardcoded workstation paths; use repo-relative defaults or explicit CLI arguments.

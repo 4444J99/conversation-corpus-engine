@@ -9,8 +9,8 @@ from typing import Any
 
 from . import __version__
 from .answering import build_answer, render_answer_text, search_documents_v4
+from .archive_database import open_database, search, search_titles
 from .archive_ingest import ArchivePaths
-from .archive_kb import open_kb, search, search_titles
 from .federation import list_registered_corpora, validate_corpus_root
 from .paths import default_project_root as default_project_root_path
 from .paths import resolve_workspace_path
@@ -343,9 +343,9 @@ class CceMcpServer:
             else:
                 raise ValueError(f"{key} must be an array of strings")
         try:
-            connection = open_kb(ArchivePaths(self.archive_root))
+            connection = open_database(ArchivePaths(self.archive_root))
         except FileNotFoundError as exc:
-            raise ValueError(f"The archive knowledge base is not built: {exc}") from exc
+            raise ValueError(f"The archive search database is not built: {exc}") from exc
         try:
             if titles_only:
                 results = search_titles(connection, query, limit=limit)

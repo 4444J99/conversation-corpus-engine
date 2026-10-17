@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from . import archive_layout as layout
 from .archive_ingest import (
     PROVIDER_SPECS,
     ArchivePaths,
@@ -17,6 +18,7 @@ from .archive_ingest import (
     require_inside,
 )
 from .archive_model import Conversation, Message, write_text_atomic
+from .archive_naming import NameLedger
 from .archive_site_assets import (
     APP_JS,
     CSP_APP,
@@ -25,6 +27,7 @@ from .archive_site_assets import (
     GRAPH_JS,
     INDEX_HTML,
     STYLE_CSS,
+    fill_names,
 )
 from .archive_text import render_markdown_html
 from .archive_topics import load_enrichment
@@ -84,7 +87,6 @@ def render_page(
     related: list[dict[str, Any]],
     topics: list[str],
     titles: dict[str, str],
-    providers: dict[str, str],
     limit: int = MESSAGE_CHARS,
 ) -> str:
     created = conversation.created or conversation.last_activity
@@ -99,14 +101,14 @@ def render_page(
         meta.append(conversation.model)
     if conversation.archived:
         meta.append("archived at source")
+    home = f"../{layout.SITE_HOME_FILENAME}"
     topic_links = " ".join(
-        f'<a class="topic" href="../../index.html#t={quote(term)}">{_esc(term)}</a>'
-        for term in topics
+        f'<a class="topic" href="{home}#t={quote(term)}">{_esc(term)}</a>' for term in topics
     )
     related_html = ""
     if related:
         items = "".join(
-            f'<li><a href="../{_esc(providers.get(row["uid"], "x"))}/{_esc(row["uid"])}.html">'
+            f'<li><a href="{_esc(layout.conversation_note_for_uid(row["uid"]))}.html">'
             f"{_esc(titles.get(row['uid'], row['uid']))}</a> "
             f'<span class="muted">({row["score"]:.2f})</span></li>'
             for row in related
@@ -122,8 +124,8 @@ def render_page(
         f'<meta http-equiv="Content-Security-Policy" content="{_esc(CSP_PAGE)}">'
         '<meta name="referrer" content="no-referrer">'
         f"<title>{_esc(conversation.title or 'Untitled')}</title>"
-        '<link rel="stylesheet" href="../../style.css"></head>'
-        f'<body class="page"><div class="wrap"><nav class="top"><a href="../../index.html">'
+        f'<link rel="stylesheet" href="../{layout.SITE_STYLE_FILENAME}"></head>'
+        f'<body class="page"><div class="wrap"><nav class="top"><a href="{home}">'
         f"← Archive</a></nav><h1>{_esc(conversation.title or 'Untitled')}</h1>"
         f'<p class="muted"><span class="dot {_esc(conversation.provider)}"></span>'
         f"{_esc(' · '.join(meta))}</p>"
@@ -215,9 +217,9 @@ def build_site(
     manifest = load_manifest(paths)
     rows = load_index(paths)
     titles = {row["uid"]: row["title"] for row in rows}
-    providers = {row["uid"]: row["provider"] for row in rows}
     enrichment = load_enrichment(paths)
     written: set[str] = set()
+    ledger = NameLedger()
 
     def emit(rel: str, content: str) -> None:
         write_text_atomic(root / rel, content)
@@ -226,14 +228,15 @@ def build_site(
     pages = 0
     for conversation in iter_store(paths):
         extra = enrichment.get(conversation.uid, {})
+        name = layout.conversation_note(conversation.provider, conversation.uid)
+        ledger.register(name, conversation.uid)
         emit(
-            f"c/{conversation.provider}/{conversation.uid}.html",
+            f"{layout.SITE_PAGES_DIRNAME}/{name}.html",
             render_page(
                 conversation,
                 related=extra.get("similar", []),
                 topics=extra.get("topics", []),
                 titles=titles,
-                providers=providers,
                 limit=message_chars,
             ),
         )
@@ -252,7 +255,7 @@ def build_site(
         for row in rows
     ]
     emit(
-        "data/index.js",
+        layout.SITE_INDEX_DATA_FILENAME,
         _js(
             "CCE",
             {
@@ -263,11 +266,11 @@ def build_site(
             },
         ),
     )
-    emit("data/graph.js", _js("CCE_GRAPH", _topic_graph(rows, enrichment)))
-    emit("index.html", INDEX_HTML.replace("__CSP__", _esc(CSP_APP)))
-    emit("graph.html", GRAPH_HTML.replace("__CSP__", _esc(CSP_APP)))
-    emit("style.css", STYLE_CSS)
-    emit("app.js", APP_JS)
-    emit("graph.js", GRAPH_JS)
+    emit(layout.SITE_TOPIC_DATA_FILENAME, _js("CCE_GRAPH", _topic_graph(rows, enrichment)))
+    emit(layout.SITE_HOME_FILENAME, fill_names(INDEX_HTML).replace("__CSP__", _esc(CSP_APP)))
+    emit(layout.SITE_GRAPH_PAGE_FILENAME, fill_names(GRAPH_HTML).replace("__CSP__", _esc(CSP_APP)))
+    emit(layout.SITE_STYLE_FILENAME, STYLE_CSS)
+    emit(layout.SITE_HOME_SCRIPT_FILENAME, fill_names(APP_JS))
+    emit(layout.SITE_GRAPH_SCRIPT_FILENAME, fill_names(GRAPH_JS))
     removed = _prune(root, written)
     return {"pages": pages, "files": len(written), "removed_stale": removed}

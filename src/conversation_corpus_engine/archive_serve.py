@@ -9,8 +9,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from .archive_database import open_database, search, search_titles
 from .archive_ingest import ArchivePaths
-from .archive_kb import open_kb, search, search_titles
+from .archive_layout import SITE_HOME_FILENAME
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 MAX_LIMIT = 50
@@ -92,7 +93,7 @@ class ArchiveHandler(BaseHTTPRequestHandler):
     do_POST = do_PUT = do_DELETE = do_PATCH = _method_not_allowed  # noqa: N815
 
     def _static(self, raw_path: str) -> None:
-        relative = unquote(raw_path).lstrip("/") or "index.html"
+        relative = unquote(raw_path).lstrip("/") or SITE_HOME_FILENAME
         target = (self.server.site_root / relative).resolve()
         try:
             target.relative_to(self.server.site_root)
@@ -100,7 +101,7 @@ class ArchiveHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
         if target.is_dir():
-            target = target / "index.html"
+            target = target / SITE_HOME_FILENAME
         if not target.is_file():
             self._json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
@@ -121,9 +122,9 @@ class ArchiveHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "limit must be an integer"})
             return
         try:
-            connection = open_kb(self.server.paths)
+            connection = open_database(self.server.paths)
         except FileNotFoundError:
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "knowledge base not built"})
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "search database not built"})
             return
         try:
             if path == "/api/titles":
@@ -152,7 +153,7 @@ def start_in_thread(paths: ArchivePaths, port: int = 0) -> tuple[ArchiveServer, 
 
 
 def serve(paths: ArchivePaths, *, host: str = "127.0.0.1", port: int = 8765) -> None:
-    if not (paths.site / "index.html").is_file():
+    if not paths.site_home.is_file():
         raise FileNotFoundError(f"No site at {paths.site}; run `cce archive site` first")
     server = ArchiveServer((host, port), paths)
     print(

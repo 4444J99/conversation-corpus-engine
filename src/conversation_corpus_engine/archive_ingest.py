@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import archive_layout as layout
 from . import (
     archive_read_chatgpt,
     archive_read_claude,
@@ -25,14 +26,14 @@ from .archive_model import (
     iter_jsonl,
     write_json_atomic,
 )
-from .archive_naming import NAMING_VERSION
+from .archive_naming import NAMING_VERSION, day_of
 from .corpus_store import CorpusStoreError, CorpusWriteAuthorization, authorize_corpus_write
 
 MANIFEST_SCHEMA = "archive-manifest.v2"
 LEGACY_MANIFEST_SCHEMA = "cce.archive.manifest.v1"
 ACCEPTED_MANIFEST_SCHEMAS = frozenset({MANIFEST_SCHEMA, LEGACY_MANIFEST_SCHEMA})
 SCHEMA_VERSION = 2
-DEFAULT_ARCHIVE_DIRNAME = "_archive"
+DEFAULT_ARCHIVE_DIRNAME = layout.ARCHIVE_DIRNAME
 # Per-provider manifest keys that hold absolute paths or host-specific error text; they are
 # dropped from the copy the source fingerprint hashes.
 FINGERPRINT_EXCLUDED_KEYS = frozenset({"source_root", "error"})
@@ -97,44 +98,119 @@ PROVIDER_SPECS: dict[str, ProviderSpec] = {
 
 @dataclass(frozen=True)
 class ArchivePaths:
+    """Every path under the archive folder. Each name comes from `archive_layout`, which mints
+    it with `derive_name`; nothing here spells a file or folder name by hand."""
+
     root: Path
 
-    @property
-    def normalized(self) -> Path:
-        return self.root / "normalized"
-
-    @property
-    def analysis(self) -> Path:
-        return self.root / "analysis"
-
-    @property
-    def vault(self) -> Path:
-        return self.root / "vault"
-
-    @property
-    def site(self) -> Path:
-        return self.root / "site"
-
-    @property
-    def kb(self) -> Path:
-        return self.root / "kb"
-
-    @property
-    def graph(self) -> Path:
-        return self.root / "graph"
+    # --- directly in the archive folder ---
 
     @property
     def manifest(self) -> Path:
-        return self.root / "manifest.json"
+        return self.root / layout.MANIFEST_FILENAME
+
+    @property
+    def database(self) -> Path:
+        return self.root / layout.DATABASE_FILENAME
+
+    @property
+    def enrichment(self) -> Path:
+        return self.root / layout.ENRICHMENT_FILENAME
+
+    @property
+    def topics(self) -> Path:
+        return self.root / layout.TOPICS_FILENAME
+
+    @property
+    def vault(self) -> Path:
+        return self.root / layout.VAULT_DIRNAME
+
+    @property
+    def site(self) -> Path:
+        return self.root / layout.SITE_DIRNAME
+
+    @property
+    def graph(self) -> Path:
+        return self.root / layout.GRAPH_DIRNAME
+
+    # --- per provider ---
+
+    def provider_dir(self, provider: str) -> Path:
+        return self.root / layout.provider_dirname(provider)
 
     def conversations(self, provider: str) -> Path:
-        return self.normalized / provider / "conversations.jsonl"
+        return self.provider_dir(provider) / layout.conversations_filename(provider)
 
     def index(self, provider: str) -> Path:
-        return self.normalized / provider / "index.jsonl"
+        return self.provider_dir(provider) / layout.index_filename(provider)
+
+    def feed(self, provider: str) -> Path:
+        return self.root / layout.feed_filename(provider)
+
+    def receipt(self, provider: str, fingerprint: str, day: str) -> Path:
+        return self.root / layout.receipt_filename(provider, fingerprint, day)
 
     def providers_present(self) -> list[str]:
         return [name for name in PROVIDER_SPECS if self.conversations(name).is_file()]
+
+    # --- the vault ---
+
+    @property
+    def vault_conversations(self) -> Path:
+        return self.vault / layout.VAULT_CONVERSATIONS_DIRNAME
+
+    @property
+    def vault_hubs(self) -> Path:
+        return self.vault / layout.VAULT_HUBS_DIRNAME
+
+    @property
+    def vault_meta(self) -> Path:
+        return self.vault / layout.VAULT_META_DIRNAME
+
+    # --- the graph ---
+
+    @property
+    def graph_nodes(self) -> Path:
+        return self.graph / layout.GRAPH_NODES_FILENAME
+
+    @property
+    def graph_edges(self) -> Path:
+        return self.graph / layout.GRAPH_EDGES_FILENAME
+
+    @property
+    def graph_graphml(self) -> Path:
+        return self.graph / layout.GRAPH_GRAPHML_FILENAME
+
+    @property
+    def graph_summary(self) -> Path:
+        return self.graph / layout.GRAPH_SUMMARY_FILENAME
+
+    # --- the site ---
+
+    @property
+    def site_pages(self) -> Path:
+        return self.site / layout.SITE_PAGES_DIRNAME
+
+    @property
+    def site_home(self) -> Path:
+        return self.site / layout.SITE_HOME_FILENAME
+
+    def site_page(self, provider: str, uid: str) -> Path:
+        return self.site_pages / f"{layout.conversation_note(provider, uid)}.html"
+
+
+def latest_activity_day(manifest: dict[str, Any]) -> str:
+    """The day (eight digits) of the latest activity any provider reports, from the data only.
+
+    Receipts carry this day. There is no clock fallback: a manifest with no activity stamp at
+    all has no day, and asking for one is an error.
+    """
+    stamps = [
+        info.get("last_activity_max", "")
+        for info in manifest["providers"].values()
+        if info.get("status") == "ok" and info.get("last_activity_max")
+    ]
+    return day_of(max(stamps)) if stamps else day_of("")
 
 
 def authorize_archive(

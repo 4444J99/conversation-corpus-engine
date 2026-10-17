@@ -8,6 +8,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .archive_database import (
+    build_database,
+    open_database,
+    search,
+    search_titles,
+    verify_database,
+)
 from .archive_graph import build_graph
 from .archive_ingest import (
     DEFAULT_ARCHIVE_DIRNAME,
@@ -18,7 +25,6 @@ from .archive_ingest import (
     ingest,
     load_manifest,
 )
-from .archive_kb import build_kb, open_kb, search, search_titles, verify_kb
 from .archive_naming import names_payload, render_names_text, verify_names
 from .archive_serve import serve
 from .archive_site import build_site
@@ -31,7 +37,7 @@ from .corpus_store import (
 )
 from .paths import default_project_root
 
-STAGES = ("ingest", "analyze", "vault", "kb", "graph", "site")
+STAGES = ("ingest", "analyze", "vault", "database", "graph", "site")
 
 
 @dataclass(frozen=True)
@@ -73,17 +79,17 @@ def verify_archive(paths: ArchivePaths) -> list[str]:
         for name in failed_providers(manifest)
     ]
     total = manifest["totals"]["conversations"]
-    enrichment = paths.analysis / "enrichment.jsonl"
+    enrichment = paths.enrichment
     if not enrichment.is_file():
         problems.append("analysis missing: run `cce archive analyze`")
     elif sum(1 for _ in enrichment.open(encoding="utf-8")) != total:
         problems.append("analysis row count differs from the manifest")
     problems += verify_vault(paths)
     try:
-        problems += verify_kb(paths)
+        problems += verify_database(paths)
     except FileNotFoundError as exc:
         problems.append(str(exc))
-    graph_summary = paths.graph / "summary.json"
+    graph_summary = paths.graph_summary
     if not graph_summary.is_file():
         problems.append("graph missing: run `cce archive graph`")
     elif (
@@ -91,7 +97,7 @@ def verify_archive(paths: ArchivePaths) -> list[str]:
         != total
     ):
         problems.append("graph conversation node count differs from the manifest")
-    pages = sum(1 for _ in (paths.site / "c").rglob("*.html")) if (paths.site / "c").is_dir() else 0
+    pages = sum(1 for _ in paths.site_pages.glob("*.html")) if paths.site_pages.is_dir() else 0
     if pages != total:
         problems.append(f"site has {pages} conversation page(s), manifest has {total}")
     return problems
@@ -110,7 +116,7 @@ def run_stages(
     runners: dict[str, Callable[[], dict[str, Any]]] = {
         "analyze": lambda: build_analysis(paths),
         "vault": lambda: build_vault(paths, authorization),
-        "kb": lambda: build_kb(paths, authorization),
+        "database": lambda: build_database(paths, authorization),
         "graph": lambda: build_graph(paths, authorization),
         "site": lambda: build_site(paths, authorization),
     }
@@ -142,7 +148,7 @@ def run_stages(
 
 def add_archive_parser(subparsers: Any) -> None:
     archive = subparsers.add_parser(
-        "archive", help="Browsable archive surfaces: vault, wiki, knowledge base, site, graph"
+        "archive", help="Browsable archive surfaces: vault, wiki, search database, site, graph"
     )
     sub = archive.add_subparsers(dest="action", required=True)
 
@@ -177,17 +183,19 @@ def add_archive_parser(subparsers: Any) -> None:
     for name, text in (
         ("analyze", "Topic hubs and similarity"),
         ("vault", "Obsidian vault (the wiki)"),
-        ("kb", "SQLite FTS5 knowledge base"),
+        ("database", "SQLite FTS5 search database"),
         ("graph", "Graph as JSONL + GraphML"),
         ("site", "Static archive site"),
         ("verify", "Cross-check every surface against the manifest"),
     ):
         common(sub.add_parser(name, help=text))
-    build = sub.add_parser("build", help="ingest + analyze + vault + kb + graph + site + verify")
+    build = sub.add_parser(
+        "build", help="ingest + analyze + vault + database + graph + site + verify"
+    )
     common(build)
     export_args(build)
 
-    search_parser = sub.add_parser("search", help="Full-text search the knowledge base")
+    search_parser = sub.add_parser("search", help="Full-text search the search database")
     common(search_parser)
     search_parser.add_argument("query")
     search_parser.add_argument("--provider", action="append", choices=sorted(PROVIDER_SPECS))
@@ -271,7 +279,7 @@ def handle_archive(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0 if payload["ok"] else 1
 
-    if action in {"analyze", "vault", "kb", "graph", "site"}:
+    if action in {"analyze", "vault", "database", "graph", "site"}:
         result = run_stages(context, (action,))
         print(json.dumps(result[action], indent=2, sort_keys=True))
         return 0
@@ -282,7 +290,7 @@ def handle_archive(args: argparse.Namespace) -> int:
         return 0 if not problems else 1
 
     if action == "search":
-        connection = open_kb(paths)
+        connection = open_database(paths)
         try:
             if args.titles:
                 results = search_titles(connection, args.query, limit=args.limit)

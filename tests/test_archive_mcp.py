@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from conversation_corpus_engine.archive_database import build_database
 from conversation_corpus_engine.archive_ingest import ingest
-from conversation_corpus_engine.archive_kb import build_kb
 from conversation_corpus_engine.archive_topics import build_analysis
 from conversation_corpus_engine.mcp_server import ARCHIVE_TOOL, CceMcpServer, build_parser
 
@@ -15,7 +15,7 @@ from conversation_corpus_engine.mcp_server import ARCHIVE_TOOL, CceMcpServer, bu
 def archive_server(archive_env, tmp_path: Path):
     ingest(export_root=archive_env.export, paths=archive_env.paths, authorization=archive_env.auth)
     build_analysis(archive_env.paths)
-    build_kb(archive_env.paths, archive_env.auth)
+    build_database(archive_env.paths, archive_env.auth)
     return CceMcpServer(default_project_root=tmp_path, archive_root=archive_env.paths.root)
 
 
@@ -79,7 +79,7 @@ def test_archive_search_validates_arguments_and_caps_limit(archive_server) -> No
     assert big["structuredContent"]["count"] <= 25
 
 
-def test_archive_search_reports_missing_knowledge_base(archive_env, tmp_path: Path) -> None:
+def test_archive_search_reports_missing_search_database(archive_env, tmp_path: Path) -> None:
     server = CceMcpServer(default_project_root=tmp_path, archive_root=archive_env.paths.root)
     result = _call(server, query="x")["result"]
     assert result["isError"] is True and "not built" in result["content"][0]["text"]

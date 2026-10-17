@@ -9,7 +9,6 @@ from .archive_ingest import ArchivePaths, iter_store, load_manifest, require_ins
 from .archive_topics import load_enrichment
 from .corpus_store import CorpusWriteAuthorization
 
-KB_NAME = "archive.sqlite"
 BATCH = 500
 WORD_RE = re.compile(r"[\w][\w'-]*", re.UNICODE)
 PHRASE_RE = re.compile(r'"([^"]+)"')
@@ -40,8 +39,8 @@ CREATE VIRTUAL TABLE title_fts USING fts5(
 """
 
 
-def kb_path(paths: ArchivePaths) -> Path:
-    return paths.kb / KB_NAME
+def database_path(paths: ArchivePaths) -> Path:
+    return paths.database
 
 
 def fts_query(text: str) -> str:
@@ -52,11 +51,11 @@ def fts_query(text: str) -> str:
     return " ".join([*phrases, *words])
 
 
-def build_kb(paths: ArchivePaths, authorization: CorpusWriteAuthorization) -> dict[str, Any]:
-    require_inside(authorization, paths.kb)
+def build_database(paths: ArchivePaths, authorization: CorpusWriteAuthorization) -> dict[str, Any]:
+    require_inside(authorization, paths.database)
     manifest = load_manifest(paths)
     enrichment = load_enrichment(paths)
-    target = kb_path(paths)
+    target = database_path(paths)
     target.parent.mkdir(parents=True, exist_ok=True)
     temp = target.with_name(f".{target.name}.tmp")
     temp.unlink(missing_ok=True)
@@ -168,10 +167,10 @@ def _flush(
     return count
 
 
-def open_kb(paths: ArchivePaths) -> sqlite3.Connection:
-    path = kb_path(paths)
+def open_database(paths: ArchivePaths) -> sqlite3.Connection:
+    path = database_path(paths)
     if not path.is_file():
-        raise FileNotFoundError(f"No knowledge base at {path}; run `cce archive kb`")
+        raise FileNotFoundError(f"No search database at {path}; run `cce archive database`")
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     return connection
@@ -238,11 +237,11 @@ def conversation_messages(connection: sqlite3.Connection, uid: str) -> list[dict
     return [dict(row) for row in connection.execute(sql, (uid,))]
 
 
-def verify_kb(paths: ArchivePaths) -> list[str]:
-    """Return a list of mismatches between the manifest denominators and the knowledge base."""
+def verify_database(paths: ArchivePaths) -> list[str]:
+    """Return a list of mismatches between the manifest denominators and the search database."""
     manifest = load_manifest(paths)
     problems: list[str] = []
-    connection = open_kb(paths)
+    connection = open_database(paths)
     try:
         by_provider = dict(
             connection.execute("SELECT provider, COUNT(*) FROM conversations GROUP BY provider")
@@ -264,7 +263,7 @@ def verify_kb(paths: ArchivePaths) -> list[str]:
             if messages.get(name, 0) != info["messages"]:
                 problems.append(f"{name}: messages {messages.get(name, 0)} != {info['messages']}")
         if stored.get("source_fingerprint") != manifest["source_fingerprint"]:
-            problems.append("knowledge base was built from a different source fingerprint")
+            problems.append("search database was built from a different source fingerprint")
         orphans = connection.execute(
             "SELECT COUNT(*) FROM messages WHERE uid NOT IN (SELECT uid FROM conversations)"
         ).fetchone()[0]
