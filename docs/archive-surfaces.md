@@ -71,6 +71,21 @@ the same conversation in the export). Output defaults to `<store>/_archive/`:
 | `cce archive verify` | cross-check every surface against the manifest denominators |
 | `cce archive search QUERY` | FTS5 search (`--provider`, `--kind`, `--limit`, `--titles`, `--json`) |
 | `cce archive serve` | site + `/api/search` on `127.0.0.1` (read-only) |
+| `cce archive names` | print the naming contract: kinds, scopes, version (`--json`) |
+| `cce archive verify-names --root DIR` | check every file and directory under `DIR` against the naming contract |
+
+## Naming contract
+
+Every name the archive layer mints comes from `archive_naming.derive_name`:
+`kind [-scope] [-subject] [-identity] [-date]`, lowercase words joined by single hyphens, at most
+80 characters (an over-long name is an error, never truncated). The kind is one word from a closed
+table that says which of the other segments each kind requires or forbids; the scope is a provider
+word or `all`; a subject is validated, never derived from a title; an identity is either a plain
+vendor identifier used as-is or the first 16 hex characters of SHA-256 over the exact identity
+string; the date is a real calendar day taken from the data and appears only on kinds that require
+it. The conversation name is `conversation-` plus today's `stable_uid`, so existing uids are
+reproduced byte for byte. `NAMING_VERSION` is recorded in every receipt; adding a kind bumps it.
+`cce archive names --json` prints the full table and `cce archive verify-names` checks a tree.
 
 `build` and `verify` exit non-zero if a provider failed to read, a vault wikilink dangles, the
 knowledge base disagrees with the manifest, or the site has a different number of conversation
