@@ -17,8 +17,10 @@ from .archive_model import (
 )
 
 PROVIDER = "claude"
-READER = "archive_read_claude@1"
+READER = "archive_read_claude@2"
 CONVERSATIONS = "conversations.json"
+TOOL_TEXT_LIMIT = 2000
+TOOL_INPUT_LIMIT = 200
 UNREAD_CHANNELS = (
     ("artifacts", "published artifact version HTML"),
     ("frames-000.zip", "artifact frames archive"),
@@ -46,12 +48,32 @@ def channels(root: Path) -> dict[str, list[str]]:
     return {"read": read, "not_read": not_read}
 
 
-def _blocks(message: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-    meta: dict[str, Any] = {"kind": "text"}
+def _flatten(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(part for part in (_flatten(item) for item in value) if part)
+    if isinstance(value, dict):
+        for key in ("text", "content", "result"):
+            if isinstance(value.get(key), (str, list, dict)):
+                return _flatten(value[key])
+    return ""
+
+
+def _cap(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + f"… [{len(text) - limit} more characters]"
+
+
+def _entry_messages(entry: dict[str, Any], include_text: bool) -> list[Message]:
+    """One raw chat message becomes up to four: reasoning, the turn itself, tool calls, results."""
+    role = normalize_role(entry.get("sender"))
+    ts = to_iso(entry.get("created_at"))
     texts: list[str] = []
     thinking: list[str] = []
-    tools: list[str] = []
-    for block in message.get("content") or []:
+    calls: list[str] = []
+    results: list[str] = []
+    names: set[str] = set()
+    for block in entry.get("content") or []:
         if not isinstance(block, dict):
             continue
         kind = block.get("type")
@@ -60,13 +82,48 @@ def _blocks(message: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         elif kind == "thinking" and block.get("thinking"):
             thinking.append(str(block["thinking"]))
         elif kind == "tool_use" and block.get("name"):
-            tools.append(str(block["name"]))
-    text = "\n\n".join(texts) if texts else str(message.get("text") or "")
+            names.add(str(block["name"]))
+            arguments = block.get("input")
+            suffix = (
+                " "
+                + _cap(json.dumps(arguments, sort_keys=True, ensure_ascii=False), TOOL_INPUT_LIMIT)
+                if arguments
+                else ""
+            )
+            calls.append(f"tool call: {block['name']}{suffix}")
+        elif kind == "tool_result":
+            result = _cap(_flatten(block.get("content")), TOOL_TEXT_LIMIT)
+            if result.strip():
+                results.append(f"tool result: {result}")
+    text = "\n\n".join(texts) if texts else str(entry.get("text") or "")
+    attachments, extracted = _attachments(entry, include_text)
+    if extracted:
+        text = f"{text}\n\n{extracted}".strip()
+    out: list[Message] = []
     if thinking:
-        meta["thinking_chars"] = sum(len(item) for item in thinking)
-    if tools:
-        meta["tools"] = sorted(set(tools))
-    return text, meta
+        out.append(
+            Message(
+                role="assistant",
+                text=clean_text("\n\n".join(thinking)),
+                ts=ts,
+                meta={"kind": "reasoning"},
+            )
+        )
+    if text.strip() or attachments:
+        meta: dict[str, Any] = {"kind": "text"}
+        if names:
+            meta["tools"] = sorted(names)
+        out.append(
+            Message(role=role, text=clean_text(text), ts=ts, attachments=attachments, meta=meta)
+        )
+    for lines in (calls, results):
+        if lines:
+            out.append(
+                Message(
+                    role="tool", text=clean_text("\n".join(lines)), ts=ts, meta={"kind": "tool"}
+                )
+            )
+    return out
 
 
 def _attachments(message: dict[str, Any], include_text: bool) -> tuple[list[Attachment], str]:
@@ -95,24 +152,13 @@ def _chat(
     messages: list[Message] = []
     parents: dict[str, int] = {}
     for entry in raw.get("chat_messages") or []:
-        text, meta = _blocks(entry)
-        attachments, extracted = _attachments(entry, include_text)
-        if extracted:
-            text = f"{text}\n\n{extracted}".strip()
-        if not text.strip() and not attachments:
-            continue
         parent = entry.get("parent_message_uuid")
         if parent:
             parents[parent] = parents.get(parent, 0) + 1
-        messages.append(
-            Message(
-                role=normalize_role(entry.get("sender")),
-                text=clean_text(text),
-                ts=to_iso(entry.get("created_at")),
-                attachments=attachments,
-                meta=meta,
-            )
-        )
+        derived = _entry_messages(entry, include_text)
+        if not derived:
+            tracker.note("empty_messages_dropped")
+        messages.extend(derived)
     messages.sort(key=lambda message: message.ts)
     return Conversation(
         provider=PROVIDER,

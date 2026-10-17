@@ -20,13 +20,13 @@ from .archive_model import (
 from .archive_text import html_to_text
 
 PROVIDER = "gemini"
-READER = "archive_read_gemini@1"
+READER = "archive_read_gemini@2"
 ACTIVITY = Path("My Activity") / "Gemini Apps" / "MyActivity.json"
 AI_MODE = Path("My Activity") / "AI Mode"
 WORKSPACE = Path("Gemini in Workspace") / "Conversation History"
 SCHEDULED = Path("Gemini") / "gemini_scheduled_actions_data.html"
 APP_RE = re.compile(r"gemini\.google\.com/app/([A-Za-z0-9_-]+)")
-PROMPT_RE = re.compile(r"^(?:Live Prompt(?:ed)?|Prompted)\s*(.*)$", re.DOTALL)
+PROMPT_RE = re.compile(r"^(Live Prompt(?:ed)?|Prompted|Branched)\s*(.*)$", re.DOTALL)
 CANVAS_PREFIX = "Created Gemini Canvas titled "
 SESSION_GAP_SECONDS = 30 * 60
 OUT_OF_SCOPE_NOTE = "other My Activity products — not AI-chat data, out of scope"
@@ -98,13 +98,14 @@ def _turns(item: dict[str, Any], tracker: SourceTracker) -> list[Message]:
     ts = to_iso(item.get("time"))
     prompt = PROMPT_RE.match(title)
     if prompt:
+        origin = {"Branched": "branched", "Prompted": "typed"}.get(prompt.group(1), "live")
         messages = [
             Message(
                 role="user",
-                text=clean_text(prompt.group(1)).strip(),
+                text=clean_text(prompt.group(2)).strip(),
                 ts=ts,
                 attachments=_attachments(item),
-                meta={"kind": "text"},
+                meta={"kind": "text", "origin": origin},
             )
         ]
         html = ((item.get("safeHtmlItem") or [{}])[0]).get("html") or ""

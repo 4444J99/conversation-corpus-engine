@@ -487,6 +487,12 @@ def build_export(root: Path) -> Path:
                 "<ul><li>pods</li><li>nodes</li></ul>",
                 attachedFiles=["shot.png"],
             ),
+            item(
+                "Branched Try another approach",
+                "2025-06-01T10:10:00.000Z",
+                "appone",
+                "<p>branch answer</p>",
+            ),
             item("Prompted Another thread", "2025-06-02T10:00:00.000Z", "apptwo", "<p>ok</p>"),
             item(
                 "Created Gemini Canvas titled Bread plan",

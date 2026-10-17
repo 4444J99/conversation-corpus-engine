@@ -18,7 +18,7 @@ from .archive_model import (
 )
 
 PROVIDER = "chatgpt"
-READER = "archive_read_chatgpt@1"
+READER = "archive_read_chatgpt@2"
 SHARD_RE = re.compile(r"conversations(-\d+)?\.json")
 ASSET_MAP_NAME = "conversation_asset_file_names.json"
 UNREAD_CHANNELS = (
@@ -142,7 +142,7 @@ def _conversation(
     on_chain = {node.get("id") for node in chain}
     messages: list[Message] = []
     models: Counter[str] = Counter()
-    hidden = 0
+    hidden = dropped = 0
     for node in chain:
         message = node.get("message")
         if not message:
@@ -164,6 +164,7 @@ def _conversation(
                 )
             )
         if kind == "skip" or (not text.strip() and not attachments):
+            dropped += 1
             continue
         entry: dict[str, Any] = {"kind": kind}
         slug = meta.get("model_slug")
@@ -187,6 +188,11 @@ def _conversation(
         1 for node in mapping.values() if node.get("message") and node.get("id") not in on_chain
     )
     model = models.most_common(1)[0][0] if models else str(raw.get("default_model_slug") or "")
+    tracker.note("message_nodes", sum(1 for node in mapping.values() if node.get("message")))
+    tracker.note("messages_kept", len(messages))
+    tracker.note("messages_hidden", hidden)
+    tracker.note("messages_dropped_empty_or_context", dropped)
+    tracker.note("messages_off_branch", off_chain)
     return Conversation(
         provider=PROVIDER,
         source_id=str(raw.get("conversation_id") or raw.get("id") or ""),
