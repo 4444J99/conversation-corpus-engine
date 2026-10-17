@@ -12,13 +12,14 @@ from .archive_model import (
     Conversation,
     Message,
     SourceTracker,
+    channel_for,
     clean_text,
     normalize_role,
     to_iso,
 )
 
 PROVIDER = "chatgpt"
-READER = "archive_read_chatgpt@2"
+READER = "archive_read_chatgpt@3"
 SHARD_RE = re.compile(r"conversations(-\d+)?\.json")
 ASSET_MAP_NAME = "conversation_asset_file_names.json"
 UNREAD_CHANNELS = (
@@ -134,6 +135,75 @@ def _chain(mapping: dict[str, Any], current: str | None) -> list[dict[str, Any]]
     return chain
 
 
+HIDDEN = "hidden"
+DROPPED = "dropped"
+KEPT = "kept"
+
+
+def _node_message(node: dict[str, Any], names: dict[str, str]) -> tuple[Message | None, str]:
+    """Turn one mapping node into a Message; the second item says what became of the node."""
+    message = node["message"]
+    meta = message.get("metadata") or {}
+    if meta.get("is_visually_hidden_from_conversation"):
+        return None, HIDDEN
+    author = message.get("author") or {}
+    attachments: list[Attachment] = []
+    text, kind = _content(message.get("content") or {}, attachments, names)
+    for item in meta.get("attachments") or []:
+        attachments.append(
+            Attachment(
+                name=str(item.get("name") or item.get("id") or ""),
+                kind=str(item.get("mime_type") or "file"),
+                size=item.get("size"),
+                ref=str(item.get("id") or ""),
+            )
+        )
+    if kind == "skip" or (not text.strip() and not attachments):
+        return None, DROPPED
+    entry: dict[str, Any] = {"kind": kind}
+    slug = meta.get("model_slug")
+    if slug:
+        entry["model"] = str(slug)
+    if author.get("name"):
+        entry["tool"] = str(author["name"])
+    return (
+        Message(
+            role=normalize_role(author.get("role")),
+            text=clean_text(text),
+            ts=to_iso(message.get("create_time")),
+            attachments=attachments,
+            meta=entry,
+            id=str(node.get("id") or message.get("id") or ""),
+        ),
+        KEPT,
+    )
+
+
+def _alternates(
+    mapping: dict[str, Any], on_chain: set[Any], names: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Visible messages on branches the person abandoned (regenerations, edits).
+
+    The conversation's own message list stays the `current_node` chain; these are kept beside it,
+    each with its own id, the id of the node it hangs from and a `branch` flag.
+    """
+    nodes = [
+        node for node in mapping.values() if node.get("message") and node.get("id") not in on_chain
+    ]
+    nodes.sort(key=lambda node: (node["message"].get("create_time") or 0, str(node.get("id", ""))))
+    rows: list[dict[str, Any]] = []
+    for node in nodes:
+        message, state = _node_message(node, names)
+        if message is None or state != KEPT:
+            continue
+        message.channel = channel_for(message, "chat")
+        row = message.to_dict()
+        row["branch"] = "alternate"
+        row["parent_id"] = str(node.get("parent") or "")
+        rows.append(row)
+    return rows
+
+
 def _conversation(
     raw: dict[str, Any], names: dict[str, str], tracker: SourceTracker, source: Path
 ) -> Conversation:
@@ -144,45 +214,18 @@ def _conversation(
     models: Counter[str] = Counter()
     hidden = dropped = 0
     for node in chain:
-        message = node.get("message")
-        if not message:
+        if not node.get("message"):
             continue
-        meta = message.get("metadata") or {}
-        if meta.get("is_visually_hidden_from_conversation"):
+        message, state = _node_message(node, names)
+        if state == HIDDEN:
             hidden += 1
-            continue
-        author = message.get("author") or {}
-        attachments: list[Attachment] = []
-        text, kind = _content(message.get("content") or {}, attachments, names)
-        for item in meta.get("attachments") or []:
-            attachments.append(
-                Attachment(
-                    name=str(item.get("name") or item.get("id") or ""),
-                    kind=str(item.get("mime_type") or "file"),
-                    size=item.get("size"),
-                    ref=str(item.get("id") or ""),
-                )
-            )
-        if kind == "skip" or (not text.strip() and not attachments):
+        elif state == DROPPED:
             dropped += 1
-            continue
-        entry: dict[str, Any] = {"kind": kind}
-        slug = meta.get("model_slug")
-        if slug:
-            entry["model"] = str(slug)
-            if normalize_role(author.get("role")) == "assistant":
-                models[str(slug)] += 1
-        if author.get("name"):
-            entry["tool"] = str(author["name"])
-        messages.append(
-            Message(
-                role=normalize_role(author.get("role")),
-                text=clean_text(text),
-                ts=to_iso(message.get("create_time")),
-                attachments=attachments,
-                meta=entry,
-            )
-        )
+        elif message is not None:
+            messages.append(message)
+            if message.role == "assistant" and message.meta.get("model"):
+                models[message.meta["model"]] += 1
+    alternates = _alternates(mapping, on_chain, names)
     leaves = sum(1 for node in mapping.values() if not node.get("children"))
     off_chain = sum(
         1 for node in mapping.values() if node.get("message") and node.get("id") not in on_chain
@@ -193,6 +236,7 @@ def _conversation(
     tracker.note("messages_hidden", hidden)
     tracker.note("messages_dropped_empty_or_context", dropped)
     tracker.note("messages_off_branch", off_chain)
+    tracker.note("alternate_messages_kept", len(alternates))
     return Conversation(
         provider=PROVIDER,
         source_id=str(raw.get("conversation_id") or raw.get("id") or ""),
@@ -206,6 +250,7 @@ def _conversation(
         messages=messages,
         provenance=tracker.provenance(source),
         extra={
+            "alternate_messages": alternates,
             "branches": leaves,
             "hidden_messages": hidden,
             "mapping_nodes": len(mapping),

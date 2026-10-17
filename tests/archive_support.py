@@ -10,6 +10,7 @@ from conversation_corpus_engine.archive_model import (
     Attachment,
     Conversation,
     Message,
+    finalize_conversation,
     write_jsonl_atomic,
 )
 
@@ -606,7 +607,7 @@ def conv(
     ]
     if attachments and messages:
         messages[0].attachments = attachments
-    return Conversation(
+    conversation = Conversation(
         provider=provider,
         source_id=source_id,
         title=title,
@@ -617,11 +618,40 @@ def conv(
         messages=messages,
         provenance={"source_file": "x.json", "source_sha256": "0" * 64, "reader": "test@1"},
     )
+    finalize_conversation(conversation)
+    return conversation
+
+
+def add_idless_chatgpt_shard(export: Path) -> Path:
+    """Add a second ChatGPT shard holding two conversations that have no vendor id.
+
+    The two differ in content, so each must get its own derived id. Every string is invented.
+    """
+    shard = export / "chatgpt" / "conversations-001.json"
+    _dump(
+        shard,
+        [
+            gpt_conversation(
+                "",
+                "Lantern maintenance",
+                [("user", "How often should lantern wicks be trimmed?"), ("assistant", "Weekly.")],
+                start=BASE_EPOCH + 86400 * 60,
+            ),
+            gpt_conversation(
+                "",
+                "Kite flying basics",
+                [("user", "Which wind speed suits a beginner kite?"), ("assistant", "Light wind.")],
+                start=BASE_EPOCH + 86400 * 61,
+            ),
+        ],
+    )
+    return shard
 
 
 def write_store(paths: ArchivePaths, conversations: list[Conversation]) -> None:
     by_provider: dict[str, list[Conversation]] = {}
     for conversation in conversations:
+        finalize_conversation(conversation)
         by_provider.setdefault(conversation.provider, []).append(conversation)
     for provider, items in by_provider.items():
         write_jsonl_atomic(paths.conversations(provider), [c.to_dict() for c in items])
