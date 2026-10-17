@@ -130,6 +130,22 @@ def _validate_git_custody(root: Path) -> Path | None:
     return git_root
 
 
+def require_git_private(directory: Path) -> Path:
+    """Refuse a directory that private text must not land in.
+
+    A directory outside any Git work tree is private. One inside a work tree must be ignored by
+    Git, so the files written there can never be staged by accident. Returns the resolved path.
+    """
+    resolved = _absolute_path(directory).resolve(strict=False)
+    probe = resolved
+    while not probe.exists():
+        probe = probe.parent
+    git_root = _git_root(probe)
+    if git_root is not None and not _git_path_is_ignored(git_root, resolved / ".private-probe"):
+        raise CorpusStoreError(f"Directory is Git-visible and cannot hold private text: {resolved}")
+    return resolved
+
+
 def _resolve_existing_store_root(root: Path) -> Path:
     lexical_root = _absolute_path(root)
     if lexical_root.is_symlink():

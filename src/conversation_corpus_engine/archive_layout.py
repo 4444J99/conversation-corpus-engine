@@ -33,6 +33,9 @@ VAULT_DIRNAME = derive_name("vault", scope="all")
 SITE_DIRNAME = derive_name("site", scope="all")
 GRAPH_DIRNAME = derive_name("graph", scope="all")
 
+# The note `cce archive fixture` writes beside the synthetic exports (counts and a digest only).
+FIXTURE_FILENAME = derive_name("fixture", scope="all") + ".json"
+
 # --- the vault ------------------------------------------------------------------------------
 
 VAULT_CONVERSATIONS_DIRNAME = "conversations"
