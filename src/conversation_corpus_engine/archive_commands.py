@@ -15,6 +15,8 @@ from .archive_database import (
     search_titles,
     verify_database,
 )
+from .archive_feed import FeedError, project_feed
+from .archive_fixture import write_fixture
 from .archive_graph import build_graph
 from .archive_ingest import (
     DEFAULT_ARCHIVE_DIRNAME,
@@ -216,6 +218,21 @@ def add_archive_parser(subparsers: Any) -> None:
     )
     verify_names_parser.add_argument("--root", type=Path, required=True)
 
+    fixture_parser = sub.add_parser(
+        "fixture",
+        help="Write deterministic synthetic exports (two providers sharing one ask) for tests",
+    )
+    fixture_parser.add_argument("--out", type=Path, required=True)
+
+    project = sub.add_parser("project", help="Project the normalized archive into another shape")
+    project_sub = project.add_subparsers(dest="target", required=True)
+    feed_parser = project_sub.add_parser(
+        "feed", help="Write each provider's prompt feed and its receipt"
+    )
+    feed_parser.add_argument("--root", type=Path, required=True, help="the archive folder")
+    feed_parser.add_argument("--out", type=Path, required=True, help="a Git-invisible folder")
+    feed_parser.add_argument("--provider", action="append", choices=sorted(PROVIDER_SPECS))
+
 
 def _overrides(raw: list[str]) -> dict[str, Path]:
     out: dict[str, Path] = {}
@@ -225,6 +242,24 @@ def _overrides(raw: list[str]) -> dict[str, Path]:
             raise ValueError(f"--source must be PROVIDER=PATH with a known provider, got: {item}")
         out[name] = Path(value)
     return out
+
+
+def _handle_project(args: argparse.Namespace) -> int:
+    if args.target != "feed":
+        raise ValueError(f"unsupported projection: {args.target}")
+    if not args.root.is_dir():
+        print(f"archive root not found: {args.root}", file=sys.stderr)
+        return 2
+    try:
+        summary = project_feed(args.root, args.out, args.provider)
+    except CorpusStoreError as exc:
+        print(f"feed refused: {exc}", file=sys.stderr)
+        return 2
+    except FeedError as exc:
+        print(f"feed not written: {exc}", file=sys.stderr)
+        return 1
+    print(json.dumps(summary, indent=2, sort_keys=True))
+    return 0
 
 
 def handle_archive(args: argparse.Namespace) -> int:
@@ -245,6 +280,11 @@ def handle_archive(args: argparse.Namespace) -> int:
             return 2
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if report["ok"] else 1
+    if action == "fixture":
+        print(json.dumps(write_fixture(args.out), indent=2, sort_keys=True))
+        return 0
+    if action == "project":
+        return _handle_project(args)
 
     export_root = getattr(args, "export_root", None)
     try:

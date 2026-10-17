@@ -63,7 +63,7 @@ build:
 | `database-all-search.sqlite` | FTS5 search database |
 | `graph-all/` | `index-all-nodes.jsonl`, `index-all-edges.jsonl`, `graph-all.graphml`, `report-all-graph.json` |
 | `site-all/` | open `home-all.html` directly, or use `cce archive serve` |
-| `feed-<p>-prompts.jsonl`, `receipt-<p>-prompts-<16hex>-<yyyymmdd>.json` | the prompt feed and its receipt (names reserved here, written by the feed projector) |
+| `feed-<p>-prompts.jsonl`, `receipt-<p>-prompts-<16hex>-<yyyymmdd>.json` | the prompt feed and its receipt, written by `cce archive project feed` (see *The prompt feed*) |
 
 ### The normalized layer (version 2)
 
@@ -97,6 +97,43 @@ Conversations carry the schema string `archive-conversation.v2`; the manifest ca
 | `cce archive serve` | site + `/api/search` on `127.0.0.1` (read-only) |
 | `cce archive names` | print the naming contract: kinds, scopes, version (`--json`) |
 | `cce archive verify-names --root DIR` | check every file and directory under `DIR` against the naming contract |
+| `cce archive project feed --root ARCHIVE --out DIR` | write each provider's prompt feed and receipt (`--provider` to pick) |
+| `cce archive fixture --out DIR` | write deterministic synthetic ChatGPT and Claude exports that share one ask |
+
+## The prompt feed
+
+`cce archive project feed --root <archive-all> --out <dir>` turns the normalized layer into one
+file per provider, `feed-<provider>-prompts.jsonl`, with one row per ask the person typed, plus
+`receipt-<provider>-prompts-<16hex>-<yyyymmdd>.json` beside it. Feeds hold private conversation
+text, so `--out` must be outside any Git work tree or ignored by it; otherwise the command refuses
+(exit 2).
+
+- **Which asks.** Role `user`, channel `typed`, in a conversation of kind `chat`, `search` or
+  `activity`. ChatGPT asks on abandoned branches (edits, regenerations) are included and carry
+  `branch: alternate`; within a conversation they follow the current-branch asks. Projects,
+  memories and notebooks are excluded. If a reader appended attachment text to an ask, only the
+  typed part (`typed_chars`) enters the feed.
+- **Row fields.** `source` = `archive-<provider>-messages`, `session_ref` = the conversation uid,
+  `event_ref` = the stable `message-<provider>-<16hex>` reference of the message (the vendor id
+  hashed with the conversation uid, so it is unique across conversations), `event_index` = the
+  ordinal in the feed, `text_index` = 0, `text`, `timestamp`, `source_locator` =
+  `<uid>#<event_ref>`, `body_kind` = `direct`, `provenance` = `unknown_user_input`. The writer has
+  no provenance parameter: a vendor export can never claim to be operator-typed input.
+- **Determinism.** Rows are written in conversation order, then message order, with sorted keys,
+  so two runs give identical bytes. A repeated `event_ref` aborts the whole write and leaves no
+  file behind. A store that disagrees with its manifest is refused.
+- **The receipt** holds counts and digests, never text: the feed's sha256, the row count, the
+  alternate-branch count, the number of asks trimmed of attachment text, the excluded messages
+  counted by reason (`kind-notebook`, `kind-memory`, `role-assistant`, `role-tool`, `empty-text`,
+  ...), `messages_seen` (which always equals rows plus excluded), the manifest's source
+  fingerprint, `NAMING_VERSION` and the reader versions. Its date is the manifest's latest-activity
+  day. A newer receipt for the same provider replaces older ones.
+
+`cce archive fixture --out <dir>` writes invented ChatGPT and Claude exports (a conversation tree
+with an edited ask, a Claude chat with reasoning and a tool call, a project and a memory archive)
+whose first conversations share one identical ask. The bytes are the same on every run, so the
+manifest fingerprint is too. `fixture-all.json` beside them records the digest of the shared ask
+and the number of asks each provider should yield.
 
 ## Naming contract
 
