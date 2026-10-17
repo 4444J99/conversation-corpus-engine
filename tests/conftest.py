@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from archive_support import build_export
+
+from conversation_corpus_engine.archive_ingest import ArchivePaths, authorize_archive
+from conversation_corpus_engine.corpus_store import register_corpus_store
 
 
 @pytest.fixture
@@ -24,6 +29,30 @@ def project_root(workspace: Path) -> Path:
 @pytest.fixture
 def source_drop_root(workspace: Path) -> Path:
     return workspace / "source-drop"
+
+
+@pytest.fixture
+def archive_env(tmp_path: Path):
+    """Synthetic export plus a registered private store and an authorized archive root."""
+    export = build_export(tmp_path / "export")
+    project = tmp_path / "project"
+    store = tmp_path / "store"
+    project.mkdir(exist_ok=True)
+    store.mkdir()
+    register_corpus_store(project, store)
+    authorization = authorize_archive(
+        project_root=project,
+        archive_root=store / "_archive",
+        corpus_store_root=store,
+        source_roots=(export,),
+    )
+    return SimpleNamespace(
+        export=export,
+        project=project,
+        store=store,
+        auth=authorization,
+        paths=ArchivePaths(authorization.destination),
+    )
 
 
 def seed_minimal_corpus(
