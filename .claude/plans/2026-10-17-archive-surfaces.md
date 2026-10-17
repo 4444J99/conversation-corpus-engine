@@ -66,4 +66,4 @@ raw export (read-only)
   HTML escaping, wikilink integrity, FTS round-trip, custody refusal, no message body under any
   tracked path.
 - `ruff check` + `ruff format --check`.
-- Real-data run against `/Volumes/Scratch/ai-exports` into a private store; report denominators.
+- Real-data run against a multi-provider export in a private store; report denominators.
