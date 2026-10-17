@@ -206,15 +206,14 @@ def render_markdown_html(text: str) -> str:
             close_list()
             level = min(6, len(heading.group(1)) + 2)
             out.append(f"<h{level}>{_inline(html.escape(heading.group(2)))}</h{level}>")
-        elif bullet or numbered:
+        elif item := bullet or numbered:
             flush_paragraph()
             kind = "ul" if bullet else "ol"
             if list_kind != kind:
                 close_list()
                 out.append(f"<{kind}>")
                 list_kind = kind
-            body = (bullet or numbered).group(1)
-            out.append(f"<li>{_inline(html.escape(body))}</li>")
+            out.append(f"<li>{_inline(html.escape(item.group(1)))}</li>")
         else:
             close_list()
             paragraph.append(line)

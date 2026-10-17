@@ -89,11 +89,11 @@ def build_analysis(paths: ArchivePaths) -> dict[str, Any]:
             postings.setdefault(term, []).append((uid, weight))
     rows: list[dict[str, Any]] = []
     for uid in sorted(vectors):
-        scores: Counter[str] = Counter()
+        scores: dict[str, float] = {}
         for term, weight in vectors[uid].items():
             for other, other_weight in postings[term]:
                 if other != uid:
-                    scores[other] += weight * other_weight
+                    scores[other] = scores.get(other, 0.0) + weight * other_weight
         ranked_similar = sorted(
             ((other, score) for other, score in scores.items() if score >= SIMILAR_MIN),
             key=lambda item: (-item[1], item[0]),

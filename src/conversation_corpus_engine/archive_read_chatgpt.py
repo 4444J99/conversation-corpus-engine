@@ -95,17 +95,17 @@ def _content(
         return str(content.get("text") or ""), "tool"
     if ctype == "thoughts":
         thoughts = content.get("thoughts") or []
-        pieces = [
+        summaries = [
             "\n".join(filter(None, [str(t.get("summary") or ""), str(t.get("content") or "")]))
             for t in thoughts
             if isinstance(t, dict)
         ]
-        return "\n\n".join(piece for piece in pieces if piece), "reasoning"
+        return "\n\n".join(piece for piece in summaries if piece), "reasoning"
     if ctype == "reasoning_recap":
         return str(content.get("content") or ""), "reasoning"
     if ctype == "tether_quote":
-        pieces = [str(content.get(key) or "") for key in ("title", "text", "url")]
-        return "\n".join(piece for piece in pieces if piece), "tool"
+        fields = [str(content.get(key) or "") for key in ("title", "text", "url")]
+        return "\n".join(piece for piece in fields if piece), "tool"
     if ctype == "tether_browsing_display":
         return str(content.get("result") or content.get("summary") or ""), "tool"
     if ctype == "user_editable_context":

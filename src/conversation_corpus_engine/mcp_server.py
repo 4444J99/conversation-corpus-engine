@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
 from . import __version__
 from .answering import build_answer, render_answer_text, search_documents_v4
+from .archive_ingest import ArchivePaths
+from .archive_kb import open_kb, search, search_titles
 from .federation import list_registered_corpora, validate_corpus_root
 from .paths import default_project_root as default_project_root_path
 from .paths import resolve_workspace_path
@@ -22,6 +25,10 @@ JSONRPC_INVALID_REQUEST = -32600
 JSONRPC_METHOD_NOT_FOUND = -32601
 JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_INTERNAL_ERROR = -32603
+
+ARCHIVE_ROOT_ENV = "CCE_ARCHIVE_ROOT"
+ARCHIVE_TOOL = "cce_archive_search"
+ARCHIVE_LIMIT_MAX = 25
 
 
 def compact_json(payload: Any) -> str:
@@ -107,11 +114,51 @@ class CceMcpServer:
         *,
         default_project_root: Path | None = None,
         default_source_drop_root: Path | None = None,
+        archive_root: Path | None = None,
     ) -> None:
         self.default_project_root = (default_project_root or default_project_root_path()).resolve()
         self.default_source_drop_root = default_source_drop_root
+        self.archive_root = archive_root.resolve() if archive_root else None
+
+    def archive_tool_definition(self) -> dict[str, Any]:
+        return {
+            "name": ARCHIVE_TOOL,
+            "title": "Search the AI Archive",
+            "description": (
+                "Full-text search the private AI-conversation archive (ChatGPT, Claude, Gemini, "
+                "NotebookLM, Grok, Perplexity). Returns the best matching message per "
+                "conversation. Results are the user's private conversation text and record "
+                "speech acts, not verified events."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Words or a quoted phrase."},
+                    "provider": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict to providers, e.g. ['claude', 'grok'].",
+                    },
+                    "kind": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict to kinds: chat, search, activity, notebook, memory.",
+                    },
+                    "titles_only": {"type": "boolean", "description": "Search titles only."},
+                    "limit": {"type": "integer", "description": "Maximum conversations (25)."},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        }
 
     def tool_definitions(self) -> list[dict[str, Any]]:
+        tools = self._core_tool_definitions()
+        if self.archive_root is not None:
+            tools.append(self.archive_tool_definition())
+        return tools
+
+    def _core_tool_definitions(self) -> list[dict[str, Any]]:
         return [
             {
                 "name": "cce_search",
@@ -205,6 +252,8 @@ class CceMcpServer:
                 return self.list_corpora(args)
             if name == "cce_surface_context":
                 return self.surface_context(args)
+            if name == ARCHIVE_TOOL and self.archive_root is not None:
+                return self.archive_search(args)
         except ValueError as exc:
             return text_result(str(exc), {"error": str(exc)}, is_error=True)
         raise KeyError(name)
@@ -277,6 +326,46 @@ class CceMcpServer:
             "family_focus": retrieval.get("family_focus", []),
         }
         return text_result(render_answer_text(answer), structured)
+
+    def archive_search(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.archive_root is None:
+            raise ValueError("archive search is not configured; set --archive-root")
+        query = required_string(arguments, "query")
+        limit = optional_limit(arguments, default=10, maximum=ARCHIVE_LIMIT_MAX)
+        titles_only = optional_bool(arguments, "titles_only", default=False)
+        filters: dict[str, list[str] | None] = {}
+        for key in ("provider", "kind"):
+            value = arguments.get(key)
+            if value is None:
+                filters[key] = None
+            elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+                filters[key] = value or None
+            else:
+                raise ValueError(f"{key} must be an array of strings")
+        try:
+            connection = open_kb(ArchivePaths(self.archive_root))
+        except FileNotFoundError as exc:
+            raise ValueError(f"The archive knowledge base is not built: {exc}") from exc
+        try:
+            if titles_only:
+                results = search_titles(connection, query, limit=limit)
+            else:
+                results = search(
+                    connection,
+                    query,
+                    providers=filters["provider"],
+                    kinds=filters["kind"],
+                    limit=limit,
+                )
+        finally:
+            connection.close()
+        structured = {"query": query, "count": len(results), "results": results}
+        lines = [
+            f"{hit['provider']} · {hit['created'][:10]} · {hit['title']} ({hit['uid']})"
+            + (f"\n    {hit['excerpt']}" if hit.get("excerpt") else "")
+            for hit in results
+        ]
+        return text_result("\n".join(lines) or "No matching conversations.", structured)
 
     def list_corpora(self, arguments: dict[str, Any]) -> dict[str, Any]:
         project_root = self.project_root_from_args(arguments)
@@ -401,6 +490,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the CCE MCP stdio server")
     parser.add_argument("--project-root", type=Path, default=default_project_root_path())
     parser.add_argument("--source-drop-root", type=Path)
+    parser.add_argument(
+        "--archive-root",
+        type=Path,
+        default=Path(os.environ[ARCHIVE_ROOT_ENV]) if os.environ.get(ARCHIVE_ROOT_ENV) else None,
+        help=f"enable {ARCHIVE_TOOL} over this archive root (or set {ARCHIVE_ROOT_ENV})",
+    )
     parser.add_argument("--version", action="store_true")
     return parser
 
@@ -414,6 +509,7 @@ def main() -> None:
     server = CceMcpServer(
         default_project_root=args.project_root,
         default_source_drop_root=args.source_drop_root,
+        archive_root=args.archive_root,
     )
     server.serve_stdio()
 
