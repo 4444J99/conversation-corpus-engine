@@ -26,12 +26,14 @@ from conversation_corpus_engine.archive_corpus import (
 from conversation_corpus_engine.archive_fixture import EDITED_ASK, SHARED_ASK, write_fixture
 from conversation_corpus_engine.archive_ingest import (
     DEFAULT_ARCHIVE_DIRNAME,
+    LEGACY_MANIFEST_SCHEMA,
     MANIFEST_SCHEMA,
     ArchivePaths,
     authorize_archive,
     ingest,
     load_manifest,
 )
+from conversation_corpus_engine.archive_model import SCHEMA as CONVERSATION_SCHEMA
 from conversation_corpus_engine.archive_model import (
     Message,
     iter_conversations,
@@ -106,6 +108,7 @@ def _hand_built_store(tmp_path: Path, conversations, fingerprint: str = "f" * 64
         paths.manifest,
         {
             "schema": MANIFEST_SCHEMA,
+            "conversation_schema": CONVERSATION_SCHEMA,
             "schema_version": 2,
             "naming_version": NAMING_VERSION,
             "reader_versions": {name: "test@1" for name in providers},
@@ -172,6 +175,22 @@ def test_each_provider_gets_a_corpus_with_all_nine_collections(fixture_archive) 
         "corpus-chatgpt-archive",
         "corpus-claude-archive",
     ]
+
+
+def test_a_first_generation_store_is_refused_with_a_rebuild_message(
+    fixture_archive, monkeypatch, capsys
+) -> None:
+    manifest = load_manifest(fixture_archive.paths)
+    manifest["schema"] = LEGACY_MANIFEST_SCHEMA
+    manifest.pop("conversation_schema")
+    write_json_atomic(fixture_archive.paths.manifest, manifest)
+    out = fixture_archive.tmp / "corpora"
+    with pytest.raises(CorpusProjectionError, match="cce archive build"):
+        project_corpus(fixture_archive.paths.root, out)
+    assert not out.exists()
+    base = ["archive", "project", "corpus", "--root", str(fixture_archive.paths.root)]
+    code, _, err = _cce(monkeypatch, capsys, *base, "--out", str(out))
+    assert code == 1 and "corpus not written" in err and "cce archive build" in err
 
 
 def test_the_contract_names_the_folder_and_validates(fixture_archive) -> None:

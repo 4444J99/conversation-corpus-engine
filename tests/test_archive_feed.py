@@ -24,6 +24,7 @@ from conversation_corpus_engine.archive_feed import (
 from conversation_corpus_engine.archive_fixture import SHARED_ASK, expected_counts, write_fixture
 from conversation_corpus_engine.archive_ingest import (
     DEFAULT_ARCHIVE_DIRNAME,
+    LEGACY_MANIFEST_SCHEMA,
     MANIFEST_SCHEMA,
     ArchivePaths,
     authorize_archive,
@@ -31,6 +32,7 @@ from conversation_corpus_engine.archive_ingest import (
     latest_activity_day,
     load_manifest,
 )
+from conversation_corpus_engine.archive_model import SCHEMA as CONVERSATION_SCHEMA
 from conversation_corpus_engine.archive_model import iter_conversations, write_json_atomic
 from conversation_corpus_engine.archive_naming import NAMING_VERSION, verify_names
 from conversation_corpus_engine.cli import main
@@ -52,6 +54,22 @@ LEDGER_READS = (
     "provenance",
 )
 LEDGER_PROVENANCE_KINDS = {"operator_typed", "unknown_user_input"}
+# The feed row keys the ledger's allowlist names, spelled out here and nowhere else. `branch` is
+# the one optional key and rides on off-branch rows only.
+FROZEN_ROW_KEYS = frozenset(
+    {
+        "body_kind",
+        "event_index",
+        "event_ref",
+        "provenance",
+        "session_ref",
+        "source",
+        "source_locator",
+        "text",
+        "text_index",
+        "timestamp",
+    }
+)
 
 
 def ledger_occurrence(event: dict[str, Any]) -> dict[str, Any]:
@@ -138,6 +156,7 @@ def _hand_built_store(tmp_path: Path, conversations, fingerprint: str = "f" * 64
         paths.manifest,
         {
             "schema": MANIFEST_SCHEMA,
+            "conversation_schema": CONVERSATION_SCHEMA,
             "schema_version": 2,
             "naming_version": NAMING_VERSION,
             "reader_versions": {name: "test@1" for name in providers},
@@ -211,6 +230,19 @@ def test_feed_rows_carry_exactly_what_the_ledger_reads(fixture_archive) -> None:
         assert len(alternates) == expected[provider]["alternate_asks"]
         assert all(row["branch"] == ALTERNATE_FLAG for row in alternates)
     assert len(occurrences) == sum(item["asks"] for item in expected.values())
+
+
+def test_the_row_key_set_is_exactly_the_frozen_list(fixture_archive) -> None:
+    """Limen allowlists these keys by name: a key added, renamed or dropped here must fail loudly."""
+    out = fixture_archive.tmp / "feeds"
+    project_feed(fixture_archive.paths.root, out)
+    assert set(ROW_FIELDS) == FROZEN_ROW_KEYS and len(ROW_FIELDS) == len(FROZEN_ROW_KEYS)
+    seen_keys: set[str] = set()
+    for provider in ("chatgpt", "claude"):
+        for row in _read_feed(out / f"feed-{provider}-prompts.jsonl"):
+            seen_keys |= set(row)
+            assert set(row) - {"branch"} == FROZEN_ROW_KEYS
+    assert seen_keys == FROZEN_ROW_KEYS | {"branch"}
 
 
 def test_one_ask_shared_by_two_providers_hashes_the_same(fixture_archive) -> None:
@@ -360,6 +392,34 @@ def test_a_new_fingerprint_replaces_the_old_receipt(tmp_path: Path) -> None:
     project_feed(paths.root, out)
     second = sorted(item.name for item in out.glob("receipt-*.json"))
     assert len(first) == len(second) == 1 and first != second
+
+
+def _make_legacy(paths: ArchivePaths) -> None:
+    """Rewrite the manifest as a first-generation one; the conversation rows stay as they are."""
+    manifest = load_manifest(paths)
+    manifest["schema"] = LEGACY_MANIFEST_SCHEMA
+    manifest.pop("conversation_schema")
+    write_json_atomic(paths.manifest, manifest)
+
+
+def test_a_first_generation_store_is_refused_with_a_rebuild_message(fixture_archive) -> None:
+    _make_legacy(fixture_archive.paths)
+    assert (
+        load_manifest(fixture_archive.paths)["schema"] == LEGACY_MANIFEST_SCHEMA
+    )  # still readable
+    out = fixture_archive.tmp / "feeds"
+    with pytest.raises(FeedError, match="cce archive build"):
+        project_feed(fixture_archive.paths.root, out)
+    assert not out.exists()
+
+
+def test_a_first_generation_store_exits_nonzero_from_the_command(
+    fixture_archive, monkeypatch, capsys
+) -> None:
+    _make_legacy(fixture_archive.paths)
+    base = ["archive", "project", "feed", "--root", str(fixture_archive.paths.root)]
+    code, _, err = _cce(monkeypatch, capsys, *base, "--out", str(fixture_archive.tmp / "feeds"))
+    assert code == 1 and "feed not written" in err and "cce archive build" in err
 
 
 def test_the_feed_names_are_valid_contract_names(fixture_archive) -> None:

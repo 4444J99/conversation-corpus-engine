@@ -439,5 +439,27 @@ def load_manifest(paths: ArchivePaths) -> dict[str, Any]:
     return manifest
 
 
+class LegacyArchiveStore(ValueError):
+    """The store was written by the first-generation normalized layer; it must be rebuilt."""
+
+
+def require_current_store(manifest: dict[str, Any]) -> None:
+    """Refuse a store that is not written in the current manifest and conversation schemas.
+
+    A first-generation store is still readable (`load_manifest` and `verify` accept it), but
+    loading it upgrades its rows on the fly: message ids are minted differently and every message
+    counts as fully typed. A projection built from that would carry different message references
+    than one built from a current store while its receipt bound to the same fingerprint, so the
+    projections refuse it and ask for a rebuild.
+    """
+    found = (manifest.get("schema"), manifest.get("conversation_schema"))
+    if found != (MANIFEST_SCHEMA, SCHEMA):
+        raise LegacyArchiveStore(
+            f"the archive was written in an older layout (manifest schema {found[0]!r}, "
+            f"conversation schema {found[1]!r}; this engine writes {MANIFEST_SCHEMA!r} and "
+            f"{SCHEMA!r}): rebuild it with `cce archive build`"
+        )
+
+
 def failed_providers(manifest: dict[str, Any]) -> list[str]:
     return [name for name, info in manifest["providers"].items() if info.get("status") == "failed"]

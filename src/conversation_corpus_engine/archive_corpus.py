@@ -23,6 +23,8 @@ Rules the projector follows, each tested:
   decision (a reviewed family merge), not something the projector guesses.
 * Two runs over the same archive write the same bytes: records are in conversation order, every
   timestamp is read from the manifest, nothing reads a clock.
+* Only a store in the current manifest and conversation schemas is projected; a first-generation
+  store is refused with a rebuild message (see `archive_feed` for why).
 * The folder is built beside its final place and swapped in, so a failed run leaves the previous
   corpus untouched.
 """
@@ -38,7 +40,12 @@ from typing import Any
 from . import archive_layout as layout
 from .answering import write_json
 from .archive_feed import ELIGIBLE_KINDS, ask_text
-from .archive_ingest import ArchivePaths, load_manifest
+from .archive_ingest import (
+    ArchivePaths,
+    LegacyArchiveStore,
+    load_manifest,
+    require_current_store,
+)
 from .archive_model import Conversation, iter_conversations, message_reference
 from .archive_naming import NAMING_VERSION, InvalidName, NameCollision, NameLedger
 from .corpus_store import require_git_private
@@ -474,6 +481,10 @@ def project_corpus(
     try:
         manifest = load_manifest(paths)
     except FileNotFoundError as exc:
+        raise CorpusProjectionError(str(exc)) from exc
+    try:
+        require_current_store(manifest)
+    except LegacyArchiveStore as exc:
         raise CorpusProjectionError(str(exc)) from exc
     if not manifest.get("source_fingerprint"):
         raise CorpusProjectionError(
