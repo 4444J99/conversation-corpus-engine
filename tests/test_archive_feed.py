@@ -315,6 +315,7 @@ def test_the_receipt_reconciles_with_the_feed_and_the_archive(fixture_archive) -
     assert chatgpt["messages_seen"] == manifest["providers"]["chatgpt"]["messages"] + 2
     assert claude["alternate_rows"] == 0
     assert claude["excluded"] == {
+        "empty-text": 1,
         "kind-memory": 3,
         "kind-notebook": 2,
         "role-assistant": 3,
@@ -322,6 +323,24 @@ def test_the_receipt_reconciles_with_the_feed_and_the_archive(fixture_archive) -
     }
     assert claude["conversations_by_kind"] == {"chat": 2, "memory": 1, "notebook": 1}
     assert claude["messages_seen"] == manifest["providers"]["claude"]["messages"]
+
+
+def test_the_fixture_exercises_every_exclusion_path_and_each_receipt_reconciles(
+    fixture_archive,
+) -> None:
+    out = fixture_archive.tmp / "feeds"
+    project_feed(fixture_archive.paths.root, out)
+    reasons: set[str] = set()
+    for provider in ("chatgpt", "claude"):
+        (path,) = out.glob(f"receipt-{provider}-prompts-*.json")
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        # `rows` already counts the alternate-branch rows, so they are not added a second time
+        assert receipt["rows"] + sum(receipt["excluded"].values()) == receipt["messages_seen"]
+        assert 0 <= receipt["alternate_rows"] <= receipt["rows"]
+        reasons |= set(receipt["excluded"])
+        if provider == "chatgpt":
+            assert receipt["alternate_rows"] > 0
+    assert {"empty-text", "kind-memory", "kind-notebook", "role-assistant", "role-tool"} <= reasons
 
 
 def test_a_receipt_holds_no_conversation_text(fixture_archive) -> None:
@@ -468,7 +487,7 @@ def test_project_feed_command_and_exit_codes(fixture_archive, monkeypatch, capsy
     payload = json.loads(stdout)
     assert code == 0 and list(payload) == ["claude"] and payload["claude"]["rows"] == 2
     assert sorted(item.name for item in out.glob("feed-*.jsonl")) == ["feed-claude-prompts.jsonl"]
-    assert "text" not in stdout
+    assert '"text"' not in stdout and SHARED_ASK not in stdout
     code, _, err = _cce(monkeypatch, capsys, *base[:4], str(out / "nowhere"), "--out", str(out))
     assert code == 2 and "archive root not found" in err
     manifest = load_manifest(fixture_archive.paths)

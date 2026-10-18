@@ -10,6 +10,11 @@ with project and memory archives), so the normal readers parse them: ingest, the
 feed. Beside the exports a small note (`fixture-all.json`) records the digest of the shared ask
 and how many asks each provider should yield, so a consumer can check its counts without
 reading any text.
+
+The fixture also drives the projector's exclusion paths: a Claude user turn that is only an
+attachment (`empty-text`), a Claude memory archive and a project (`kind-memory`, `kind-notebook`),
+assistant and tool turns (`role-assistant`, `role-tool`), and a ChatGPT edit that leaves an
+abandoned branch (`alternate_rows`).
 """
 
 from __future__ import annotations
@@ -110,7 +115,7 @@ def _claude_entry(uuid: str, sender: str, when: str, text: str, **extra: Any) ->
         "created_at": when,
         "text": text,
         "content": extra.pop("content", [{"type": "text", "text": text}]),
-        "attachments": [],
+        "attachments": extra.pop("attachments", []),
         "files": [],
         "parent_message_uuid": extra.pop("parent", "root"),
     }
@@ -190,12 +195,24 @@ def _claude_export() -> list[dict[str, Any]]:
                     day_two,
                     "Draft a checklist for packing a small tent.",
                 ),
+                # A user turn that is only an attachment: the reader keeps it, with no text, so
+                # the feed projector counts it as `empty-text`.
+                _claude_entry(
+                    "fixture-c2-photo",
+                    "human",
+                    "2025-10-11T09:00:30Z",
+                    "",
+                    parent="fixture-c2-ask",
+                    attachments=[
+                        {"file_name": "campsite.png", "file_size": 12, "file_type": "png"}
+                    ],
+                ),
                 _claude_entry(
                     "fixture-c2-reply",
                     "assistant",
                     "2025-10-11T09:01:00Z",
                     "Poles, pegs, fly sheet, groundsheet.",
-                    parent="fixture-c2-ask",
+                    parent="fixture-c2-photo",
                 ),
             ],
         ),
@@ -248,7 +265,7 @@ def expected_counts() -> dict[str, Any]:
         1
         for conversation in _claude_export()
         for entry in conversation["chat_messages"]
-        if entry["sender"] == "human"
+        if entry["sender"] == "human" and entry["text"].strip()
     )
     alternates = sum(
         1
