@@ -171,6 +171,11 @@ ignored by it.
 - **Repeatable.** Two runs write the same bytes (every timestamp is read from the manifest). The
   corpus is built beside its final place and swapped in, so a failed run, including a store that
   disagrees with its manifest, leaves the previous corpus untouched.
+- **Nothing eligible.** A provider whose conversations are all excluded writes no corpus and
+  reports `status: empty`. If an earlier run left `corpus-<provider>-archive` in `--out`, it is
+  removed (`removed_stale: true`) so its text is not federated; only a folder this projector wrote
+  is ever removed. A project that still registers the folder sees it as an invalid contract with
+  no content, which the federation tolerates, until the entry is unregistered.
 
 The export importers (`import_chatgpt_export_corpus`, `import_claude_export_corpus`) are not yet
 rewired onto the archive. They share `corpus_text` with the projector and stay until a golden
