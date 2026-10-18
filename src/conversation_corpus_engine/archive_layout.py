@@ -173,7 +173,7 @@ def corpus_dirname(provider: str) -> str:
     return derive_name("corpus", scope=provider, subject=CORPUS_SUBJECT)
 
 
-def _uid_tail(provider: str, uid: str) -> str:
+def _identity_tail(provider: str, uid: str) -> str:
     prefix = f"{provider}-"
     if not uid.startswith(prefix):
         raise InvalidName(repr(uid), [f"uid does not start with {prefix!r}"])
@@ -182,12 +182,12 @@ def _uid_tail(provider: str, uid: str) -> str:
 
 def thread_id(provider: str, uid: str) -> str:
     """`thread-<provider>-<tail>`: a thread's id, from its conversation uid and nothing else."""
-    return derive_name("thread", scope=provider, identity=_uid_tail(provider, uid))
+    return derive_name("thread", scope=provider, identity=_identity_tail(provider, uid))
 
 
 def family_id(provider: str, uid: str) -> str:
     """`family-<provider>-<tail>`: the family a conversation forms by itself."""
-    return derive_name("family", scope=provider, identity=_uid_tail(provider, uid))
+    return derive_name("family", scope=provider, identity=_identity_tail(provider, uid))
 
 
 def pair_id(provider: str, uid: str, message_ref: str) -> str:
