@@ -397,6 +397,21 @@ def test_derive_and_parse_round_trip_for_every_kind_and_scope() -> None:
             assert validate_name(name) == []
 
 
+def test_parse_returns_the_hashed_segment_not_the_identity_that_was_hashed() -> None:
+    """The docstring's round-trip claim holds over resolved segments only."""
+    fields = {"scope": "chatgpt", "subject": "prompts", "date": "20261017"}
+    name = derive_name("receipt", identity="a fingerprint", **fields)
+    parts = parse_name(name)
+    assert parts.identity == hash_identity("a fingerprint") != "a fingerprint"
+    assert parts.render() == name  # the parse is faithful to the name it was given
+    # the original identity is not recoverable, and the segment hashes again if fed back
+    again = derive_name("receipt", identity=parts.identity, **fields)
+    assert again != name
+    assert parse_name(again).identity == hash_identity(parts.identity)
+    # where nothing is hashed (a plain identity on a plain kind) the segment is the input
+    assert parse_name(derive_name("thread", scope="claude", identity="abc-1")).identity == "abc-1"
+
+
 def test_a_subject_made_of_hex_does_not_confuse_the_receipt_parse() -> None:
     name = derive_name(
         "receipt", scope="claude", subject="deadbeefdeadbeef", identity="f", date="20260102"

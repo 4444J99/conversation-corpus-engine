@@ -23,9 +23,12 @@ of the name.
 
 The grammar is unambiguous by construction: scope words are a closed list, a date is always
 the last token of a kind that requires one, and a kind that allows both a subject and an
-identity requires the identity to be a 16 hex hash in the last position. `derive_name` and
-`parse_name` are exact inverses over resolved segments, and `derive_name` re-parses every
-name it mints before returning it.
+identity requires the identity to be a 16 hex hash in the last position. `derive_name` re-parses every name it mints
+before returning it, and `parse_name(derive_name(...))` always gives back the segments the name
+holds. Those are the resolved segments, which equal the inputs only where nothing was hashed. For
+a hashed identity (the `receipt` and `pattern` kinds, and any other kind given an identity that
+is not plain) `parse_name` returns the 16 hex segment, not the identity string that was hashed:
+the hash is one way, and feeding the segment back to `derive_name` hashes it again.
 """
 
 from __future__ import annotations
