@@ -171,7 +171,13 @@ ignored by it.
 
 The export importers (`import_chatgpt_export_corpus`, `import_claude_export_corpus`) are not yet
 rewired onto the archive. They share `corpus_text` with the projector and stay until a golden
-comparison of an importer corpus against the projected one lands (a named follow-up).
+comparison of an importer corpus against the projected one lands. Follow-up: importer-to-projector
+golden comparison, before either `import_*_export_corpus` module is retired.
+
+A projected corpus folder keeps the engine's own collection names inside (`corpus/threads-index`
+and the rest), so `verify-names` applies to the archive folder and to a store's top-level
+folders, not to the inside of a corpus. A federation build rewrites each corpus's `contract.json`
+(clock time, five counts), so the file is no longer byte-identical to a fresh projection after one.
 
 ## Naming contract
 
