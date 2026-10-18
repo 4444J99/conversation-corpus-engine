@@ -236,6 +236,23 @@ def test_upsert_and_build_federation_accept_both_corpora(fixture_archive) -> Non
     assert len(federated) == sum(summary[p]["families"] for p in PROVIDERS)
 
 
+def test_federating_the_projected_corpora_leaves_the_archive_manifest_unchanged(
+    fixture_archive,
+) -> None:
+    out = fixture_archive.tmp / "corpora"
+    project_corpus(fixture_archive.paths.root, out)
+    federation_root = fixture_archive.tmp / "federation-project"
+    federation_root.mkdir()
+    for provider in PROVIDERS:
+        name = f"corpus-{provider}-archive"
+        upsert_corpus(federation_root, out / name, corpus_id=name)
+    manifest_bytes = fixture_archive.paths.manifest.read_bytes()
+    result = build_federation(federation_root, archive_root=fixture_archive.paths.root)
+    recorded = result["archive_manifest_fingerprint"]
+    assert recorded["source_fingerprint"] == fixture_archive.manifest["source_fingerprint"]
+    assert fixture_archive.paths.manifest.read_bytes() == manifest_bytes
+
+
 # --- names -------------------------------------------------------------------------------------
 
 
