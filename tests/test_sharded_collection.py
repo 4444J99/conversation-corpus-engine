@@ -12,6 +12,7 @@ from conversation_corpus_engine.sharded_collection import (
     SHARDED_COLLECTION_CONTRACT,
     ShardedCollectionError,
     collection_current_path,
+    collection_exists,
     collection_generations_path,
     collection_storage_path,
     iter_collection,
@@ -171,6 +172,31 @@ def test_incomplete_v2_state_never_falls_back_to_v1(tmp_path: Path) -> None:
 
     with pytest.raises(ShardedCollectionError, match="CURRENT"):
         load_collection(logical_path)
+
+
+def test_dangling_storage_symlink_with_legacy_v1_file_fails_closed(tmp_path: Path) -> None:
+    logical_path = tmp_path / "threads-index.json"
+    logical_path.write_text('[{"id":"stale"}]\n', encoding="utf-8")
+    collection_storage_path(logical_path).symlink_to(tmp_path / "nonexistent_dir")
+
+    with pytest.raises(ShardedCollectionError):
+        collection_exists(logical_path)
+    with pytest.raises(ShardedCollectionError):
+        list(iter_collection(logical_path))
+    with pytest.raises(ShardedCollectionError):
+        load_collection(logical_path)
+
+
+def test_dangling_storage_symlink_without_legacy_file_fails_closed(tmp_path: Path) -> None:
+    logical_path = tmp_path / "threads-index.json"
+    collection_storage_path(logical_path).symlink_to(tmp_path / "nonexistent_dir")
+
+    with pytest.raises(ShardedCollectionError):
+        collection_exists(logical_path)
+    with pytest.raises(ShardedCollectionError):
+        list(iter_collection(logical_path))
+    with pytest.raises(ShardedCollectionError):
+        load_collection(logical_path, default=[])
 
 
 def test_interrupted_publication_preserves_previous_current(tmp_path: Path) -> None:
