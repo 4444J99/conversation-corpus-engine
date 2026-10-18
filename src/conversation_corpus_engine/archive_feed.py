@@ -80,7 +80,7 @@ def feed_source(provider: str) -> str:
     return f"archive-{provider}-messages"
 
 
-def _ask_text(message: Message) -> tuple[str, bool]:
+def ask_text(message: Message) -> tuple[str, bool]:
     """What the person typed, and whether attachment text was cut off the end."""
     text, typed = message.text, message.typed_chars
     if isinstance(typed, int) and 0 <= typed < len(text):
@@ -171,7 +171,7 @@ def _stage_provider(
                     if reason:
                         excluded[reason] += 1
                         continue
-                    text, was_trimmed = _ask_text(message)
+                    text, was_trimmed = ask_text(message)
                     if not text.strip():
                         excluded["empty-text"] += 1
                         continue

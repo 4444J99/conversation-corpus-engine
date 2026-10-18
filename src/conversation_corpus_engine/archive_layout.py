@@ -162,6 +162,58 @@ def collection_note(provider: str, collection: str) -> str:
     return derive_name("collection", scope=provider, subject=collection_subject(collection))
 
 
+# --- the projected corpus -------------------------------------------------------------------
+
+CORPUS_SUBJECT = "archive"
+
+
+def corpus_dirname(provider: str) -> str:
+    """`corpus-<provider>-archive`: the folder of a provider's projected engine corpus. It is also
+    the corpus's registry key and the `corpus_id` in its contract."""
+    return derive_name("corpus", scope=provider, subject=CORPUS_SUBJECT)
+
+
+def _uid_tail(provider: str, uid: str) -> str:
+    prefix = f"{provider}-"
+    if not uid.startswith(prefix):
+        raise InvalidName(repr(uid), [f"uid does not start with {prefix!r}"])
+    return uid[len(prefix) :]
+
+
+def thread_id(provider: str, uid: str) -> str:
+    """`thread-<provider>-<tail>`: a thread's id, from its conversation uid and nothing else."""
+    return derive_name("thread", scope=provider, identity=_uid_tail(provider, uid))
+
+
+def family_id(provider: str, uid: str) -> str:
+    """`family-<provider>-<tail>`: the family a conversation forms by itself."""
+    return derive_name("family", scope=provider, identity=_uid_tail(provider, uid))
+
+
+def pair_id(provider: str, uid: str, message_ref: str) -> str:
+    """`pair-<provider>-<16hex>`: a prompt/response pair, from the conversation uid and the stable
+    reference of the message that opens it."""
+    return derive_name("pair", scope=provider, identity=hash_identity(f"{uid}\0{message_ref}"))
+
+
+def action_id(provider: str, text: str) -> str:
+    """`action-<provider>-<16hex>`: the digest of the exact action sentence. The same sentence in
+    two conversations is one action; a different sentence is a different one, never a slug."""
+    return derive_name("action", scope=provider, identity=hash_identity(text))
+
+
+def question_id(provider: str, text: str) -> str:
+    """`question-<provider>-<16hex>`: the digest of the exact open-question sentence."""
+    return derive_name("question", scope=provider, identity=hash_identity(text))
+
+
+def entity_id(term: str) -> str:
+    """`topic-all-<term>` for a concept term that is one valid word, `topic-all-<16hex>` (the
+    digest of the term) for any other."""
+    name = topic_note(term)
+    return name or derive_name("topic", scope="all", subject=hash_identity(term))
+
+
 def wikilink(target: str, label: str | None = None, *, in_table: bool = False) -> str:
     """The one place a `[[wikilink]]` is written.
 

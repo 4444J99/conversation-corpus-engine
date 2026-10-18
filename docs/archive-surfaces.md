@@ -98,6 +98,7 @@ Conversations carry the schema string `archive-conversation.v2`; the manifest ca
 | `cce archive names` | print the naming contract: kinds, scopes, version (`--json`) |
 | `cce archive verify-names --root DIR` | check every file and directory under `DIR` against the naming contract |
 | `cce archive project feed --root ARCHIVE --out DIR` | write each provider's prompt feed and receipt (`--provider` to pick) |
+| `cce archive project corpus --root ARCHIVE --out DIR` | write each provider's engine corpus folder for the federation (`--provider` to pick) |
 | `cce archive fixture --out DIR` | write deterministic synthetic ChatGPT and Claude exports that share one ask |
 
 ## The prompt feed
@@ -134,6 +135,43 @@ with an edited ask, a Claude chat with reasoning and a tool call, a project and 
 whose first conversations share one identical ask. The bytes are the same on every run, so the
 manifest fingerprint is too. `fixture-all.json` beside them records the digest of the shared ask
 and the number of asks each provider should yield.
+
+## The corpus projection
+
+`cce archive project corpus --root <archive-all> --out <store>` shapes the normalized layer as
+engine corpora, so the federation can accept archive text. For each provider it writes
+`corpus-<provider>-archive/`, the folder that is also the registry key and the `corpus_id` in its
+`contract.json` (checked against `corpus-contract.schema.json` before anything is swapped in). Each
+folder holds the five collections federation requires (`threads-index`, `semantic-v3-index`,
+`pairs-index`, `doctrine-briefs`, `family-dossiers`) and the four it uses when present
+(`canonical-families`, `action-ledger`, `unresolved-ledger`, `canonical-entities`). Register one
+with `upsert_corpus(project_root, <store>/corpus-<provider>-archive, corpus_id=<same name>)`.
+Like the feed, the output holds private text, so `--out` must be outside any Git work tree or
+ignored by it.
+
+- **Which text.** The current branch only. Conversations of kind `chat`, `search` or `activity`;
+  projects, memories and notebooks are counted as excluded. Per message, channels `typed` and
+  `reply`: reasoning, tool output and system text stay out, and a user message is cut at
+  `typed_chars`. Off-branch messages stay in the archive.
+- **Ids.** Every id is minted by `derive_name` from the conversation uid and digests of exact
+  text, never from a title or a slug of a sentence: `thread-<provider>-<uid tail>`,
+  `family-<provider>-<uid tail>`, `pair-<provider>-<16hex>` (conversation uid plus the opening
+  message's stable reference), `action-<provider>-<16hex>` and `question-<provider>-<16hex>`
+  (the exact sentence), and `topic-all-<term>` for a concept entity (the digest of the term when
+  it is not one valid word). Renaming a conversation changes no id. The same sentence in two
+  conversations is one action; a name collision aborts the run.
+- **Families.** A conversation is its own family. Joining families across conversations or
+  providers is a reviewed federation decision, not a projector guess.
+- **Heuristics.** Sentence splitting, keywords, vector terms, action and open-question
+  detection, concept entities and the prompt/response pairing are the functions in `corpus_text`,
+  the one module the two export importers also use.
+- **Repeatable.** Two runs write the same bytes (every timestamp is read from the manifest). The
+  corpus is built beside its final place and swapped in, so a failed run, including a store that
+  disagrees with its manifest, leaves the previous corpus untouched.
+
+The export importers (`import_chatgpt_export_corpus`, `import_claude_export_corpus`) are not yet
+rewired onto the archive. They share `corpus_text` with the projector and stay until a golden
+comparison of an importer corpus against the projected one lands (a named follow-up).
 
 ## Naming contract
 
