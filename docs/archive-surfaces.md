@@ -68,7 +68,10 @@ build:
 ### The normalized layer (version 2)
 
 Conversations carry the schema string `archive-conversation.v2`; the manifest carries
-`archive-manifest.v2`. Version 1 files still load (missing message fields are filled in on read).
+`archive-manifest.v2`. Version 1 files still load (missing message fields are filled in on read),
+so `verify` and the readers accept a first-generation store. `project feed` and `project corpus`
+do not: a version 1 upgrade mints different message ids and counts attachment text as typed, so
+those two commands exit non-zero and ask for `cce archive build`.
 
 - Each **message** has an `id`: the vendor message id where the export has one (the ChatGPT node
   id, the Claude message uuid), otherwise `message-<provider>-<16hex>` over provider, conversation

@@ -17,6 +17,9 @@ Rules the writer follows, each tested:
   provenance argument, so a caller cannot promote a vendor export to operator-typed input.
 * Rows are written in conversation order, then message order, with sorted keys, so two runs give
   identical bytes. A repeated `event_ref` aborts the write and leaves no feed behind.
+* Only a store in the current manifest and conversation schemas is projected. A first-generation
+  store upgrades its rows on read, which mints different message ids and counts attachment text
+  as typed, so it is refused with a rebuild message (`cce archive build`).
 * The receipt holds counts, a digest of the feed and the manifest's source fingerprint; it holds
   no conversation text and no clock reading.
 """
@@ -31,7 +34,13 @@ from pathlib import Path
 from typing import Any
 
 from . import archive_layout as layout
-from .archive_ingest import ArchivePaths, latest_activity_day, load_manifest
+from .archive_ingest import (
+    ArchivePaths,
+    LegacyArchiveStore,
+    latest_activity_day,
+    load_manifest,
+    require_current_store,
+)
 from .archive_model import (
     Conversation,
     Message,
@@ -263,6 +272,10 @@ def project_feed(
     try:
         manifest = load_manifest(paths)
     except FileNotFoundError as exc:
+        raise FeedError(str(exc)) from exc
+    try:
+        require_current_store(manifest)
+    except LegacyArchiveStore as exc:
         raise FeedError(str(exc)) from exc
     if not manifest.get("source_fingerprint"):
         raise FeedError("the manifest has no source fingerprint: run `cce archive ingest` again")
