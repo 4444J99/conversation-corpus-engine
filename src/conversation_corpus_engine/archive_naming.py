@@ -177,7 +177,11 @@ KIND_TABLE: dict[str, KindRule] = {
         identity_form=IDENTITY_HASH,
         note="one recurring form; the identity hashes its lineage id, so the name never moves",
     ),
-    "manifest": KindRule(scope_values=SCOPE_ONLY_ALL),
+    "manifest": KindRule(
+        scope_values=SCOPE_ONLY_ALL,
+        subject=OPTIONAL,
+        note="the archive manifest; with a subject, the manifest of one surface (manifest-all-vault)",
+    ),
     "report": KindRule(subject=REQUIRED),
     "vault": KindRule(scope_values=SCOPE_ONLY_ALL),
     "site": KindRule(scope_values=SCOPE_ONLY_ALL),

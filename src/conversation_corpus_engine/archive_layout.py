@@ -30,6 +30,8 @@ DATABASE_FILENAME = derive_name("database", scope="all", subject="search") + ".s
 ENRICHMENT_FILENAME = derive_name("index", scope="all", subject="enrichment") + ".jsonl"
 TOPICS_FILENAME = derive_name("report", scope="all", subject="topics") + ".json"
 VAULT_DIRNAME = derive_name("vault", scope="all")
+# The list of files the vault build generated; it sits beside the manifest, not inside the vault.
+VAULT_MANIFEST_FILENAME = derive_name("manifest", scope="all", subject="vault") + ".json"
 SITE_DIRNAME = derive_name("site", scope="all")
 GRAPH_DIRNAME = derive_name("graph", scope="all")
 
@@ -238,6 +240,7 @@ def layout_payload() -> dict[str, Any]:
         "enrichment": ENRICHMENT_FILENAME,
         "topics": TOPICS_FILENAME,
         "vault": VAULT_DIRNAME,
+        "vault_manifest": VAULT_MANIFEST_FILENAME,
         "site": SITE_DIRNAME,
         "graph": GRAPH_DIRNAME,
         "home": HOME_NOTE,

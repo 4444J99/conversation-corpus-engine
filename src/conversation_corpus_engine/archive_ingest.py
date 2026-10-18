@@ -126,6 +126,10 @@ class ArchivePaths:
         return self.root / layout.VAULT_DIRNAME
 
     @property
+    def vault_manifest(self) -> Path:
+        return self.root / layout.VAULT_MANIFEST_FILENAME
+
+    @property
     def site(self) -> Path:
         return self.root / layout.SITE_DIRNAME
 

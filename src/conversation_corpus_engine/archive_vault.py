@@ -22,7 +22,9 @@ from .archive_text import FenceTracker
 from .archive_topics import load_enrichment
 from .corpus_store import CorpusWriteAuthorization
 
-VAULT_MANIFEST = ".cce-vault-manifest.json"
+# Where earlier builds kept the list of generated files, inside the vault. It is only read and
+# deleted now; the live list is `ArchivePaths.vault_manifest`, beside the archive manifest.
+RETIRED_VAULT_MANIFEST = ".cce-vault-manifest.json"
 MESSAGE_CHARS = 60_000
 NOTE_CHARS = 400_000
 ROLE_LABELS = {"user": "User", "assistant": "Assistant", "system": "System", "tool": "Tool"}
@@ -313,11 +315,18 @@ def _obsidian_config() -> dict[str, str]:
     }
 
 
-def _sync_manifest(root: Path, written: set[str]) -> int:
-    path = root / VAULT_MANIFEST
+def _sync_manifest(paths: ArchivePaths, root: Path, written: set[str]) -> int:
+    """Record the generated files beside the archive manifest and prune what the last build wrote
+    and this one did not. A manifest an earlier build left inside the vault is read once for its
+    file list, then deleted."""
+    path = paths.vault_manifest
     previous: list[str] = []
     if path.is_file():
         previous = json.loads(path.read_text(encoding="utf-8")).get("files", [])
+    retired = root / RETIRED_VAULT_MANIFEST
+    if retired.is_file():
+        previous += json.loads(retired.read_text(encoding="utf-8")).get("files", [])
+        retired.unlink()
     removed = 0
     for rel in previous:
         if rel not in written:
@@ -343,7 +352,7 @@ def link_targets(markdown: str) -> list[str]:
 def verify_vault(paths: ArchivePaths) -> list[str]:
     """Check that every generated file exists and every wikilink resolves to a note."""
     root = paths.vault
-    manifest_path = root / VAULT_MANIFEST
+    manifest_path = paths.vault_manifest
     if not manifest_path.is_file():
         return [f"vault manifest missing: {manifest_path}"]
     files = json.loads(manifest_path.read_text(encoding="utf-8")).get("files", [])
@@ -476,7 +485,8 @@ def build_vault(
         if not (root / rel).is_file():
             write_text_atomic(root / rel, content)
         written.add(rel)
-    removed = _sync_manifest(root, written)
+    require_inside(authorization, paths.vault_manifest)
+    removed = _sync_manifest(paths, root, written)
     hub_notes = sum(1 for rel in written if rel.startswith(f"{hubs}/"))
     return {
         "notes": notes,
