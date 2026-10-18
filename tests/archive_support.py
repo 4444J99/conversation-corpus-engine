@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -696,3 +697,255 @@ def topical_corpus() -> list[Conversation]:
             )
         )
     return items
+
+
+# --- synthetic Copilot captures --------------------------------------------------------------
+# SingleFile-style saved pages built from small pieces so a test can vary one trait at a time.
+# Every string is invented. Page text is passed as HTML source: nothing here is escaped.
+
+COPILOT_ID = "Zq8Lw3Nx-Tp_4RmKe7Vh2"
+COPILOT_URL = f"https://copilot.microsoft.com/research/{COPILOT_ID}"
+COPILOT_SAVED = "Tue Mar 10 2026 09:15:00 GMT-0400 (Eastern Daylight Time)"
+COPILOT_SAVED_ISO = "2026-03-10T13:15:00Z"
+COPILOT_TITLE = "Lantern Wick Care"
+COPILOT_BADGE = "Deep Research"
+COPILOT_PAGE_NAME = "research-lantern.html"
+COPILOT_CHROME_STRINGS = (
+    "SIDEBAR-CHROME-MUST-NOT-APPEAR",
+    "New chat chrome",
+    "Share chrome",
+    "DIALOG-CHROME-MUST-NOT-APPEAR",
+    "INFOBAR-CHROME-MUST-NOT-APPEAR",
+    "STYLE-CHROME-MUST-NOT-APPEAR",
+    "GENERIC-TITLE-CHROME",
+)
+COPILOT_CARD_URLS = (
+    "https://lamps.example.org/guides/wicks",
+    "https://oil.example.com/handbook/glass",
+)
+
+_COPILOT_HEAD = (
+    "<!DOCTYPE html><html lang=en-US data-theme=light dir=ltr><head><meta charset=utf-8>"
+    "<title>GENERIC-TITLE-CHROME</title>"
+    '<meta property=og:title content="GENERIC-TITLE-CHROME">'
+    "<style>.sidebar-chrome{color:red}/* STYLE-CHROME-MUST-NOT-APPEAR */</style></head>"
+)
+_COPILOT_OPEN = (
+    "<body data-tabster='{\"root\":{}}'><div id=root>"
+    '<div class="bg-sidebar-light flex h-full overflow-hidden"><div class=flex-none>'
+    "<div role=navigation>SIDEBAR-CHROME-MUST-NOT-APPEAR"
+    "<button type=button data-testid=sidebar-new-conversation-nav-item>New chat chrome</button>"
+    "</div></div>"
+    '<main class="after:border"><div class="flex-1 h-full overflow-hidden">'
+    '<div class="bg-background-150 overflow-y-auto size-full">'
+    '<div class="pointer-events-none sticky top-0 w-full"><span>Share chrome</span></div>'
+    '<div class="flex items-center justify-center pb-20 pt-14 w-full">'
+    '<div class="lg:max-w-[768px] min-w-[320px] px-4">'
+)
+_COPILOT_CLOSE = (
+    "</div></div></div></div></main></div>"
+    "<dialog>DIALOG-CHROME-MUST-NOT-APPEAR</dialog>"
+    "<single-file-infobar><template shadowrootmode=open>INFOBAR-CHROME-MUST-NOT-APPEAR"
+    "</template></single-file-infobar></div></body></html>\n"
+)
+
+
+def copilot_spans(text: str) -> str:
+    """Text as thousands of tiny inline spans, one per word, each keeping its trailing space."""
+    return "".join(f"<span>{piece}</span>" for piece in re.findall(r"\S+\s*|\s+", text))
+
+
+def copilot_pill(label: str = "lamps.example.org+2") -> str:
+    """An inline citation pill: a button holding `domain+N`."""
+    return (
+        '<span class="align-middle group h-6"><button type=button aria-expanded=false '
+        f'aria-label="Source {label}">{label}</button></span>'
+    )
+
+
+def copilot_card(
+    index: int | str | None,
+    site: str | None,
+    title: str | tuple[str, ...] | None,
+    url: str | tuple[str, ...] | None,
+) -> str:
+    """One source card (`<li class="list-none w-full">`, end tag omitted like the real pages)."""
+    hrefs = (url,) if isinstance(url, str) else tuple(url or ())
+    anchors = "".join(
+        f'<a class="active:bg-white/60" href="{href}" target=_blank rel=noopener></a>'
+        for href in hrefs
+    )
+    badge = "" if index is None else f'<span class="bg-accent-200 h-4">{index}</span>'
+    domain = "" if site is None else f"<span class=me-0.5>{site}</span>"
+    titles = (title,) if isinstance(title, str) else tuple(title or ())
+    heading = "".join(f"<div>{part}</div>" for part in titles)
+    return (
+        '<li class="list-none w-full"><span class=inline-flex><div class="flex flex-col">'
+        f'<div class="flex items-center">{anchors}{badge}{domain}</div>{heading}</div></span>'
+    )
+
+
+def copilot_card_list(*cards: str, closed: bool = True) -> str:
+    """The trailing sources list around already-built cards."""
+    return '<ul class="flex flex-col">' + "".join(cards) + ("</ul>" if closed else "")
+
+
+def copilot_item(
+    role: str,
+    body: str,
+    *,
+    title: str | None = None,
+    badge: str = COPILOT_BADGE,
+    closed: bool = True,
+) -> str:
+    """One message item. A `title` adds the header block (badge + `text-3xl` session title)."""
+    header = ""
+    if title is not None:
+        header = (
+            '<div class="flex flex-col gap-y-6"><div class="flex items-center gap-2">'
+            f'<div class="bg-current forced-color-adjust-none">{badge}</div></div>'
+            f"<div class=text-3xl>{title}</div></div>"
+        )
+    opening = f'<div class="break-words group/{role}-message-item pt-9 space-y-3">'
+    return f"{opening}{header}{body}" + ("</div>" if closed else "")
+
+
+def copilot_comment(url: str | None = COPILOT_URL, saved: str | None = COPILOT_SAVED) -> str:
+    """The three-line SingleFile comment; passing None leaves that line out."""
+    lines = ["<!--", " Page saved with SingleFile "]
+    if url is not None:
+        lines.append(f" url: {url}")
+    if saved is not None:
+        lines.append(f" saved date: {saved}")
+    lines.append("-->")
+    return "\n".join(lines)
+
+
+def copilot_page(
+    items: str | list[str],
+    *,
+    url: str | None = COPILOT_URL,
+    saved: str | None = COPILOT_SAVED,
+    wrap: bool = True,
+) -> str:
+    """A whole saved page. `wrap=True` surrounds the items with balanced page chrome (sidebar,
+    share bar, dialog, template, style); `wrap=False` puts them straight in the body, which is
+    what a test of an item that never closes needs (no later `</div>` to balance it)."""
+    inner = items if isinstance(items, str) else "".join(items)
+    if wrap:
+        return copilot_comment(url, saved) + _COPILOT_HEAD + _COPILOT_OPEN + inner + _COPILOT_CLOSE
+    return copilot_comment(url, saved) + "<html><body>" + inner + "</body></html>\n"
+
+
+def write_copilot_page(path: Path, items: str | list[str], **kwargs: Any) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(copilot_page(items, **kwargs), encoding="utf-8")
+    return path
+
+
+def copilot_report_body() -> str:
+    """The body of the standard report: h1, two h2, one h3, tiny-span paragraphs, pills (some
+    before punctuation), strong/em, a list with omitted `</li>`, an `ol start=3`, a blockquote, a
+    table with omitted cell and row end tags (one cell holds a pipe), and two source cards."""
+    spans = copilot_spans
+    pill = copilot_pill
+    wrapper_open = (
+        '<div class=max-w-full><div class="relative max-w-full">'
+        '<div class="horizontal-scrollbar mt-6" aria-label="Table" role=region tabindex=0>'
+    )
+    return "".join(
+        [
+            '<h1 class="[&:not(:first-child)]:pt-6 text-2xl-medium">',
+            spans("Lantern Care Playbook: Wicks, Oil and Glass"),
+            "</h1>",
+            '<div class="after:absolute after:border-b relative pb-6 w-full"></div>',
+            '<h2 class="text-xl-medium pb-1">Overview</h2>',
+            '<p><span class="font-ligatures-none whitespace-pre-wrap">',
+            spans("A trimmed wick burns evenly "),
+            pill("lamps.example.org+2"),
+            spans(". Keep the oil level high "),
+            pill("oil.example.com"),
+            spans(", and the glass clean."),
+            "</span>",
+            "<p><span class=font-ligatures-none>",
+            spans("Trim "),
+            "<strong>",
+            spans("twice weekly "),
+            "</strong>",
+            spans("when "),
+            "<em>",
+            spans("windy"),
+            "</em>",
+            spans(", once when calm."),
+            "</span>",
+            '<h3 class="text-lg-medium">Trimming schedule</h3>',
+            '<ul class="flex flex-col list-outside ms-4">',
+            "<li class=ps-2><span>Cut the char flat.</span>",
+            pill("lamps.example.org"),
+            "<li class=ps-2><span>Round the corners lightly.</span>",
+            "<li class=ps-2><span>Wipe the glass.</span>",
+            "</ul>",
+            "<ol start=3 class=list-outside>",
+            "<li class=ps-2><span>Light the lantern.</span>",
+            "<li class=ps-2><span>Check the flame height.</span>",
+            "</ol>",
+            '<blockquote class="border-foreground-300 border-s-2 flex flex-col gap-3 ps-3">',
+            "<p><span>A steady flame is a quiet flame.</span>",
+            "</blockquote>",
+            '<h2 class="text-xl-medium pb-1">Comparison</h2>',
+            wrapper_open,
+            "<table class=t-table><thead><tr><th>Wick<th>Burn rate<th>Notes",
+            "<tbody><tr><td>Flat cotton<td><span>Slow</span>",
+            pill("oil.example.com"),
+            "<td>Use a | b mix",
+            "<tr><td>Round braid<td><strong>Fast</strong><td>Needs trimming",
+            "</table></div></div></div>",
+            copilot_card_list(
+                copilot_card(
+                    1, "lamps.example.org", "Wick Trimming for Oil Lanterns", COPILOT_CARD_URLS[0]
+                ),
+                copilot_card(2, "oil.example.com", "Glass Care Handbook", COPILOT_CARD_URLS[1]),
+            ),
+        ]
+    )
+
+
+def copilot_report_page(**kwargs: Any) -> str:
+    return copilot_page(
+        [copilot_item("ai", copilot_report_body(), title=COPILOT_TITLE)],
+        **kwargs,
+    )
+
+
+def copilot_small_page(
+    identifier: str,
+    title: str,
+    paragraph: str,
+    *,
+    saved: str | None = COPILOT_SAVED,
+    surface: str = "research",
+) -> str:
+    """A one-paragraph page for tests that need several distinct captures."""
+    url = f"https://copilot.microsoft.com/{surface}/{identifier}"
+    body = f"<p>{copilot_spans(paragraph)}"
+    return copilot_page([copilot_item("ai", body, title=title)], url=url, saved=saved)
+
+
+def foreign_singlefile_page(url: str = "https://example.org/article") -> str:
+    """A SingleFile page from some other site: it must never be read as a Copilot page."""
+    return (
+        copilot_comment(url, COPILOT_SAVED)
+        + "<html><body><div class=article><p>NOT-A-COPILOT-PAGE-TEXT</div></body></html>\n"
+    )
+
+
+def build_copilot_folder(root: Path) -> Path:
+    """A provider folder: the standard page plus a `.docx` pair, a `.txt` and a foreign `.html`."""
+    root.mkdir(parents=True, exist_ok=True)
+    (root / COPILOT_PAGE_NAME).write_text(copilot_report_page(), encoding="utf-8")
+    (root / "attachments").mkdir(exist_ok=True)
+    (root / "attachments" / "report-draft.docx").write_bytes(b"stub-docx-one")
+    (root / "summary.docx").write_bytes(b"stub-docx-two")
+    (root / "notes.txt").write_text("stub text capture\n", encoding="utf-8")
+    (root / "unrelated.html").write_text(foreign_singlefile_page(), encoding="utf-8")
+    return root

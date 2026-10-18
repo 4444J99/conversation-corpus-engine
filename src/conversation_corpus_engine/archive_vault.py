@@ -36,6 +36,7 @@ PALETTE = {
     "notebooklm": 0x8E6BD6,
     "grok": 0x7A7A7A,
     "perplexity": 0x20B8CD,
+    "copilot": 0xD6409F,
 }
 INLINE_CODE_RE = re.compile(r"(`[^`\n]+`)")
 TAG_RE = re.compile(r"(?<![\w&\\/])#(?=[\w/-])")

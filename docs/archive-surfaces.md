@@ -48,7 +48,11 @@ cce archive serve --project-root … --corpus-store-root …      # http://127.0
 ```
 
 `--export-root` expects one folder per provider: `chatgpt/`, `claude/`, `gemini/` (including
-`NotebookLM/`), `grok/`, `perplexity/`. Override any with `--source provider=PATH`. A ChatGPT
+`NotebookLM/`), `grok/`, `perplexity/`, `copilot/`. Override any with `--source provider=PATH`.
+The Copilot reader takes SingleFile captures of Copilot web research pages (point it elsewhere with
+`--source copilot=/path/to/copilot-captures`). It reads only the `.html` pages; every other file is
+counted by extension and never opened. The capture date is the only timestamp, and no user message
+is emitted because those pages contain none. A ChatGPT
 account export is a snapshot; pass the live delta with `--chatgpt-extra delta.json` (it wins over
 the same conversation in the export). Output defaults to `<store>/archive-all/`. Every name below
 is minted by `derive_name` (see *Naming contract*), so `cce archive verify-names` accepts a whole

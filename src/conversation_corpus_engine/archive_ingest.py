@@ -12,6 +12,7 @@ from . import archive_layout as layout
 from . import (
     archive_read_chatgpt,
     archive_read_claude,
+    archive_read_copilot,
     archive_read_gemini,
     archive_read_grok,
     archive_read_notebooklm,
@@ -91,6 +92,9 @@ PROVIDER_SPECS: dict[str, ProviderSpec] = {
             "perplexity",
             archive_read_perplexity,
             _plain(archive_read_perplexity),
+        ),
+        ProviderSpec(
+            "copilot", "Copilot", "copilot", archive_read_copilot, _plain(archive_read_copilot)
         ),
     )
 }
