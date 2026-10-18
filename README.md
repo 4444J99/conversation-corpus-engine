@@ -109,11 +109,11 @@ Perplexity, Copilot) into an Obsidian vault/wiki, a static archive site, a SQLit
 database and a graph, all inside the private corpus store. See
 [docs/archive-surfaces.md](docs/archive-surfaces.md).
 
-The Copilot reader takes SingleFile captures of Copilot web research pages from a `copilot/`
-folder (or any folder, with
-`--source copilot=/path/to/copilot-captures`). It reads only the `.html` pages; other files are
-counted by extension and never opened. The capture date is the only timestamp, and no user message
-is emitted because those pages contain none.
+The Copilot reader takes SingleFile captures of Copilot web research pages from a `copilot/` folder,
+or from any folder with `--source copilot=/path/to/copilot-captures`. It reads the `.html`/`.htm`
+pages that carry a Copilot SingleFile header; HTML that is not a Copilot page is skipped and
+counted, and every other file is counted by extension and never opened. The capture date is the
+only timestamp. The pages hold no user turn, and none is invented.
 
 Corpus-destination writers fail closed unless a store has first been registered and the
 configured root exactly matches that active registration. The

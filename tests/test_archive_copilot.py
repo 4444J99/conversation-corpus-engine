@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ from archive_support import (
     build_copilot_folder,
     copilot_card,
     copilot_card_list,
+    copilot_comment,
     copilot_item,
     copilot_page,
     copilot_pill,
@@ -107,7 +110,17 @@ PAGE_LINE = (
     "source cards; the capture date is the only timestamp"
 )
 UNRECOGNIZED_LINE = "{k} .html file(s) — not recognized as saved Copilot pages (not read)"
+UNREADABLE_LINE = "{k} .html file(s) — could not be read (permissions or I/O error)"
+FOLDER_LINE = "{k} folder(s) — could not be listed (permissions or I/O error)"
 OTHER_LINE = "{k} {suffix} file(s) — not saved Copilot pages (names and bytes not read)"
+MARKER = "Page saved with SingleFile"
+# Elements in a row for the linear-time tests, per case. Each size is chosen so that the quadratic
+# form of the pill pattern fails the bound within seconds instead of hanging a run for minutes:
+# 30,000 pills took about 11 s there and 200,000 blank spans about 8.5 s, against well under a
+# second for the linear form on a slow runner.
+PILL_RUN = 30_000
+BLANK_RUN = 200_000
+SCALE_SECONDS = 5.0
 
 
 def _read(root: Path) -> tuple[list[Conversation], SourceTracker]:
@@ -136,6 +149,24 @@ def _page_only(tmp_path: Path, page: str) -> tuple[list[Conversation], SourceTra
     root.mkdir()
     (root / "page.html").write_text(page, encoding="utf-8")
     return _read(root)
+
+
+def _header_block(title: str, badge: str = COPILOT_BADGE) -> str:
+    """The session header as `copilot_item` writes it (a badge div beside a `text-3xl` title),
+    for tests that must put something around it: `copilot_item` cannot wrap header and body."""
+    return (
+        '<div class="flex flex-col gap-y-6"><div class="flex items-center gap-2">'
+        f'<div class="bg-current forced-color-adjust-none">{badge}</div></div>'
+        f"<div class=text-3xl>{title}</div></div>"
+    )
+
+
+def _page_with_marker_at(offset: int) -> str:
+    """A Copilot page whose SingleFile marker starts exactly `offset` bytes in (ASCII only): a
+    leading comment pads the page; its `<!--` and `-->\\n` take 8 of the bytes."""
+    page = copilot_page([copilot_item("ai", "<p>" + S("Edge text."), title="Edge Session")])
+    pad = offset - page.index(MARKER) - len("<!---->\n")
+    return "<!--" + "x" * pad + "-->\n" + page
 
 
 def _cce(monkeypatch, capsys, *argv: str) -> tuple[int, str, str]:
@@ -212,6 +243,12 @@ def test_detect_ignores_pages_under_dot_components(tmp_path: Path) -> None:
         "https://notcopilot.microsoft.com/research/Zq8Lw3Nx-Tp_4RmKe7Vh2",
         "https://example.org/copilot.microsoft.com/research/Zq8Lw3Nx-Tp_4RmKe7Vh2",
         "https://microsoft.com/research/Zq8Lw3Nx-Tp_4RmKe7Vh2",
+        "https://evil.example/copilot.microsoft.com",
+        f"ftp://copilot.microsoft.com/research/{COPILOT_ID}",
+        # the host is whatever follows the last `@`, so this one names evil.example
+        f"https://copilot.microsoft.com@evil.example/research/{COPILOT_ID}",
+        # an unparsable URL (urlsplit raises ValueError) is a foreign page, not a crash
+        f"https://[copilot.microsoft.com/research/{COPILOT_ID}",
     ],
 )
 def test_only_the_exact_host_makes_a_copilot_page(tmp_path: Path, url: str) -> None:
@@ -224,6 +261,25 @@ def test_only_the_exact_host_makes_a_copilot_page(tmp_path: Path, url: str) -> N
     assert tracker.hashes() == {} and tracker.files_read == []
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"https://copilot.microsoft.com:443/research/{COPILOT_ID}",
+        f"HTTPS://COPILOT.MICROSOFT.COM/research/{COPILOT_ID}",
+        f"https://user@copilot.microsoft.com/research/{COPILOT_ID}",
+    ],
+    ids=["explicit-port", "upper-case-scheme-and-host", "userinfo"],
+)
+def test_the_host_is_the_parsed_hostname_not_the_url_text(tmp_path: Path, url: str) -> None:
+    root = tmp_path / "caps"
+    write_copilot_page(root / "page.html", [copilot_item("ai", "<p>" + S("Found."))], url=url)
+    assert archive_read_copilot.detect(root) is True
+    (conversation,), tracker = _read(root)
+    assert (conversation.source_id, conversation.collection) == (COPILOT_ID, "research")
+    assert conversation.messages[0].text == "Found."
+    assert dict(tracker.counters) == {"pages_read": 1}
+
+
 def test_a_page_without_the_singlefile_marker_is_not_a_copilot_page(tmp_path: Path) -> None:
     root = tmp_path / "caps"
     root.mkdir()
@@ -231,6 +287,20 @@ def test_a_page_without_the_singlefile_marker_is_not_a_copilot_page(tmp_path: Pa
         f"<!--\n url: {COPILOT_URL}\n-->\n<html><body><p>text</body></html>\n", encoding="utf-8"
     )
     assert archive_read_copilot.detect(root) is False
+
+
+def test_a_url_line_after_the_comment_closes_does_not_make_a_copilot_page(tmp_path: Path) -> None:
+    root = tmp_path / "caps"
+    root.mkdir()
+    page = (
+        copilot_comment(url=None)  # the marker and the date, but no `url:` line inside
+        + f"\nurl: {COPILOT_URL}\n<html><body><p>text</body></html>\n"
+    )
+    (root / "page.html").write_text(page, encoding="utf-8")
+    assert archive_read_copilot.detect(root) is False
+    conversations, tracker = _read(root)
+    assert conversations == []
+    assert dict(tracker.counters) == {"pages_skipped_not_copilot": 1}
 
 
 def test_the_marker_must_sit_in_the_first_8192_bytes(tmp_path: Path) -> None:
@@ -246,6 +316,33 @@ def test_the_marker_must_sit_in_the_first_8192_bytes(tmp_path: Path) -> None:
     (conversation,) = _read(near)[0]
     assert conversation.messages[0].text == "Near enough."
     assert _read(far)[0] == []
+
+
+@pytest.mark.parametrize(
+    ("offset", "detected"),
+    [(7604, True), (8204, False)],
+    ids=["whole-header-inside-the-window", "marker-starts-past-the-window"],
+)
+def test_the_detection_window_is_exercised_on_both_sides_of_8192(
+    tmp_path: Path, offset: int, detected: bool
+) -> None:
+    root = tmp_path / "caps"
+    root.mkdir()
+    (root / "page.html").write_text(_page_with_marker_at(offset), encoding="utf-8")
+    raw = (root / "page.html").read_bytes()
+    assert archive_read_copilot.HEAD_BYTES == 8192
+    assert raw.index(MARKER.encode()) == offset
+    assert (raw.index(b"-->", offset) + 3 <= archive_read_copilot.HEAD_BYTES) is detected
+    assert archive_read_copilot.detect(root) is detected
+    conversations, tracker = _read(root)
+    if detected:
+        (conversation,) = conversations
+        assert conversation.messages[0].text == "Edge text."
+        assert conversation.updated == COPILOT_SAVED_ISO
+        assert dict(tracker.counters) == {"pages_read": 1}
+    else:
+        assert conversations == []
+        assert dict(tracker.counters) == {"pages_skipped_not_copilot": 1}
 
 
 # --- channels ----------------------------------------------------------------------------
@@ -308,6 +405,7 @@ def test_channels_count_every_copilot_page(tmp_path: Path) -> None:
     assert archive_read_copilot.channels(root)["read"] == [PAGE_LINE.format(n=2)]
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes, so nothing would be proven")
 def test_non_html_files_are_never_opened(tmp_path: Path) -> None:
     root = build_copilot_folder(tmp_path / "caps")
     locked = [root / "attachments" / "report-draft.docx", root / "summary.docx", root / "notes.txt"]
@@ -320,12 +418,56 @@ def test_non_html_files_are_never_opened(tmp_path: Path) -> None:
     finally:
         for path in locked:
             path.chmod(0o644)
-    assert info["not_read"][1:] == [
-        OTHER_LINE.format(k=2, suffix=".docx"),
-        OTHER_LINE.format(k=1, suffix=".txt"),
-    ]
+    # the whole report: a file that could not be opened would show up as an unreadable .html
+    # line or change a count, so nothing else may be in the list
+    assert info == {
+        "read": [PAGE_LINE.format(n=1)],
+        "not_read": [
+            UNRECOGNIZED_LINE.format(k=1),
+            OTHER_LINE.format(k=2, suffix=".docx"),
+            OTHER_LINE.format(k=1, suffix=".txt"),
+        ],
+    }
     assert len(conversations) == 1
     assert tracker.files_read == [COPILOT_PAGE_NAME]
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes, so nothing would be proven")
+def test_an_unreadable_page_is_counted_and_not_called_foreign(tmp_path: Path) -> None:
+    root = tmp_path / "caps"
+    write_copilot_page(root / "a-ok.html", [copilot_item("ai", "<p>" + S("Readable."))])
+    locked = write_copilot_page(root / "b-locked.html", [copilot_item("ai", "<p>" + S("Sealed."))])
+    locked.chmod(0)
+    try:
+        conversations, tracker = _read(root)
+        info = archive_read_copilot.channels(root)
+    finally:
+        locked.chmod(0o644)
+    assert [c.messages[0].text for c in conversations] == ["Readable."]
+    assert dict(tracker.counters) == {"pages_read": 1, "pages_unreadable": 1}
+    assert "pages_skipped_not_copilot" not in tracker.counters
+    assert info == {"read": [PAGE_LINE.format(n=1)], "not_read": [UNREADABLE_LINE.format(k=1)]}
+
+
+@pytest.mark.skipif(
+    os.geteuid() == 0, reason="root ignores folder modes, so nothing would be proven"
+)
+def test_a_folder_that_cannot_be_listed_is_counted_and_the_rest_is_still_read(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "caps"
+    write_copilot_page(root / "a-ok.html", [copilot_item("ai", "<p>" + S("Readable."))])
+    write_copilot_page(root / "sealed" / "hidden.html", [copilot_item("ai", "<p>" + S("Hidden."))])
+    (root / "sealed").chmod(0)
+    try:
+        conversations, tracker = _read(root)
+        info = archive_read_copilot.channels(root)
+    finally:
+        (root / "sealed").chmod(0o755)
+    assert [c.messages[0].text for c in conversations] == ["Readable."]
+    assert dict(tracker.counters) == {"folders_unreadable": 1, "pages_read": 1}
+    assert tracker.files_read == ["a-ok.html"]
+    assert info == {"read": [PAGE_LINE.format(n=1)], "not_read": [FOLDER_LINE.format(k=1)]}
 
 
 # --- field mapping (spec 2.3, 2.4, 2.5) -----------------------------------------------------
@@ -571,6 +713,74 @@ def test_the_mode_is_the_badge_text(tmp_path: Path) -> None:
     assert plain.extra["mode"] == ""
 
 
+# The header is the OUTERMOST div around the item's first `text-3xl` element that holds no body
+# block (h1-h6, p, ul, ol, table, blockquote, pre, hr); a wrapper that also holds the report is
+# refused and the next div inward is tried. Each case: (item content, title, mode, body text).
+HEADER_CASES = [
+    pytest.param(
+        "<div class=wrap>"
+        + _header_block("Wrapped Title")
+        + "<h1>Report</h1><p>Body text</p></div>",
+        "Wrapped Title",
+        COPILOT_BADGE,
+        "# Report\n\nBody text",
+        id="wrapper-around-header-and-body-is-refused",
+    ),
+    pytest.param(
+        "<div class=top><div class=chip>CHIP-TEXT </div>"
+        + _header_block("Outer Title")
+        + "</div><p>Body</p>",
+        "Outer Title",
+        f"CHIP-TEXT {COPILOT_BADGE}",
+        "Body",
+        id="the-outermost-clean-div-is-the-header",
+    ),
+    pytest.param(
+        "<div class=text-3xl>Lone Title</div><p>Body text",
+        "Lone Title",
+        "",
+        "Body text",
+        id="text-3xl-div-alone-under-the-item",
+    ),
+    pytest.param(
+        "<div class=prose><h1>Report</h1><p>Body</p><p class=text-3xl>42%</p></div>",
+        "Report",
+        "",
+        "# Report\n\nBody\n\n42%",
+        id="text-3xl-paragraph-in-the-body-is-no-header",
+    ),
+    pytest.param(
+        "<div class=prose><h1>Report</h1><p>Body</p><span class=text-3xl>42%</span></div>",
+        "Report",
+        "",
+        "# Report\n\nBody\n\n42%",
+        id="text-3xl-span-in-the-body-is-no-header",
+    ),
+]
+
+
+@pytest.mark.parametrize(("content", "title", "mode", "text"), HEADER_CASES)
+def test_the_header_block_is_the_outermost_div_without_body_blocks(
+    tmp_path: Path, content: str, title: str, mode: str, text: str
+) -> None:
+    conversation, _ = _probe(tmp_path, content, title=None)
+    assert conversation.title == title
+    assert conversation.extra["mode"] == mode
+    assert [m.text for m in conversation.messages] == [text]
+
+
+# A `text-3xl` div that comes after body blocks is content (a figure, a callout), not a header: a
+# header opens the item. Found by the independent test author as a disagreement between the spec
+# and the first form of the rule (a lone text-3xl div was its own innermost candidate, so its text
+# left the body and became the title); the rule now also requires no body block before the header.
+def test_a_text_3xl_div_inside_the_body_is_not_a_header(tmp_path: Path) -> None:
+    body = "<div class=prose><h1>Report</h1><p>Body</p><div class=text-3xl>42%</div></div>"
+    conversation, _ = _probe(tmp_path, body, title=None)
+    assert conversation.title == "Report"
+    assert conversation.extra["mode"] == ""
+    assert [m.text for m in conversation.messages] == ["# Report\n\nBody\n\n42%"]
+
+
 # --- url, id and date (spec 2.3) ----------------------------------------------------------
 
 
@@ -589,17 +799,40 @@ def test_the_mode_is_the_badge_text(tmp_path: Path) -> None:
             "research",
         ),
         (f"{COPILOT_URL}?src=share#top", COPILOT_ID, "research"),
+        (f"{COPILOT_URL}?src=share", COPILOT_ID, "research"),
+        (f"{COPILOT_URL}#top", COPILOT_ID, "research"),
+        (f"{COPILOT_URL}/", COPILOT_ID, "research"),
+        (
+            "https://copilot.microsoft.com/a/b/Qw3Er4Ty5Ui6Op7As8Df9",
+            "Qw3Er4Ty5Ui6Op7As8Df9",
+            "a",
+        ),
+        (
+            "https://copilot.microsoft.com/a/b/Qw3Er4Ty5Ui6Op7As8Df9?src=share#top",
+            "Qw3Er4Ty5Ui6Op7As8Df9",
+            "a",
+        ),
     ],
 )
 def test_the_id_is_the_last_path_segment_and_the_collection_the_first(
     tmp_path: Path, url: str, source_id: str, collection: str
 ) -> None:
-    conversation, _ = _probe(tmp_path, "<p>x", url=url)
+    conversation, tracker = _probe(tmp_path, "<p>x", url=url)
     assert conversation.source_id == source_id
     assert conversation.collection == collection
+    assert "pages_without_url" not in tracker.counters
 
 
-@pytest.mark.parametrize("url", ["https://copilot.microsoft.com/", "https://copilot.microsoft.com"])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://copilot.microsoft.com/",
+        "https://copilot.microsoft.com",
+        # a lone segment could as well be the id or the surface, so it is neither
+        f"https://copilot.microsoft.com/{COPILOT_ID}",
+        f"https://copilot.microsoft.com/{COPILOT_ID}?src=share#top",
+    ],
+)
 def test_a_url_without_an_id_degrades_visibly(tmp_path: Path, url: str) -> None:
     conversation, tracker = _probe(tmp_path, "<p>" + S("Some text."), url=url)
     assert conversation.source_id == ""
@@ -635,8 +868,25 @@ def test_the_saved_date_becomes_utc(tmp_path: Path, saved: str, iso: str) -> Non
 
 @pytest.mark.parametrize(
     "saved",
-    [None, "not a date at all", "Tue Feb 30 2026 09:15:00 GMT-0400 (Eastern Daylight Time)"],
-    ids=["absent", "garbage", "impossible-day"],
+    [
+        None,
+        "not a date at all",
+        "Tue Feb 30 2026 09:15:00 GMT-0400 (Eastern Daylight Time)",
+        # the local time is a valid datetime but its UTC moment is not: OverflowError, not a crash
+        "Mon Jan 01 0001 00:30:00 GMT+0100 (Zone)",
+        "Fri Dec 31 9999 23:30:00 GMT-0100 (Zone)",
+        "Mon Jan 01 0001 00:59:59 GMT+0100 (Zone)",
+        "Fri Dec 31 9999 23:00:00 GMT-0100 (Zone)",
+    ],
+    ids=[
+        "absent",
+        "garbage",
+        "impossible-day",
+        "year-one-ahead-of-utc",
+        "year-9999-behind-utc",
+        "one-second-before-year-one-in-utc",
+        "one-hour-into-year-10000-in-utc",
+    ],
 )
 def test_a_missing_or_unparsable_date_degrades_visibly(tmp_path: Path, saved: str | None) -> None:
     conversation, tracker = _probe(tmp_path, "<p>" + S("Kept."), saved=saved)
@@ -647,6 +897,25 @@ def test_a_missing_or_unparsable_date_degrades_visibly(tmp_path: Path, saved: st
     assert tracker.counters["saved_date_unparsed"] == 1
 
 
+@pytest.mark.parametrize(
+    ("saved", "iso"),
+    [
+        ("Mon Jan 01 0001 01:00:00 GMT+0100 (Zone)", "0001-01-01T00:00:00Z"),
+        ("Mon Jan 01 0001 00:30:00 GMT-0100 (Zone)", "0001-01-01T01:30:00Z"),
+        ("Fri Dec 31 9999 22:59:59 GMT-0100 (Zone)", "9999-12-31T23:59:59Z"),
+        ("Fri Dec 31 9999 23:30:00 GMT+0100 (Zone)", "9999-12-31T22:30:00Z"),
+    ],
+    ids=["first-utc-second", "year-one-behind-utc", "last-utc-second", "year-9999-ahead-of-utc"],
+)
+def test_a_date_at_the_ends_of_the_calendar_still_parses_when_its_utc_moment_fits(
+    tmp_path: Path, saved: str, iso: str
+) -> None:
+    conversation, tracker = _probe(tmp_path, "<p>x", saved=saved)
+    assert conversation.updated == iso
+    assert conversation.extra["captured_at"] == iso
+    assert "saved_date_unparsed" not in tracker.counters
+
+
 # --- pills ---------------------------------------------------------------------------------
 
 
@@ -655,6 +924,90 @@ def test_pills_are_counted_per_button(tmp_path: Path) -> None:
     conversation, tracker = _probe(tmp_path, body)
     assert tracker.counters["citation_pills_stripped"] == 3
     assert conversation.messages[0].text == "One two three."
+
+
+# A pill right before a CLOSING mark leaves no space behind it: `claim <pill>.` -> `claim.`.
+# Marks that could as well open something (straight quotes, dashes, opening brackets) keep it.
+CLOSING_MARKS = {
+    "period": ".",
+    "comma": ",",
+    "semicolon": ";",
+    "colon": ":",
+    "exclamation": "!",
+    "question": "?",
+    "paren": ")",
+    "bracket": "]",
+    "brace": "}",
+    "curly-double-quote": "”",
+    "curly-single-quote": "’",
+    "guillemet": "»",
+    "ellipsis": "…",
+}
+KEPT_SPACE_MARKS = {
+    "straight-double-quote": '"',
+    "straight-single-quote": "'",
+    "em-dash": "—",
+    "en-dash": "–",
+    "curly-opening-quote": "“",
+    "opening-paren": "(",
+}
+
+
+@pytest.mark.parametrize("mark", list(CLOSING_MARKS.values()), ids=list(CLOSING_MARKS))
+def test_a_pill_before_a_closing_mark_takes_the_space_before_it_along(
+    tmp_path: Path, mark: str
+) -> None:
+    conversation, tracker = _probe(tmp_path, "<p>" + S("a ") + P() + S(f"{mark} b"))
+    assert conversation.messages[0].text == f"a{mark} b"
+    assert tracker.counters["citation_pills_stripped"] == 1
+
+
+@pytest.mark.parametrize("mark", list(KEPT_SPACE_MARKS.values()), ids=list(KEPT_SPACE_MARKS))
+def test_a_pill_before_a_mark_that_could_open_something_keeps_the_space(
+    tmp_path: Path, mark: str
+) -> None:
+    conversation, _ = _probe(tmp_path, "<p>" + S("a ") + P() + S(f"{mark} b"))
+    assert conversation.messages[0].text == f"a {mark} b"
+
+
+@pytest.mark.parametrize(
+    ("unit", "count", "pills"),
+    [
+        ("<button>p</button><span> </span>", PILL_RUN, PILL_RUN),
+        ("<span> </span>", BLANK_RUN, 0),
+    ],
+    ids=["pills-each-followed-by-a-blank-span", "blank-spans"],
+)
+def test_a_very_long_run_of_pills_or_blank_spans_reads_in_linear_time(
+    tmp_path: Path, unit: str, count: int, pills: int
+) -> None:
+    body = "<p>" + S("a ") + unit * count + "<span>b</span>"
+    root = tmp_path / "caps"
+    write_copilot_page(root / "page.html", [copilot_item("ai", body, title="Scale Session")])
+    started = time.perf_counter()
+    (conversation,), tracker = _read(root)
+    elapsed = time.perf_counter() - started
+    assert conversation.messages[0].text == "a b"
+    assert tracker.counters["citation_pills_stripped"] == pills
+    assert elapsed < SCALE_SECONDS, f"{count} elements took {elapsed:.1f}s"
+
+
+def test_an_item_that_ends_inside_a_skipped_subtree_keeps_its_text_and_is_counted(
+    tmp_path: Path,
+) -> None:
+    page = copilot_page(
+        [
+            copilot_item("ai", "<p>before<button>pill<p>AFTER", title="Skip Session"),
+            copilot_item("user", "<p>" + S("Next item.")),
+        ]
+    )
+    (conversation,), tracker = _page_only(tmp_path, page)
+    assert [(m.role, m.text) for m in conversation.messages] == [
+        ("assistant", "before"),
+        ("user", "Next item."),
+    ]
+    assert tracker.counters["skips_unterminated"] == 1
+    assert tracker.counters["citation_pills_stripped"] == 1
 
 
 # --- cards ---------------------------------------------------------------------------------
@@ -752,6 +1105,77 @@ CARD_CASES = [
         [{"index": 1, "site": LAMPS, "text": "Last", "url": URL0}],
         id="list-never-closes",
     ),
+    pytest.param(
+        [copilot_card("1234567890" * 4, "s.example.org", "T", URL0)],
+        True,
+        f"1. [T]({URL0}) — s.example.org",
+        [{"index": None, "site": "s.example.org", "text": "T", "url": URL0}],
+        id="forty-digit-badge-is-consumed-and-the-site-still-follows",
+    ),
+    # the digits are spelled out, not read from `INDEX_DIGITS`, so a changed cap fails here
+    pytest.param(
+        [copilot_card("123456789", LAMPS, "T", URL0)],
+        True,
+        f"123456789. [T]({URL0}) — {LAMPS}",
+        [{"index": 123456789, "site": LAMPS, "text": "T", "url": URL0}],
+        id="nine-digit-badge-is-the-longest-trusted-index",
+    ),
+    pytest.param(
+        [copilot_card("1234567890", LAMPS, "T", URL0)],
+        True,
+        f"1. [T]({URL0}) — {LAMPS}",
+        [{"index": None, "site": LAMPS, "text": "T", "url": URL0}],
+        id="ten-digit-badge-is-consumed-but-not-trusted",
+    ),
+    pytest.param(
+        [copilot_card(1, LAMPS, "Part 1] notes", URL0)],
+        True,
+        f"1. [Part 1\\] notes]({URL0}) — {LAMPS}",
+        [{"index": 1, "site": LAMPS, "text": "Part 1] notes", "url": URL0}],
+        id="bracket-in-the-title-is-escaped",
+    ),
+    pytest.param(
+        [copilot_card(1, LAMPS, "Title", "https://lamps.example.org/a b(c)")],
+        True,
+        f"1. [Title](https://lamps.example.org/a%20b%28c%29) — {LAMPS}",
+        [{"index": 1, "site": LAMPS, "text": "Title", "url": "https://lamps.example.org/a b(c)"}],
+        id="space-and-parentheses-are-encoded-in-the-link-not-in-the-citation",
+    ),
+    pytest.param(
+        [copilot_card(1, LAMPS, "Title", (URL0, URL1))],
+        True,
+        f"1. [Title]({URL0}) — {LAMPS}",
+        [{"index": 1, "site": LAMPS, "text": "Title", "url": URL0}],
+        id="the-first-of-two-http-anchors-wins",
+    ),
+    pytest.param(
+        [copilot_card(1, None, "Report v2.0", URL0)],
+        True,
+        f"1. [Report v2.0]({URL0})",
+        [{"index": 1, "site": "", "text": "Report v2.0", "url": URL0}],
+        id="a-segment-with-a-dot-and-a-space-is-a-title-not-a-site",
+    ),
+    pytest.param(
+        [copilot_card(1, LAMPS, "Title", "httpfoo://x.example.org")],
+        True,
+        f"1. Title — {LAMPS}",
+        [{"index": 1, "site": LAMPS, "text": "Title", "url": ""}],
+        id="httpfoo-scheme-is-no-card-url",
+    ),
+    pytest.param(
+        [copilot_card(1, LAMPS, "Title", "ftp://x.example.org")],
+        True,
+        f"1. Title — {LAMPS}",
+        [{"index": 1, "site": LAMPS, "text": "Title", "url": ""}],
+        id="ftp-scheme-is-no-card-url",
+    ),
+    pytest.param(
+        [copilot_card(1, LAMPS, "Title", ("httpfoo://x.example.org", "ftp://x.example.org", URL1))],
+        True,
+        f"1. [Title]({URL1}) — {LAMPS}",
+        [{"index": 1, "site": LAMPS, "text": "Title", "url": URL1}],
+        id="near-miss-schemes-are-passed-over-for-a-real-http-anchor",
+    ),
 ]
 
 
@@ -797,6 +1221,39 @@ def test_citations_belong_to_the_item_that_held_the_cards(tmp_path: Path) -> Non
     ]
     assert "citations" not in conversation.messages[2].meta
     assert conversation.messages[1].text == f"Answer.\n\n1. [Only card]({URL0}) — {LAMPS}"
+
+
+def test_a_source_list_whose_end_tag_never_comes_does_not_swallow_what_follows(
+    tmp_path: Path,
+) -> None:
+    cards = copilot_card_list(
+        copilot_card(1, LAMPS, "Wick Guide", URL0),
+        copilot_card(2, "oil.example.com", "Glass Care", URL1),
+        closed=False,
+    )
+    conversation, tracker = _probe(tmp_path, cards + "<h2>Next Heading</h2><p>AFTER TEXT</p>")
+    (message,) = conversation.messages
+    assert message.text == "\n\n".join(
+        [
+            f"1. [Wick Guide]({URL0}) — {LAMPS}\n2. [Glass Care]({URL1}) — oil.example.com",
+            "## Next Heading",
+            "AFTER TEXT",
+        ]
+    )
+    assert message.meta["citations"] == [
+        {"index": 1, "site": LAMPS, "text": "Wick Guide", "url": URL0},
+        {"index": 2, "site": "oil.example.com", "text": "Glass Care", "url": URL1},
+    ]
+    assert tracker.counters["source_cards"] == 2
+
+
+def test_an_empty_source_card_renders_nothing_and_is_not_counted(tmp_path: Path) -> None:
+    conversation, tracker = _probe(tmp_path, '<ul><li class="list-none w-full"><span></span></ul>')
+    (message,) = conversation.messages
+    assert message.text == ""
+    assert message.meta == {"kind": "text"}
+    assert "source_cards" not in tracker.counters
+    assert conversation.extra["sources"] == 0
 
 
 # --- rendering rules (spec section 3) -----------------------------------------------------
@@ -1045,12 +1502,135 @@ RENDER_CASES = [
         "Kept",
         id="no-leading-blank-blocks",
     ),
+    # containers kept as inline text must not let their end tags close a real container
+    pytest.param(
+        "<blockquote><ul><li>a<blockquote>b</blockquote><li>c</ul></blockquote><p>after",
+        "> - a b\n> - c\n\nafter",
+        id="quote-kept-as-text-in-a-list-item-cannot-close-the-real-quote",
+    ),
+    pytest.param(
+        "<table><tr><td>x<ul><li>a<li>b</ul> y<td>z</table><ul><li>one<li>two</ul><p>after",
+        "| x a b y | z |\n| --- | --- |\n\n- one\n- two\n\nafter",
+        id="list-kept-as-text-in-a-cell-leaves-the-next-real-list-alone",
+    ),
+    pytest.param(
+        "<blockquote>" * 10 + "<p>deep text</p>" + "</blockquote>" * 10,
+        "> " * 10 + "deep text",
+        id="ten-nested-quotes-get-ten-prefixes",
+    ),
+    pytest.param(
+        "<ul><li>run<pre>x = 1\n  y = 2</pre><li>next</ul>",
+        "- run x = 1 y = 2\n- next",
+        id="pre-inside-a-list-item-is-flattened-to-inline-text",
+    ),
+    # pills before closing marks
+    pytest.param(
+        "<p>" + S("he said “claim ") + P() + S("”."),
+        "he said “claim”.",
+        id="pill-before-a-closing-curly-quote",
+    ),
+    # the start attribute of a list
+    pytest.param("<ol start=3><li>a<li>b</ol>", "3. a\n4. b", id="ol-plain-start"),
+    pytest.param(
+        '<ol start=" 7 "><li>a<li>b</ol>', "7. a\n8. b", id="ol-start-is-stripped-before-parsing"
+    ),
+    pytest.param(
+        "<ol start=1_000><li>a<li>b</ol>", "1. a\n2. b", id="ol-start-with-an-underscore-is-ignored"
+    ),
+    pytest.param("<ol start=-3><li>a<li>b</ol>", "1. a\n2. b", id="ol-negative-start-is-ignored"),
+    pytest.param(
+        "<ol start=12345678901><li>a<li>b</ol>",
+        "1. a\n2. b",
+        id="ol-eleven-digit-start-is-ignored",
+    ),
+    # escaping in links and cells
+    pytest.param(
+        '<p><a href="https://x.example.org">a]b</a>',
+        "[a\\]b](https://x.example.org)",
+        id="bracket-in-link-text-is-escaped",
+    ),
+    pytest.param(
+        '<p><a href="https://x.example.org/a b(c)">t</a>',
+        "[t](https://x.example.org/a%20b%28c%29)",
+        id="space-and-parentheses-in-an-href-are-encoded",
+    ),
+    pytest.param(
+        '<p><a href="httpfoo://x.example.org">t</a><span> and </span>'
+        '<a href="ftp://x.example.org">u</a>',
+        "t and u",
+        id="near-miss-and-foreign-schemes-make-no-inline-link",
+    ),
+    pytest.param(
+        r"<table><tr><th>k<th>v<th>w<tr><td>a|b<td>a\|b<td>c\d</table>",
+        "| k | v | w |\n| --- | --- | --- |\n" + r"| a\|b | a\\\|b | c\d |",
+        id="pipe-is-escaped-and-a-backslash-before-one-is-doubled",
+    ),
+    # line breaks
+    pytest.param(
+        "<table><tr><th>a<br>b<th>c<tr><td>1<td>2</table>",
+        "| a b | c |\n| --- | --- |\n| 1 | 2 |",
+        id="br-in-a-table-cell-is-a-space",
+    ),
+    pytest.param("<h2>a<br>b</h2>", "## a b", id="br-in-a-heading-is-a-space"),
+    pytest.param("<p>a<br><br><br><br>b", "a\n\nb", id="four-br-in-a-row-make-one-blank-line"),
+    pytest.param(
+        "<p><strong>x<br></strong>y",
+        "**x**\ny",
+        id="br-at-the-end-of-strong-stays-outside-the-delimiters",
+    ),
+    # nested inline marks
+    pytest.param(
+        '<p><a href="https://x.example.org"><strong>bold</strong> link</a>',
+        "[**bold** link](https://x.example.org)",
+        id="strong-inside-a-link",
+    ),
+    pytest.param("<p><strong><em>both</em></strong>", "***both***", id="em-inside-strong"),
+    # a heading inside a list item is flattened into the item's inline text
+    pytest.param(
+        "<ul><li>one<h3>Head</h3> two</ul>",
+        "- one Head two",
+        id="heading-inside-a-list-item-is-flattened-to-inline-text",
+    ),
+    # a flattened heading ends as it began: with no whitespace in the source, what follows is still
+    # a separate word (the reader used to add the leading space only and rendered `- Headtext`)
+    pytest.param(
+        "<ul><li><h3>Head</h3>text</ul>",
+        "- Head text",
+        id="heading-inside-a-list-item-with-no-source-whitespace",
+    ),
+    # tables
+    pytest.param(
+        "<table><tr><th>a<th>b<tr><td>x <table><tr><td>in1<td>in2</table> y<td>z"
+        "<tr><td>p<td>q</table><p>after",
+        "| a | b |\n| --- | --- |\n| x in1 in2 y | z |\n| p | q |\n\nafter",
+        id="table-in-a-cell-is-flattened-and-the-outer-table-stays-intact",
+    ),
+    pytest.param(
+        "<table><tr><th>a<th>b</tr><tr><td>x <table><tr><td>in1</td><td>in2</td></tr></table> y"
+        "</td><td>z</td></tr></table><p>after",
+        "| a | b |\n| --- | --- |\n| x in1 in2 y | z |\n\nafter",
+        id="table-in-a-cell-with-all-end-tags-leaves-the-outer-end-tags-working",
+    ),
+    pytest.param(
+        "<table><tr>stray<td>x</table>",
+        "| stray | x |\n| --- | --- |",
+        id="text-in-a-row-outside-any-cell-opens-an-implicit-cell",
+    ),
 ]
 
 
 @pytest.mark.parametrize(("body", "expected"), RENDER_CASES)
 def test_markdown_rendering_rules(tmp_path: Path, body: str, expected: str) -> None:
     conversation, _ = _probe(tmp_path, body)
+    assert [m.text for m in conversation.messages] == [expected]
+
+
+@pytest.mark.parametrize(("body", "expected"), RENDER_CASES)
+def test_markdown_rendering_rules_without_a_header_block(
+    tmp_path: Path, body: str, expected: str
+) -> None:
+    """The same cases with no header block: the header only moves metadata, never the body."""
+    conversation, _ = _probe(tmp_path, body, title=None)
     assert [m.text for m in conversation.messages] == [expected]
 
 
@@ -1090,6 +1670,50 @@ def test_tables_are_counted_per_page(tmp_path: Path) -> None:
     conversation, tracker = _probe(tmp_path, f"<p>One{table}<p>Two{table}")
     assert tracker.counters["tables"] == 2
     assert conversation.extra["tables"] == 2
+
+
+def test_a_table_inside_a_cell_is_not_a_second_table(tmp_path: Path) -> None:
+    body = "<table><tr><th>a<tr><td>x <table><tr><td>in1<td>in2</table> y</table><p>After"
+    conversation, tracker = _probe(tmp_path, body)
+    assert conversation.messages[0].text == "| a |\n| --- |\n| x in1 in2 y |\n\nAfter"
+    assert tracker.counters["tables"] == 1
+    assert conversation.extra["tables"] == 1
+
+
+def test_quotes_nested_past_the_depth_cap_are_kept_as_text_and_closed_once(
+    tmp_path: Path,
+) -> None:
+    body = "<blockquote>" * 40 + "<p>deep text</p>" + "</blockquote>" * 40
+    conversation, _ = _probe(tmp_path, body)
+    (text,) = [m.text for m in conversation.messages]
+    capped = archive_read_copilot.MAX_DEPTH - 1  # the page root holds the first of the slots
+    assert text == "> " * capped + "deep text"
+    assert text.count("deep text") == 1
+    assert text.count("> ") == capped
+    assert capped < 40
+
+
+def test_lists_nested_past_the_depth_cap_are_kept_as_text_and_closed_once(tmp_path: Path) -> None:
+    # 40 nested lists; the ones past the cap stay inline text, so their 9 end tags must be
+    # swallowed instead of closing real lists early. Text between the end tags then still belongs
+    # to the deepest REAL item (one line with `deep` and `mid`), and what follows every list is
+    # its own paragraph. Without the demotion record the first end tags close real lists and
+    # `mid` falls into a shallower item on a line of its own.
+    levels, past_cap = 40, 9
+    body = (
+        "<ul><li>x " * levels
+        + "deep "
+        + "</ul>" * past_cap
+        + " mid "
+        + "</ul>" * (levels - past_cap)
+        + "<p>after"
+    )
+    conversation, _ = _probe(tmp_path, body)
+    (text,) = [m.text for m in conversation.messages]
+    lines = text.split("\n")
+    assert sum("deep" in line for line in lines) == 1
+    assert any("deep" in line and "mid" in line for line in lines)
+    assert text.endswith("\n\nafter")
 
 
 # --- determinism and registration of the three public functions --------------------------

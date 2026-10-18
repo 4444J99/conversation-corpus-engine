@@ -20,6 +20,13 @@ the symmetric name, unobserved in real captures.
 
 Pages are saved with compressed HTML, so optional end tags are missing and a parsed tree would nest
 siblings. The page is therefore converted from a flat, linear stream of start/end/data events.
+
+Limits, all on markup the real captures do not contain. A quote, list, table or code block that
+opens inside a list item, a table cell or a heading is flattened into that container's inline text.
+The fields of a source card (number, site, title) are read as separate text segments, so a field
+that is split across inline spans reads as separate words. Plain text is not markdown-escaped, as in
+the sibling readers. What cannot be read is counted and reported, never skipped silently: pages and
+folders that cannot be read, HTML that is not a Copilot page, skipped subtrees and items that never end.
 """
 
 from __future__ import annotations
@@ -51,6 +58,8 @@ BLOCK_TAGS = frozenset(
     | {"figcaption", "details", "summary", "dl", "dt", "dd"}
 )
 HEADINGS = {f"h{n}": n for n in range(1, 7)}
+BODY_TAGS = frozenset({"p", "ul", "ol", "table", "blockquote", "pre", "hr"} | set(HEADINGS))
+CARD_ENDERS = BODY_TAGS - {"ul", "ol", "hr"}  # block starts that cannot be part of a source card
 MARKS = {"strong": "**", "b": "**", "em": "*", "i": "*", "code": "`"}
 CELL_TAGS = frozenset({"thead", "tbody", "tfoot", "tr", "td", "th"})
 FLOW = ("root", "quote")
@@ -75,30 +84,48 @@ _STAMP = re.compile(
     r"[A-Za-z]{3} ([A-Za-z]{3}) (\d{1,2}) (\d{4}) (\d{2}):(\d{2}):(\d{2}) GMT([+-])(\d{2})(\d{2})"
 )
 _ITEM = re.compile(r"group/(.+)-message-item")
-_DIGITS = re.compile(r"[0-9]{1,9}")
-_PILL_BEFORE_PUNCTUATION = re.compile(r" *\x00[\x00 ]*(?=[.,;:!?)\]}])")
+_NUMBER = re.compile(r"[0-9]+")
+_LIST_START = re.compile(r"[0-9]{1,9}")
+INDEX_DIGITS = 9  # a card number longer than this is consumed but not trusted as a number
+# A pill marker (with the spaces around it) that sits right before closing punctuation goes
+# together with the space that preceded it: `claim <pill>.` -> `claim.`. Only closing marks count
+# (the straight quotes and the dashes could as well open something). The lookbehind lets an
+# attempt start only at the head of a run of spaces and markers and the possessive quantifiers
+# never backtrack, so a long run is scanned once: the plain ` *\x00[\x00 ]*` form was quadratic
+# on thousands of pills (or whitespace-only spans) in a row.
+_PILL_BEFORE_PUNCTUATION = re.compile(r"(?<![\x00 ]) *+\x00[\x00 ]*+(?=[.,;:!?)\]}”’»…])")
+_CELL_PIPE = re.compile(r"(\\*)\|")
 _EDGE = " \n\x00"
 
 
 # --- files ------------------------------------------------------------------------------------
 
 
-def _files(root: Path) -> list[Path]:
-    """Every file under root (names only), dot-prefixed names skipped, in relative-path order."""
+def _walk(root: Path) -> tuple[list[Path], int]:
+    """Every file under root (names only, dot-prefixed names skipped) in relative-path order,
+    and how many folders could not be listed (their files are invisible, so they are counted)."""
     found: list[Path] = []
+    unreadable = 0
     if not root.is_dir():
-        return found
-    for folder, dirs, names in os.walk(root):
+        return found, unreadable
+
+    def failed(_: OSError) -> None:
+        nonlocal unreadable
+        unreadable += 1
+
+    for folder, dirs, names in os.walk(root, onerror=failed):
         dirs[:] = sorted(d for d in dirs if not d.startswith("."))
         found.extend(Path(folder, name) for name in names if not name.startswith("."))
-    return sorted(found, key=lambda path: path.relative_to(root).parts)
+    return sorted(found, key=lambda path: path.relative_to(root).parts), unreadable
 
 
-def _html(root: Path) -> Iterator[Path]:
-    return (path for path in _files(root) if path.suffix.lower() in PAGE_SUFFIXES)
+def _pages(files: list[Path]) -> list[Path]:
+    return [path for path in files if path.suffix.lower() in PAGE_SUFFIXES]
 
 
 def _head(path: Path) -> bytes | None:
+    """The first bytes of a candidate page; None when it cannot be read (not a regular file,
+    permissions, I/O error), which is not the same as being a foreign page."""
     try:
         if not path.is_file():
             return None
@@ -119,7 +146,7 @@ def _page_header(head: bytes) -> tuple[str, str] | None:
         parts = urlsplit(match.group(1))
     except ValueError:
         return None
-    if parts.scheme not in {"http", "https"} or parts.netloc.lower() != HOST:
+    if parts.scheme not in {"http", "https"} or parts.hostname != HOST:
         return None
     saved = _SAVED.search(comment)
     return match.group(1), saved.group(1) if saved else ""
@@ -143,24 +170,32 @@ def _saved_iso(text: str) -> str:
         stamp = datetime(
             int(year), month, int(day), int(hour), int(minute), int(second), tzinfo=zone
         )
-    except ValueError:
+        # At the ends of the calendar (year 1 with a positive offset, year 9999 with a negative
+        # one) the move to UTC leaves the datetime range: OverflowError, which a build would not
+        # survive, so it degrades like any other unreadable date.
+        utc = stamp.astimezone(timezone.utc).replace(tzinfo=None)
+    except (ValueError, OverflowError):
         return ""
-    utc = stamp.astimezone(timezone.utc).replace(tzinfo=None)
     return utc.isoformat(timespec="seconds") + "Z"
 
 
 def detect(root: Path) -> bool:
-    return any(_page_info(path) is not None for path in _html(root))
+    return any(_page_info(path) is not None for path in _pages(_walk(root)[0]))
 
 
 def channels(root: Path) -> dict[str, list[str]]:
-    pages = unrecognized = 0
+    files, folders = _walk(root)
+    pages = unrecognized = unreadable = 0
     other: Counter[str] = Counter()
-    for path in _files(root):
+    for path in files:
         suffix = path.suffix.lower()
         if suffix not in PAGE_SUFFIXES:
             other[suffix or "(none)"] += 1
-        elif _page_info(path) is not None:
+            continue
+        head = _head(path)
+        if head is None:
+            unreadable += 1
+        elif _page_header(head) is not None:
             pages += 1
         else:
             unrecognized += 1
@@ -168,11 +203,17 @@ def channels(root: Path) -> dict[str, list[str]]:
         f"{pages} saved Copilot page(s) (SingleFile .html) — report text, headings, tables, "
         "lists and source cards; the capture date is the only timestamp"
     ]
-    not_read = (
-        [f"{unrecognized} .html file(s) — not recognized as saved Copilot pages (not read)"]
-        if unrecognized
-        else []
-    )
+    not_read = []
+    if unrecognized:
+        not_read.append(
+            f"{unrecognized} .html file(s) — not recognized as saved Copilot pages (not read)"
+        )
+    if unreadable:
+        not_read.append(
+            f"{unreadable} .html file(s) — could not be read (permissions or I/O error)"
+        )
+    if folders:
+        not_read.append(f"{folders} folder(s) — could not be listed (permissions or I/O error)")
     not_read += [
         f"{count} {suffix} file(s) — not saved Copilot pages (names and bytes not read)"
         for suffix, count in sorted(other.items())
@@ -273,19 +314,32 @@ def _items(events: Sequence[Event]) -> list[_Item]:
 
 
 def _header(events: Sequence[Event], lo: int, hi: int) -> tuple[int, int] | None:
-    """Span of the first direct-child div of the item that holds a `text-3xl` element."""
-    index = lo
-    while index < hi:
-        kind, tag, _ = events[index]
-        if kind != "s" or tag != "div":
-            index += 1
-            continue
-        end = min(_match_end(events, index, hi) + 1, hi)
-        if any(
-            events[j][0] == "s" and _has_class(events[j][2], "text-3xl") for j in range(index, end)
-        ):
-            return index, end
-        index = end
+    """Span of the header block: the outermost div around the item's `text-3xl` element that
+    holds no body block (heading, paragraph, list, table, quote, code) and has none before it.
+
+    The real header is a plain div of mode badge and title that opens the item. A wrapper that
+    also holds the report is refused and the next div inward is tried, so a body is never mistaken
+    for a header; a `text-3xl` div that comes after body blocks is content (a figure, a callout),
+    not a header. With no such div there is no header and the title falls back to the first heading.
+    """
+    open_divs: list[int] = []
+    ends: dict[int, int] = {}
+    chain: list[int] | None = None
+    body = [0]  # body[i]: how many body-block start tags precede events[lo + i]
+    for position in range(lo, hi):
+        kind, name, attrs = events[position]
+        body.append(body[-1] + int(kind == "s" and name in BODY_TAGS))
+        if kind != "d" and name == "div":
+            if kind == "s":
+                open_divs.append(position)
+            elif open_divs:
+                ends[open_divs.pop()] = position
+        if chain is None and kind == "s" and _has_class(attrs, "text-3xl"):
+            chain = list(open_divs)
+    for start in chain or []:  # outermost first; spans nest, so the first clean one is the widest
+        end = min(ends.get(start, hi) + 1, hi)
+        if body[end - lo] == 0:  # no body block inside it, and none before it: it opens the item
+            return start, end
     return None
 
 
@@ -315,10 +369,24 @@ def _is_http(href: str) -> bool:
 
 
 def _start(attrs: dict[str, str]) -> int:
-    try:
-        return int(attrs.get("start", "1"))
-    except ValueError:
-        return 1
+    value = attrs.get("start", "1").strip()
+    return int(value) if _LIST_START.fullmatch(value) else 1
+
+
+def _destination(url: str) -> str:
+    """A link target that stays one token in markdown (spaces and parentheses percent-encoded)."""
+    return url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
+
+
+def _link(text: str, url: str) -> str:
+    escaped = text.replace("]", "\\]")
+    return f"[{escaped}]({_destination(url)})"
+
+
+def _escape_cell(text: str) -> str:
+    """Escape the pipes of a GFM cell; backslashes right before a pipe are doubled so that they
+    cannot swallow the escape."""
+    return _CELL_PIPE.sub(lambda match: match.group(1) * 2 + "\\|", text)
 
 
 @dataclass
@@ -362,7 +430,7 @@ def _wrap(mark: _Mark) -> str:
     start = len(content) - len(content.lstrip(_EDGE))
     lead, trail = content[:start], content[start + len(inner) :]
     if mark.tag == "a":
-        return f"{lead}[{inner}]({mark.href}){trail}"
+        return f"{lead}{_link(inner, mark.href)}{trail}"
     delimiter = MARKS[mark.tag]
     return f"{lead}{delimiter}{inner}{delimiter}{trail}"
 
@@ -398,6 +466,8 @@ class _Renderer:
         self.lang = ""
         self.skip = ""
         self.skip_depth = 0
+        self.skip_open = False  # the item ended inside a skipped subtree (a button with no end tag)
+        self.ignored = {"quote": 0, "list": 0}  # start tags kept as text, so their end tags are too
         self.pills = 0
         self.tables = 0
 
@@ -444,11 +514,17 @@ class _Renderer:
             self._start_pre(tag, attrs)
             return
         if self.card is not None:
-            if tag == "li":
-                self._li(attrs)
-            elif tag == "a" and not self.card.url and _is_http(attrs.get("href", "")):
-                self.card.url = attrs["href"].strip()
-            return
+            if tag in CARD_ENDERS:
+                # Block content after the sources although the list's end tag never came: the
+                # cards are over, so they must not swallow what follows.
+                self._flush_card()
+                self._close(("list",))
+            else:
+                if tag == "li":
+                    self._li(attrs)
+                elif tag == "a" and not self.card.url and _is_http(attrs.get("href", "")):
+                    self.card.url = attrs["href"].strip()
+                return
         top = self.stack[-1]
         if tag in MARKS or tag == "a":
             href = attrs.get("href", "").strip() if tag == "a" else ""
@@ -476,6 +552,7 @@ class _Renderer:
                 self.stack.append(_Frame("quote"))
             else:
                 self._put(" ")
+                self.ignored["quote"] += 1
         elif tag == "pre":
             if self._flow():
                 self._emit()
@@ -510,12 +587,14 @@ class _Renderer:
             if self.heading:
                 self._emit()
                 self.heading = 0
+            else:
+                self._put(" ")  # a flattened heading ends as it began: what follows is a new word
         elif tag == "li":
             self._flush_item()
         elif tag in {"ul", "ol"}:
-            self._close(("list",))
+            self._end_container("list")
         elif tag == "blockquote":
-            self._close(("quote",))
+            self._end_container("quote")
         elif tag == "table":
             if top.kind == "table" and top.nested:
                 top.nested -= 1
@@ -530,7 +609,16 @@ class _Renderer:
         elif tag in BLOCK_TAGS:
             self._boundary()
 
+    def _end_container(self, kind: str) -> None:
+        """End tag of a quote or list. One whose start tag was kept as text (it opened inside a
+        list item, a cell, a heading or past the depth cap) must not close a real container."""
+        if self.ignored[kind]:
+            self.ignored[kind] -= 1
+        else:
+            self._close((kind,))
+
     def finish(self) -> str:
+        self.skip_open = bool(self.skip)
         if self.pre is not None:
             self._fence()
         while len(self.stack) > 1:
@@ -645,6 +733,7 @@ class _Renderer:
         top = self.stack[-1]
         if len(self.stack) >= MAX_DEPTH:
             self._put(" ")
+            self.ignored["list"] += 1
             return
         if top.kind == "list":
             self._flush_item()
@@ -652,6 +741,7 @@ class _Renderer:
             self._emit()
         else:
             self._put(" ")
+            self.ignored["list"] += 1
             return
         frame = _Frame("list", ordered=tag == "ol", counter=_start(attrs))
         if top.kind == "list":
@@ -698,7 +788,10 @@ class _Renderer:
         if card is None:
             return
         segments = list(card.segments)
-        index = int(segments.pop(0)) if segments and _DIGITS.fullmatch(segments[0]) else None
+        index = None
+        if segments and _NUMBER.fullmatch(segments[0]):
+            digits = segments.pop(0)  # a number of any length is the badge, never part of the title
+            index = int(digits) if len(digits) <= INDEX_DIGITS else None
         site = ""
         if segments and "." in segments[0] and not _SPACE.search(segments[0]):
             site = segments.pop(0)
@@ -708,7 +801,7 @@ class _Renderer:
         number = index if index is not None else len(self.cards) + 1
         tail = f" — {site}" if site else ""
         if title and card.url:
-            line = f"{number}. [{title}]({card.url}){tail}"
+            line = f"{number}. {_link(title, card.url)}{tail}"
         elif title:
             line = f"{number}. {title}{tail}"
         else:
@@ -742,7 +835,7 @@ class _Renderer:
 
     def _close_cell(self, frame: _Frame) -> None:
         if frame.cell:
-            frame.row.append(self._take().replace("|", "\\|"))
+            frame.row.append(_escape_cell(self._take()))
             frame.cell = False
 
     def _close_row(self, frame: _Frame) -> None:
@@ -810,6 +903,7 @@ def _conversation(path: Path, header: tuple[str, str], tracker: SourceTracker) -
             ("citation_pills_stripped", renderer.pills),
             ("source_cards", len(renderer.cards)),
             ("tables", renderer.tables),
+            ("skips_unterminated", int(renderer.skip_open)),
         ):
             if amount:
                 tracker.note(name, amount)
@@ -822,7 +916,9 @@ def _conversation(path: Path, header: tuple[str, str], tracker: SourceTracker) -
         title=title or fallback or "Untitled",
         updated=captured,
         kind="search",
-        collection=segments[0] if segments else "",
+        # The surface that precedes the id; a lone segment could as well be the id, so it is not
+        # filed as a collection.
+        collection=segments[0] if len(segments) > 1 else "",
         messages=messages,
         provenance=tracker.provenance(path),
         extra={
@@ -837,8 +933,15 @@ def _conversation(path: Path, header: tuple[str, str], tracker: SourceTracker) -
 
 
 def iter_conversations(root: Path, tracker: SourceTracker) -> Iterator[Conversation]:
-    for path in _html(root):
-        header = _page_info(path)
+    files, folders = _walk(root)
+    if folders:
+        tracker.note("folders_unreadable", folders)
+    for path in _pages(files):
+        head = _head(path)
+        if head is None:
+            tracker.note("pages_unreadable")
+            continue
+        header = _page_header(head)
         if header is None:
             tracker.note("pages_skipped_not_copilot")
             continue
