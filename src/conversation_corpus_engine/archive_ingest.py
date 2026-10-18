@@ -309,6 +309,8 @@ def _ingest_provider(
                 seen[uid] = content
                 if derived:
                     _bump(totals, "derived_ids")
+                    if derived == "unnameable":
+                        _bump(totals, "unnameable_ids")
                 conv_out.write(
                     json.dumps(conversation.to_dict(), sort_keys=True, ensure_ascii=False)
                 )
@@ -349,6 +351,7 @@ def _ingest_provider(
         "conversations": totals["conversations"],
         "empty_conversations": totals["empty_conversations"],
         "derived_ids": totals["derived_ids"],
+        "unnameable_ids": totals["unnameable_ids"],
         "duplicates_folded": totals["duplicates_folded"],
         "duplicates_folded_identical": totals["duplicates_folded_identical"],
         "duplicates_folded_differing": totals["duplicates_folded_differing"],
