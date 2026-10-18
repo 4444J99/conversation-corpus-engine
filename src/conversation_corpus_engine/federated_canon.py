@@ -617,6 +617,16 @@ def apply_decision_groups(
     *,
     skipped: list[dict[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
+    repeated = sorted(
+        member_id
+        for member_id, count in Counter(record["member_id"] for record in records).items()
+        if count > 1
+    )
+    if repeated:
+        raise FederatedGroupingError(
+            f"{len(repeated)} member id(s) appear more than once in the {accepted_key} records, "
+            f"so a record would be silently lost: {', '.join(repeated[:5])}"
+        )
     record_map = {record["member_id"]: record for record in records}
     union = UnionFind(
         list(record_map.keys()),
@@ -656,10 +666,10 @@ def apply_decision_groups(
             )
         groups[group_id] = members
     placed = [member["member_id"] for members in groups.values() for member in members]
-    if sorted(placed) != sorted(record_map):
+    if sorted(placed) != sorted(record["member_id"] for record in records):
         raise FederatedGroupingError(
             f"grouping for {accepted_key} placed {len(placed)} members "
-            f"of {len(record_map)}: every member must appear exactly once"
+            f"of {len(records)}: every member must appear exactly once"
         )
     return groups
 

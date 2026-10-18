@@ -133,6 +133,14 @@ def test_two_groups_given_one_canonical_subject_is_an_error_not_an_overwrite() -
     assert "same-name" in str(raised.value)
 
 
+def test_a_duplicated_record_is_an_error_not_a_silent_loss() -> None:
+    records = [_record("alpha", "one"), _record("beta", "two"), _record("alpha", "one")]
+    with pytest.raises(canon.FederatedGroupingError) as raised:
+        _apply(records, _decisions())
+    message = str(raised.value)
+    assert "1 member id(s)" in message and "alpha:one" in message
+
+
 # --- completeness: every member family appears exactly once -------------------------------------
 
 
