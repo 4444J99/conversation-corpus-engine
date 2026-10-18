@@ -8,8 +8,10 @@ from archive_support import conv, topical_corpus, write_store
 
 from conversation_corpus_engine.archive_ingest import ingest
 from conversation_corpus_engine.archive_model import Message, write_jsonl_atomic
+from conversation_corpus_engine.archive_naming import verify_names
 from conversation_corpus_engine.archive_topics import build_analysis
 from conversation_corpus_engine.archive_vault import (
+    RETIRED_VAULT_MANIFEST,
     build_vault,
     link_targets,
     neutralize,
@@ -58,6 +60,36 @@ def test_vault_from_synthetic_export_has_resolvable_links(archive_env) -> None:
         "tag:#provider/chatgpt",
         "tag:#provider/claude",
     }
+
+
+def test_the_vault_manifest_sits_beside_the_archive_manifest_not_inside_the_vault(
+    archive_env,
+) -> None:
+    _full_build(archive_env)
+    paths = archive_env.paths
+    assert paths.vault_manifest == paths.root / "manifest-all-vault.json"
+    assert paths.vault_manifest.parent == paths.manifest.parent
+    listed = json.loads(paths.vault_manifest.read_text(encoding="utf-8"))["files"]
+    assert "home-all.md" in listed and listed == sorted(listed)
+    assert not [p for p in paths.vault.iterdir() if "manifest" in p.name]
+    assert verify_vault(paths) == []
+    report = verify_names(paths.root)
+    assert report["ok"], report["problems"]
+    paths.vault_manifest.unlink()
+    assert "vault manifest missing" in verify_vault(paths)[0]
+
+
+def test_a_manifest_left_inside_an_old_vault_is_read_once_and_removed(archive_env) -> None:
+    _full_build(archive_env)
+    paths = archive_env.paths
+    old_note = paths.vault_hubs / "topic-all-gone.md"
+    old_note.write_text("# stale\n", encoding="utf-8")
+    retired = paths.vault / RETIRED_VAULT_MANIFEST
+    retired.write_text(json.dumps({"files": ["hubs/topic-all-gone.md"]}), encoding="utf-8")
+    summary = build_vault(paths, archive_env.auth)
+    assert not retired.exists() and not old_note.exists()
+    assert summary["removed_stale"] == 1
+    assert verify_vault(paths) == []
 
 
 def test_vault_note_content_and_frontmatter(archive_env) -> None:

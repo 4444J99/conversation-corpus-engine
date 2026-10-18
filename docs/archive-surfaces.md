@@ -60,6 +60,7 @@ build:
 | `provider-<p>/collection-<p>-conversations.jsonl`, `provider-<p>/index-<p>-conversations.jsonl` | the provider-neutral store: full conversations, and one light summary row each |
 | `index-all-enrichment.jsonl`, `report-all-topics.json` | topics and nearest neighbours per conversation; the topic hub table |
 | `vault-all/` | open this folder in Obsidian |
+| `manifest-all-vault.json` | the files the vault build generated, kept beside the manifest so the vault holds only notes and Obsidian's own settings; a rebuild prunes what it no longer writes, and removes the `.cce-vault-manifest.json` an earlier build left inside the vault |
 | `database-all-search.sqlite` | FTS5 search database |
 | `graph-all/` | `index-all-nodes.jsonl`, `index-all-edges.jsonl`, `graph-all.graphml`, `report-all-graph.json` |
 | `site-all/` | open `home-all.html` directly, or use `cce archive serve` |

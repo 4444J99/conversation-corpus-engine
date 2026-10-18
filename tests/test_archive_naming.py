@@ -71,6 +71,7 @@ GOLDEN: list[tuple[str, dict]] = [
     ("site-all", {"kind": "site", "scope": "all"}),
     ("graph-all", {"kind": "graph", "scope": "all"}),
     ("manifest-all", {"kind": "manifest", "scope": "all"}),
+    ("manifest-all-vault", {"kind": "manifest", "scope": "all", "subject": "vault"}),
     ("provider-chatgpt", {"kind": "provider", "scope": "chatgpt"}),
     ("month-all-202506", {"kind": "month", "scope": "all", "subject": "202506"}),
     ("topic-all-kubernetes", {"kind": "topic", "scope": "all", "subject": "kubernetes"}),

@@ -187,6 +187,7 @@ def test_a_full_build_writes_only_names_the_contract_accepts(full_build) -> None
         "database-all-search.sqlite",
         "graph-all",
         "index-all-enrichment.jsonl",
+        "manifest-all-vault.json",
         "manifest-all.json",
         "provider-chatgpt",
         "provider-claude",
