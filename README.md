@@ -1,6 +1,6 @@
 # Conversation Corpus Engine
 
-[![CI](https://github.com/organvm-i-theoria/conversation-corpus-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/organvm-i-theoria/conversation-corpus-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/4444J99/conversation-corpus-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/4444J99/conversation-corpus-engine/actions/workflows/ci.yml)
 
 `conversation-corpus-engine` is the canonical Organ I implementation of the AI conversation corpus system extracted from the staging workspace at `Workspace/intake/ai-exports`.
 
