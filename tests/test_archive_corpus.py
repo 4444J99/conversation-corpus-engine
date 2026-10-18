@@ -272,6 +272,31 @@ def test_federating_the_projected_corpora_leaves_the_archive_manifest_unchanged(
     assert fixture_archive.paths.manifest.read_bytes() == manifest_bytes
 
 
+def test_two_conversations_with_long_shared_uid_stems_federate_under_distinct_ids(
+    tmp_path: Path,
+) -> None:
+    stem = "the-same-long-conversation-prefix-used-twice"
+    paths = _hand_built_store(
+        tmp_path,
+        [
+            conv("claude", f"{stem}-one", "One", [("user", "We should plan the route.")]),
+            conv("claude", f"{stem}-two", "Two", [("user", "We should pack the tent.")]),
+        ],
+    )
+    out = tmp_path / "corpora"
+    project_corpus(paths.root, out)
+    federation_root = tmp_path / "federation-project"
+    federation_root.mkdir()
+    upsert_corpus(federation_root, out / "corpus-claude-archive", corpus_id="corpus-claude-archive")
+    build_federation(federation_root)  # used to abort on a duplicate federated id
+    canonical = load_corpus_collection(
+        federation_root / "federation" / "canonical-families.json", default=[]
+    )
+    ids = [item["federated_family_id"] for item in canonical]
+    assert len(ids) == len(set(ids)) == 2
+    assert all(len(group_id.rsplit("-", 1)[-1]) == 16 for group_id in ids)
+
+
 # --- names -------------------------------------------------------------------------------------
 
 

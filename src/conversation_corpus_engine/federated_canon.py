@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""Federated canon: review queue, decisions and the materialized canonical groups.
+
+Federated group ids. A group a human named keeps that name (`canonical_subject`). Any other
+group, a singleton included, is `<prefix>-<slug of its member ids>`. The slug is cut at
+`GROUP_SLUG_LIMIT` characters, and a cut slug no longer tells two long member ids apart (archive
+members share a long `corpus-<provider>-archive:family-<provider>-` stem), so whenever the cut
+removes anything the id gets a stable 16 hex digest of the full, sorted member ids appended. A slug
+that fits is left exactly as it was, and the same members always give the same id.
+"""
+
 from __future__ import annotations
 
 from collections import Counter, defaultdict
@@ -8,9 +18,11 @@ from pathlib import Path
 from typing import Any
 
 from .answering import load_json, slugify, tokenize, write_json, write_markdown
+from .archive_naming import hash_identity
 from .schema_validation import validate_json_file
 from .sharded_collection import collection_storage_path, write_corpus_collection
 
+GROUP_SLUG_LIMIT = 72
 FEDERATION_CONTRACT = "conversation-corpus-engine.v2"
 FEDERATION_CONTRACT_VERSION = 2
 FEDERATED_REVIEW_TYPES = {
@@ -609,6 +621,16 @@ def _group_canonical_subject(accepted: list[dict[str, Any]], member_ids: list[st
     return chosen
 
 
+def default_group_id(prefix: str, member_ids: list[str]) -> str:
+    """`<prefix>-<slug>` for a group no human named; the full-member digest is appended when the
+    slug had to be cut, so two groups whose ids share their first characters cannot collide."""
+    joined = " ".join(member_ids)
+    slug = slugify(joined, limit=GROUP_SLUG_LIMIT)
+    if slug != slugify(joined, limit=len(joined) + 1):
+        return f"{prefix}-{slug}-{hash_identity(decision_subject_key(member_ids))}"
+    return f"{prefix}-{slug}"
+
+
 def apply_decision_groups(
     records: list[dict[str, Any]],
     decisions: dict[str, Any],
@@ -654,10 +676,7 @@ def apply_decision_groups(
     for _root, member_ids in union.groups().items():
         members = [record_map[member_id] for member_id in member_ids]
         canonical_subject = _group_canonical_subject(accepted, member_ids)
-        group_id = (
-            canonical_subject
-            or f"{canonical_subject_prefix}-{slugify(' '.join(member_ids), limit=72)}"
-        )
+        group_id = canonical_subject or default_group_id(canonical_subject_prefix, member_ids)
         if group_id in groups:
             clash = sorted({record["member_id"] for record in groups[group_id]} | set(member_ids))
             raise DuplicateFederatedId(

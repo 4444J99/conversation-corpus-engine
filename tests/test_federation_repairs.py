@@ -78,6 +78,28 @@ def test_the_widest_then_latest_decision_names_the_group() -> None:
     assert list(_apply(records, decisions)) == ["wide-name"]
 
 
+def test_long_member_ids_that_share_their_first_72_characters_get_distinct_group_ids() -> None:
+    stem = "corpus-claude-archive:family-claude-" + "a-long-shared-conversation-stem-" * 2
+    first, second = f"{stem}one", f"{stem}two"
+    assert first[:72] == second[:72]
+    records = [_record("alpha", "x"), _record("alpha", "y")]
+    records[0]["member_id"], records[1]["member_id"] = first, second
+    groups = _apply(records, _decisions())
+    assert len(groups) == 2
+    for group_id in groups:
+        assert group_id.startswith("federated-family-") and len(group_id.rsplit("-", 1)[-1]) == 16
+    assert set(_apply(list(reversed(records)), _decisions())) == set(groups)
+
+
+def test_a_slug_that_fits_is_left_without_a_digest() -> None:
+    assert canon.default_group_id("federated-family", ["alpha:one"]) == (
+        "federated-family-alpha-one"
+    )
+    assert canon.default_group_id("federated-family", ["beta:two", "alpha:one"]) == (
+        "federated-family-beta-two-alpha-one"
+    )
+
+
 def test_a_group_with_no_named_decision_gets_the_prefixed_slug() -> None:
     records = [_record("alpha", "one"), _record("beta", "two")]
     decisions = _decisions(_decision("r1", ["alpha:one", "beta:two"], "", "2026-01-01"))
