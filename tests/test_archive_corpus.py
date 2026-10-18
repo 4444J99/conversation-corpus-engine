@@ -456,6 +456,55 @@ def test_a_provider_with_no_eligible_conversation_writes_nothing(tmp_path: Path)
     assert [item.name for item in (tmp_path / "out").iterdir()] == ["corpus-chatgpt-archive"]
 
 
+def test_a_stale_corpus_is_removed_when_a_provider_has_nothing_eligible_any_more(
+    tmp_path: Path,
+) -> None:
+    plan = "We should plan the route."
+    first = _hand_built_store(
+        tmp_path,
+        [
+            conv("claude", "chat-1", "Chat", [("user", plan), ("assistant", "Yes.")]),
+            conv("chatgpt", "chat-2", "Other", [("user", plan)]),
+        ],
+    )
+    out = tmp_path / "out"
+    assert project_corpus(first.root, out)["claude"]["status"] == "written"
+    federation_root = tmp_path / "federation-project"
+    federation_root.mkdir()
+    for name in ("corpus-claude-archive", "corpus-chatgpt-archive"):
+        upsert_corpus(federation_root, out / name, corpus_id=name)
+
+    memory = conv("claude", "mem-1", "Memory", [("user", "x"), ("assistant", "y")], kind="memory")
+    chat = conv("chatgpt", "chat-2", "Other", [("user", plan)])
+    second = _hand_built_store(tmp_path, [memory, chat])
+    summary = project_corpus(second.root, out)
+    assert summary["claude"]["status"] == "empty" and summary["claude"]["removed_stale"] is True
+    assert [item.name for item in out.iterdir()] == ["corpus-chatgpt-archive"]
+    assert project_corpus(second.root, out)["claude"]["removed_stale"] is False  # nothing left
+
+    build_federation(federation_root)  # the dangling registration is tolerated
+    index = {
+        item["corpus_id"]: item
+        for item in load_corpus_collection(
+            federation_root / "federation" / "corpora-summary.json", default=[]
+        )
+    }
+    assert index["corpus-claude-archive"]["thread_count"] == 0
+    assert not index["corpus-claude-archive"]["valid_contract"]
+    assert index["corpus-chatgpt-archive"]["valid_contract"]
+
+
+def test_a_folder_the_projector_did_not_write_is_never_removed(tmp_path: Path) -> None:
+    memory = conv("claude", "mem-1", "Memory", [("user", "x"), ("assistant", "y")], kind="memory")
+    paths = _hand_built_store(tmp_path, [memory])
+    foreign = tmp_path / "out" / "corpus-claude-archive"
+    (foreign / "corpus").mkdir(parents=True)
+    (foreign / "notes.txt").write_text("not ours", encoding="utf-8")
+    with pytest.raises(CorpusProjectionError, match="not removed"):
+        project_corpus(paths.root, tmp_path / "out")
+    assert (foreign / "notes.txt").is_file()
+
+
 # --- repeatability and safety -----------------------------------------------------------------
 
 

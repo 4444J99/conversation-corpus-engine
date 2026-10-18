@@ -27,6 +27,8 @@ Rules the projector follows, each tested:
   store is refused with a rebuild message (see `archive_feed` for why).
 * The folder is built beside its final place and swapped in, so a failed run leaves the previous
   corpus untouched.
+* A provider with nothing eligible writes no corpus, and removes the one an earlier run left
+  (`removed_stale: true` in its summary), so stale text is not federated.
 """
 
 from __future__ import annotations
@@ -38,7 +40,7 @@ from pathlib import Path
 from typing import Any
 
 from . import archive_layout as layout
-from .answering import write_json
+from .answering import load_json, write_json
 from .archive_feed import ELIGIBLE_KINDS, ask_text
 from .archive_ingest import (
     ArchivePaths,
@@ -408,6 +410,28 @@ def _write_corpus(
     )
 
 
+def _remove_stale(out: Path, name: str) -> bool:
+    """Remove the corpus an earlier run wrote for a provider that now has nothing eligible.
+
+    Left in place it would stay registered and federated with text the archive no longer
+    projects. Federation tolerates the missing folder: the registered corpus shows as an invalid
+    contract with no content. Only a folder this projector wrote (by its adapter type) is
+    removed. Returns whether a corpus was removed.
+    """
+    for leftover in (out / f".{name}.building", out / f".{name}.previous"):
+        shutil.rmtree(leftover, ignore_errors=True)
+    final = out / name
+    if not final.exists():
+        return False
+    contract = load_json(final / "corpus" / "contract.json", default={}) or {}
+    if contract.get("adapter_type") != ADAPTER_TYPE:
+        raise CorpusProjectionError(
+            f"{final} is not a corpus this projector wrote, so it is not removed"
+        )
+    shutil.rmtree(final)
+    return True
+
+
 def _project_provider(
     paths: ArchivePaths, provider: str, manifest: dict[str, Any], out: Path
 ) -> dict[str, Any]:
@@ -446,7 +470,7 @@ def _project_provider(
         "excluded": dict(sorted(excluded.items())),
     }
     if not rows.threads:
-        return {**summary, "status": "empty"}
+        return {**summary, "status": "empty", "removed_stale": _remove_stale(out, name)}
 
     counts = {
         "threads": len(rows.threads),
