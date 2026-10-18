@@ -257,7 +257,9 @@ def _coverage(manifest: dict[str, Any]) -> str:
                 "",
                 f"- conversations: {info['conversations']} ({info['empty_conversations']} empty, "
                 f"{info.get('duplicates_folded', info.get('duplicates_skipped', 0))} duplicate(s) "
-                f"folded, {info.get('derived_ids', 0)} derived id(s))",
+                f"folded: {info.get('duplicates_folded_identical', 0)} identical, "
+                f"{info.get('duplicates_folded_differing', 0)} differing; "
+                f"{info.get('derived_ids', 0)} derived id(s))",
                 f"- messages: {info['messages']}; roles: {info['roles']}",
                 f"- kinds: {info['kinds']}",
                 f"- reader: `{info['reader']}`; counters: {info['reader_counters'] or 'none'}",

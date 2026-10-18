@@ -256,6 +256,16 @@ def _bump(counter: Counter[str], key: str, amount: int = 1) -> None:
     counter[key] += amount
 
 
+def content_digest(conversation: Conversation) -> str:
+    """SHA-256 of a normalized conversation's content: everything but where it was read from, so
+    the same conversation found in two files gives one digest."""
+    payload = conversation.to_dict()
+    payload.pop("provenance", None)
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
 def _ingest_provider(
     spec: ProviderSpec, root: Path, paths: ArchivePaths, options: dict[str, Any]
 ) -> dict[str, Any]:
@@ -266,7 +276,7 @@ def _ingest_provider(
             "channels": {"read": [], "not_read": []},
         }
     tracker = SourceTracker(root, spec.module.READER)
-    seen: set[str] = set()
+    seen: dict[str, str] = {}
     kinds: Counter[str] = Counter()
     roles: Counter[str] = Counter()
     totals: Counter[str] = Counter()
@@ -286,10 +296,13 @@ def _ingest_provider(
             for conversation in spec.open_reader(root, tracker, options):
                 derived = finalize_conversation(conversation)
                 uid = conversation.uid
+                content = content_digest(conversation)
                 if uid in seen:
                     _bump(totals, "duplicates_folded")
+                    kept = "identical" if seen[uid] == content else "differing"
+                    _bump(totals, f"duplicates_folded_{kept}")
                     continue
-                seen.add(uid)
+                seen[uid] = content
                 if derived:
                     _bump(totals, "derived_ids")
                 conv_out.write(
@@ -333,6 +346,8 @@ def _ingest_provider(
         "empty_conversations": totals["empty_conversations"],
         "derived_ids": totals["derived_ids"],
         "duplicates_folded": totals["duplicates_folded"],
+        "duplicates_folded_identical": totals["duplicates_folded_identical"],
+        "duplicates_folded_differing": totals["duplicates_folded_differing"],
         "messages": totals["messages"],
         "words": totals["words"],
         "attachments": totals["attachments"],

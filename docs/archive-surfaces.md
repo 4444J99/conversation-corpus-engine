@@ -56,7 +56,7 @@ build:
 
 | Path | What |
 |---|---|
-| `manifest-all.json` | per-provider counts, denominators (`derived_ids`, `duplicates_folded`), channels read / not read, source sha256, naming / schema / reader versions, source fingerprint |
+| `manifest-all.json` | per-provider counts, denominators (`derived_ids`, `duplicates_folded`, `duplicates_folded_identical`, `duplicates_folded_differing`), channels read / not read, source sha256, naming / schema / reader versions, source fingerprint |
 | `provider-<p>/collection-<p>-conversations.jsonl`, `provider-<p>/index-<p>-conversations.jsonl` | the provider-neutral store: full conversations, and one light summary row each |
 | `index-all-enrichment.jsonl`, `report-all-topics.json` | topics and nearest neighbours per conversation; the topic hub table |
 | `vault-all/` | open this folder in Obsidian |
@@ -80,7 +80,11 @@ those two commands exit non-zero and ask for `cce archive build`.
   `typed_chars`, the characters the person typed before any appended attachment text.
 - A conversation with **no vendor id** (or one the naming contract cannot express) gets
   `derived-<16hex>` over provider, creation stamp and the first three messages' text. The manifest
-  counts `derived_ids`; an exact repeat is counted in `duplicates_folded`.
+  counts `derived_ids`.
+- A **repeated uid** keeps its first occurrence: every later conversation with the same uid is
+  folded away, whether or not its content matches. The manifest counts them in
+  `duplicates_folded`, split into `duplicates_folded_identical` (same content, wherever it was
+  read from) and `duplicates_folded_differing` (the first occurrence won over different content).
 - ChatGPT messages on abandoned branches are kept in `extra.alternate_messages` (own id, a
   `branch: alternate` flag, the id of the node they hang from); the message list itself remains the
   `current_node` chain, so the counts do not move.
