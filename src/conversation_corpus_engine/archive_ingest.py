@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import zipfile
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -159,7 +160,18 @@ class ArchivePaths:
         return self.root / layout.receipt_filename(provider, fingerprint, day)
 
     def providers_present(self) -> list[str]:
-        return [name for name in PROVIDER_SPECS if self.conversations(name).is_file()]
+        """Providers readable in this ingest; preserve but ignore older inactive files.
+
+        Before a manifest exists, low-level normalized stores are discovered from their files.
+        Once ingested, only providers the current manifest marks successful are active.
+        """
+        current = load_manifest(self)["providers"] if self.manifest.is_file() else None
+        return [
+            name
+            for name in PROVIDER_SPECS
+            if self.conversations(name).is_file()
+            and (current is None or current.get(name, {}).get("status") == "ok")
+        ]
 
     # --- the vault ---
 
@@ -260,6 +272,14 @@ def resolve_sources(
     return sources
 
 
+def input_source_roots(
+    sources: dict[str, Path], options: dict[str, Any] | None = None
+) -> tuple[Path, ...]:
+    """Every effective provider input, including deltas outside the normal export tree."""
+    extras = (options or {}).get("chatgpt_extra_files", ()) if "chatgpt" in sources else ()
+    return (*sources.values(), *(Path(path).resolve() for path in extras))
+
+
 def _bump(counter: Counter[str], key: str, amount: int = 1) -> None:
     counter[key] += amount
 
@@ -277,12 +297,6 @@ def content_digest(conversation: Conversation) -> str:
 def _ingest_provider(
     spec: ProviderSpec, root: Path, paths: ArchivePaths, options: dict[str, Any]
 ) -> dict[str, Any]:
-    if not root.exists() or not spec.module.detect(root):
-        return {
-            "status": "absent",
-            "source_root": str(root),
-            "channels": {"read": [], "not_read": []},
-        }
     tracker = SourceTracker(root, spec.module.READER)
     seen: dict[str, str] = {}
     kinds: Counter[str] = Counter()
@@ -292,11 +306,15 @@ def _ingest_provider(
     activity: list[str] = []
     conv_path = paths.conversations(spec.name)
     index_path = paths.index(spec.name)
-    conv_path.parent.mkdir(parents=True, exist_ok=True)
     temp_conv = conv_path.with_name(f".{conv_path.name}.tmp")
     temp_index = index_path.with_name(f".{index_path.name}.tmp")
     error = ""
+    channels: dict[str, list[str]] = {"read": [], "not_read": []}
     try:
+        if not root.exists() or not spec.module.detect(root):
+            return {"status": "absent", "source_root": str(root), "channels": channels}
+        channels = spec.module.channels(root)
+        conv_path.parent.mkdir(parents=True, exist_ok=True)
         with (
             temp_conv.open("w", encoding="utf-8") as conv_out,
             temp_index.open("w", encoding="utf-8") as index_out,
@@ -336,7 +354,15 @@ def _ingest_provider(
                     created.append(conversation.created)
                 if conversation.last_activity:
                     activity.append(conversation.last_activity)
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        IndexError,
+        zipfile.BadZipFile,
+    ) as exc:
         error = f"{type(exc).__name__}: {exc}"
     if error:
         temp_conv.unlink(missing_ok=True)
@@ -345,7 +371,7 @@ def _ingest_provider(
             "status": "failed",
             "error": error,
             "source_root": str(root),
-            "channels": spec.module.channels(root),
+            "channels": channels,
         }
     temp_conv.replace(conv_path)
     temp_index.replace(index_path)
@@ -368,7 +394,7 @@ def _ingest_provider(
         "last_activity_max": max(activity) if activity else "",
         "reader": spec.module.READER,
         "reader_counters": dict(sorted(tracker.counters.items())),
-        "channels": spec.module.channels(root),
+        "channels": channels,
         "source_files": tracker.hashes(),
     }
 
@@ -385,6 +411,14 @@ def ingest(
     require_inside(authorization, paths.root)
     options = dict(options or {})
     sources = resolve_sources(export_root, providers, overrides)
+    if "chatgpt" in sources and "chatgpt_extra_files" in options:
+        options["chatgpt_extra_files"] = tuple(options["chatgpt_extra_files"])
+    authorize_archive(
+        project_root=authorization.project_root,
+        archive_root=paths.root,
+        corpus_store_root=authorization.store_root,
+        source_roots=input_source_roots(sources, options),
+    )
     report: dict[str, Any] = {}
     for name, root in sources.items():
         report[name] = _ingest_provider(PROVIDER_SPECS[name], root, paths, options)
@@ -437,8 +471,11 @@ def source_fingerprint(
 
 
 def iter_store(paths: ArchivePaths, providers: list[str] | None = None) -> Iterator[Conversation]:
-    """Stream every normalized conversation in provider-registry then file order."""
-    for name in providers or paths.providers_present():
+    """Stream current successful providers in provider-registry then file order."""
+    present = paths.providers_present()
+    for name in providers or present:
+        if name not in present:
+            continue
         path = paths.conversations(name)
         if path.is_file():
             yield from iter_conversations(path)
@@ -446,7 +483,10 @@ def iter_store(paths: ArchivePaths, providers: list[str] | None = None) -> Itera
 
 def load_index(paths: ArchivePaths, providers: list[str] | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for name in providers or paths.providers_present():
+    present = paths.providers_present()
+    for name in providers or present:
+        if name not in present:
+            continue
         path = paths.index(name)
         if path.is_file():
             rows.extend(iter_jsonl(path))

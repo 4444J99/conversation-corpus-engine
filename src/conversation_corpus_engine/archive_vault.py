@@ -38,7 +38,7 @@ PALETTE = {
     "perplexity": 0x20B8CD,
     "copilot": 0xD6409F,
 }
-INLINE_CODE_RE = re.compile(r"(`[^`\n]+`)")
+INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`)[^\n]*?(?<!`)\1(?!`)")
 TAG_RE = re.compile(r"(?<![\w&\\/])#(?=[\w/-])")
 READING_NOTE = (
     "*Conversation record — statements here are speech acts that were typed, not verified events.*"
@@ -72,7 +72,12 @@ def neutralize(text: str) -> str:
         if tracker.feed(raw):
             lines.append(raw)
             continue
-        pieces = INLINE_CODE_RE.split(raw)
+        pieces: list[str] = []
+        end = 0
+        for match in INLINE_CODE_RE.finditer(raw):
+            pieces.extend((raw[end : match.start()], match.group()))
+            end = match.end()
+        pieces.append(raw[end:])
         for index in range(0, len(pieces), 2):
             pieces[index] = TAG_RE.sub(
                 "\\#", pieces[index].replace("[[", "\\[\\[").replace("]]", "\\]\\]")
@@ -94,6 +99,15 @@ def _stamp(ts: str) -> str:
     return ts[:16].replace("T", " ") if ts else "undated"
 
 
+def _attachment_name(name: str) -> str:
+    """Display metadata as one inert code span, even when the filename contains backticks."""
+    name = " ".join(name.splitlines())
+    ticks = "`" * (max((len(run[0]) for run in re.finditer(r"`+", name)), default=0) + 1)
+    if name.startswith(("`", " ")) or name.endswith(("`", " ")):
+        name = f" {name} "
+    return f"{ticks}{name}{ticks}"
+
+
 def render_message(message: Message, limit: int) -> tuple[str, bool]:
     text = message.text
     cut = len(text) > limit
@@ -105,7 +119,7 @@ def render_message(message: Message, limit: int) -> tuple[str, bool]:
     if kind not in {"text", "code"}:
         label = f"{label} · {kind}"
     if message.attachments:
-        names = ", ".join(f"`{a.name}`" for a in message.attachments if a.name)
+        names = ", ".join(_attachment_name(a.name) for a in message.attachments if a.name)
         if names:
             body = f"{body}\n\n*Attachments (names only):* {names}".strip()
     if kind in COLLAPSED_KINDS:
@@ -316,6 +330,49 @@ def _obsidian_config() -> dict[str, str]:
     }
 
 
+def _manifest_files(path: Path, root: Path) -> list[str]:
+    """Validate every recorded path before using a manifest to read or remove vault files."""
+    error = f"invalid vault manifest {path.name}"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{error}: cannot read JSON") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("files"), list):
+        raise ValueError(f"{error}: files must be a list")
+    files = payload["files"]
+    vault = root.resolve()
+    for index, rel in enumerate(files):
+        if not isinstance(rel, str) or not rel or "\0" in rel:
+            raise ValueError(f"{error}: file entry {index} must be a nonempty path string")
+        entry = Path(rel)
+        if entry.is_absolute() or ".." in entry.parts:
+            raise ValueError(f"{error}: file entry {index} must be relative without '..'")
+        try:
+            target = (root / entry).resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"{error}: file entry {index} cannot be resolved") from exc
+        if target == vault or not target.is_relative_to(vault):
+            raise ValueError(f"{error}: file entry {index} resolves outside the vault")
+    return files
+
+
+def _vault_target(root: Path, target: Path) -> Path:
+    """Keep generated files inside the resolved vault, including existing symlink parents."""
+    try:
+        resolved = target.resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("generated vault path cannot be resolved") from exc
+    if resolved == root or not resolved.is_relative_to(root):
+        raise ValueError("generated path resolves outside the vault")
+    return target
+
+
+def _write_vault_text(root: Path, rel: str, content: str) -> None:
+    target = _vault_target(root, root / rel)
+    _vault_target(root, target.with_name(f".{target.name}.tmp"))
+    write_text_atomic(target, content)
+
+
 def _sync_manifest(paths: ArchivePaths, root: Path, written: set[str]) -> int:
     """Record the generated files beside the archive manifest and prune what the last build wrote
     and this one did not. A manifest an earlier build left inside the vault is read once for its
@@ -323,10 +380,12 @@ def _sync_manifest(paths: ArchivePaths, root: Path, written: set[str]) -> int:
     path = paths.vault_manifest
     previous: list[str] = []
     if path.is_file():
-        previous = json.loads(path.read_text(encoding="utf-8")).get("files", [])
+        previous = _manifest_files(path, root)
     retired = root / RETIRED_VAULT_MANIFEST
     if retired.is_file():
-        previous += json.loads(retired.read_text(encoding="utf-8")).get("files", [])
+        previous += _manifest_files(retired, root)
+    # Neither a stale note nor the legacy manifest is removed until both lists are safe.
+    if retired.is_file():
         retired.unlink()
     removed = 0
     for rel in previous:
@@ -356,7 +415,10 @@ def verify_vault(paths: ArchivePaths) -> list[str]:
     manifest_path = paths.vault_manifest
     if not manifest_path.is_file():
         return [f"vault manifest missing: {manifest_path}"]
-    files = json.loads(manifest_path.read_text(encoding="utf-8")).get("files", [])
+    try:
+        files = _manifest_files(manifest_path, root)
+    except ValueError as exc:
+        return [str(exc)]
     problems = [f"missing generated file: {rel}" for rel in files if not (root / rel).is_file()]
     names = {Path(rel).stem for rel in files if rel.endswith(".md")}
     dangling: Counter[str] = Counter()
@@ -379,6 +441,22 @@ def build_vault(
     note_chars: int = NOTE_CHARS,
 ) -> dict[str, Any]:
     root = require_inside(authorization, paths.vault)
+    require_inside(authorization, paths.vault_manifest)
+    require_inside(
+        authorization, paths.vault_manifest.with_name(f".{paths.vault_manifest.name}.tmp")
+    )
+    # Refuse corrupt records before replacing any note. Synchronization validates again before
+    # cleanup, so it never silently trusts a manifest changed during rendering.
+    for previous_manifest in (paths.vault_manifest, root / RETIRED_VAULT_MANIFEST):
+        if previous_manifest.is_file():
+            _manifest_files(previous_manifest, root)
+    for folder in (
+        layout.VAULT_CONVERSATIONS_DIRNAME,
+        layout.VAULT_HUBS_DIRNAME,
+        layout.VAULT_META_DIRNAME,
+        ".obsidian",
+    ):
+        _vault_target(root, root / folder)
     manifest = load_manifest(paths)
     rows = load_index(paths)
     titles = {row["uid"]: row["title"] for row in rows}
@@ -392,7 +470,7 @@ def build_vault(
         title (not even one that differs only by letter case)."""
         ledger.register(name, identity)
         rel = f"{folder}/{name}.md" if folder else f"{name}.md"
-        write_text_atomic(root / rel, content)
+        _write_vault_text(root, rel, content)
         written.add(rel)
 
     by_month: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -483,10 +561,10 @@ def build_vault(
     emit(layout.VAULT_META_DIRNAME, layout.COVERAGE_NOTE, "coverage", _coverage(manifest))
     emit(layout.VAULT_META_DIRNAME, layout.GUIDE_NOTE, "guide", READING_GUIDE)
     for rel, content in _obsidian_config().items():
-        if not (root / rel).is_file():
-            write_text_atomic(root / rel, content)
+        target = _vault_target(root, root / rel)
+        if not target.is_file():
+            _write_vault_text(root, rel, content)
         written.add(rel)
-    require_inside(authorization, paths.vault_manifest)
     removed = _sync_manifest(paths, root, written)
     hub_notes = sum(1 for rel in written if rel.startswith(f"{hubs}/"))
     return {

@@ -238,6 +238,13 @@ def test_api_search_returns_best_hits_and_validates_input(server) -> None:
     assert len(big["results"]) <= 50
 
 
+@pytest.mark.parametrize("kind, expected", [("chat", ["chatgpt-aaaa1111"]), ("notebook", [])])
+def test_api_title_search_honors_provider_and_kind(server, kind, expected) -> None:
+    status, _, body = _get(server, f"/api/titles?q=kubernetes&provider=chatgpt&kind={kind}")
+    assert status == 200
+    assert [hit["uid"] for hit in json.loads(body)["results"]] == expected
+
+
 def test_api_reports_missing_search_database(archive_env) -> None:
     write_store(archive_env.paths, topical_corpus())
     archive_env.paths.site.mkdir(parents=True)

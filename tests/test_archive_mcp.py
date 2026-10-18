@@ -63,6 +63,21 @@ def test_archive_search_returns_structured_hits(archive_server) -> None:
     assert empty["content"][0]["text"] == "No matching conversations."
 
 
+@pytest.mark.parametrize("kind, expected", [(["chat"], ["chatgpt-aaaa1111"]), (["notebook"], [])])
+def test_archive_title_search_honors_both_filters(archive_server, kind, expected) -> None:
+    result = _call(
+        archive_server,
+        query="kubernetes",
+        titles_only=True,
+        provider=["chatgpt"],
+        kind=kind,
+    )["result"]
+    assert result["isError"] is False
+    hits = result["structuredContent"]["results"]
+    assert [hit["uid"] for hit in hits] == expected
+    assert result["structuredContent"]["count"] == len(expected)
+
+
 def test_archive_search_validates_arguments_and_caps_limit(archive_server) -> None:
     for arguments in (
         {},

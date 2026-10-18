@@ -115,6 +115,134 @@ def test_ingest_reports_absent_providers_without_inventing_them(
     assert manifest["totals"]["conversations"] == 0
 
 
+@pytest.mark.parametrize("state", ["absent", "failed", "unselected"])
+def test_reingest_excludes_inactive_providers_but_preserves_previous_files(
+    archive_env, state: str
+) -> None:
+    kwargs = {
+        "export_root": archive_env.export,
+        "paths": archive_env.paths,
+        "authorization": archive_env.auth,
+    }
+    ingest(**kwargs)
+    previous = {
+        path: path.read_bytes()
+        for path in (
+            archive_env.paths.conversations("claude"),
+            archive_env.paths.index("claude"),
+        )
+    }
+    if state == "absent":
+        (archive_env.export / "claude").rename(archive_env.export / "saved-claude-export")
+    elif state == "failed":
+        (archive_env.export / "claude" / "conversations.json").write_text("{", encoding="utf-8")
+    else:
+        kwargs["providers"] = ["chatgpt"]
+    manifest = ingest(**kwargs)
+
+    assert "claude" not in archive_env.paths.providers_present()
+    assert all(c.provider != "claude" for c in iter_store(archive_env.paths))
+    assert list(iter_store(archive_env.paths, ["claude"])) == []
+    assert load_index(archive_env.paths, ["claude"]) == []
+    assert len(load_index(archive_env.paths)) == manifest["totals"]["conversations"]
+    assert sum(1 for _ in iter_store(archive_env.paths)) == manifest["totals"]["conversations"]
+    assert {path: path.read_bytes() for path in previous} == previous
+
+
+@pytest.mark.parametrize("channel", ["projects", "memories", "design_chats"])
+def test_ingest_isolates_a_corrupt_optional_claude_zip(archive_env, channel: str) -> None:
+    corrupt = archive_env.export / "claude" / f"{channel}-000.zip"
+    corrupt.write_bytes(b"a truncated synthetic ZIP")
+    manifest = ingest(
+        export_root=archive_env.export, paths=archive_env.paths, authorization=archive_env.auth
+    )
+    assert failed_providers(manifest) == ["claude"]
+    assert manifest["providers"]["claude"]["error"].startswith("BadZipFile")
+    assert manifest["providers"]["perplexity"]["status"] == "ok"
+    assert not archive_env.paths.conversations("claude").exists()
+    assert not list(archive_env.paths.root.rglob(".*.tmp"))
+    assert corrupt.read_bytes() == b"a truncated synthetic ZIP"
+
+
+@pytest.mark.parametrize("phase", ["detect", "channels"])
+def test_ingest_isolates_provider_discovery_failures(archive_env, monkeypatch, phase: str) -> None:
+    def unreadable(_root: Path):
+        raise OSError("synthetic source is unreadable")
+
+    monkeypatch.setattr(PROVIDER_SPECS["claude"].module, phase, unreadable)
+    manifest = ingest(
+        export_root=archive_env.export, paths=archive_env.paths, authorization=archive_env.auth
+    )
+    assert failed_providers(manifest) == ["claude"]
+    assert manifest["providers"]["claude"]["error"].startswith("OSError")
+    assert manifest["providers"]["perplexity"]["status"] == "ok"
+    assert not archive_env.paths.conversations("claude").exists()
+    assert not list(archive_env.paths.root.rglob(".*.tmp"))
+
+
+@pytest.mark.parametrize("input_kind", ["override", "delta"])
+def test_ingest_rechecks_actual_inputs_before_writing(archive_env, input_kind: str) -> None:
+    source = archive_env.paths.root / "synthetic-input"
+    source.mkdir(parents=True)
+    shard = source / "conversations-000.json"
+    shard.write_text(
+        json.dumps([gpt_conversation("inside", "Inside", [("user", "synthetic source")])]),
+        encoding="utf-8",
+    )
+    kwargs = (
+        {"overrides": {"chatgpt": source}}
+        if input_kind == "override"
+        else {"options": {"chatgpt_extra_files": [shard]}}
+    )
+    before = {p: p.read_bytes() for p in archive_env.paths.root.rglob("*") if p.is_file()}
+    with pytest.raises(CorpusStoreError, match="overlap"):
+        ingest(
+            export_root=archive_env.export,
+            paths=archive_env.paths,
+            authorization=archive_env.auth,
+            providers=["chatgpt"],
+            **kwargs,
+        )
+    after = {p: p.read_bytes() for p in archive_env.paths.root.rglob("*") if p.is_file()}
+    assert after == before
+
+
+def test_input_authorization_preserves_single_pass_delta_iterables(
+    archive_env, tmp_path: Path
+) -> None:
+    delta = tmp_path / "delta.json"
+    delta.write_text(
+        json.dumps([gpt_conversation("delta-only", "Delta", [("user", "extra synthetic ask")])]),
+        encoding="utf-8",
+    )
+    ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["chatgpt"],
+        options={"chatgpt_extra_files": iter([delta])},
+    )
+    assert "delta-only" in {c.source_id for c in iter_store(archive_env.paths)}
+
+
+def test_unselected_chatgpt_does_not_consume_delta_iterable(archive_env, tmp_path: Path) -> None:
+    delta = tmp_path / "delta.json"
+    delta.write_text(
+        json.dumps([gpt_conversation("delta-only", "Delta", [("user", "extra synthetic ask")])]),
+        encoding="utf-8",
+    )
+    options = {"chatgpt_extra_files": iter([delta])}
+    for provider in ("claude", "chatgpt"):
+        ingest(
+            export_root=archive_env.export,
+            paths=archive_env.paths,
+            authorization=archive_env.auth,
+            providers=[provider],
+            options=options,
+        )
+    assert "delta-only" in {c.source_id for c in iter_store(archive_env.paths)}
+
+
 def test_ingest_dedupes_by_uid_keeping_first(archive_env, tmp_path: Path) -> None:
     shutil.copytree(archive_env.export / "chatgpt", tmp_path / "gpt")
     (tmp_path / "gpt" / "conversations-001.json").write_text(
