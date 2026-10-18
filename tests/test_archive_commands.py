@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from archive_support import gpt_conversation
 
 from conversation_corpus_engine.archive_commands import verify_archive
 from conversation_corpus_engine.archive_ingest import ArchivePaths
@@ -64,6 +65,121 @@ def test_verify_search_and_titles_commands(cli_env, monkeypatch, capsys) -> None
         monkeypatch, capsys, "archive", "search", "rollout", "--titles", "--json", *common
     )
     assert [h["uid"] for h in json.loads(out)] == ["chatgpt-aaaa1111"]
+
+
+def test_title_search_respects_provider_and_kind_filters(cli_env, monkeypatch, capsys) -> None:
+    _, common, _, _, _ = cli_env
+    code, out, _ = _cce(
+        monkeypatch,
+        capsys,
+        "archive",
+        "search",
+        "kubernetes",
+        "--titles",
+        "--provider",
+        "claude",
+        "--kind",
+        "chat",
+        "--json",
+        *common,
+    )
+    hits = json.loads(out)
+    assert code == 0 and hits
+    assert {(hit["provider"], hit["kind"]) for hit in hits} == {("claude", "chat")}
+
+
+@pytest.mark.parametrize("state", ["absent", "failed", "unselected"])
+def test_rebuild_uses_only_current_successful_providers(
+    cli_env, monkeypatch, capsys, state: str
+) -> None:
+    env, common, _, _, _ = cli_env
+    provider_args = []
+    if state == "absent":
+        (env.export / "claude").rename(env.export / "saved-claude-export")
+    elif state == "failed":
+        (env.export / "claude" / "conversations.json").write_text("{", encoding="utf-8")
+    else:
+        provider_args = ["--provider", "chatgpt"]
+    code, out, _ = _cce(
+        monkeypatch,
+        capsys,
+        "archive",
+        "build",
+        "--export-root",
+        str(env.export),
+        *provider_args,
+        *common,
+    )
+    payload = json.loads(out)
+    assert code == (1 if state == "failed" else 0)
+    assert (
+        payload["stages"]["site"]["pages"] == payload["stages"]["ingest"]["totals"]["conversations"]
+    )
+    assert all("provider claude failed" in problem for problem in payload["problems"])
+
+
+def test_rebuild_with_all_providers_absent_has_consistent_empty_surfaces(
+    cli_env, monkeypatch, capsys
+) -> None:
+    env, common, _, _, _ = cli_env
+    env.export.rename(env.export.with_name("saved-export"))
+    env.export.mkdir()
+    code, out, _ = _cce(
+        monkeypatch,
+        capsys,
+        "archive",
+        "build",
+        "--export-root",
+        str(env.export),
+        *common,
+    )
+    payload = json.loads(out)
+    assert payload["stages"]["ingest"]["totals"]["conversations"] == 0
+    assert payload["stages"]["site"]["pages"] == 0
+    assert code == 0 and payload["problems"] == []
+
+
+@pytest.mark.parametrize("relationship", ["inside", "equal", "ancestor", "delta"])
+def test_archive_refuses_overlapping_effective_inputs_without_writes(
+    archive_env, monkeypatch, capsys, relationship: str
+) -> None:
+    root = archive_env.paths.root
+    source = {
+        "inside": root / "input",
+        "equal": root,
+        "ancestor": archive_env.store,
+        "delta": root / "input",
+    }[relationship]
+    source.mkdir(parents=True, exist_ok=True)
+    shard = source / "conversations-000.json"
+    shard.write_text(
+        json.dumps([gpt_conversation("inside", "Inside", [("user", "synthetic source")])]),
+        encoding="utf-8",
+    )
+    input_args = (
+        ["--chatgpt-extra", str(shard)]
+        if relationship == "delta"
+        else ["--source", f"chatgpt={source}"]
+    )
+    before = {p: p.read_bytes() for p in archive_env.store.rglob("*") if p.is_file()}
+    code, _, err = _cce(
+        monkeypatch,
+        capsys,
+        "archive",
+        "ingest",
+        "--export-root",
+        str(archive_env.export),
+        "--provider",
+        "chatgpt",
+        *input_args,
+        "--project-root",
+        str(archive_env.project),
+        "--corpus-store-root",
+        str(archive_env.store),
+    )
+    after = {p: p.read_bytes() for p in archive_env.store.rglob("*") if p.is_file()}
+    assert code == 2 and "overlap" in err
+    assert after == before
 
 
 def test_verify_detects_tampering_across_surfaces(cli_env, monkeypatch, capsys) -> None:

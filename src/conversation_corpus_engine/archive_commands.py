@@ -26,7 +26,9 @@ from .archive_ingest import (
     authorize_archive,
     failed_providers,
     ingest,
+    input_source_roots,
     load_manifest,
+    resolve_sources,
 )
 from .archive_naming import names_payload, render_names_text, verify_names
 from .archive_serve import serve
@@ -56,13 +58,14 @@ def open_context(
     corpus_store_root: Path | None,
     archive_root: Path | None,
     export_root: Path | None = None,
+    source_roots: tuple[Path, ...] = (),
 ) -> ArchiveContext:
     store = resolve_configured_corpus_store_root(corpus_store_root)
     authorization = authorize_archive(
         project_root=project_root,
         archive_root=archive_root or store / DEFAULT_ARCHIVE_DIRNAME,
         corpus_store_root=store,
-        source_roots=(export_root.resolve(),) if export_root else (),
+        source_roots=((export_root.resolve(),) if export_root else ()) + source_roots,
     )
     return ArchiveContext(ArchivePaths(authorization.destination), authorization, export_root)
 
@@ -96,7 +99,7 @@ def verify_archive(paths: ArchivePaths) -> list[str]:
     if not graph_summary.is_file():
         problems.append("graph missing: run `cce archive graph`")
     elif (
-        json.loads(graph_summary.read_text(encoding="utf-8"))["node_kinds"].get("conversation")
+        json.loads(graph_summary.read_text(encoding="utf-8"))["node_kinds"].get("conversation", 0)
         != total
     ):
         problems.append("graph conversation node count differs from the manifest")
@@ -295,12 +298,29 @@ def handle_archive(args: argparse.Namespace) -> int:
         return _handle_project(args)
 
     export_root = getattr(args, "export_root", None)
+    providers = None
+    overrides = None
+    options = {}
+    source_roots: tuple[Path, ...] = ()
+    if action in {"ingest", "build"}:
+        if export_root is None:
+            raise ValueError("ingest needs --export-root")
+        providers = args.provider or None
+        overrides = _overrides(args.source)
+        options = {
+            "chatgpt_extra_files": args.chatgpt_extra,
+            "include_attachment_text": args.include_attachment_text,
+        }
+        source_roots = input_source_roots(
+            resolve_sources(export_root, providers, overrides), options
+        )
     try:
         context = open_context(
             project_root=args.project_root,
             corpus_store_root=args.corpus_store_root,
             archive_root=args.archive_root,
             export_root=export_root,
+            source_roots=source_roots,
         )
     except CorpusStoreError as exc:
         print(f"archive custody refused: {exc}", file=sys.stderr)
@@ -312,14 +332,9 @@ def handle_archive(args: argparse.Namespace) -> int:
     paths = context.paths
 
     if action in {"ingest", "build"}:
-        providers = args.provider or None
-        options = {
-            "chatgpt_extra_files": args.chatgpt_extra,
-            "include_attachment_text": args.include_attachment_text,
-        }
         stages = ("ingest",) if action == "ingest" else STAGES
         result = run_stages(
-            context, stages, providers=providers, overrides=_overrides(args.source), options=options
+            context, stages, providers=providers, overrides=overrides, options=options
         )
         problems = verify_archive(paths) if action == "build" else []
         failed = [n for n, i in result["ingest"]["providers"].items() if i["status"] == "failed"]
@@ -341,7 +356,13 @@ def handle_archive(args: argparse.Namespace) -> int:
         connection = open_database(paths)
         try:
             if args.titles:
-                results = search_titles(connection, args.query, limit=args.limit)
+                results = search_titles(
+                    connection,
+                    args.query,
+                    providers=args.provider,
+                    kinds=args.kind,
+                    limit=args.limit,
+                )
             else:
                 results = search(
                     connection,

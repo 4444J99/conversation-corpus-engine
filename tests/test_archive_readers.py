@@ -44,7 +44,7 @@ def test_chatgpt_linearizes_current_branch_and_hides_scaffolding(archive_env) ->
     assert items["bbbb2222"].archived is True
     empty = items["cccc3333p"]
     assert empty.messages == [] and empty.collection == "g-p-proj"
-    assert tracker.files_read == ["conversations-000.json"]
+    assert tracker.files_read == ["conversation_asset_file_names.json", "conversations-000.json"]
 
 
 def test_chatgpt_ids_are_node_ids_and_off_branch_messages_are_kept_beside_the_chain(

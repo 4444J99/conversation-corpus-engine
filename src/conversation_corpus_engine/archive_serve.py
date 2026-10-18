@@ -128,7 +128,13 @@ class ArchiveHandler(BaseHTTPRequestHandler):
             return
         try:
             if path == "/api/titles":
-                results = search_titles(connection, text, limit=limit)
+                results = search_titles(
+                    connection,
+                    text,
+                    providers=_csv(query.get("provider", [])) or None,
+                    kinds=_csv(query.get("kind", [])) or None,
+                    limit=limit,
+                )
             else:
                 results = search(
                     connection,

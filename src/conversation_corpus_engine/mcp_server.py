@@ -348,7 +348,13 @@ class CceMcpServer:
             raise ValueError(f"The archive search database is not built: {exc}") from exc
         try:
             if titles_only:
-                results = search_titles(connection, query, limit=limit)
+                results = search_titles(
+                    connection,
+                    query,
+                    providers=filters["provider"],
+                    kinds=filters["kind"],
+                    limit=limit,
+                )
             else:
                 results = search(
                     connection,

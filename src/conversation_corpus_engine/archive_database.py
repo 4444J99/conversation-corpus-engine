@@ -203,9 +203,10 @@ def search(
         "m.ts, snippet(message_fts, 0, '[', ']', '…', 24) AS excerpt, bm25(message_fts) AS rank "
         "FROM message_fts JOIN messages m ON m.id = message_fts.rowid "
         "JOIN conversations c ON c.uid = m.uid "
-        f"WHERE {' AND '.join(clauses)} ORDER BY rank LIMIT ?"
+        f"WHERE {' AND '.join(clauses)} ORDER BY rank"
     )
-    params.append(max(limit * 8, 40))
+    # Stream ranked messages until the requested number of distinct conversations is found.
+    # A raw-hit cap can be consumed by one conversation before other matches are considered.
     seen: set[str] = set()
     results: list[dict[str, Any]] = []
     for row in connection.execute(sql, params):
@@ -219,17 +220,31 @@ def search(
 
 
 def search_titles(
-    connection: sqlite3.Connection, query: str, *, limit: int = 20
+    connection: sqlite3.Connection,
+    query: str,
+    *,
+    providers: list[str] | None = None,
+    kinds: list[str] | None = None,
+    limit: int = 20,
 ) -> list[dict[str, Any]]:
     match = fts_query(query)
     if not match:
         return []
+    clauses = ["title_fts MATCH ?"]
+    params: list[Any] = [match]
+    if providers:
+        clauses.append(f"c.provider IN ({','.join('?' * len(providers))})")
+        params.extend(providers)
+    if kinds:
+        clauses.append(f"c.kind IN ({','.join('?' * len(kinds))})")
+        params.extend(kinds)
     sql = (
         "SELECT c.uid, c.provider, c.kind, c.title, c.created, c.message_count "
         "FROM title_fts JOIN conversations c ON c.rowid = title_fts.rowid "
-        "WHERE title_fts MATCH ? ORDER BY bm25(title_fts) LIMIT ?"
+        f"WHERE {' AND '.join(clauses)} ORDER BY bm25(title_fts) LIMIT ?"
     )
-    return [dict(row) for row in connection.execute(sql, (match, limit))]
+    params.append(limit)
+    return [dict(row) for row in connection.execute(sql, params)]
 
 
 def conversation_messages(connection: sqlite3.Connection, uid: str) -> list[dict[str, Any]]:

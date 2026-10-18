@@ -2,12 +2,20 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter, defaultdict
 from pathlib import Path
 
+import pytest
 from archive_support import conv, topical_corpus, write_store
 
-from conversation_corpus_engine.archive_ingest import ingest
-from conversation_corpus_engine.archive_model import Message, write_jsonl_atomic
+from conversation_corpus_engine.archive_ingest import MANIFEST_SCHEMA, ArchivePaths, ingest
+from conversation_corpus_engine.archive_model import (
+    SCHEMA,
+    Attachment,
+    Conversation,
+    Message,
+    write_jsonl_atomic,
+)
 from conversation_corpus_engine.archive_naming import verify_names
 from conversation_corpus_engine.archive_topics import build_analysis
 from conversation_corpus_engine.archive_vault import (
@@ -17,6 +25,7 @@ from conversation_corpus_engine.archive_vault import (
     neutralize,
     plain_title,
     render_conversation,
+    render_message,
     verify_vault,
 )
 
@@ -44,6 +53,47 @@ def _full_build(env) -> dict:
     ingest(export_root=env.export, paths=env.paths, authorization=env.auth)
     build_analysis(env.paths)
     return build_vault(env.paths, env.auth)
+
+
+def _write_ingest_manifest(
+    paths: ArchivePaths, conversations: list[Conversation], fingerprint: str
+) -> None:
+    """Describe the synthetic store faithfully; an empty provider registry means no providers."""
+    grouped: dict[str, list[Conversation]] = defaultdict(list)
+    for conversation in conversations:
+        grouped[conversation.provider].append(conversation)
+    providers = {}
+    for provider, items in grouped.items():
+        providers[provider] = {
+            "status": "ok",
+            "conversations": len(items),
+            "empty_conversations": sum(not c.messages for c in items),
+            "messages": sum(c.message_count for c in items),
+            "words": sum(c.word_count for c in items),
+            "created_min": min((c.created for c in items if c.created), default=""),
+            "last_activity_max": max((c.last_activity for c in items), default=""),
+            "roles": dict(Counter(m.role for c in items for m in c.messages)),
+            "kinds": dict(Counter(c.kind for c in items)),
+            "reader": "synthetic@1",
+            "reader_counters": {},
+            "channels": {"read": ["synthetic conversations"], "not_read": []},
+        }
+    paths.manifest.write_text(
+        json.dumps(
+            {
+                "schema": MANIFEST_SCHEMA,
+                "conversation_schema": SCHEMA,
+                "source_fingerprint": fingerprint,
+                "totals": {
+                    "conversations": len(conversations),
+                    "messages": sum(c.message_count for c in conversations),
+                    "words": sum(c.word_count for c in conversations),
+                },
+                "providers": providers,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_vault_from_synthetic_export_has_resolvable_links(archive_env) -> None:
@@ -92,6 +142,122 @@ def test_a_manifest_left_inside_an_old_vault_is_read_once_and_removed(archive_en
     assert verify_vault(paths) == []
 
 
+@pytest.mark.parametrize("retired", [False, True], ids=["current", "retired"])
+@pytest.mark.parametrize("escape", ["parent", "absolute", "directory-symlink", "file-symlink"])
+def test_rebuild_rejects_unsafe_manifest_paths_before_any_cleanup(
+    archive_env, tmp_path: Path, retired: bool, escape: str
+) -> None:
+    _full_build(archive_env)
+    paths = archive_env.paths
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "keep.md"
+    victim.write_text("private material outside the vault\n", encoding="utf-8")
+    if escape == "parent":
+        victim = paths.vault.parent / "keep.md"
+        victim.write_text("private material outside the vault\n", encoding="utf-8")
+        record = "../keep.md"
+    elif escape == "absolute":
+        record = str(victim)
+    elif escape == "directory-symlink":
+        (paths.vault / "escape").symlink_to(outside, target_is_directory=True)
+        record = "escape/keep.md"
+    else:
+        (paths.vault / "old-alias.md").symlink_to(victim)
+        record = "old-alias.md"
+    stale = paths.vault_hubs / "topic-all-stale.md"
+    stale.write_text("stale but retained when validation fails\n", encoding="utf-8")
+    manifest = paths.vault / RETIRED_VAULT_MANIFEST if retired else paths.vault_manifest
+    poisoned = json.dumps({"files": ["hubs/topic-all-stale.md", record]})
+    manifest.write_text(poisoned, encoding="utf-8")
+    (paths.vault / "home-all.md").write_text(
+        "existing note must survive refusal\n", encoding="utf-8"
+    )
+    before = _vault_files(paths.vault)
+
+    with pytest.raises(ValueError, match="invalid vault manifest"):
+        build_vault(paths, archive_env.auth)
+
+    assert victim.read_text(encoding="utf-8") == "private material outside the vault\n"
+    assert stale.is_file(), "all records must be validated before deleting even a safe stale note"
+    assert manifest.read_text(encoding="utf-8") == poisoned
+    assert _vault_files(paths.vault) == before
+
+
+@pytest.mark.parametrize("retired", [False, True], ids=["current", "retired"])
+def test_malformed_manifest_refusal_leaves_existing_notes_untouched(archive_env, retired) -> None:
+    _full_build(archive_env)
+    paths = archive_env.paths
+    (paths.vault / "home-all.md").write_text("retain this existing note\n", encoding="utf-8")
+    before = _vault_files(paths.vault)
+    manifest = paths.vault / RETIRED_VAULT_MANIFEST if retired else paths.vault_manifest
+    manifest.write_text('{"files":', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="invalid vault manifest"):
+        build_vault(paths, archive_env.auth)
+
+    assert _vault_files(paths.vault) == before
+    assert manifest.read_text(encoding="utf-8") == '{"files":'
+
+
+@pytest.mark.parametrize("unsafe_manifest", [False, True], ids=["unlisted", "unsafe-manifest"])
+@pytest.mark.parametrize(
+    ("directory", "filename"),
+    [("conversations", "conversation-chatgpt-aaaa1111.md"), (".obsidian", "graph.json")],
+)
+def test_generated_directory_symlink_cannot_write_outside_the_vault(
+    archive_env, tmp_path: Path, unsafe_manifest: bool, directory: str, filename: str
+) -> None:
+    _full_build(archive_env)
+    paths = archive_env.paths
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / filename
+    sentinel = b"\x00external sentinel\xff\n"
+    victim.write_bytes(sentinel)
+    generated_directory = paths.vault / directory
+    generated_directory.rename(tmp_path / "saved-generated")
+    generated_directory.symlink_to(outside, target_is_directory=True)
+    records = ["../keep.md"] if unsafe_manifest else []
+    paths.vault_manifest.write_text(json.dumps({"files": records}), encoding="utf-8")
+    existing_note = paths.vault / "home-all.md"
+    existing_note.write_text("keep this generated note unchanged\n", encoding="utf-8")
+    manifest_before = paths.vault_manifest.read_bytes()
+
+    with pytest.raises(ValueError, match="invalid vault manifest|outside the vault"):
+        build_vault(paths, archive_env.auth)
+
+    assert victim.read_bytes() == sentinel
+    assert list(outside.iterdir()) == [victim], "no generated file may appear outside the vault"
+    assert existing_note.read_text(encoding="utf-8") == "keep this generated note unchanged\n"
+    assert paths.vault_manifest.read_bytes() == manifest_before
+
+
+@pytest.mark.parametrize("record", ["../outside.md", "/outside.md", "", 17, None])
+def test_vault_verification_reports_invalid_manifest_records(archive_env, record) -> None:
+    _full_build(archive_env)
+    archive_env.paths.vault_manifest.write_text(json.dumps({"files": [record]}), encoding="utf-8")
+    problems = verify_vault(archive_env.paths)
+    assert len(problems) == 1
+    assert "invalid vault manifest" in problems[0]
+
+
+def test_vault_verification_does_not_read_through_manifest_symlinks(
+    archive_env, tmp_path: Path
+) -> None:
+    _full_build(archive_env)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "private.md").write_text("[[outside-only-secret]]\n", encoding="utf-8")
+    (archive_env.paths.vault / "escape").symlink_to(outside, target_is_directory=True)
+    archive_env.paths.vault_manifest.write_text(
+        json.dumps({"files": ["escape/private.md"]}), encoding="utf-8"
+    )
+    problems = verify_vault(archive_env.paths)
+    assert len(problems) == 1 and "invalid vault manifest" in problems[0]
+    assert "outside-only-secret" not in " ".join(problems)
+
+
 def test_vault_note_content_and_frontmatter(archive_env) -> None:
     _full_build(archive_env)
     note = (archive_env.paths.vault_conversations / "conversation-chatgpt-aaaa1111.md").read_text(
@@ -112,6 +278,26 @@ def test_vault_note_content_and_frontmatter(archive_env) -> None:
     assert "[[provider-chatgpt\\|ChatGPT]]" in home
     coverage = (archive_env.paths.vault / "meta" / "coverage-all.md").read_text(encoding="utf-8")
     assert "Channels not read" in coverage and "user.json" in coverage
+
+
+def test_attachment_filename_cannot_create_links_or_headings() -> None:
+    message = Message(
+        role="user",
+        text="Attached sample.",
+        attachments=[Attachment(name="x` [[missing-target]] `\n# injected-heading.md")],
+    )
+    rendered, _ = render_message(message, 100)
+    assert link_targets(rendered) == []
+    assert "``x` [[missing-target]] ` # injected-heading.md``" in rendered
+    assert "\n# injected-heading" not in rendered
+    assert message.attachments[0].name == "x` [[missing-target]] `\n# injected-heading.md"
+
+
+def test_attachment_code_span_survives_backticks_at_both_edges() -> None:
+    message = Message(role="user", text="", attachments=[Attachment(name="``[[ghost]]``")])
+    rendered, _ = render_message(message, 100)
+    assert "``` ``[[ghost]]`` ```" in rendered
+    assert link_targets(rendered) == []
 
 
 def test_message_text_cannot_create_links_tags_or_headings() -> None:
@@ -189,17 +375,9 @@ def test_large_messages_and_notes_are_capped_with_a_marker() -> None:
 
 
 def test_rebuild_is_stable_prunes_stale_notes_and_keeps_user_notes(archive_env) -> None:
-    write_store(archive_env.paths, topical_corpus())
-    archive_env.paths.manifest.write_text(
-        json.dumps(
-            {
-                "source_fingerprint": "a" * 64,
-                "totals": {"conversations": 12, "messages": 24, "words": 100},
-                "providers": {},
-            }
-        ),
-        encoding="utf-8",
-    )
+    conversations = topical_corpus()
+    write_store(archive_env.paths, conversations)
+    _write_ingest_manifest(archive_env.paths, conversations, "a" * 64)
     build_analysis(archive_env.paths)
     first = build_vault(archive_env.paths, archive_env.auth)
     root = archive_env.paths.vault
@@ -219,6 +397,7 @@ def test_rebuild_is_stable_prunes_stale_notes_and_keeps_user_notes(archive_env) 
         "".join(json.dumps(c.index_row()) + "\n" for c in kept if c.provider == "chatgpt"),
         encoding="utf-8",
     )
+    _write_ingest_manifest(archive_env.paths, kept, "a" * 64)
     build_analysis(archive_env.paths)
     pruned = build_vault(archive_env.paths, archive_env.auth)
     assert pruned["removed_stale"] >= 1
@@ -228,17 +407,9 @@ def test_rebuild_is_stable_prunes_stale_notes_and_keeps_user_notes(archive_env) 
 
 
 def test_topic_hubs_bridge_providers(archive_env) -> None:
-    write_store(archive_env.paths, topical_corpus())
-    archive_env.paths.manifest.write_text(
-        json.dumps(
-            {
-                "source_fingerprint": "b" * 64,
-                "totals": {"conversations": 12, "messages": 0, "words": 0},
-                "providers": {},
-            }
-        ),
-        encoding="utf-8",
-    )
+    conversations = topical_corpus()
+    write_store(archive_env.paths, conversations)
+    _write_ingest_manifest(archive_env.paths, conversations, "b" * 64)
     build_analysis(archive_env.paths)
     build_vault(archive_env.paths, archive_env.auth)
     hub = (archive_env.paths.vault / "hubs" / "topic-all-kubernetes.md").read_text(encoding="utf-8")
@@ -311,16 +482,7 @@ def test_shell_conditionals_in_messages_do_not_break_vault_verification(archive_
         )
     )
     write_store(archive_env.paths, [conversation])
-    archive_env.paths.manifest.write_text(
-        json.dumps(
-            {
-                "source_fingerprint": "c" * 64,
-                "totals": {"conversations": 1, "messages": 3, "words": 10},
-                "providers": {},
-            }
-        ),
-        encoding="utf-8",
-    )
+    _write_ingest_manifest(archive_env.paths, [conversation], "c" * 64)
     build_analysis(archive_env.paths)
     build_vault(archive_env.paths, archive_env.auth)
     note = next(archive_env.paths.vault.rglob("conversation-chatgpt-shell.md")).read_text(
@@ -333,20 +495,9 @@ def test_shell_conditionals_in_messages_do_not_break_vault_verification(archive_
 def test_undated_conversations_get_no_month_link_and_unnameable_topics_stay_plain(
     archive_env,
 ) -> None:
-    write_store(
-        archive_env.paths,
-        [conv("grok", "u1", "Undated", created=""), conv("grok", "u2", "Dated")],
-    )
-    archive_env.paths.manifest.write_text(
-        json.dumps(
-            {
-                "source_fingerprint": "d" * 64,
-                "totals": {"conversations": 2, "messages": 4, "words": 8},
-                "providers": {},
-            }
-        ),
-        encoding="utf-8",
-    )
+    conversations = [conv("grok", "u1", "Undated", created=""), conv("grok", "u2", "Dated")]
+    write_store(archive_env.paths, conversations)
+    _write_ingest_manifest(archive_env.paths, conversations, "d" * 64)
     rows = [
         {"uid": "grok-u1", "topics": ["well-known", "kubernetes"], "terms": [], "similar": []},
         {"uid": "grok-u2", "topics": ["kubernetes"], "terms": [], "similar": []},

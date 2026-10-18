@@ -16,7 +16,7 @@ from .archive_model import (
 )
 
 PROVIDER = "grok"
-READER = "archive_read_grok@1"
+READER = "archive_read_grok@2"
 BACKEND = "prod-grok-backend.json"
 TASK_TEXT_KEYS = ("title", "name", "prompt", "description", "instruction", "message", "text")
 
@@ -181,16 +181,32 @@ def _task(item: dict[str, Any], index: int, tracker: SourceTracker, source: Path
 
 
 def _media(
-    posts: list[dict[str, Any]], tracker: SourceTracker, source: Path
+    posts: list[tuple[dict[str, Any], Path]], tracker: SourceTracker
 ) -> Iterator[Conversation]:
-    months: dict[str, list[dict[str, Any]]] = {}
-    for post in posts:
+    months: dict[str, list[tuple[dict[str, Any], Path]]] = {}
+    for post, source in posts:
         stamp = to_iso(post.get("create_time"))
-        months.setdefault(stamp[:7] or "undated", []).append(post)
+        months.setdefault(stamp[:7] or "undated", []).append((post, source))
     for month in sorted(months):
-        ordered = sorted(
-            months[month], key=lambda post: (to_iso(post.get("create_time")), str(post.get("id")))
-        )
+        unique: dict[tuple[str, ...], dict[str, Any]] = {}
+        sources: dict[str, dict[str, Any]] = {}
+        for post, source in months[month]:
+            # Overlapping exports repeat records. Keep differing observations, including
+            # distinct post ids that happen to carry the same prompt.
+            key = (
+                to_iso(post.get("create_time")),
+                str(post.get("id") or ""),
+                clean_text(post.get("original_prompt")),
+                str(post.get("media_type") or ""),
+                str(post.get("link") or ""),
+            )
+            unique.setdefault(key, post)
+            info = tracker.provenance(source)
+            sources[info["source_file"]] = info
+        ordered = [unique[key] for key in sorted(unique)]
+        if duplicates := len(months[month]) - len(ordered):
+            tracker.note("media_posts_duplicate_observations", duplicates)
+        provenance = [sources[name] for name in sorted(sources)]
         messages = [
             Message(
                 role="user",
@@ -216,12 +232,13 @@ def _media(
             kind="activity",
             collection="media",
             messages=messages,
-            provenance=tracker.provenance(source),
+            provenance={**provenance[0], "sources": provenance},
             extra={"posts": len(ordered)},
         )
 
 
 def iter_conversations(root: Path, tracker: SourceTracker) -> Iterator[Conversation]:
+    media_posts: list[tuple[dict[str, Any], Path]] = []
     for source in backend_files(root):
         payload = json.loads(source.read_text(encoding="utf-8"))
         for item in payload.get("conversations") or []:
@@ -230,4 +247,5 @@ def iter_conversations(root: Path, tracker: SourceTracker) -> Iterator[Conversat
             yield _project(item, tracker, source)
         for index, item in enumerate(payload.get("tasks") or []):
             yield _task(item, index, tracker, source)
-        yield from _media(payload.get("media_posts") or [], tracker, source)
+        media_posts.extend((post, source) for post in payload.get("media_posts") or [])
+    yield from _media(media_posts, tracker)

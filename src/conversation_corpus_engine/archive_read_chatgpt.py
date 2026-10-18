@@ -19,7 +19,7 @@ from .archive_model import (
 )
 
 PROVIDER = "chatgpt"
-READER = "archive_read_chatgpt@3"
+READER = "archive_read_chatgpt@4"
 SHARD_RE = re.compile(r"conversations(-\d+)?\.json")
 ASSET_MAP_NAME = "conversation_asset_file_names.json"
 UNREAD_CHANNELS = (
@@ -261,10 +261,11 @@ def _conversation(
     )
 
 
-def _asset_names(root: Path) -> dict[str, str]:
+def _asset_names(root: Path, tracker: SourceTracker) -> dict[str, str]:
     path = root / ASSET_MAP_NAME
     if not path.is_file():
         return {}
+    tracker.provenance(path)
     payload = json.loads(path.read_text(encoding="utf-8"))
     return {str(k): str(v) for k, v in payload.items()} if isinstance(payload, dict) else {}
 
@@ -276,7 +277,7 @@ def iter_conversations(
     extra_files: Iterable[Path] = (),
 ) -> Iterator[Conversation]:
     """Yield every conversation; `extra_files` (live deltas) are read first so they win."""
-    names = _asset_names(root)
+    names = _asset_names(root, tracker)
     for source in [*(Path(p) for p in extra_files), *shard_files(root)]:
         payload = json.loads(source.read_text(encoding="utf-8"))
         records = payload if isinstance(payload, list) else payload.get("conversations", [])

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
+from archive_support import gpt_conversation
 
 from conversation_corpus_engine.archive_database import (
     build_database,
@@ -78,6 +80,58 @@ def test_full_text_search_returns_best_hit_per_conversation(built) -> None:
         assert search(connection, '"') == []
         searches = search(connection, "kubernetes", kinds=["search"])
         assert {h["provider"] for h in searches} == {"perplexity", "gemini"}
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("limit, expected_count", [(1, 1), (2, 2), (10, 3)])
+def test_full_text_limit_counts_conversations_after_repeated_message_hits(
+    archive_env, limit: int, expected_count: int
+) -> None:
+    conversations = [
+        gpt_conversation("crowded", "Many matches", [("user", "quasar")] * 100),
+        gpt_conversation("other-a", "Another match", [("user", "quasar farther away")]),
+        gpt_conversation("other-b", "Last match", [("user", "quasar still farther away")]),
+    ]
+    source = archive_env.export / "chatgpt" / "conversations-000.json"
+    source.write_text(json.dumps(conversations), encoding="utf-8")
+    ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["chatgpt"],
+    )
+    build_database(archive_env.paths, archive_env.auth)
+    connection = open_database(archive_env.paths)
+    try:
+        hits = search(connection, "quasar", limit=limit)
+        assert len(hits) == expected_count
+        assert len({hit["uid"] for hit in hits}) == expected_count
+        assert hits[0]["uid"] == "chatgpt-crowded"
+        if limit == 10:
+            assert {hit["uid"] for hit in hits} == {
+                "chatgpt-crowded",
+                "chatgpt-other-a",
+                "chatgpt-other-b",
+            }
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "providers, kinds, expected",
+    [
+        (["chatgpt"], None, ["chatgpt-aaaa1111"]),
+        (["chatgpt"], ["chat"], ["chatgpt-aaaa1111"]),
+        (["chatgpt"], ["notebook"], []),
+    ],
+)
+def test_title_search_applies_provider_and_kind_filters(built, providers, kinds, expected) -> None:
+    env, _, _ = built
+    connection = open_database(env.paths)
+    try:
+        hits = search_titles(connection, "kubernetes", providers=providers, kinds=kinds)
+        assert [hit["uid"] for hit in hits] == expected
     finally:
         connection.close()
 
