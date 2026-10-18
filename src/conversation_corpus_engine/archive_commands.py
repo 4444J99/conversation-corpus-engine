@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .archive_corpus import CorpusProjectionError, project_corpus
 from .archive_database import (
     build_database,
     open_database,
@@ -232,6 +233,12 @@ def add_archive_parser(subparsers: Any) -> None:
     feed_parser.add_argument("--root", type=Path, required=True, help="the archive folder")
     feed_parser.add_argument("--out", type=Path, required=True, help="a Git-invisible folder")
     feed_parser.add_argument("--provider", action="append", choices=sorted(PROVIDER_SPECS))
+    corpus_parser = project_sub.add_parser(
+        "corpus", help="Write each provider's corpus folder for the federation"
+    )
+    corpus_parser.add_argument("--root", type=Path, required=True, help="the archive folder")
+    corpus_parser.add_argument("--out", type=Path, required=True, help="a Git-invisible folder")
+    corpus_parser.add_argument("--provider", action="append", choices=sorted(PROVIDER_SPECS))
 
 
 def _overrides(raw: list[str]) -> dict[str, Path]:
@@ -245,18 +252,19 @@ def _overrides(raw: list[str]) -> dict[str, Path]:
 
 
 def _handle_project(args: argparse.Namespace) -> int:
-    if args.target != "feed":
+    if args.target not in {"feed", "corpus"}:
         raise ValueError(f"unsupported projection: {args.target}")
     if not args.root.is_dir():
         print(f"archive root not found: {args.root}", file=sys.stderr)
         return 2
+    project = project_feed if args.target == "feed" else project_corpus
     try:
-        summary = project_feed(args.root, args.out, args.provider)
+        summary = project(args.root, args.out, args.provider)
     except CorpusStoreError as exc:
-        print(f"feed refused: {exc}", file=sys.stderr)
+        print(f"{args.target} refused: {exc}", file=sys.stderr)
         return 2
-    except FeedError as exc:
-        print(f"feed not written: {exc}", file=sys.stderr)
+    except (FeedError, CorpusProjectionError) as exc:
+        print(f"{args.target} not written: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
