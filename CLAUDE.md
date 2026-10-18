@@ -69,6 +69,7 @@ cce evaluation  run                        # regression gate evaluation
 cce review      queue | history | resolve | triage | assist | campaign | campaign-index | packet-hydrate | campaign-scoreboard | campaign-rollup | reject-stage | apply-plan | sample-summary | sample-propose | sample-compare
 cce source      freshness                  # source staleness check
 cce dashboard                              # operator-facing health summary
+cce archive     ingest | analyze | vault | kb | graph | site | build | verify | search | serve  # browsable archive surfaces (docs/archive-surfaces.md)
 ```
 
 **`provider refresh`** is the primary operational workflow — orchestrates import → bootstrap eval → run eval → stage candidate → (optionally) review → promote in a single command. Use `--approve --promote` for end-to-end auto-promote.

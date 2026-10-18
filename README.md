@@ -97,8 +97,16 @@ cce evaluation run --root /path/to/corpus --project-root /path/to/project --corp
 cce review queue --project-root /path/to/project
 cce review resolve federated-family-merge-... --decision accepted --note "same family"
 cce source freshness /path/to/corpus
-cce-mcp --project-root /path/to/project
+cce archive build --export-root /path/to/ai-exports --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
+cce archive verify --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
+cce archive search "kubernetes ingress" --provider claude --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
+cce archive serve --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
+cce-mcp --project-root /path/to/project --archive-root /path/to/private-corpus-store/_archive
 ```
+
+`cce archive` turns raw provider exports (ChatGPT, Claude, Gemini Takeout + NotebookLM, Grok,
+Perplexity) into an Obsidian vault/wiki, a static archive site, a SQLite FTS5 knowledge base and
+a graph, all inside the private corpus store. See [docs/archive-surfaces.md](docs/archive-surfaces.md).
 
 Corpus-destination writers fail closed unless a store has first been registered and the
 configured root exactly matches that active registration. The
@@ -129,6 +137,9 @@ currently exposes:
   answer, citations, and structured top-hit metadata.
 - `cce_list_corpora`: list registered project corpora.
 - `cce_surface_context`: build the MCP-facing project context payload.
+- `cce_archive_search`: full-text search the private AI archive knowledge base. Only advertised
+  when the server is started with `--archive-root` (or `CCE_ARCHIVE_ROOT`); the root is server
+  configuration and is never a tool argument. Results are private conversation text.
 
 ## Layout
 
@@ -159,7 +170,13 @@ currently exposes:
 - `src/conversation_corpus_engine/governance_candidates.py` — candidate stage/review/apply/rollback workflow
 - `src/conversation_corpus_engine/corpus_diff.py` — live-vs-candidate structural and retrieval diffing
 - `src/conversation_corpus_engine/corpus_candidates.py` — corpus candidate stage/review/promote/rollback workflow
-- `tests/` — extraction-safe regression tests
+- `src/conversation_corpus_engine/archive_model.py` — provider-neutral conversation schema, ids, time, atomic JSONL
+- `src/conversation_corpus_engine/archive_read_*.py` — streaming readers (chatgpt, claude, gemini, notebooklm, grok, perplexity)
+- `src/conversation_corpus_engine/archive_ingest.py` — normalized store, manifest denominators, custody gate
+- `src/conversation_corpus_engine/archive_topics.py` — TF-IDF topic hubs and cross-provider neighbours
+- `src/conversation_corpus_engine/archive_vault.py` / `archive_kb.py` / `archive_graph.py` / `archive_site.py` / `archive_serve.py` — vault, knowledge base, graph, site and loopback server
+- `src/conversation_corpus_engine/archive_commands.py` — `cce archive` command group and cross-surface verification
+- `tests/` — extraction-safe regression tests (archive tests use only synthetic fixtures)
 
 ## Runtime Outputs
 

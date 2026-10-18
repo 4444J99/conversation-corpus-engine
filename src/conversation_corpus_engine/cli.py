@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .archive_commands import add_archive_parser, handle_archive
 from .chatgpt_local_session import (
     discover_chatgpt_projects,
     fetch_chatgpt_project,
@@ -720,12 +721,17 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--source-drop-root", type=Path)
     dashboard.add_argument("--json", action="store_true")
 
+    add_archive_parser(subparsers)
+
     return parser
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.group == "archive":
+        raise SystemExit(handle_archive(args))
 
     if args.group == "corpus" and args.action == "list":
         corpora = list_registered_corpora(args.project_root)
