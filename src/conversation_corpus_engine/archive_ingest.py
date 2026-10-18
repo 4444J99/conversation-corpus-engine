@@ -5,10 +5,10 @@ import json
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from . import archive_layout as layout
 from . import (
     archive_read_chatgpt,
     archive_read_claude,
@@ -18,16 +18,25 @@ from . import (
     archive_read_perplexity,
 )
 from .archive_model import (
+    SCHEMA,
     Conversation,
     SourceTracker,
+    finalize_conversation,
     iter_conversations,
     iter_jsonl,
     write_json_atomic,
 )
+from .archive_naming import NAMING_VERSION, day_of
 from .corpus_store import CorpusStoreError, CorpusWriteAuthorization, authorize_corpus_write
 
-MANIFEST_SCHEMA = "cce.archive.manifest.v1"
-DEFAULT_ARCHIVE_DIRNAME = "_archive"
+MANIFEST_SCHEMA = "archive-manifest.v2"
+LEGACY_MANIFEST_SCHEMA = "cce.archive.manifest.v1"
+ACCEPTED_MANIFEST_SCHEMAS = frozenset({MANIFEST_SCHEMA, LEGACY_MANIFEST_SCHEMA})
+SCHEMA_VERSION = 2
+DEFAULT_ARCHIVE_DIRNAME = layout.ARCHIVE_DIRNAME
+# Per-provider manifest keys that hold absolute paths or host-specific error text; they are
+# dropped from the copy the source fingerprint hashes.
+FINGERPRINT_EXCLUDED_KEYS = frozenset({"source_root", "error"})
 
 
 @dataclass(frozen=True)
@@ -89,44 +98,123 @@ PROVIDER_SPECS: dict[str, ProviderSpec] = {
 
 @dataclass(frozen=True)
 class ArchivePaths:
+    """Every path under the archive folder. Each name comes from `archive_layout`, which mints
+    it with `derive_name`; nothing here spells a file or folder name by hand."""
+
     root: Path
 
-    @property
-    def normalized(self) -> Path:
-        return self.root / "normalized"
-
-    @property
-    def analysis(self) -> Path:
-        return self.root / "analysis"
-
-    @property
-    def vault(self) -> Path:
-        return self.root / "vault"
-
-    @property
-    def site(self) -> Path:
-        return self.root / "site"
-
-    @property
-    def kb(self) -> Path:
-        return self.root / "kb"
-
-    @property
-    def graph(self) -> Path:
-        return self.root / "graph"
+    # --- directly in the archive folder ---
 
     @property
     def manifest(self) -> Path:
-        return self.root / "manifest.json"
+        return self.root / layout.MANIFEST_FILENAME
+
+    @property
+    def database(self) -> Path:
+        return self.root / layout.DATABASE_FILENAME
+
+    @property
+    def enrichment(self) -> Path:
+        return self.root / layout.ENRICHMENT_FILENAME
+
+    @property
+    def topics(self) -> Path:
+        return self.root / layout.TOPICS_FILENAME
+
+    @property
+    def vault(self) -> Path:
+        return self.root / layout.VAULT_DIRNAME
+
+    @property
+    def vault_manifest(self) -> Path:
+        return self.root / layout.VAULT_MANIFEST_FILENAME
+
+    @property
+    def site(self) -> Path:
+        return self.root / layout.SITE_DIRNAME
+
+    @property
+    def graph(self) -> Path:
+        return self.root / layout.GRAPH_DIRNAME
+
+    # --- per provider ---
+
+    def provider_dir(self, provider: str) -> Path:
+        return self.root / layout.provider_dirname(provider)
 
     def conversations(self, provider: str) -> Path:
-        return self.normalized / provider / "conversations.jsonl"
+        return self.provider_dir(provider) / layout.conversations_filename(provider)
 
     def index(self, provider: str) -> Path:
-        return self.normalized / provider / "index.jsonl"
+        return self.provider_dir(provider) / layout.index_filename(provider)
+
+    def feed(self, provider: str) -> Path:
+        return self.root / layout.feed_filename(provider)
+
+    def receipt(self, provider: str, fingerprint: str, day: str) -> Path:
+        return self.root / layout.receipt_filename(provider, fingerprint, day)
 
     def providers_present(self) -> list[str]:
         return [name for name in PROVIDER_SPECS if self.conversations(name).is_file()]
+
+    # --- the vault ---
+
+    @property
+    def vault_conversations(self) -> Path:
+        return self.vault / layout.VAULT_CONVERSATIONS_DIRNAME
+
+    @property
+    def vault_hubs(self) -> Path:
+        return self.vault / layout.VAULT_HUBS_DIRNAME
+
+    @property
+    def vault_meta(self) -> Path:
+        return self.vault / layout.VAULT_META_DIRNAME
+
+    # --- the graph ---
+
+    @property
+    def graph_nodes(self) -> Path:
+        return self.graph / layout.GRAPH_NODES_FILENAME
+
+    @property
+    def graph_edges(self) -> Path:
+        return self.graph / layout.GRAPH_EDGES_FILENAME
+
+    @property
+    def graph_graphml(self) -> Path:
+        return self.graph / layout.GRAPH_GRAPHML_FILENAME
+
+    @property
+    def graph_summary(self) -> Path:
+        return self.graph / layout.GRAPH_SUMMARY_FILENAME
+
+    # --- the site ---
+
+    @property
+    def site_pages(self) -> Path:
+        return self.site / layout.SITE_PAGES_DIRNAME
+
+    @property
+    def site_home(self) -> Path:
+        return self.site / layout.SITE_HOME_FILENAME
+
+    def site_page(self, provider: str, uid: str) -> Path:
+        return self.site_pages / f"{layout.conversation_note(provider, uid)}.html"
+
+
+def latest_activity_day(manifest: dict[str, Any]) -> str:
+    """The day (eight digits) of the latest activity any provider reports, from the data only.
+
+    Receipts carry this day. There is no clock fallback: a manifest with no activity stamp at
+    all has no day, and asking for one is an error.
+    """
+    stamps = [
+        info.get("last_activity_max", "")
+        for info in manifest["providers"].values()
+        if info.get("status") == "ok" and info.get("last_activity_max")
+    ]
+    return day_of(max(stamps)) if stamps else day_of("")
 
 
 def authorize_archive(
@@ -172,6 +260,16 @@ def _bump(counter: Counter[str], key: str, amount: int = 1) -> None:
     counter[key] += amount
 
 
+def content_digest(conversation: Conversation) -> str:
+    """SHA-256 of a normalized conversation's content: everything but where it was read from, so
+    the same conversation found in two files gives one digest."""
+    payload = conversation.to_dict()
+    payload.pop("provenance", None)
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+
+
 def _ingest_provider(
     spec: ProviderSpec, root: Path, paths: ArchivePaths, options: dict[str, Any]
 ) -> dict[str, Any]:
@@ -182,7 +280,7 @@ def _ingest_provider(
             "channels": {"read": [], "not_read": []},
         }
     tracker = SourceTracker(root, spec.module.READER)
-    seen: set[str] = set()
+    seen: dict[str, str] = {}
     kinds: Counter[str] = Counter()
     roles: Counter[str] = Counter()
     totals: Counter[str] = Counter()
@@ -200,11 +298,19 @@ def _ingest_provider(
             temp_index.open("w", encoding="utf-8") as index_out,
         ):
             for conversation in spec.open_reader(root, tracker, options):
+                derived = finalize_conversation(conversation)
                 uid = conversation.uid
+                content = content_digest(conversation)
                 if uid in seen:
-                    _bump(totals, "duplicates_skipped")
+                    _bump(totals, "duplicates_folded")
+                    kept = "identical" if seen[uid] == content else "differing"
+                    _bump(totals, f"duplicates_folded_{kept}")
                     continue
-                seen.add(uid)
+                seen[uid] = content
+                if derived:
+                    _bump(totals, "derived_ids")
+                    if derived == "unnameable":
+                        _bump(totals, "unnameable_ids")
                 conv_out.write(
                     json.dumps(conversation.to_dict(), sort_keys=True, ensure_ascii=False)
                 )
@@ -244,7 +350,11 @@ def _ingest_provider(
         "source_root": str(root),
         "conversations": totals["conversations"],
         "empty_conversations": totals["empty_conversations"],
-        "duplicates_skipped": totals["duplicates_skipped"],
+        "derived_ids": totals["derived_ids"],
+        "unnameable_ids": totals["unnameable_ids"],
+        "duplicates_folded": totals["duplicates_folded"],
+        "duplicates_folded_identical": totals["duplicates_folded_identical"],
+        "duplicates_folded_differing": totals["duplicates_folded_differing"],
         "messages": totals["messages"],
         "words": totals["words"],
         "attachments": totals["attachments"],
@@ -274,16 +384,16 @@ def ingest(
     report: dict[str, Any] = {}
     for name, root in sources.items():
         report[name] = _ingest_provider(PROVIDER_SPECS[name], root, paths, options)
-    fingerprint = hashlib.sha256(
-        json.dumps(
-            {name: info.get("source_files", {}) for name, info in sorted(report.items())},
-            sort_keys=True,
-        ).encode()
-    ).hexdigest()
+    reader_versions = {name: PROVIDER_SPECS[name].module.READER for name in report}
     manifest = {
         "schema": MANIFEST_SCHEMA,
-        "conversation_schema": "cce.archive.conversation.v1",
-        "source_fingerprint": fingerprint,
+        "conversation_schema": SCHEMA,
+        "schema_version": SCHEMA_VERSION,
+        "naming_version": NAMING_VERSION,
+        "reader_versions": reader_versions,
+        "source_fingerprint": source_fingerprint(
+            report, reader_versions=reader_versions, naming_version=NAMING_VERSION
+        ),
         "providers": report,
         "totals": {
             "conversations": sum(info.get("conversations", 0) for info in report.values()),
@@ -292,11 +402,34 @@ def ingest(
         },
     }
     write_json_atomic(paths.manifest, manifest)
-    write_json_atomic(
-        paths.root / "run.json",
-        {"finished_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"), "stage": "ingest"},
-    )
     return manifest
+
+
+def source_fingerprint(
+    providers: dict[str, dict[str, Any]],
+    *,
+    reader_versions: dict[str, str],
+    naming_version: int,
+) -> str:
+    """SHA-256 over a canonical copy of the ingest result, with host-specific data removed.
+
+    Absolute source paths (`source_root`) and exception text (`error`) never enter the hash, so
+    the same export read on two hosts, from two different folders, gives the same fingerprint.
+    Everything else counts: source file hashes, per-provider counts and counters, the reader
+    versions, the schema version and the naming version.
+    """
+    canonical = {
+        "naming_version": naming_version,
+        "schema_version": SCHEMA_VERSION,
+        "reader_versions": dict(sorted(reader_versions.items())),
+        "providers": {
+            name: {k: v for k, v in sorted(info.items()) if k not in FINGERPRINT_EXCLUDED_KEYS}
+            for name, info in sorted(providers.items())
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
 
 
 def iter_store(paths: ArchivePaths, providers: list[str] | None = None) -> Iterator[Conversation]:
@@ -321,7 +454,33 @@ def load_manifest(paths: ArchivePaths) -> dict[str, Any]:
         raise FileNotFoundError(
             f"No archive manifest at {paths.manifest}; run `cce archive ingest`"
         )
-    return json.loads(paths.manifest.read_text(encoding="utf-8"))
+    manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
+    schema = manifest.get("schema")
+    if schema is not None and schema not in ACCEPTED_MANIFEST_SCHEMAS:
+        raise ValueError(f"unsupported archive manifest schema: {schema!r}")
+    return manifest
+
+
+class LegacyArchiveStore(ValueError):
+    """The store was written by the first-generation normalized layer; it must be rebuilt."""
+
+
+def require_current_store(manifest: dict[str, Any]) -> None:
+    """Refuse a store that is not written in the current manifest and conversation schemas.
+
+    A first-generation store is still readable (`load_manifest` and `verify` accept it), but
+    loading it upgrades its rows on the fly: message ids are minted differently and every message
+    counts as fully typed. A projection built from that would carry different message references
+    than one built from a current store while its receipt bound to the same fingerprint, so the
+    projections refuse it and ask for a rebuild.
+    """
+    found = (manifest.get("schema"), manifest.get("conversation_schema"))
+    if found != (MANIFEST_SCHEMA, SCHEMA):
+        raise LegacyArchiveStore(
+            f"the archive was written in an older layout (manifest schema {found[0]!r}, "
+            f"conversation schema {found[1]!r}; this engine writes {MANIFEST_SCHEMA!r} and "
+            f"{SCHEMA!r}): rebuild it with `cce archive build`"
+        )
 
 
 def failed_providers(manifest: dict[str, Any]) -> list[str]:

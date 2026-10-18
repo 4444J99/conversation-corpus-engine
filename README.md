@@ -101,11 +101,11 @@ cce archive build --export-root /path/to/ai-exports --project-root /path/to/proj
 cce archive verify --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
 cce archive search "kubernetes ingress" --provider claude --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
 cce archive serve --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
-cce-mcp --project-root /path/to/project --archive-root /path/to/private-corpus-store/_archive
+cce-mcp --project-root /path/to/project --archive-root /path/to/private-corpus-store/archive-all
 ```
 
 `cce archive` turns raw provider exports (ChatGPT, Claude, Gemini Takeout + NotebookLM, Grok,
-Perplexity) into an Obsidian vault/wiki, a static archive site, a SQLite FTS5 knowledge base and
+Perplexity) into an Obsidian vault/wiki, a static archive site, a SQLite FTS5 search database and
 a graph, all inside the private corpus store. See [docs/archive-surfaces.md](docs/archive-surfaces.md).
 
 Corpus-destination writers fail closed unless a store has first been registered and the
@@ -137,7 +137,7 @@ currently exposes:
   answer, citations, and structured top-hit metadata.
 - `cce_list_corpora`: list registered project corpora.
 - `cce_surface_context`: build the MCP-facing project context payload.
-- `cce_archive_search`: full-text search the private AI archive knowledge base. Only advertised
+- `cce_archive_search`: full-text search the private AI archive search database. Only advertised
   when the server is started with `--archive-root` (or `CCE_ARCHIVE_ROOT`); the root is server
   configuration and is never a tool argument. Results are private conversation text.
 
@@ -174,7 +174,8 @@ currently exposes:
 - `src/conversation_corpus_engine/archive_read_*.py` — streaming readers (chatgpt, claude, gemini, notebooklm, grok, perplexity)
 - `src/conversation_corpus_engine/archive_ingest.py` — normalized store, manifest denominators, custody gate
 - `src/conversation_corpus_engine/archive_topics.py` — TF-IDF topic hubs and cross-provider neighbours
-- `src/conversation_corpus_engine/archive_vault.py` / `archive_kb.py` / `archive_graph.py` / `archive_site.py` / `archive_serve.py` — vault, knowledge base, graph, site and loopback server
+- `src/conversation_corpus_engine/archive_vault.py` / `archive_database.py` / `archive_graph.py` / `archive_site.py` / `archive_serve.py` — vault, search database, graph, site and loopback server
+- `src/conversation_corpus_engine/archive_layout.py` — every archive file, folder and note name, and the one wikilink function, minted through `derive_name`
 - `src/conversation_corpus_engine/archive_commands.py` — `cce archive` command group and cross-surface verification
 - `tests/` — extraction-safe regression tests (archive tests use only synthetic fixtures)
 

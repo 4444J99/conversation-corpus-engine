@@ -1,4 +1,29 @@
+"""The static site's fixed assets. File names are placeholders (`__STYLE__` and the like) that
+`fill_names` replaces with the names `archive_layout` mints, so the templates spell none."""
+
 from __future__ import annotations
+
+from . import archive_layout as layout
+
+NAME_PLACEHOLDERS = {
+    "__STYLE__": layout.SITE_STYLE_FILENAME,
+    "__HOME__": layout.SITE_HOME_FILENAME,
+    "__GRAPH_PAGE__": layout.SITE_GRAPH_PAGE_FILENAME,
+    "__HOME_SCRIPT__": layout.SITE_HOME_SCRIPT_FILENAME,
+    "__GRAPH_SCRIPT__": layout.SITE_GRAPH_SCRIPT_FILENAME,
+    "__INDEX_DATA__": layout.SITE_INDEX_DATA_FILENAME,
+    "__TOPIC_DATA__": layout.SITE_TOPIC_DATA_FILENAME,
+    "__PAGES__": layout.SITE_PAGES_DIRNAME,
+    "__PAGE_PREFIX__": layout.CONVERSATION_PREFIX,
+}
+
+
+def fill_names(template: str) -> str:
+    """Replace every name placeholder in a template with its minted name."""
+    for placeholder, name in NAME_PLACEHOLDERS.items():
+        template = template.replace(placeholder, name)
+    return template
+
 
 CSP_PAGE = (
     "default-src 'none'; style-src 'self'; img-src 'self' data:; base-uri 'none'; "
@@ -92,17 +117,17 @@ INDEX_HTML = """\
 <meta http-equiv="Content-Security-Policy" content="__CSP__">
 <meta name="referrer" content="no-referrer">
 <title>AI Archive</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="__STYLE__">
 </head>
 <body>
 <div class="wrap">
 <header class="top">
   <h1>AI Archive</h1>
   <p id="stats">Loading…</p>
-  <nav><a href="graph.html">Topic map</a><a href="#coverage">Coverage</a></nav>
+  <nav><a href="__GRAPH_PAGE__">Topic map</a><a href="#coverage">Coverage</a></nav>
 </header>
 <noscript><p>This archive needs JavaScript for search. Conversation pages under
-<code>c/</code> work without it.</p></noscript>
+<code>__PAGES__/</code> work without it.</p></noscript>
 <section class="controls" aria-label="Search and filters">
   <div class="row">
     <label class="sr-only" for="q">Search</label>
@@ -128,8 +153,8 @@ INDEX_HTML = """\
 <section id="coverage" aria-label="Coverage"><h2>Coverage</h2><div id="coverage-body"></div></section>
 <p class="banner">Conversation text is a record of speech acts, not of verified events.</p>
 </div>
-<script src="data/index.js"></script>
-<script src="app.js"></script>
+<script src="__INDEX_DATA__"></script>
+<script src="__HOME_SCRIPT__"></script>
 </body>
 </html>
 """
@@ -142,20 +167,20 @@ GRAPH_HTML = """\
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="__CSP__">
 <title>AI Archive — topic map</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="__STYLE__">
 </head>
 <body>
 <div class="wrap">
 <header class="top"><h1>Topic map</h1>
 <p>Each node is a topic hub; size is the number of conversations, colour the dominant
 provider, lines link topics that share conversations. Click a node to open its conversations.</p>
-<nav><a href="index.html">← Archive</a></nav></header>
+<nav><a href="__HOME__">← Archive</a></nav></header>
 <canvas id="map" role="img" aria-label="Topic co-occurrence map"></canvas>
 <div id="tip"></div>
 <noscript><p>The topic map needs JavaScript.</p></noscript>
 </div>
-<script src="data/graph.js"></script>
-<script src="graph.js"></script>
+<script src="__TOPIC_DATA__"></script>
+<script src="__GRAPH_SCRIPT__"></script>
 </body>
 </html>
 """
@@ -184,7 +209,7 @@ APP_JS = """\
     (kids || []).forEach(function (kid) { node.appendChild(kid); });
     return node;
   }
-  function pageHref(row) { return 'c/' + encodeURIComponent(row[COL.provider]) + '/' + encodeURIComponent(row[COL.uid]) + '.html'; }
+  function pageHref(uid) { return '__PAGES__/__PAGE_PREFIX__' + encodeURIComponent(uid) + '.html'; }
 
   function readHash() {
     var out = { q: '', p: [], k: '', y: '', t: '', s: 'new', fts: false };
@@ -236,7 +261,7 @@ APP_JS = """\
     return wrap;
   }
   function renderRow(row) {
-    var title = el('h3', {}, [el('a', { href: pageHref(row), text: row[COL.title] || 'Untitled' })]);
+    var title = el('h3', {}, [el('a', { href: pageHref(row[COL.uid]), text: row[COL.title] || 'Untitled' })]);
     var meta = el('div', { 'class': 'meta' }, [badge(row[COL.provider]),
       document.createTextNode(row[COL.provider] + ' · ' + row[COL.kind] + ' · ' + (row[COL.created].slice(0, 10) || 'undated') + ' · ' + row[COL.msgs] + ' msg')]);
     return el('li', { 'class': 'result' }, [title, meta, el('p', { text: row[COL.snippet] }), topicLinks(row[COL.topics])]);
@@ -251,9 +276,8 @@ APP_JS = """\
     return p;
   }
   function renderHit(hit) {
-    var href = 'c/' + encodeURIComponent(hit.provider) + '/' + encodeURIComponent(hit.uid) + '.html';
     return el('li', { 'class': 'result' }, [
-      el('h3', {}, [el('a', { href: href, text: hit.title || 'Untitled' })]),
+      el('h3', {}, [el('a', { href: pageHref(hit.uid), text: hit.title || 'Untitled' })]),
       el('div', { 'class': 'meta' }, [badge(hit.provider), document.createTextNode(hit.provider + ' · ' + hit.kind + ' · ' + (hit.created || '').slice(0, 10) + ' · ' + hit.role + ' message ' + (hit.idx + 1))]),
       renderExcerpt(hit.excerpt)]);
   }
@@ -468,7 +492,7 @@ GRAPH_JS = """\
   canvas.addEventListener('mouseleave', function () { tip.style.display = 'none'; draw(null); });
   canvas.addEventListener('click', function (ev) {
     var n = pick(ev);
-    if (n) { location.href = 'index.html#t=' + encodeURIComponent(n.label); }
+    if (n) { location.href = '__HOME__#t=' + encodeURIComponent(n.label); }
   });
   window.addEventListener('resize', resize);
   layout();

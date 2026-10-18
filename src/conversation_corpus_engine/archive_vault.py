@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+from . import archive_layout as layout
 from .archive_ingest import (
     PROVIDER_SPECS,
     ArchivePaths,
@@ -14,12 +15,16 @@ from .archive_ingest import (
     load_manifest,
     require_inside,
 )
+from .archive_layout import wikilink
 from .archive_model import Conversation, Message, write_json_atomic, write_text_atomic
+from .archive_naming import NameLedger
 from .archive_text import FenceTracker
 from .archive_topics import load_enrichment
 from .corpus_store import CorpusWriteAuthorization
 
-VAULT_MANIFEST = ".cce-vault-manifest.json"
+# Where earlier builds kept the list of generated files, inside the vault. It is only read and
+# deleted now; the live list is `ArchivePaths.vault_manifest`, beside the archive manifest.
+RETIRED_VAULT_MANIFEST = ".cce-vault-manifest.json"
 MESSAGE_CHARS = 60_000
 NOTE_CHARS = 400_000
 ROLE_LABELS = {"user": "User", "assistant": "Assistant", "system": "System", "tool": "Tool"}
@@ -34,7 +39,6 @@ PALETTE = {
 }
 INLINE_CODE_RE = re.compile(r"(`[^`\n]+`)")
 TAG_RE = re.compile(r"(?<![\w&\\/])#(?=[\w/-])")
-UNSAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 READING_NOTE = (
     "*Conversation record — statements here are speech acts that were typed, not verified events.*"
 )
@@ -54,8 +58,9 @@ def link_label(text: str) -> str:
     return cleaned[:90] or "Untitled"
 
 
-def safe_name(text: str, limit: int = 80) -> str:
-    return UNSAFE_NAME_RE.sub("-", text).strip("-.")[:limit] or "x"
+def conversation_link(uid: str, label: str, *, in_table: bool = False) -> str:
+    """The link to a conversation's note, minted from the same name its file gets."""
+    return wikilink(layout.conversation_note_for_uid(uid), link_label(label), in_table=in_table)
 
 
 def neutralize(text: str) -> str:
@@ -120,7 +125,7 @@ def render_conversation(
     created = conversation.created or conversation.last_activity
     year = created[:4] if created else "undated"
     tags = [f"provider/{conversation.provider}", f"kind/{conversation.kind}", f"year/{year}"]
-    tags += [f"topic/{safe_name(term, 40)}" for term in topics]
+    tags += [f"topic/{term}" for term in topics if layout.topic_note(term)]
     front = [
         "---",
         f"uid: {yaml_text(conversation.uid)}",
@@ -140,24 +145,27 @@ def render_conversation(
         f"tags: [{', '.join(tags)}]",
         "---",
     ]
-    month = (created or "")[:7] or "undated"
+    month = layout.month_note(created)
+    facts = [f"**Provider** {wikilink(layout.provider_note(conversation.provider))}"]
+    if month:
+        facts.append(f"**Month** {wikilink(month)}")
+    if collection_link:
+        facts.append(f"**Collection** {collection_link}")
     header = [
         f"# {plain_title(conversation.title)}",
         "",
         READING_NOTE,
         "",
-        f"**Provider** [[provider-{conversation.provider}]] · **Month** [[month-{month}]]"
-        + (f" · **Collection** {collection_link}" if collection_link else ""),
+        " · ".join(facts),
     ]
     if topics:
-        header.append(
-            "**Topics** " + " · ".join(f"[[topic-{safe_name(t, 40)}|{t}]]" for t in topics)
-        )
+        header.append("**Topics** " + " · ".join(_topic_label(term) for term in topics))
     if related:
         header.append(
             "**Related** "
             + " · ".join(
-                f"[[{row['uid']}|{link_label(titles.get(row['uid'], row['uid']))}]] ({row['score']:.2f})"
+                f"{conversation_link(row['uid'], titles.get(row['uid'], row['uid']))} "
+                f"({row['score']:.2f})"
                 for row in related
             )
         )
@@ -177,13 +185,19 @@ def render_conversation(
     return "\n".join(parts).rstrip() + "\n", truncated
 
 
+def _topic_label(term: str) -> str:
+    """A topic as a link to its hub, or as plain text when the term has no valid hub name."""
+    note = layout.topic_note(term)
+    return wikilink(note, term) if note else term
+
+
 def _hub(title: str, intro: str, rows: list[dict[str, Any]]) -> str:
     lines = [f"# {title}", "", intro, ""]
     for row in sorted(
         rows, key=lambda r: (r.get("created") or r.get("last_activity") or "", r["uid"])
     ):
         lines.append(
-            f"- [[{row['uid']}|{link_label(row['title'])}]] — {row['provider']} · "
+            f"- {conversation_link(row['uid'], row['title'])} — {row['provider']} · "
             f"{row['message_count']} msg · {(row.get('created') or '')[:10] or 'undated'}"
         )
     return "\n".join(lines) + "\n"
@@ -216,15 +230,15 @@ def _home(manifest: dict[str, Any], rows: list[dict[str, Any]], hub_count: int) 
             lines.append(f"| {display} | *{info.get('status')}* | | | | | |")
             continue
         lines.append(
-            f"| [[provider-{name}\\|{display}]] | {info['conversations']} | "
-            f"{info['empty_conversations']} | {info['messages']} | {info['words']} | "
-            f"{info['created_min'][:10]} | {info['last_activity_max'][:10]} |"
+            f"| {wikilink(layout.provider_note(name), display, in_table=True)} | "
+            f"{info['conversations']} | {info['empty_conversations']} | {info['messages']} | "
+            f"{info['words']} | {info['created_min'][:10]} | {info['last_activity_max'][:10]} |"
         )
     lines += [
         "",
-        "See [[coverage]] for the channels read and not read, and [[reading-guide]] for how to use "
-        "this vault.",
-        f"Topic hubs: {hub_count}. Browse by month via the `month-YYYY-MM` notes.",
+        f"See {wikilink(layout.COVERAGE_NOTE)} for the channels read and not read, and "
+        f"{wikilink(layout.GUIDE_NOTE)} for how to use this vault.",
+        f"Topic hubs: {hub_count}. Browse by month via the `month-all-YYYYMM` notes.",
         "",
     ]
     return "\n".join(lines)
@@ -244,7 +258,10 @@ def _coverage(manifest: dict[str, Any]) -> str:
             lines += [
                 "",
                 f"- conversations: {info['conversations']} ({info['empty_conversations']} empty, "
-                f"{info['duplicates_skipped']} duplicate(s) skipped)",
+                f"{info.get('duplicates_folded', info.get('duplicates_skipped', 0))} duplicate(s) "
+                f"folded: {info.get('duplicates_folded_identical', 0)} identical, "
+                f"{info.get('duplicates_folded_differing', 0)} differing; "
+                f"{info.get('derived_ids', 0)} derived id(s))",
                 f"- messages: {info['messages']}; roles: {info['roles']}",
                 f"- kinds: {info['kinds']}",
                 f"- reader: `{info['reader']}`; counters: {info['reader_counters'] or 'none'}",
@@ -269,7 +286,7 @@ READING_GUIDE = """# Reading guide
 - Notes are *derived*: regenerate them with `cce archive vault`; edits inside generated notes
   are overwritten. Add your own notes anywhere outside the generated paths — they are never
   touched.
-- Colour in the graph view is by provider. Topic hubs (`topic-*`) bridge providers; the
+- Colour in the graph view is by provider. Topic hubs (`topic-all-*`) bridge providers; the
   *Related* line on each note lists its nearest neighbours by TF-IDF cosine similarity.
 - Attachments are referenced by file name only; their bytes are not part of the vault.
 """
@@ -298,11 +315,18 @@ def _obsidian_config() -> dict[str, str]:
     }
 
 
-def _sync_manifest(root: Path, written: set[str]) -> int:
-    path = root / VAULT_MANIFEST
+def _sync_manifest(paths: ArchivePaths, root: Path, written: set[str]) -> int:
+    """Record the generated files beside the archive manifest and prune what the last build wrote
+    and this one did not. A manifest an earlier build left inside the vault is read once for its
+    file list, then deleted."""
+    path = paths.vault_manifest
     previous: list[str] = []
     if path.is_file():
         previous = json.loads(path.read_text(encoding="utf-8")).get("files", [])
+    retired = root / RETIRED_VAULT_MANIFEST
+    if retired.is_file():
+        previous += json.loads(retired.read_text(encoding="utf-8")).get("files", [])
+        retired.unlink()
     removed = 0
     for rel in previous:
         if rel not in written:
@@ -328,7 +352,7 @@ def link_targets(markdown: str) -> list[str]:
 def verify_vault(paths: ArchivePaths) -> list[str]:
     """Check that every generated file exists and every wikilink resolves to a note."""
     root = paths.vault
-    manifest_path = root / VAULT_MANIFEST
+    manifest_path = paths.vault_manifest
     if not manifest_path.is_file():
         return [f"vault manifest missing: {manifest_path}"]
     files = json.loads(manifest_path.read_text(encoding="utf-8")).get("files", [])
@@ -360,8 +384,13 @@ def build_vault(
     enrichment = load_enrichment(paths)
     collection_names = _collection_names(rows)
     written: set[str] = set()
+    ledger = NameLedger()
 
-    def emit(rel: str, content: str) -> None:
+    def emit(folder: str, name: str, identity: str, content: str) -> None:
+        """Write one note. The name is claimed first, so two different notes can never share a
+        title (not even one that differs only by letter case)."""
+        ledger.register(name, identity)
+        rel = f"{folder}/{name}.md" if folder else f"{name}.md"
         write_text_atomic(root / rel, content)
         written.add(rel)
 
@@ -369,19 +398,25 @@ def build_vault(
     by_provider: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_topic: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_collection: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    unnamed_topics: set[str] = set()
     for row in rows:
-        by_month[(row["created"] or row["last_activity"])[:7] or "undated"].append(row)
+        month = layout.month_note(row["created"] or row["last_activity"])
+        if month:
+            by_month[month].append(row)
         by_provider[row["provider"]].append(row)
         if row["collection"]:
             by_collection[(row["provider"], row["collection"])].append(row)
         for term in enrichment.get(row["uid"], {}).get("topics", []):
-            by_topic[term].append(row)
+            if layout.topic_note(term):
+                by_topic[term].append(row)
+            else:
+                unnamed_topics.add(term)
 
     def collection_link(provider: str, collection: str) -> str:
         if not collection:
             return ""
         name = collection_names.get((provider, collection), collection)
-        return f"[[collection-{provider}-{safe_name(collection, 40)}|{link_label(name)}]]"
+        return wikilink(layout.collection_note(provider, collection), link_label(name))
 
     truncated = notes = 0
     for conversation in iter_store(paths):
@@ -395,21 +430,39 @@ def build_vault(
             message_limit=message_chars,
             note_limit=note_chars,
         )
-        year = (conversation.created or conversation.last_activity)[:4] or "undated"
-        emit(f"Conversations/{conversation.provider}/{year}/{conversation.uid}.md", text)
+        emit(
+            layout.VAULT_CONVERSATIONS_DIRNAME,
+            layout.conversation_note(conversation.provider, conversation.uid),
+            f"conversation:{conversation.uid}",
+            text,
+        )
         truncated += int(cut)
         notes += 1
 
+    hubs = layout.VAULT_HUBS_DIRNAME
     for name, items in by_provider.items():
         emit(
-            f"Hubs/provider-{name}.md",
+            hubs,
+            layout.provider_note(name),
+            f"provider:{name}",
             _hub(PROVIDER_SPECS[name].display, f"{len(items)} conversations.", items),
         )
     for month, items in by_month.items():
-        emit(f"Hubs/month-{month}.md", _hub(month, f"{len(items)} conversations started.", items))
-    for term, items in by_topic.items():
+        digits = month.rsplit("-", 1)[-1]
         emit(
-            f"Hubs/topic-{safe_name(term, 40)}.md",
+            hubs,
+            month,
+            f"month:{digits}",
+            _hub(f"{digits[:4]}-{digits[4:]}", f"{len(items)} conversations started.", items),
+        )
+    for term, items in by_topic.items():
+        note = layout.topic_note(term)
+        if note is None:  # by_topic only holds named terms; this keeps the type honest
+            continue
+        emit(
+            hubs,
+            note,
+            f"topic:{term}",
             _hub(
                 f"Topic: {term}",
                 f"{len(items)} conversations across "
@@ -420,23 +473,26 @@ def build_vault(
     for (provider, collection), items in by_collection.items():
         name = collection_names.get((provider, collection), collection)
         emit(
-            f"Hubs/collection-{provider}-{safe_name(collection, 40)}.md",
+            hubs,
+            layout.collection_note(provider, collection),
+            f"collection:{provider}\0{collection}",
             _hub(f"{PROVIDER_SPECS[provider].display}: {name}", f"{len(items)} item(s).", items),
         )
-    emit("Home.md", _home(manifest, rows, len(by_topic)))
-    emit("Meta/coverage.md", _coverage(manifest))
-    emit("Meta/reading-guide.md", READING_GUIDE)
+    emit("", layout.HOME_NOTE, "home", _home(manifest, rows, len(by_topic)))
+    emit(layout.VAULT_META_DIRNAME, layout.COVERAGE_NOTE, "coverage", _coverage(manifest))
+    emit(layout.VAULT_META_DIRNAME, layout.GUIDE_NOTE, "guide", READING_GUIDE)
     for rel, content in _obsidian_config().items():
         if not (root / rel).is_file():
-            emit(rel, content)
-        else:
-            written.add(rel)
-    removed = _sync_manifest(root, written)
-    hubs = sum(1 for rel in written if rel.startswith("Hubs/"))
+            write_text_atomic(root / rel, content)
+        written.add(rel)
+    require_inside(authorization, paths.vault_manifest)
+    removed = _sync_manifest(paths, root, written)
+    hub_notes = sum(1 for rel in written if rel.startswith(f"{hubs}/"))
     return {
         "notes": notes,
-        "hubs": hubs,
+        "hubs": hub_notes,
         "truncated_notes": truncated,
         "removed_stale": removed,
         "files": len(written),
+        "topics_without_hub": len(unnamed_topics),
     }

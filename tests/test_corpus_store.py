@@ -14,6 +14,7 @@ from conversation_corpus_engine.corpus_store import (
     CorpusStoreError,
     authorize_corpus_write,
     register_corpus_store,
+    require_git_private,
     resolve_configured_corpus_store_root,
 )
 from conversation_corpus_engine.federation import REGISTRY_VERSION, registry_path
@@ -161,6 +162,58 @@ def test_outside_git_and_git_ignored_roots_are_accepted(tmp_path: Path) -> None:
         corpus_store_root=ignored_store,
         destination=ignored_store / "corpus",
     )
+
+
+def _fake_git(directory: Path, *, exit_code: int, message: str) -> None:
+    """A `git` that fails the way a real one can: nothing on stdout, a message on stderr."""
+    directory.mkdir()
+    script = directory / "git"
+    script.write_text(f"#!/bin/sh\necho '{message}' >&2\nexit {exit_code}\n", encoding="utf-8")
+    script.chmod(0o755)
+
+
+def test_git_saying_not_a_repository_means_outside_every_work_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_git(
+        tmp_path / "bin",
+        exit_code=128,
+        message="fatal: not a git repository (or any of the parent directories): .git",
+    )
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+    target = tmp_path / "private-output"
+    target.mkdir()
+    assert require_git_private(target) == target.resolve()
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "message"),
+    [
+        (128, "fatal: detected dubious ownership in repository"),
+        (1, "fatal: not a git repository"),
+        (2, "error: permission denied"),
+    ],
+)
+def test_any_other_git_failure_is_an_error_not_a_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int, message: str
+) -> None:
+    _fake_git(tmp_path / "bin", exit_code=exit_code, message=message)
+    monkeypatch.setenv("PATH", str(tmp_path / "bin"))
+    target = tmp_path / "private-output"
+    target.mkdir()
+    with pytest.raises(CorpusStoreError, match=rf"git could not inspect .*exit {exit_code}"):
+        require_git_private(target)
+
+
+def test_a_missing_git_binary_is_an_error_not_a_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "empty-bin").mkdir()
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+    target = tmp_path / "private-output"
+    target.mkdir()
+    with pytest.raises(CorpusStoreError, match="Could not run git"):
+        require_git_private(target)
 
 
 def test_tracked_content_and_ignore_negation_are_rejected(tmp_path: Path) -> None:

@@ -162,6 +162,11 @@ def build_parser() -> argparse.ArgumentParser:
     federation_sub = federation.add_subparsers(dest="action", required=True)
     federation_build = federation_sub.add_parser("build", help="Build federation artifacts")
     federation_build.add_argument("--project-root", type=Path, default=default_project_root())
+    federation_build.add_argument(
+        "--archive-root",
+        type=Path,
+        help="Archive folder whose manifest fingerprint must be unchanged by the build",
+    )
 
     migration = subparsers.add_parser("migration", help="Migration helpers")
     migration_sub = migration.add_subparsers(dest="action", required=True)
@@ -785,7 +790,10 @@ def main() -> None:
         return
 
     if args.group == "federation" and args.action == "build":
-        result = build_federation(args.project_root)
+        if args.archive_root is None:
+            result = build_federation(args.project_root)
+        else:
+            result = build_federation(args.project_root, archive_root=args.archive_root)
         print(json.dumps(result, indent=2))
         return
 

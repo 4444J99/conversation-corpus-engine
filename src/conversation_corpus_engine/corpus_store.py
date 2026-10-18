@@ -11,6 +11,9 @@ from typing import Any, Mapping, Sequence
 from .federation import REGISTRY_VERSION, load_registry, now_iso, registry_path, save_registry
 
 CORPUS_STORE_ROOT_ENV = "CCE_CORPUS_STORE_ROOT"
+# What `git rev-parse` reports, with exit status 128, for a directory outside every work tree.
+NOT_A_REPOSITORY = "not a git repository"
+NOT_A_REPOSITORY_EXIT = 128
 
 
 class CorpusStoreError(ValueError):
@@ -45,16 +48,31 @@ def _run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
         check=False,
         capture_output=True,
         text=True,
+        env={**os.environ, "LC_ALL": "C"},  # git's messages are matched by text below
     )
 
 
 def _git_root(path: Path) -> Path | None:
-    result = _run_git(path, "rev-parse", "--show-toplevel")
+    """The work tree `path` sits in, or None when it sits in none.
+
+    None means exactly one thing: git said this is not a repository. Any other failure (no git
+    binary, a permission error, an ownership refusal) is raised, because treating it as "outside
+    every work tree" would let private text land somewhere Git can see.
+    """
+    try:
+        result = _run_git(path, "rev-parse", "--show-toplevel")
+    except OSError as exc:
+        raise CorpusStoreError(f"Could not run git to inspect {path}: {exc}") from exc
     if result.returncode != 0:
-        return None
+        if result.returncode == NOT_A_REPOSITORY_EXIT and NOT_A_REPOSITORY in result.stderr:
+            return None
+        raise CorpusStoreError(
+            f"git could not inspect {path} (exit {result.returncode}): "
+            f"{result.stderr.strip() or 'no message'}"
+        )
     value = result.stdout.strip()
     if not value:
-        return None
+        raise CorpusStoreError(f"git named no work tree for {path} although it reported success")
     return Path(value).resolve()
 
 
@@ -128,6 +146,22 @@ def _validate_git_custody(root: Path) -> Path | None:
             f"{git_root / visible_path}"
         )
     return git_root
+
+
+def require_git_private(directory: Path) -> Path:
+    """Refuse a directory that private text must not land in.
+
+    A directory outside any Git work tree is private. One inside a work tree must be ignored by
+    Git, so the files written there can never be staged by accident. Returns the resolved path.
+    """
+    resolved = _absolute_path(directory).resolve(strict=False)
+    probe = resolved
+    while not probe.exists():
+        probe = probe.parent
+    git_root = _git_root(probe)
+    if git_root is not None and not _git_path_is_ignored(git_root, resolved / ".private-probe"):
+        raise CorpusStoreError(f"Directory is Git-visible and cannot hold private text: {resolved}")
+    return resolved
 
 
 def _resolve_existing_store_root(root: Path) -> Path:

@@ -108,7 +108,7 @@ def build_analysis(paths: ArchivePaths) -> dict[str, Any]:
                 ],
             }
         )
-    write_jsonl_atomic(paths.analysis / "enrichment.jsonl", rows)
+    write_jsonl_atomic(paths.enrichment, rows)
     hub_table = {
         term: {
             "documents": len(members[term]),
@@ -130,12 +130,12 @@ def build_analysis(paths: ArchivePaths) -> dict[str, Any]:
             "similar_min": SIMILAR_MIN,
         },
     }
-    write_json_atomic(paths.analysis / "topics.json", {"hubs": hub_table, "summary": summary})
+    write_json_atomic(paths.topics, {"hubs": hub_table, "summary": summary})
     return summary
 
 
 def load_enrichment(paths: ArchivePaths) -> dict[str, dict[str, Any]]:
-    path = paths.analysis / "enrichment.jsonl"
+    path = paths.enrichment
     if not path.is_file():
         return {}
     return {row["uid"]: row for row in iter_jsonl(path)}

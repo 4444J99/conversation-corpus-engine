@@ -17,7 +17,7 @@ from .archive_model import (
 )
 
 PROVIDER = "claude"
-READER = "archive_read_claude@2"
+READER = "archive_read_claude@3"
 CONVERSATIONS = "conversations.json"
 TOOL_TEXT_LIMIT = 2000
 TOOL_INPUT_LIMIT = 200
@@ -65,7 +65,10 @@ def _cap(text: str, limit: int) -> str:
 
 
 def _entry_messages(entry: dict[str, Any], include_text: bool) -> list[Message]:
-    """One raw chat message becomes up to four: reasoning, the turn itself, tool calls, results."""
+    """One raw chat message becomes up to four: reasoning, the turn itself, tool calls, results.
+
+    Only the turn itself carries the vendor message uuid; the other three get minted ids.
+    """
     role = normalize_role(entry.get("sender"))
     ts = to_iso(entry.get("created_at"))
     texts: list[str] = []
@@ -97,7 +100,9 @@ def _entry_messages(entry: dict[str, Any], include_text: bool) -> list[Message]:
                 results.append(f"tool result: {result}")
     text = "\n\n".join(texts) if texts else str(entry.get("text") or "")
     attachments, extracted = _attachments(entry, include_text)
+    typed_chars: int | None = None
     if extracted:
+        typed_chars = len(clean_text(text).lstrip())
         text = f"{text}\n\n{extracted}".strip()
     out: list[Message] = []
     if thinking:
@@ -114,7 +119,15 @@ def _entry_messages(entry: dict[str, Any], include_text: bool) -> list[Message]:
         if names:
             meta["tools"] = sorted(names)
         out.append(
-            Message(role=role, text=clean_text(text), ts=ts, attachments=attachments, meta=meta)
+            Message(
+                role=role,
+                text=clean_text(text),
+                ts=ts,
+                attachments=attachments,
+                meta=meta,
+                id=str(entry.get("uuid") or ""),
+                typed_chars=typed_chars,
+            )
         )
     for lines in (calls, results):
         if lines:

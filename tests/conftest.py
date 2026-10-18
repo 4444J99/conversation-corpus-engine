@@ -7,7 +7,11 @@ from types import SimpleNamespace
 import pytest
 from archive_support import build_export
 
-from conversation_corpus_engine.archive_ingest import ArchivePaths, authorize_archive
+from conversation_corpus_engine.archive_ingest import (
+    DEFAULT_ARCHIVE_DIRNAME,
+    ArchivePaths,
+    authorize_archive,
+)
 from conversation_corpus_engine.corpus_store import register_corpus_store
 
 
@@ -42,7 +46,7 @@ def archive_env(tmp_path: Path):
     register_corpus_store(project, store)
     authorization = authorize_archive(
         project_root=project,
-        archive_root=store / "_archive",
+        archive_root=store / DEFAULT_ARCHIVE_DIRNAME,
         corpus_store_root=store,
         source_roots=(export,),
     )

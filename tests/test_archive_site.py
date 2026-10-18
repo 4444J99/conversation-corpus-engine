@@ -10,8 +10,8 @@ from html.parser import HTMLParser
 import pytest
 from archive_support import XSS, conv, topical_corpus, write_store
 
+from conversation_corpus_engine.archive_database import build_database
 from conversation_corpus_engine.archive_ingest import ingest
-from conversation_corpus_engine.archive_kb import build_kb
 from conversation_corpus_engine.archive_model import Message
 from conversation_corpus_engine.archive_serve import ArchiveServer, start_in_thread
 from conversation_corpus_engine.archive_site import build_site, render_message_html, render_page
@@ -35,7 +35,7 @@ class _Scripts(HTMLParser):
 def built(archive_env):
     ingest(export_root=archive_env.export, paths=archive_env.paths, authorization=archive_env.auth)
     build_analysis(archive_env.paths)
-    build_kb(archive_env.paths, archive_env.auth)
+    build_database(archive_env.paths, archive_env.auth)
     summary = build_site(archive_env.paths, archive_env.auth)
     return archive_env, summary
 
@@ -45,18 +45,18 @@ def test_site_has_shell_data_and_one_page_per_conversation(built) -> None:
     root = env.paths.site
     assert summary["pages"] == 24
     for name in (
-        "index.html",
-        "graph.html",
-        "style.css",
-        "app.js",
-        "graph.js",
-        "data/index.js",
-        "data/graph.js",
+        "home-all.html",
+        "graph-all.html",
+        "site-all.css",
+        "home-all.js",
+        "graph-all.js",
+        "index-all-conversations.js",
+        "index-all-topic-graph.js",
     ):
         assert (root / name).is_file(), name
-    page = root / "c" / "chatgpt" / "chatgpt-aaaa1111.html"
-    assert page.is_file()
-    payload = (root / "data" / "index.js").read_text(encoding="utf-8")
+    page = root / "conversations" / "conversation-chatgpt-aaaa1111.html"
+    assert page.is_file() and page == env.paths.site_page("chatgpt", "chatgpt-aaaa1111")
+    payload = (root / "index-all-conversations.js").read_text(encoding="utf-8")
     assert payload.startswith("window.CCE = ")
     data = json.loads(payload.removeprefix("window.CCE = ").rstrip(";\n"))
     assert len(data["index"]) == 24
@@ -71,7 +71,7 @@ def test_site_has_shell_data_and_one_page_per_conversation(built) -> None:
     assert data["totals"]["conversations"] == 24
     assert next(p for p in data["providers"] if p["name"] == "gemini")["not_read"]
     graph = json.loads(
-        (root / "data" / "graph.js")
+        (root / "index-all-topic-graph.js")
         .read_text(encoding="utf-8")
         .removeprefix("window.CCE_GRAPH = ")
         .rstrip(";\n")
@@ -83,7 +83,7 @@ def test_site_has_shell_data_and_one_page_per_conversation(built) -> None:
 
 def test_conversation_pages_escape_hostile_content_and_ship_no_scripts(built) -> None:
     env, _ = built
-    page = (env.paths.site / "c" / "chatgpt" / "chatgpt-aaaa1111.html").read_text(encoding="utf-8")
+    page = env.paths.site_page("chatgpt", "chatgpt-aaaa1111").read_text(encoding="utf-8")
     assert XSS not in page
     assert "&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;" in page
     parser = _Scripts()
@@ -113,13 +113,14 @@ def test_every_internal_link_resolves(built) -> None:
 
 def test_app_scripts_are_external_only_and_dom_safe(built) -> None:
     env, _ = built
-    index = (env.paths.site / "index.html").read_text(encoding="utf-8")
+    index = env.paths.site_home.read_text(encoding="utf-8")
     parser = _Scripts()
     parser.feed(index)
     assert all(s.get("src") for s in parser.scripts) and len(parser.scripts) == 2
-    app = (env.paths.site / "app.js").read_text(encoding="utf-8")
+    assert [s["src"] for s in parser.scripts] == ["index-all-conversations.js", "home-all.js"]
+    app = (env.paths.site / "home-all.js").read_text(encoding="utf-8")
     assert "innerHTML" not in app and "document.write" not in app and "eval(" not in app
-    graph_js = (env.paths.site / "graph.js").read_text(encoding="utf-8")
+    graph_js = (env.paths.site / "graph-all.js").read_text(encoding="utf-8")
     assert "innerHTML" not in graph_js
     assert "script-src &#x27;self&#x27;" in index
 
@@ -130,7 +131,7 @@ def test_collapsed_kinds_use_details_and_hostile_titles_are_escaped() -> None:
     )
     assert "<details><summary>Assistant · reasoning" in render_message_html(message)
     conversation = conv("grok", "t", '"><img src=x onerror=alert(1)>')
-    page = render_page(conversation, related=[], topics=['x"><b>'], titles={}, providers={})
+    page = render_page(conversation, related=[], topics=['x"><b>'], titles={})
     assert "<img" not in page and "onerror=alert" not in page.replace(
         "&quot;&gt;&lt;img src=x onerror=alert(1)&gt;", ""
     )
@@ -139,7 +140,7 @@ def test_collapsed_kinds_use_details_and_hostile_titles_are_escaped() -> None:
 
 def test_rebuild_prunes_pages_for_removed_conversations(built) -> None:
     env, first = built
-    stale = env.paths.site / "c" / "chatgpt" / "chatgpt-stale.html"
+    stale = env.paths.site_pages / "conversation-chatgpt-stale.html"
     stale.write_text("old", encoding="utf-8")
     again = build_site(env.paths, env.auth)
     assert again["removed_stale"] == 1 and not stale.exists()
@@ -186,17 +187,20 @@ def test_server_serves_static_pages_and_security_headers(server) -> None:
     assert headers["X-Content-Type-Options"] == "nosniff"
     assert headers["X-Frame-Options"] == "DENY"
     assert headers["Cache-Control"] == "no-store"
-    status, headers, _ = _get(server, "/app.js")
+    status, headers, _ = _get(server, "/home-all.js")
     assert status == 200 and headers["Content-Type"].startswith("text/javascript")
-    assert _get(server, "/c/chatgpt/chatgpt-aaaa1111.html")[0] == 200
+    assert _get(server, "/conversations/conversation-chatgpt-aaaa1111.html")[0] == 200
+    assert _get(server, "/index.html")[0] == 404, "the old entry-point name is gone"
 
 
 def test_server_blocks_traversal_bad_hosts_and_writes(server) -> None:
+    manifest = "manifest-all.json"
+    assert (server.paths.root / manifest).is_file(), "the probes aim at a file that exists"
     for attempt in (
-        "/../manifest.json",
-        "/%2e%2e/manifest.json",
-        "/..%2f..%2fmanifest.json",
-        "/c/../../manifest.json",
+        f"/../{manifest}",
+        f"/%2e%2e/{manifest}",
+        f"/..%2f..%2f{manifest}",
+        f"/conversations/../../{manifest}",
     ):
         assert _get(server, attempt)[0] == 404
     port = server.server_address[1]
@@ -234,10 +238,10 @@ def test_api_search_returns_best_hits_and_validates_input(server) -> None:
     assert len(big["results"]) <= 50
 
 
-def test_api_reports_missing_knowledge_base(archive_env) -> None:
+def test_api_reports_missing_search_database(archive_env) -> None:
     write_store(archive_env.paths, topical_corpus())
-    (archive_env.paths.site).mkdir(parents=True)
-    (archive_env.paths.site / "index.html").write_text("x", encoding="utf-8")
+    archive_env.paths.site.mkdir(parents=True)
+    archive_env.paths.site_home.write_text("x", encoding="utf-8")
     srv, thread = start_in_thread(archive_env.paths)
     try:
         assert _get(srv, "/api/search?q=kubernetes")[0] == 503
@@ -250,6 +254,6 @@ def test_api_reports_missing_knowledge_base(archive_env) -> None:
 def test_pages_survive_empty_conversations_and_missing_fields() -> None:
     conversation = conv("grok", "e", "")
     conversation.messages = []
-    page = render_page(conversation, related=[], topics=[], titles={}, providers={})
+    page = render_page(conversation, related=[], topics=[], titles={})
     assert "<title>Untitled</title>" in page
     assert "0 messages" in page
