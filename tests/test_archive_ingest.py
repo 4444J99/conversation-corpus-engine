@@ -126,9 +126,35 @@ def test_ingest_dedupes_by_uid_keeping_first(archive_env, tmp_path: Path) -> Non
         providers=["chatgpt"],
         overrides={"chatgpt": tmp_path / "gpt"},
     )
-    assert manifest["providers"]["chatgpt"]["duplicates_folded"] == 1
-    assert manifest["providers"]["chatgpt"]["conversations"] == 3
-    assert "duplicates_skipped" not in manifest["providers"]["chatgpt"]
+    info = manifest["providers"]["chatgpt"]
+    assert info["duplicates_folded"] == 1 and info["conversations"] == 3
+    # the repeat holds different content, and the first occurrence still wins
+    assert (info["duplicates_folded_identical"], info["duplicates_folded_differing"]) == (0, 1)
+    assert "duplicates_skipped" not in info
+    kept = next(c for c in iter_store(archive_env.paths) if c.source_id == "aaaa1111")
+    assert kept.title == "Kubernetes rollout planning"
+
+
+def test_duplicates_are_classified_as_identical_or_differing(archive_env, tmp_path: Path) -> None:
+    shard = tmp_path / "gpt"
+    shard.mkdir()
+    original = gpt_conversation("dup-a", "Original", [("user", "first"), ("assistant", "ok")])
+    changed = gpt_conversation("dup-a", "Original", [("user", "edited"), ("assistant", "ok")])
+    other = gpt_conversation("dup-b", "Other", [("user", "other ask")])
+    (shard / "conversations-000.json").write_text(
+        json.dumps([original, original, changed, other, other]), encoding="utf-8"
+    )
+    manifest = ingest(
+        export_root=tmp_path,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["chatgpt"],
+        overrides={"chatgpt": shard},
+    )
+    info = manifest["providers"]["chatgpt"]
+    assert info["conversations"] == 2
+    assert (info["duplicates_folded_identical"], info["duplicates_folded_differing"]) == (2, 1)
+    assert info["duplicates_folded"] == 3
 
 
 def test_manifest_records_versions_and_per_provider_counters(archive_env) -> None:
@@ -182,6 +208,7 @@ def test_identical_id_less_conversations_fold_into_one(archive_env, tmp_path: Pa
     )
     info = manifest["providers"]["chatgpt"]
     assert (info["conversations"], info["derived_ids"], info["duplicates_folded"]) == (1, 1, 1)
+    assert info["duplicates_folded_identical"] == 1 and info["duplicates_folded_differing"] == 0
 
 
 def test_fingerprint_is_the_same_on_two_hosts_and_moves_with_the_source(
