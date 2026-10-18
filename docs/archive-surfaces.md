@@ -56,7 +56,7 @@ build:
 
 | Path | What |
 |---|---|
-| `manifest-all.json` | per-provider counts, denominators (`derived_ids`, `duplicates_folded`, `duplicates_folded_identical`, `duplicates_folded_differing`), channels read / not read, source sha256, naming / schema / reader versions, source fingerprint |
+| `manifest-all.json` | per-provider counts, denominators (`derived_ids`, `unnameable_ids`, `duplicates_folded`, `duplicates_folded_identical`, `duplicates_folded_differing`), channels read / not read, source sha256, naming / schema / reader versions, source fingerprint |
 | `provider-<p>/collection-<p>-conversations.jsonl`, `provider-<p>/index-<p>-conversations.jsonl` | the provider-neutral store: full conversations, and one light summary row each |
 | `index-all-enrichment.jsonl`, `report-all-topics.json` | topics and nearest neighbours per conversation; the topic hub table |
 | `vault-all/` | open this folder in Obsidian |
@@ -81,7 +81,8 @@ those two commands exit non-zero and ask for `cce archive build`.
   `typed_chars`, the characters the person typed before any appended attachment text.
 - A conversation with **no vendor id** (or one the naming contract cannot express) gets
   `derived-<16hex>` over provider, creation stamp and the first three messages' text. The manifest
-  counts `derived_ids`.
+  counts `derived_ids`, and `unnameable_ids` for the subset that had a vendor id the contract
+  cannot express (see *Naming contract*).
 - A **repeated uid** keeps its first occurrence: every later conversation with the same uid is
   folded away, whether or not its content matches. The manifest counts them in
   `duplicates_folded`, split into `duplicates_folded_identical` (same content, wherever it was
@@ -202,7 +203,10 @@ word or `all`; a subject is validated, never derived from a title; an identity i
 vendor identifier used as-is or the first 16 hex characters of SHA-256 over the exact identity
 string; the date is a real calendar day taken from the data and appears only on kinds that require
 it. The conversation name is `conversation-` plus today's `stable_uid`, so existing uids are
-reproduced byte for byte. `NAMING_VERSION` is recorded in every receipt; adding a kind bumps it.
+reproduced byte for byte. One disclosed deviation from "`stable_uid` is frozen": a vendor id that
+is valid for `stable_uid` but that the contract cannot express as a name (an edge or doubled
+hyphen, or a name over 80 characters) is replaced by a derived id, with the original kept in
+`extra.vendor_id`, and the manifest counts it in `unnameable_ids`. `NAMING_VERSION` is recorded in every receipt; adding a kind bumps it.
 `cce archive names --json` prints the full table and `cce archive verify-names` checks a tree. Only
 three plain folder words are outside the grammar (`conversations`, `hubs`, `meta`); everything
 else a build writes is a minted name, which `verify-names` confirms on a whole archive folder.

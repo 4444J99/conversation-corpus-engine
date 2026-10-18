@@ -170,6 +170,7 @@ def test_manifest_records_versions_and_per_provider_counters(archive_env) -> Non
     }
     for info in manifest["providers"].values():
         assert info["derived_ids"] == 0 and info["duplicates_folded"] == 0
+        assert info["unnameable_ids"] == 0
     assert len(manifest["source_fingerprint"]) == 64
 
 
@@ -192,6 +193,33 @@ def test_id_less_conversations_each_get_their_own_derived_id(archive_env) -> Non
         assert conversation.extra["source_id_derived"] == "empty"
         assert conversation.messages and all(m.id for m in conversation.messages)
         assert not validate_name(conversation_name("chatgpt", conversation.uid))
+
+
+def test_an_unnameable_vendor_id_is_replaced_and_counted_apart_from_empty_ones(
+    archive_env, tmp_path: Path
+) -> None:
+    shard = tmp_path / "gpt"
+    shard.mkdir()
+    conversations = [
+        gpt_conversation("a--b", "Doubled hyphen", [("user", "first ask")]),
+        gpt_conversation("", "No id", [("user", "second ask")]),
+        gpt_conversation("fine-id", "Fine", [("user", "third ask")]),
+    ]
+    (shard / "conversations-000.json").write_text(json.dumps(conversations), encoding="utf-8")
+    manifest = ingest(
+        export_root=tmp_path,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["chatgpt"],
+        overrides={"chatgpt": shard},
+    )
+    info = manifest["providers"]["chatgpt"]
+    assert (info["conversations"], info["derived_ids"], info["unnameable_ids"]) == (3, 2, 1)
+    stored = {c.title: c for c in iter_store(archive_env.paths)}
+    assert stored["Doubled hyphen"].extra["vendor_id"] == "a--b"
+    assert stored["Doubled hyphen"].extra["source_id_derived"] == "unnameable"
+    assert stored["No id"].extra["source_id_derived"] == "empty"
+    assert stored["Fine"].source_id == "fine-id"
 
 
 def test_identical_id_less_conversations_fold_into_one(archive_env, tmp_path: Path) -> None:
