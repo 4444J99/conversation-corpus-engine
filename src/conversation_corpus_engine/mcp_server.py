@@ -126,7 +126,7 @@ class CceMcpServer:
             "title": "Search the AI Archive",
             "description": (
                 "Full-text search the private AI-conversation archive (ChatGPT, Claude, Gemini, "
-                "NotebookLM, Grok, Perplexity). Returns the best matching message per "
+                "NotebookLM, Grok, Perplexity, Copilot). Returns the best matching message per "
                 "conversation. Results are the user's private conversation text and record "
                 "speech acts, not verified events."
             ),

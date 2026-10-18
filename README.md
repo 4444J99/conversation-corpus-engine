@@ -105,8 +105,16 @@ cce-mcp --project-root /path/to/project --archive-root /path/to/private-corpus-s
 ```
 
 `cce archive` turns raw provider exports (ChatGPT, Claude, Gemini Takeout + NotebookLM, Grok,
-Perplexity) into an Obsidian vault/wiki, a static archive site, a SQLite FTS5 search database and
-a graph, all inside the private corpus store. See [docs/archive-surfaces.md](docs/archive-surfaces.md).
+Perplexity, Copilot) into an Obsidian vault/wiki, a static archive site, a SQLite FTS5 search
+database and a graph, all inside the private corpus store. See
+[docs/archive-surfaces.md](docs/archive-surfaces.md).
+
+The Copilot reader takes SingleFile captures of Copilot web research pages from a `copilot/` folder,
+or from any folder with `--source copilot=/path/to/copilot-captures`. Each recognized page becomes
+one search-kind conversation. It reads the `.html`/`.htm` pages that carry a Copilot SingleFile
+header; HTML that is not a Copilot page is skipped and counted, and every other file is counted by
+extension and never opened. The capture date is the only timestamp. The pages hold no user turn,
+and none is invented.
 
 Corpus-destination writers fail closed unless a store has first been registered and the
 configured root exactly matches that active registration. The
@@ -171,7 +179,7 @@ currently exposes:
 - `src/conversation_corpus_engine/corpus_diff.py` — live-vs-candidate structural and retrieval diffing
 - `src/conversation_corpus_engine/corpus_candidates.py` — corpus candidate stage/review/promote/rollback workflow
 - `src/conversation_corpus_engine/archive_model.py` — provider-neutral conversation schema, ids, time, atomic JSONL
-- `src/conversation_corpus_engine/archive_read_*.py` — streaming readers (chatgpt, claude, gemini, notebooklm, grok, perplexity)
+- `src/conversation_corpus_engine/archive_read_*.py` — streaming readers (chatgpt, claude, gemini, notebooklm, grok, perplexity, copilot)
 - `src/conversation_corpus_engine/archive_ingest.py` — normalized store, manifest denominators, custody gate
 - `src/conversation_corpus_engine/archive_topics.py` — TF-IDF topic hubs and cross-provider neighbours
 - `src/conversation_corpus_engine/archive_vault.py` / `archive_database.py` / `archive_graph.py` / `archive_site.py` / `archive_serve.py` — vault, search database, graph, site and loopback server

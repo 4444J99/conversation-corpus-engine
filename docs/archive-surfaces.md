@@ -47,12 +47,20 @@ cce archive search "kubernetes ingress" --provider claude --project-root … --c
 cce archive serve --project-root … --corpus-store-root …      # http://127.0.0.1:8765/
 ```
 
+The Copilot reader reads SingleFile captures of Copilot web research pages: `.html` or `.htm` files
+whose SingleFile header names the Copilot host. Each page becomes one conversation, the report
+rendered as markdown with its numbered sources kept in place and in `meta.citations`. The capture
+date is the only timestamp, and the pages hold no user turn (none is invented). HTML files that are
+not Copilot pages are skipped and counted, and every other file in the folder is counted by
+extension and never opened, so a folder of captures with other documents beside them can be read in
+place: `--source copilot=/path/to/copilot-captures`.
+
 `--export-root` expects one folder per provider: `chatgpt/`, `claude/`, `gemini/` (including
-`NotebookLM/`), `grok/`, `perplexity/`. Override any with `--source provider=PATH`. A ChatGPT
-account export is a snapshot; pass the live delta with `--chatgpt-extra delta.json` (it wins over
-the same conversation in the export). Output defaults to `<store>/archive-all/`. Every name below
-is minted by `derive_name` (see *Naming contract*), so `cce archive verify-names` accepts a whole
-build:
+`NotebookLM/`), `grok/`, `perplexity/`, `copilot/`. Override any with `--source provider=PATH`. A
+ChatGPT account export is a snapshot; pass the live delta with `--chatgpt-extra delta.json` (it wins
+over the same conversation in the export). Output defaults to `<store>/archive-all/`. Every name
+below is minted by `derive_name` (see *Naming contract*), so `cce archive verify-names` accepts a
+whole build:
 
 | Path | What |
 |---|---|

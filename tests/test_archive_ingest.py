@@ -43,16 +43,17 @@ def test_ingest_builds_store_manifest_and_denominators(archive_env) -> None:
         export_root=archive_env.export, paths=archive_env.paths, authorization=archive_env.auth
     )
     providers = manifest["providers"]
-    assert {n: i["status"] for n, i in providers.items()} == dict.fromkeys(
-        ["chatgpt", "claude", "gemini", "notebooklm", "grok", "perplexity"], "ok"
-    )
+    assert {n: i["status"] for n, i in providers.items()} == {
+        **dict.fromkeys(["chatgpt", "claude", "gemini", "notebooklm", "grok", "perplexity"], "ok"),
+        "copilot": "absent",
+    }
     assert providers["chatgpt"]["conversations"] == 3
     assert providers["chatgpt"]["empty_conversations"] == 1
     assert providers["claude"]["kinds"] == {"chat": 3, "memory": 1, "notebook": 1}
     assert providers["gemini"]["reader_counters"]["skipped_deleted_turns"] == 1
     assert providers["notebooklm"]["conversations"] == 1
     assert manifest["totals"]["conversations"] == sum(
-        i["conversations"] for i in providers.values()
+        i.get("conversations", 0) for i in providers.values()
     )
     assert providers["chatgpt"]["source_files"]["conversations-000.json"]
     assert providers["gemini"]["channels"]["not_read"]
@@ -169,6 +170,8 @@ def test_manifest_records_versions_and_per_provider_counters(archive_env) -> Non
         name: spec.module.READER for name, spec in PROVIDER_SPECS.items()
     }
     for info in manifest["providers"].values():
+        if info["status"] == "absent":  # the shared export has no copilot/ folder
+            continue
         assert info["derived_ids"] == 0 and info["duplicates_folded"] == 0
         assert info["unnameable_ids"] == 0
     assert len(manifest["source_fingerprint"]) == 64

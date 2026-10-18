@@ -39,7 +39,7 @@ STYLE_CSS = """\
   --bg: #fbfaf8; --fg: #1d1c1a; --muted: #6a665f; --line: #e2ded6; --card: #ffffff;
   --accent: #2b5fd9; --mark: #fff0a8;
   --chatgpt: #10a37f; --claude: #d97757; --gemini: #4285f4; --notebooklm: #8e6bd6;
-  --grok: #7a7a7a; --perplexity: #20b8cd;
+  --grok: #7a7a7a; --perplexity: #20b8cd; --copilot: #d6409f;
 }
 :root[data-theme="dark"] {
   --bg: #15151a; --fg: #ece9e2; --muted: #9a968d; --line: #2c2c34; --card: #1d1d24;
@@ -76,6 +76,7 @@ input[type="search"] { flex: 1 1 280px; min-width: 0; }
 .dot.chatgpt { background: var(--chatgpt); } .dot.claude { background: var(--claude); }
 .dot.gemini { background: var(--gemini); } .dot.notebooklm { background: var(--notebooklm); }
 .dot.grok { background: var(--grok); } .dot.perplexity { background: var(--perplexity); }
+.dot.copilot { background: var(--copilot); }
 .results { list-style: none; margin: 0; padding: 0; display: grid; gap: 10px; }
 .result { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
   padding: 12px 14px; }
@@ -398,7 +399,7 @@ GRAPH_JS = """\
   var canvas = document.getElementById('map');
   var tip = document.getElementById('tip');
   var COLORS = { chatgpt: '#10a37f', claude: '#d97757', gemini: '#4285f4', notebooklm: '#8e6bd6',
-                 grok: '#7a7a7a', perplexity: '#20b8cd' };
+                 grok: '#7a7a7a', perplexity: '#20b8cd', copilot: '#d6409f' };
   var nodes = G.nodes.map(function (n, i) {
     var a = (i / G.nodes.length) * Math.PI * 2;
     return { id: n.id, label: n.label, n: n.n, color: COLORS[n.dominant] || '#888',
