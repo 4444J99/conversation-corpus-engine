@@ -5,8 +5,10 @@ A name is a kind word followed by up to four more segments, joined by single hyp
     name = kind [-scope] [-subject] [-identity] [-date]
 
 * kind: one word from the closed table in KIND_TABLE. The table says, per kind, which
-  segments are required, optional or forbidden. Adding a kind bumps NAMING_VERSION;
-  removing or renaming one is forbidden.
+  segments are required, optional or forbidden. Adding a kind, or widening what a kind
+  accepts, bumps NAMING_VERSION; removing or renaming one is forbidden. Names minted under an
+  earlier version stay valid under a later one.
+  Version notes: 1 the first table; 2 the `manifest` kind accepts an optional subject.
 * scope: a provider word (see PROVIDER_SCOPES) or the word `all`.
 * subject: lowercase words `[a-z0-9]+` joined by hyphens, at most 32 characters. A subject is
   validated, never transformed: a title, prompt text or free text is not a subject.
@@ -41,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-NAMING_VERSION = 1
+NAMING_VERSION = 2
 
 MAX_NAME_LENGTH = 80
 MAX_SUBJECT_LENGTH = 32

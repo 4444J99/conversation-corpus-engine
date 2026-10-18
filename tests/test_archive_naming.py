@@ -174,7 +174,7 @@ def test_derive_is_pure_and_repeatable() -> None:
 
 def test_kind_table_is_the_closed_spec_list_in_order() -> None:
     assert list(KINDS) == SPEC_KINDS
-    assert NAMING_VERSION == 1
+    assert NAMING_VERSION == 2
 
 
 def test_every_kind_is_one_lowercase_word_and_not_a_scope() -> None:
@@ -540,7 +540,10 @@ def test_names_payload_lists_every_kind_with_its_rule() -> None:
         "hash",
     )
     json.dumps(payload)  # serializable
-    assert "kind" in naming.render_names_text() and "version 1" in naming.render_names_text()
+    assert (
+        "kind" in naming.render_names_text()
+        and f"version {NAMING_VERSION}" in naming.render_names_text()
+    )
 
 
 def test_names_command_prints_the_contract_as_json(monkeypatch, capsys) -> None:
