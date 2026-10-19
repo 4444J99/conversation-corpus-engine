@@ -20,6 +20,11 @@ archive_layout.py mints every file, folder and note name (and every wikilink) wi
 
 ## Privacy model
 
+An opt-in [encrypted publication layer](encrypted-publication.md) can package explicitly selected
+private files as ciphertext in a separate dedicated Git worktree. It does not change any of the
+plaintext write rules below. Its keys, selections, manifests after decryption and restored files
+remain private; ordinary `archive` commands never write plaintext into that publication tree.
+
 - Raw exports are read, never written, moved or deduplicated. Output may not overlap a source root.
 - Every write goes through `authorize_corpus_write`: the destination must be a strict descendant of
   a registered, non-symlinked, non-Git corpus store (see `cce corpus-store register`).
