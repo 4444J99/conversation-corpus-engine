@@ -26,7 +26,13 @@ Repository = "https://github.com/organvm-i-theoria/conversation-corpus-engine"
 Issues = "https://github.com/organvm-i-theoria/conversation-corpus-engine/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=9.0.3", "ruff>=0.15.8,<0.16", "mypy>=1.10.0"]
+# Pin CI-executed dev tooling to the known-good versions recorded in uv.lock. CI installs
+# via `pip install -e ".[dev]"` (which ignores the lockfile), so unpinned ranges
+# let pip pull whatever pytest/ruff is newest at run time. A newer ruff with
+# formatter or lint-rule changes silently breaks `ruff check` / `ruff format --check`
+# on every PR even though no source changed. Pinning keeps CI reproducible; bump
+# these deliberately.
+dev = ["pytest==9.0.3", "ruff==0.15.8", "mypy>=1.10.0"]
 mcp = []
 
 [project.scripts]
