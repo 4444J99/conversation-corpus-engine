@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from markdown_it import MarkdownIt
 
 
 @pytest.fixture
@@ -277,4 +278,23 @@ def test_split_never_cuts_through_a_backtick_delimiter(packer, tmp_path):
     row = json.loads(output.joinpath(".cce-package/ledger.jsonl").read_text())
     for piece in row["pieces"]:
         assert piece["source_end"] not in {2047, 2048, len(raw) - 2, len(raw) - 1}
+    assert b"".join(packer.reconstruct(output, "note.md")) == raw
+
+
+def test_multiline_inline_code_preserves_literal_images_across_parts(packer, tmp_path):
+    raw = (
+        b"prefix `first\n"
+        + b"a" * 2047
+        + b"![pixel](https://example.invalid/)"
+        + b"b" * 2200
+        + b"\nlast`\n"
+    )
+    _, output, _ = build(packer, tmp_path, {"note.md": raw})
+    parser = MarkdownIt("commonmark")
+    for path in output.glob("note.__part*.md"):
+        queue = parser.parse(path.read_text())
+        while queue:
+            token = queue.pop()
+            assert token.type != "image"
+            queue.extend(token.children or [])
     assert b"".join(packer.reconstruct(output, "note.md")) == raw

@@ -70,12 +70,97 @@ def publish_manifest(path, data, budget):
     temporary.unlink()
 
 
+def preserve_existing(output, findings, before, prior_hash, budget):
+    """Retire one verified derivative marker only after its changed files have custody."""
+    manifest_path = output / base.META / "manifest.json"
+    base.require(base.hash_file(manifest_path, budget) == prior_hash, "prior manifest mismatch")
+    prior = json.loads(base.read_source(manifest_path, 16 * 1024**2))
+    base.require(
+        prior.get("status") == "verified" and prior.get("schema") == base.SCHEMA,
+        "prior package is not verified",
+    )
+    base.require(
+        prior.get("repair", {}).get("source_metadata_sha256") == before
+        and prior["repair"].get("source_metadata_unchanged") is True,
+        "prior repair has another original source",
+    )
+    _count, budget.written = inventory(output, budget)
+    current = metadata(output, budget)
+    base.require(
+        current["ledger.jsonl"] == prior["ledger_sha256"]
+        and current["sources.jsonl"] == prior["source_inventory_sha256"]
+        and current["navigation.sqlite"] == prior["navigation_sha256"],
+        "prior package metadata mismatch",
+    )
+    old_parts = set()
+    old_records = set()
+    expected = {}
+    ledger = output / base.META / "ledger.jsonl"
+    with ledger.open() as stream:
+        for line in stream:
+            budget.check()
+            row = json.loads(line)
+            wrapped = {
+                p["path"] for p in row["pieces"] if p.get("inline_before") or p.get("inline_after")
+            }
+            old_parts.update(wrapped)
+            if wrapped:
+                old_records.add(row["path"])
+            if wrapped or row["path"] in findings:
+                expected.update((p["path"], p) for p in row["pieces"])
+    requested = {part for spans in findings.values() for span in spans for part in span["parts"]}
+    union = old_parts | requested
+    base.require(union <= expected.keys(), "audit part absent from prior ledger")
+    history = output / base.META / "repair-history" / prior_hash
+    base.require(not history.exists(), "repair history already exists")
+    base.private_dir(history.parent)
+    history.mkdir(mode=0o700)
+    budget.charge(ledger.stat().st_size)
+    clone_file(ledger, history / "ledger.jsonl.bin")
+    base.require(
+        base.hash_file(history / "ledger.jsonl.bin", budget) == current["ledger.jsonl"],
+        "ledger history copy mismatch",
+    )
+    preserved = []
+    for relative in sorted(union):
+        path = output / relative
+        base.safe_path(path)
+        base.require(path.resolve().is_relative_to(output.resolve()), "history part outside output")
+        piece = expected[relative]
+        base.require(
+            path.stat().st_size == piece["bytes"]
+            and base.hash_file(path, budget) == piece["sha256"],
+            "prior rendered piece mismatch",
+        )
+        target = history / "parts" / (relative + ".bin")
+        base.private_dir(target.parent)
+        budget.charge(piece["bytes"])
+        clone_file(path, target)
+        base.require(
+            base.hash_file(target, budget) == piece["sha256"], "part history copy mismatch"
+        )
+        preserved.append({"path": relative, "bytes": piece["bytes"], "sha256": piece["sha256"]})
+    history_receipt = {
+        "schema": "cce.obsidian-repair-history.v1",
+        "prior_manifest_sha256": prior_hash,
+        "prior_ledger_sha256": current["ledger.jsonl"],
+        "parts": preserved,
+    }
+    base.write(history / "history.json", base.encoded(history_receipt), budget)
+    # The completed marker leaves the live package before the first body write.
+    base.require(base.hash_file(manifest_path, budget) == prior_hash, "prior manifest changed")
+    manifest_path.rename(history / "manifest.json.bin")
+    return old_parts, old_records, history.relative_to(output).as_posix(), prior
+
+
 def repair(
     source,
     output,
     audit_path,
     *,
     clone_receipt=None,
+    repair_existing=False,
+    prior_manifest_sha256=None,
     max_output_bytes=8 * 1024**3,
     max_seconds=1800,
 ):
@@ -99,7 +184,16 @@ def repair(
         "derived output must stay outside the canonical generation",
     )
     base.require(max_seconds > 0 and max_output_bytes > 0, "invalid repair limits")
-    base.require(clone_receipt is not None or not output.exists(), "output already exists")
+    base.require(
+        repair_existing == (prior_manifest_sha256 is not None),
+        "prior manifest requires explicit repair-existing mode",
+    )
+    base.require(
+        not repair_existing or clone_receipt is None, "existing repair cannot use a clone receipt"
+    )
+    base.require(
+        repair_existing or clone_receipt is not None or not output.exists(), "output already exists"
+    )
     budget = base.Budget(output, max_output_bytes, max_seconds)
     with base.deadline(max_seconds):
         before = metadata(source, budget)
@@ -120,7 +214,15 @@ def repair(
         base.require(
             sum(map(len, findings.values())) == audit["crossing_spans"], "audit span count mismatch"
         )
-        if clone_receipt is not None:
+        old_parts = set()
+        old_records = set()
+        history_path = None
+        prior = None
+        if repair_existing:
+            old_parts, old_records, history_path, prior = preserve_existing(
+                output, findings, before, prior_manifest_sha256, budget
+            )
+        elif clone_receipt is not None:
             receipt = json.loads(Path(clone_receipt).read_text())
             base.require(
                 receipt.get("schema") == "cce.obsidian-cow-clone.v1"
@@ -167,15 +269,18 @@ def repair(
         temporary = ledger.with_name("ledger.inline-repair-tmp")
         old_ledger_size = ledger.stat().st_size
         changed = set()
+        wrapped_parts = set()
         seen = set()
         added_bytes = 0
-        with base.private_file(temporary) as target, ledger.open() as original:
+        original_ledger = source / base.META / "ledger.jsonl" if repair_existing else ledger
+        with base.private_file(temporary) as target, original_ledger.open() as original:
             for line in original:
                 budget.check()
                 row = json.loads(line)
                 spans = findings.get(row["path"], [])
-                if spans:
-                    seen.add(row["path"])
+                if spans or row["path"] in old_records:
+                    if spans:
+                        seen.add(row["path"])
                     base.require(
                         0
                         <= row["bytes"]
@@ -223,14 +328,22 @@ def repair(
                             if span["span_start"] < piece["source_end"] < span["span_end"]:
                                 base.require(not suffix, "overlapping audit spans")
                                 suffix = b" " + delimiter + b"\n"
-                        if not (prefix or suffix):
+                        if not (prefix or suffix) and piece["path"] not in old_parts:
                             continue
                         path = output / piece["path"]
                         base.safe_path(path)
                         base.require(
                             path.resolve().is_relative_to(output.resolve()), "piece outside output"
                         )
-                        data = base.read_source(path, manifest["max_note_bytes"])
+                        original_path = source / piece["path"] if repair_existing else path
+                        base.safe_path(original_path)
+                        base.require(
+                            original_path.resolve().is_relative_to(
+                                (source if repair_existing else output).resolve()
+                            ),
+                            "original part outside package",
+                        )
+                        data = base.read_source(original_path, manifest["max_note_bytes"])
                         base.require(
                             len(data) == piece["bytes"] and base.digest(data) == piece["sha256"],
                             "clone piece mismatch",
@@ -252,11 +365,19 @@ def repair(
                             inline_after=suffix.decode(),
                         )
                         changed.add(piece["path"])
+                        if prefix or suffix:
+                            wrapped_parts.add(piece["path"])
                 payload = base.encoded(row)
                 budget.charge(len(payload))
                 target.write(payload)
         base.require(seen == set(findings), "audit source absent from ledger")
-        base.require(len(changed) == audit["affected_parts"], "audit repaired part count mismatch")
+        expected_parts = {
+            part for spans in findings.values() for span in spans for part in span["parts"]
+        }
+        base.require(wrapped_parts == expected_parts, "audit repaired part identities mismatch")
+        base.require(
+            len(wrapped_parts) == audit["affected_parts"], "audit repaired part count mismatch"
+        )
         temporary.replace(ledger)
         budget.written -= old_ledger_size
         manifest["ledger_sha256"] = base.hash_file(ledger, budget)
@@ -266,13 +387,20 @@ def repair(
             "source_manifest_sha256": before["manifest.json"],
             "audit_sha256": base.digest(audit_bytes),
             "affected_notes": len(seen),
-            "affected_parts": len(changed),
+            "affected_parts": len(wrapped_parts),
+            "rewritten_parts": len(changed),
+            "reverted_parts": len(changed - wrapped_parts),
             "added_wrapper_bytes": added_bytes,
             "source_metadata_sha256": before,
             "source_metadata_unchanged": False,
             "body_bytes_unchanged": True,
             "native_obsidian_acceptance": "unverified",
         }
+        if history_path:
+            manifest["repair"].update(
+                history_path=history_path, prior_manifest_sha256=prior_manifest_sha256
+            )
+            manifest["repair_history"] = prior.get("repair_history", []) + [history_path]
         base.verify_package(output, budget=budget, expected=manifest)
         base.require(metadata(source, budget) == before, "source package metadata changed")
         manifest["repair"]["source_metadata_unchanged"] = True
@@ -290,6 +418,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--audit", type=Path, required=True)
     parser.add_argument("--clone-receipt", type=Path)
+    parser.add_argument("--repair-existing", action="store_true")
+    parser.add_argument("--prior-manifest-sha256")
     parser.add_argument("--max-output-bytes", type=int, default=8 * 1024**3)
     parser.add_argument("--max-seconds", type=int, default=1800)
     args = parser.parse_args()
@@ -301,6 +431,8 @@ def main():
                 args.output,
                 args.audit,
                 clone_receipt=args.clone_receipt,
+                repair_existing=args.repair_existing,
+                prior_manifest_sha256=args.prior_manifest_sha256,
                 max_output_bytes=args.max_output_bytes,
                 max_seconds=args.max_seconds,
             ),

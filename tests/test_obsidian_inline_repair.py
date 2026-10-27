@@ -224,3 +224,97 @@ def test_manifest_sync_failure_never_creates_completion_marker(repairer, tmp_pat
         repairer.repair(source, output, audit)
     assert not (output / repairer.base.META / "manifest.json").exists()
     assert (output / repairer.base.META / "manifest.inline-repair-tmp").is_file()
+
+
+def test_existing_repair_reverts_obsolete_wrappers_from_v1_and_preserves_history(
+    repairer, tmp_path
+):
+    source, audit, raw = fixture(repairer, tmp_path)
+    output = tmp_path / "v2"
+    repairer.repair(source, output, audit)
+    before = {str(p.relative_to(output)): p.read_bytes() for p in output.rglob("*") if p.is_file()}
+    prior = repairer.base.digest(before[".cce-package/manifest.json"])
+    corrected = json.loads(audit.read_text())
+    corrected.update(findings=[], crossing_spans=0, affected_notes=0, affected_parts=0)
+    audit.write_bytes(repairer.base.encoded(corrected))
+    result = repairer.repair(
+        source, output, audit, repair_existing=True, prior_manifest_sha256=prior
+    )
+    assert result["repair"]["affected_parts"] == 0
+    assert result["repair"]["rewritten_parts"] == 2
+    assert result["repair"]["reverted_parts"] == 2
+    assert output.joinpath("part0.md").read_bytes() == source.joinpath("part0.md").read_bytes()
+    history = output / result["repair"]["history_path"]
+    assert (
+        history.joinpath("manifest.json.bin").read_bytes() == before[".cce-package/manifest.json"]
+    )
+    assert history.joinpath("ledger.jsonl.bin").read_bytes() == before[".cce-package/ledger.jsonl"]
+    assert history.joinpath("parts/part0.md.bin").read_bytes() == before["part0.md"]
+    assert not list(history.rglob("*.md"))
+    assert b"".join(repairer.base.reconstruct(output, "original.md")) == raw
+
+
+def test_existing_repair_requires_exact_prior_manifest_before_any_mutation(repairer, tmp_path):
+    source, audit, _ = fixture(repairer, tmp_path)
+    output = tmp_path / "v2"
+    repairer.repair(source, output, audit)
+    before = {str(p.relative_to(output)): p.read_bytes() for p in output.rglob("*") if p.is_file()}
+    with pytest.raises(ValueError, match="prior manifest"):
+        repairer.repair(source, output, audit, repair_existing=True, prior_manifest_sha256="0" * 64)
+    assert before == {
+        str(p.relative_to(output)): p.read_bytes() for p in output.rglob("*") if p.is_file()
+    }
+
+
+def test_existing_repair_rebuilds_from_original_without_double_wrapping(repairer, tmp_path):
+    source, audit, raw = fixture(repairer, tmp_path)
+    output = tmp_path / "v2"
+    repairer.repair(source, output, audit)
+    parts = {p.name: p.read_bytes() for p in output.glob("*.md")}
+    prior = repairer.base.hash_file(output / repairer.base.META / "manifest.json")
+    repairer.repair(source, output, audit, repair_existing=True, prior_manifest_sha256=prior)
+    assert parts == {p.name: p.read_bytes() for p in output.glob("*.md")}
+    assert b"".join(repairer.base.reconstruct(output, "original.md")) == raw
+
+
+def test_existing_repair_failure_preserves_history_and_removes_completion(
+    repairer, tmp_path, monkeypatch
+):
+    source, audit, _ = fixture(repairer, tmp_path)
+    output = tmp_path / "v2"
+    repairer.repair(source, output, audit)
+    marker = output / repairer.base.META / "manifest.json"
+    old = marker.read_bytes()
+    prior = repairer.base.digest(old)
+
+    def fail(*args, **kwargs):
+        raise ValueError("forced final verification failure")
+
+    monkeypatch.setattr(repairer.base, "verify_package", fail)
+    with pytest.raises(ValueError, match="forced final"):
+        repairer.repair(source, output, audit, repair_existing=True, prior_manifest_sha256=prior)
+    assert not marker.exists()
+    assert (
+        output / repairer.base.META / "repair-history" / prior / "manifest.json.bin"
+    ).read_bytes() == old
+
+
+def test_existing_history_copy_is_charged_to_the_output_cap(repairer, tmp_path):
+    source, audit, _ = fixture(repairer, tmp_path)
+    output = tmp_path / "v2"
+    repairer.repair(source, output, audit)
+    marker = output / repairer.base.META / "manifest.json"
+    prior = repairer.base.hash_file(marker)
+    existing = sum(p.stat().st_size for p in output.rglob("*") if p.is_file())
+    maximum = existing + (output / repairer.base.META / "ledger.jsonl").stat().st_size - 1
+    with pytest.raises(ValueError, match="budget"):
+        repairer.repair(
+            source,
+            output,
+            audit,
+            repair_existing=True,
+            prior_manifest_sha256=prior,
+            max_output_bytes=maximum,
+        )
+    assert sum(p.stat().st_size for p in output.rglob("*") if p.is_file()) <= maximum
+    assert repairer.base.hash_file(marker) == prior
