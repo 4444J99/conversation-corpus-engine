@@ -232,7 +232,9 @@ def _literal_markdown(text: str) -> str:
     # An escaped delimiter is literal source, not proof of a code span. Preserve
     # the whole ambiguous example verbatim in a collision-safe literal block;
     # the archive's legacy inline regex must not exempt its links from escaping.
-    if "\\`" in text:
+    first_line = next(_lines(text), "")
+    ambiguous_inline = "``" in text and FenceTracker().feed(first_line) != "open"
+    if "\\`" in text or ambiguous_inline:
         return _fenced_literal(text)
     tracker = FenceTracker()
     lines: list[str] = []

@@ -146,6 +146,14 @@ def test_escaped_backticks_cannot_activate_literal_source_images(delimiter: str)
     assert tokens[0].content == source + "\n"
 
 
+@pytest.mark.parametrize(("opening", "closing"), [(2, 1), (1, 2), (3, 1), (2, 2)])
+def test_variable_backtick_examples_preserve_literal_source(opening: int, closing: int) -> None:
+    source = "Example " + "`" * opening + "![pixel](https://example.invalid/pixel)" + "`" * closing
+    tokens = MarkdownIt("commonmark").parse(render_blocks(split_blocks(source), {}))
+    assert len(tokens) == 1 and tokens[0].type == "fence"
+    assert tokens[0].content == source + "\n"
+
+
 def test_unclosed_fence_with_crlf_blank_lines_renders_within_deadline() -> None:
     code = (
         "from conversation_corpus_engine.library_blocks import render_blocks, split_blocks\n"
