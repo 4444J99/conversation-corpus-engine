@@ -12,6 +12,7 @@ from .answering import build_answer, render_answer_text, search_documents_v4
 from .archive_database import open_database, search, search_titles
 from .archive_ingest import ArchivePaths
 from .federation import list_registered_corpora, validate_corpus_root
+from .library_commands import STORE_ENV
 from .paths import default_project_root as default_project_root_path
 from .paths import resolve_workspace_path
 from .surface_exports import build_mcp_context_payload
@@ -259,7 +260,10 @@ class CceMcpServer:
             if name == ARCHIVE_TOOL and self.archive_root is not None:
                 return self.archive_search(args)
             if name in library_mcp.LIBRARY_TOOLS and self.library_store_root is not None:
-                result = library_mcp.call_tool(self.library_store_root, name, args)
+                try:
+                    result = library_mcp.call_tool(self.library_store_root, name, args)
+                except KeyError as exc:
+                    raise ValueError("library record, version or digest not found") from exc
                 return text_result(pretty_json(result), result)
         except (ValueError, FileNotFoundError) as exc:
             return text_result(str(exc), {"error": str(exc)}, is_error=True)
@@ -505,8 +509,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="store_true")
     parser.add_argument(
-        "--library-store-root", type=Path,
-        default=Path(os.environ["CCE_LIBRARY_STORE_ROOT"]) if os.environ.get("CCE_LIBRARY_STORE_ROOT") else None,
+        "--library-store-root",
+        type=Path,
+        default=Path(os.environ[STORE_ENV]) if os.environ.get(STORE_ENV) else None,
         help="enable bounded unified-library search/read/history over this registered private store",
     )
     return parser

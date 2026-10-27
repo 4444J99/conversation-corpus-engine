@@ -29,10 +29,11 @@ cce library read RECORD_UID --store-root /private/store --message 0 --offset 0 -
 cce library history RECORD_UID --store-root /private/store
 cce library read RECORD_UID --store-root /private/store --version 1.1.0
 cce library read RECORD_UID --store-root /private/store --digest SNAPSHOT_SHA256
+cce library read RECORD_UID --store-root /private/store --sequence alternate --message 0 --limit 12000
 cce library verify --store-root /private/store
 ```
 
-`CCE_LIBRARY_STORE_ROOT` supplies the store when a command omits it; the existing `CCE_CORPUS_STORE_ROOT` is a fallback. Search returns an exact total, bounded excerpts, stable record identities, vault paths and the next offset. Read retrieves one message span; history and digest selection also expose retained snapshots that were not selected as the current body. `cce-mcp --library-store-root /private/store` adds three read-only tools: `cce_library_search`, `cce_library_read`, and `cce_library_history`. Clients cannot choose arbitrary filesystem paths through these tools.
+`CCE_LIBRARY_STORE_ROOT` supplies the store when a command omits it; the existing `CCE_CORPUS_STORE_ROOT` is a fallback. Search returns an exact total, bounded excerpts, stable record identities, vault paths and the next offset. Read retrieves one message span and reports main/alternate sequence counts; use `--sequence alternate` (MCP `sequence: "alternate"`) to page retained conversation branches. History and digest selection also expose retained snapshots that were not selected as the current body. `cce-mcp --library-store-root /private/store` adds three read-only tools: `cce_library_search`, `cce_library_read`, and `cce_library_history`. Clients cannot choose arbitrary filesystem paths through these tools.
 
 ## Source manifest
 

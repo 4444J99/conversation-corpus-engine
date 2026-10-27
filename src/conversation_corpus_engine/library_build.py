@@ -8,6 +8,7 @@ import json
 import os
 import shutil
 import signal
+import sqlite3
 import threading
 import time
 import uuid
@@ -22,13 +23,18 @@ from .corpus_store import authorize_corpus_write
 from .library_documents import iter_documents
 from .library_native import iter_estate
 from .library_resume import prepare_resume
-from .library_store import Library, digest_json
+from .library_store import LIBRARY_SCHEMA, SCHEMA_SQL, Library, digest_json
 
 SOURCES_SCHEMA = "cce.library-sources.v1"
 REPORT_SCHEMA = "cce.library-build.v1"
 DIRECTORY = "library-all"
 POINTER = "current.json"
 DEFAULT_LIMITS = {"max_records": 100000, "max_seconds": 1800, "max_output_bytes": 8 * 1024**3}
+FAILURE_RESERVE = 4096
+
+
+def _json_bytes(value: Any) -> bytes:
+    return (json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
 
 
 def private_json(path: Path, value: Any) -> None:
@@ -36,7 +42,7 @@ def private_json(path: Path, value: Any) -> None:
     temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     with temp.open("x", encoding="utf-8") as stream:
         temp.chmod(0o600)
-        stream.write(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        stream.write(_json_bytes(value).decode("utf-8"))
         stream.flush()
         os.fsync(stream.fileno())
     temp.replace(path)
@@ -158,6 +164,9 @@ def build_library(
     """Build a private immutable candidate; publication is a separate explicit operation."""
     limits = _validate_manifest(manifest)
     started = time.monotonic()
+    working_budget = limits["max_output_bytes"] - FAILURE_RESERVE
+    if working_budget <= 0:
+        raise ValueError("library output byte limit cannot reserve failure evidence")
     store_root = store_root.expanduser().absolute()
     previous_pointer = _pointer(store_root)
     previous = current_generation(store_root)
@@ -249,16 +258,30 @@ def build_library(
         }
         if "inherited_report" in seed_report:
             report["inherited_report"] = seed_report["inherited_report"]
-    private_json(destination / "sources.json", manifest)
-    private_json(destination / "build-state.json", {"state": "building", "report": report})
-
     planned_output_bytes = 0
     measured_database_bytes = 0
+    receipt_bytes = 0
     next_size_check = 0.0
+
+    def write_receipt(filename: str, value: Any, *, failure: bool = False) -> None:
+        nonlocal receipt_bytes, measured_database_bytes
+        # Checkpoints are infrequent. Measure all actual bytes here, including
+        # old receipts retained during the atomic temporary-file replacement.
+        current = sum(path.stat().st_size for path in destination.rglob("*") if path.is_file())
+        ceiling = limits["max_output_bytes"] if failure else working_budget
+        if current + len(_json_bytes(value)) > ceiling:
+            raise ValueError("library output byte limit exceeded by receipt")
+        private_json(destination / filename, value)
+        receipt_bytes = sum(
+            path.stat().st_size
+            for name in ("sources.json", "build-state.json", "report.json")
+            if (path := destination / name).is_file()
+        )
+        database = destination / "library.sqlite"
+        measured_database_bytes = database.stat().st_size if database.is_file() else 0
 
     def check_bound(*, record: bool = False, bytes_written: int = 0) -> None:
         nonlocal planned_output_bytes, measured_database_bytes, next_size_check
-        planned_output_bytes += bytes_written
         now = time.monotonic()
         if now - started > limits["max_seconds"]:
             raise ValueError("library execution deadline exceeded")
@@ -268,8 +291,12 @@ def build_library(
         if record or now >= next_size_check:
             measured_database_bytes = database.stat().st_size if database.exists() else 0
             next_size_check = now + 0.25
-        if measured_database_bytes + planned_output_bytes > limits["max_output_bytes"]:
+        if (
+            measured_database_bytes + planned_output_bytes + bytes_written + receipt_bytes
+            > working_budget
+        ):
             raise ValueError("library output byte limit exceeded")
+        planned_output_bytes += bytes_written
 
     def hash_file(path: Path) -> str:
         digest = hashlib.sha256()
@@ -297,9 +324,32 @@ def build_library(
             raise ValueError("current library pointer changed during resume copy")
 
     try:
+        write_receipt("sources.json", manifest)
+        write_receipt("build-state.json", {"state": "building", "report": report})
         assert_resume_unchanged()
         if resume is not None and progress:
             progress({"stage": "copy_resume", "generation": str(resume_generation)})
+        database_source = (
+            resume["database"]
+            if resume is not None
+            else previous / "library.sqlite"
+            if previous
+            else None
+        )
+        if database_source is not None:
+            initial_database_bytes = database_source.stat().st_size
+        else:
+            # Establish the actual empty-schema size without creating an
+            # over-budget file before SQLite's page cap can be installed.
+            with sqlite3.connect(":memory:") as probe:
+                probe.executescript(SCHEMA_SQL)
+                probe.execute("INSERT INTO meta VALUES ('schema', ?)", (LIBRARY_SCHEMA,))
+                initial_database_bytes = (
+                    probe.execute("PRAGMA page_count").fetchone()[0]
+                    * probe.execute("PRAGMA page_size").fetchone()[0]
+                )
+        if initial_database_bytes + receipt_bytes > working_budget:
+            raise ValueError("library output byte limit exceeded by database copy or schema")
         with Library.create(
             destination / "library.sqlite",
             previous=resume["database"]
@@ -312,7 +362,7 @@ def build_library(
             assert_resume_unchanged()
             page_size = library.connection.execute("PRAGMA page_size").fetchone()[0]
             library.connection.execute(
-                f"PRAGMA max_page_count={max(1, limits['max_output_bytes'] // page_size)}"
+                f"PRAGMA max_page_count={max(1, (working_budget - receipt_bytes) // page_size)}"
             )
 
             def accept(item: Conversation, *, observation_only: bool = False) -> None:
@@ -401,9 +451,12 @@ def build_library(
             report["findings"].extend(document_report.get("findings", []))
             check_bound()
             report["phase"] = "ingested"
-            private_json(
-                destination / "build-state.json",
+            write_receipt(
+                "build-state.json",
                 {"state": "building", "phase": "ingested", "report": report},
+            )
+            library.connection.execute(
+                f"PRAGMA max_page_count={max(1, (working_budget - receipt_bytes) // page_size)}"
             )
             if progress:
                 progress({"stage": "index_blocks", "accepted": report["accepted_observations"]})
@@ -466,17 +519,48 @@ def build_library(
         report["complete"] = True
         report["phase"] = "verified"
         report["elapsed_seconds"] = round(time.monotonic() - started, 3)
-        private_json(destination / "report.json", report)
-        private_json(
-            destination / "build-state.json",
+        write_receipt(
+            "build-state.json",
             {"state": "verified", "record_fingerprint": report["record_fingerprint"]},
         )
+        existing_bytes = sum(
+            path.stat().st_size for path in destination.rglob("*") if path.is_file()
+        )
+        report["output_bytes"] = existing_bytes
+        while (total := existing_bytes + len(_json_bytes(report))) != report["output_bytes"]:
+            report["output_bytes"] = total
+        # Write the completed report last. A failed receipt can never leave a
+        # publishable report behind without the verified state and byte check.
+        write_receipt("report.json", report)
         return report
     except Exception as error:
-        private_json(
-            destination / "build-state.json",
-            {"state": "failed", "error": str(error), "report": report},
-        )
+        report["complete"] = False
+        if report["phase"] == "verified":
+            report["phase"] = "verifying"
+        try:
+            write_receipt(
+                "build-state.json",
+                {"state": "failed", "error": str(error), "report": report},
+                failure=True,
+            )
+        except ValueError:
+            # Keep a bounded, explicitly non-resumable receipt when retaining
+            # the complete source proof would itself breach the output cap.
+            write_receipt(
+                "build-state.json",
+                {
+                    "state": "failed",
+                    "resumable": False,
+                    "report_omitted": True,
+                    "reason": "full failure report exceeds output byte limit",
+                    "error_type": type(error).__name__,
+                    "error": str(error)[:512],
+                    "phase": report["phase"],
+                    "source_manifest_hash": report["source_manifest_hash"],
+                    "accepted_observations": report["accepted_observations"],
+                },
+                failure=True,
+            )
         raise
 
 
@@ -484,6 +568,14 @@ def verify_candidate(generation: Path) -> dict[str, Any]:
     report = json.loads((generation / "report.json").read_text(encoding="utf-8"))
     if report.get("schema") != REPORT_SCHEMA or not report.get("complete"):
         raise ValueError("candidate does not have completed verification")
+    state = json.loads((generation / "build-state.json").read_text(encoding="utf-8"))
+    if state.get("state") != "verified" or state.get("record_fingerprint") != report.get(
+        "record_fingerprint"
+    ):
+        raise ValueError("candidate build state is not verified")
+    total = sum(path.stat().st_size for path in generation.rglob("*") if path.is_file())
+    if total > report["limits"]["max_output_bytes"]:
+        raise ValueError("candidate output byte limit exceeded including receipts")
     for relative, expected in report["artifacts"].items():
         path = generation / relative
         if (
@@ -502,7 +594,9 @@ def verify_candidate(generation: Path) -> dict[str, Any]:
 
 
 def publish_library(generation: Path, *, project_root: Path, store_root: Path) -> dict[str, Any]:
-    generation = generation.absolute()
+    generation = generation.expanduser().absolute()
+    store_root = store_root.expanduser().absolute()
+    project_root = project_root.expanduser().absolute()
     expected_parent = (store_root / DIRECTORY / "generations").resolve()
     if generation.parent.resolve() != expected_parent or generation.is_symlink():
         raise ValueError("candidate must be a direct generation of the configured library")

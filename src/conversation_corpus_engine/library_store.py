@@ -448,8 +448,8 @@ class Library:
     ) -> dict[str, Any]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_PAGE:
             raise ValueError(f"limit must be an integer from 1 to {MAX_PAGE}")
-        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-            raise ValueError("offset must be a nonnegative integer")
+        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 1000000000:
+            raise ValueError("offset must be an integer from 0 to 1000000000")
         match = fts_query(query)
         empty = {
             "query": query,

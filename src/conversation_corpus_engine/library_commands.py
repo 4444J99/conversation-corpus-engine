@@ -41,6 +41,7 @@ def read_record(
     version: str | None = None,
     digest: str | None = None,
     message: int = 0,
+    sequence: str = "main",
     offset: int = 0,
     limit: int = 12000,
 ) -> dict[str, Any]:
@@ -49,14 +50,22 @@ def read_record(
             raise ValueError(f"{name} must be a nonnegative integer")
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 32000:
         raise ValueError("limit must be from 1 to 32000 characters")
+    if not isinstance(sequence, str) or sequence not in {"main", "alternate"}:
+        raise ValueError("sequence must be main or alternate")
     payload = library.record(uid, version=version, digest=digest)
-    messages = payload["messages"]
+    alternates = payload["extra"].get("alternate_messages", [])
+    if not isinstance(alternates, list) or any(not isinstance(item, dict) for item in alternates):
+        raise ValueError("alternate message sequence is malformed")
+    messages = payload["messages"] if sequence == "main" else alternates
     result = {
         "uid": uid,
         "title": payload["title"][:512],
         "provider": payload["provider"],
         "kind": payload["kind"][:128],
         "message_count": len(messages),
+        "sequence": sequence,
+        "main_message_count": len(payload["messages"]),
+        "alternate_message_count": len(alternates),
         "body_status": payload["extra"].get("body_status", "full" if messages else "metadata_only"),
         "provenance": {
             key[:128]: value
@@ -81,13 +90,13 @@ def read_record(
     if message >= len(messages):
         raise ValueError("message index is outside the record")
     item = messages[message]
-    text = item["text"]
+    text = str(item.get("text", ""))
     if offset > len(text):
         raise ValueError("text offset is outside the message")
     end = min(len(text), offset + limit)
     result.update(
         text=text[offset:end],
-        role=item["role"][:128],
+        role=str(item.get("role", "unknown"))[:128],
         channel=item.get("channel", "")[:128],
         message_id=item.get("id", "")[:512],
         total_characters=len(text),
@@ -136,6 +145,7 @@ def add_library_parser(subparsers: Any) -> None:
     read.add_argument("--version")
     read.add_argument("--digest", help="Read any retained source snapshot by its content digest")
     read.add_argument("--message", type=int, default=0)
+    read.add_argument("--sequence", choices=("main", "alternate"), default="main")
     read.add_argument("--offset", type=int, default=0)
     read.add_argument("--limit", type=int, default=12000)
     history = sub.add_parser("history", help="Read accepted semantic revisions")
@@ -199,6 +209,7 @@ def handle_library(args: argparse.Namespace) -> int:
                         version=args.version,
                         digest=args.digest,
                         message=args.message,
+                        sequence=args.sequence,
                         offset=args.offset,
                         limit=args.limit,
                     )

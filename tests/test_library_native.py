@@ -5,6 +5,8 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from conversation_corpus_engine.library_native import _protobuf_strings, iter_estate
 
 
@@ -121,6 +123,32 @@ def test_same_event_replayed_in_two_files_keeps_locations(tmp_path):
     item = next(iter_estate(db))
     assert len(item.messages) == 1
     assert len(item.messages[0].meta["source_locations"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("second_text", "second_timestamp"),
+    [
+        ("same", "2026-01-01T00:00:00Z"),
+        ("different", "2026-01-01T00:00:00Z"),
+        ("same", "2026-01-02T00:00:00Z"),
+    ],
+)
+def test_idless_events_at_same_line_in_distinct_files_remain_occurrences(
+    tmp_path, second_text, second_timestamp
+):
+    first_event = codex_message(None, "same")
+    second_event = codex_message(None, second_text)
+    second_event["timestamp"] = second_timestamp
+    first = jsonl(tmp_path / "a.jsonl", [first_event])
+    second = jsonl(tmp_path / "b.jsonl", [second_event])
+    db = estate(tmp_path, [("codex", "s", first)], [("codex", str(second), "session_meta", "s")])
+    item = next(iter_estate(db))
+    assert len(item.messages) == 2
+    assert len({message.id for message in item.messages}) == 2
+    assert [message.text for message in item.messages] == ["same", second_text]
+    assert [message.ts for message in item.messages] == [first_event["timestamp"], second_timestamp]
+    assert all("revision_of" not in message.meta for message in item.messages)
+    assert all(len(message.meta["source_locations"]) == 1 for message in item.messages)
 
 
 def test_claude_blocks_preserve_tool_thinking_and_parent_metadata(tmp_path):
@@ -385,8 +413,16 @@ def test_decompressed_source_limit_is_enforced(tmp_path):
 def test_claude_subagent_composite_identity_requires_parent_and_agent(tmp_path):
     source = jsonl(
         tmp_path / "agent-a1.jsonl",
-        [{"sessionId": "parent", "agentId": "a1", "isSidechain": True,
-          "type": "user", "uuid": "u", "message": {"role": "user", "content": "child"}}],
+        [
+            {
+                "sessionId": "parent",
+                "agentId": "a1",
+                "isSidechain": True,
+                "type": "user",
+                "uuid": "u",
+                "message": {"role": "user", "content": "child"},
+            }
+        ],
     )
     item = next(iter_estate(estate(tmp_path, [("claude", "parent/agent/a1", source)])))
     assert [m.text for m in item.messages] == ["child"]
@@ -399,8 +435,16 @@ def test_claude_subagent_composite_identity_requires_parent_and_agent(tmp_path):
 def test_claude_subagent_rejects_same_parent_with_wrong_agent(tmp_path):
     source = jsonl(
         tmp_path / "agent-a1.jsonl",
-        [{"sessionId": "parent", "agentId": "other", "isSidechain": True,
-          "type": "user", "uuid": "u", "message": {"role": "user", "content": "wrong"}}],
+        [
+            {
+                "sessionId": "parent",
+                "agentId": "other",
+                "isSidechain": True,
+                "type": "user",
+                "uuid": "u",
+                "message": {"role": "user", "content": "wrong"},
+            }
+        ],
     )
     item = next(iter_estate(estate(tmp_path, [("claude", "parent/agent/a1", source)])))
     assert not item.messages
@@ -412,10 +456,16 @@ def test_codex_fork_accepts_only_explicitly_declared_ancestor_headers(tmp_path):
     source = jsonl(
         tmp_path / "rollout-child.jsonl",
         [
-            {"type": "session_meta", "payload": {
-                "id": "child", "session_id": "parent", "forked_from_id": "parent",
-                "parent_thread_id": "parent", "subagent_history_start_ordinal": 15,
-            }},
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": "child",
+                    "session_id": "parent",
+                    "forked_from_id": "parent",
+                    "parent_thread_id": "parent",
+                    "subagent_history_start_ordinal": 15,
+                },
+            },
             {"type": "session_meta", "payload": {"id": "parent", "forked_from_id": "grandparent"}},
             {"type": "session_meta", "payload": {"id": "grandparent"}},
             codex_message("inherited", "parent context"),

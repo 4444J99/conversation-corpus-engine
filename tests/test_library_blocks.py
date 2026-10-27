@@ -172,6 +172,12 @@ def test_reference_labels_and_paths_cannot_escape_the_generated_link() -> None:
     assert "](" not in rendered.split("](../records/", 1)[0]
 
 
+@pytest.mark.parametrize("prefix", ["    ", "\t", ">     "])
+def test_indented_code_remains_copyable_literal_text(prefix: str) -> None:
+    text = prefix + "values[0] < 2 and ![literal](image.png)\n"
+    assert render_blocks(split_blocks(text), {}) == text
+
+
 def test_renderer_rejects_noncontiguous_or_modified_blocks() -> None:
     block = split_blocks(PARAGRAPH)[0]
     with pytest.raises(ValueError, match="contiguous"):

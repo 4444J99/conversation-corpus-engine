@@ -25,7 +25,7 @@ from typing import Any
 
 from .archive_model import Conversation, Message, to_iso
 
-READER = "library-native@1.1.0"
+READER = "library-native@1.1.1"
 PROVIDERS = {
     "codex": "codex",
     "claude": "claudecode",
@@ -126,12 +126,9 @@ class _Body:
         self, event: dict[str, Any], content: Any, role: str, locator: str, *, kind: str = ""
     ) -> list[Message]:
         observed: list[Message] = []
-        native_event = str(
-            event.get("id")
-            or event.get("uuid")
-            or event.get("call_id")
-            or locator.rsplit("#", 1)[-1]
-        )
+        # Only an explicit native ID can prove replay across distinct sources.
+        # A line/key suffix alone conflates unrelated anonymous occurrences.
+        native_event = str(event.get("id") or event.get("uuid") or event.get("call_id") or locator)
         timestamp = to_iso(event.get("timestamp") or event.get("ts") or event.get("time_created"))
         for index, (resolved_role, channel, text, extra) in enumerate(_blocks(content, role)):
             identity = f"{kind}:{native_event}:{index}"
@@ -220,7 +217,9 @@ def _bytes(path: Path, body: _Body) -> tuple[bytes, str]:
 
 
 def _codex_parents(payload: dict[str, Any]) -> list[str]:
-    values = [payload.get(key) for key in ("parent_session_id", "forked_from_id", "parent_thread_id")]
+    values = [
+        payload.get(key) for key in ("parent_session_id", "forked_from_id", "parent_thread_id")
+    ]
     source = payload.get("source")
     if isinstance(source, dict):
         subagent = source.get("subagent")
@@ -265,11 +264,16 @@ def _codex(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) -
         parents = _codex_parents(primary)
         if parents:
             body.parent = parents[0]
-        body.identity(path, {
-            "kind": "codex-session", "inventory_id": body.native_id,
-            "primary_id": primary_id, "declared_parent_ids": parents,
-            "inherited_ids": sorted(inherited),
-        })
+        body.identity(
+            path,
+            {
+                "kind": "codex-session",
+                "inventory_id": body.native_id,
+                "primary_id": primary_id,
+                "declared_parent_ids": parents,
+                "inherited_ids": sorted(inherited),
+            },
+        )
     has_messages = any(r.get("type") == "response_item" for _, r in records)
     for line, record in records:
         payload = record.get("payload", record)
@@ -329,17 +333,27 @@ def _claude(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) 
     )
     if proven:
         body.parent = parent
-        body.identity(path, {
-            "kind": "claude-subagent", "inventory_id": body.native_id,
-            "parent_session_id": parent, "agent_id": agent,
-        })
+        body.identity(
+            path,
+            {
+                "kind": "claude-subagent",
+                "inventory_id": body.native_id,
+                "parent_session_id": parent,
+                "agent_id": agent,
+            },
+        )
     for line, record in records:
         mismatch = (
-            not proven or (
-                bool(record.get("sessionId") or record.get("agentId"))
-                and (record.get("sessionId") != parent or record.get("agentId") != agent)
+            (
+                not proven
+                or (
+                    bool(record.get("sessionId") or record.get("agentId"))
+                    and (record.get("sessionId") != parent or record.get("agentId") != agent)
+                )
             )
-        ) if composite else bool(record.get("sessionId") and record["sessionId"] != body.native_id)
+            if composite
+            else bool(record.get("sessionId") and record["sessionId"] != body.native_id)
+        )
         if mismatch:
             body.finding("identity_mismatch", path, str(line))
             continue

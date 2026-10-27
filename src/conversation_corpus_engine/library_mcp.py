@@ -40,6 +40,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "version": {"type": "string"},
                 "digest": {"type": "string"},
                 "message": {"type": "integer", "minimum": 0},
+                "sequence": {"enum": ["main", "alternate"]},
             },
             ["uid"],
         ),
@@ -122,6 +123,7 @@ def call_tool(store_root: Path, name: str, arguments: dict[str, Any]) -> dict[st
                 version=arguments.get("version"),
                 digest=arguments.get("digest"),
                 message=_integer(arguments, "message", 0, 10000000),
+                sequence=arguments.get("sequence", "main"),
                 offset=offset,
                 limit=limit,
             )

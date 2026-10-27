@@ -187,7 +187,7 @@ def _literal_markdown(text: str) -> str:
     tracker = FenceTracker()
     lines: list[str] = []
     for raw in text.splitlines():
-        if tracker.feed(raw):
+        if tracker.feed(raw) or _INDENTED_CODE.match(_unquote_line(raw)[0]):
             lines.append(raw)
             continue
         pieces = INLINE_CODE_RE.split(raw)
