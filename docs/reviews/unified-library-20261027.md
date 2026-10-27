@@ -21,3 +21,7 @@ Production ingestion and consumer acceptance have separate private receipts. Cov
 Production validation found a disagreement between preserved indented source code and the Markdown link checker. The candidate remained unpublished. The renderer now places indentation-based and quoted code inside explicit collision-safe fences, preserving literal bytes instead of weakening the checker. Space, tab and quote regressions reproduce the original failure and pass after the renderer change. A retained production record was independently rerendered with zero unsafe active links; the failed generation remained unchanged.
 
 Native analysis review also found an empty-query selection ambiguity and eager block allocation before atom limits. The bridge rejects empty queries, preserves nested SQL deadline scopes, and uses a lazy block iterator that checks its budget during scanning. An input with 200,000 potential blocks stopped at an eight-atom bound before creating output, using under 2 MiB of measured Python allocation.
+
+## CI receipt (2026-10-27)
+
+Workflow run CI on commit d4656c78c586b5967f8786bf8b49e9322e446d45 completed successfully (https://github.com/4444J99/conversation-corpus-engine/actions/runs/40556034920). Test jobs for Python 3.11/3.12/3.13 and schema-check passed. CodeRabbit and Semgrep checks were still in progress at the time of this note. Mergeable state remains unstable pending those.
