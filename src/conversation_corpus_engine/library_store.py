@@ -14,6 +14,8 @@ import re
 import sqlite3
 import zlib
 from collections.abc import Iterator
+from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +25,17 @@ from .library_blocks import split_blocks
 
 LIBRARY_SCHEMA = "cce.knowledge-library.v1"
 MAX_PAGE = 200
+
+
+def _bounded_sql(method: Any) -> Any:
+    @wraps(method)
+    def run(self: Library, *args: Any, **kwargs: Any) -> Any:
+        with self.sql_progress(kwargs.get("check_callback")):
+            return method(self, *args, **kwargs)
+
+    return run
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS objects (
@@ -112,6 +125,7 @@ class Library:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
         self.connection.execute("PRAGMA cache_size=-32768")
+        self._owned_sql_handler: tuple[Any, int] | None = None
         version = self.connection.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
         if version is None or version[0] != LIBRARY_SCHEMA:
             self.connection.close()
@@ -159,6 +173,43 @@ class Library:
     def _write(self) -> None:
         if not self.writable:
             raise ValueError("knowledge library is read-only")
+
+    @contextmanager
+    def sql_progress(self, check_callback: Any, *, instructions: int = 10000) -> Iterator[None]:
+        """Interrupt long SQL when its budget callback raises; preserve nested scopes.
+
+        SQLite has no progress-handler getter. This scope owns and restores only
+        handlers installed through this method; callers should not mix direct
+        connection.set_progress_handler calls with active owned scopes.
+        """
+        if check_callback is None:
+            yield
+            return
+        if isinstance(instructions, bool) or not isinstance(instructions, int) or instructions < 1:
+            raise ValueError("SQL progress instructions must be a positive integer")
+        previous = self._owned_sql_handler
+        errors: list[BaseException] = []
+
+        def progress() -> int:
+            try:
+                check_callback()
+                return 0
+            except BaseException as error:
+                if not errors:
+                    errors.append(error)
+                return 1
+
+        self.connection.set_progress_handler(progress, instructions)
+        self._owned_sql_handler = (progress, instructions)
+        try:
+            yield
+        except sqlite3.OperationalError:
+            if errors:
+                raise errors[0] from None
+            raise
+        finally:
+            self.connection.set_progress_handler(*(previous or (None, 0)))
+            self._owned_sql_handler = previous
 
     def put(
         self, conversation: Conversation, *, reconcile: bool = False, observation_only: bool = False
@@ -377,7 +428,10 @@ class Library:
         for row in self.connection.execute("SELECT * FROM records ORDER BY uid"):
             yield dict(row)
 
-    def index_blocks(self, *, check_callback: Any = None) -> dict[str, Any]:
+    @_bounded_sql
+    def index_blocks(
+        self, *, check_callback: Any = None, uids: list[str] | None = None
+    ) -> dict[str, Any]:
         self._write()
 
         # Rebuild only this candidate's derived occurrence view. Raw revisions remain intact.
@@ -385,10 +439,26 @@ class Library:
             # sqlite3 begins implicit transactions on DML, not DROP INDEX. Start
             # explicitly so an interrupted rebuild restores both data and index.
             self.connection.execute("SAVEPOINT block_reindex")
-            self.connection.execute("DROP INDEX IF EXISTS occurrences_digest")
-            self.connection.execute("DELETE FROM occurrences")
-            self.connection.execute("DELETE FROM blocks")
-            for row in self.rows():
+            if uids is None:
+                self.connection.execute("DROP INDEX IF EXISTS occurrences_digest")
+                self.connection.execute("DROP INDEX IF EXISTS blocks_eligible_digest_chars")
+                self.connection.execute("DELETE FROM occurrences")
+                self.connection.execute("DELETE FROM blocks")
+                selected_rows = self.rows()
+            else:
+                selected = []
+                for uid in sorted(set(uids)):
+                    if check_callback:
+                        check_callback()
+                    row = self.connection.execute(
+                        "SELECT * FROM records WHERE uid=?", (uid,)
+                    ).fetchone()
+                    if row is None:
+                        raise KeyError(uid)
+                    selected.append(dict(row))
+                    self.connection.execute("DELETE FROM occurrences WHERE uid=?", (uid,))
+                selected_rows = iter(selected)
+            for row in selected_rows:
                 if check_callback:
                     check_callback()
                 payload = self.record(row["uid"])
@@ -422,9 +492,23 @@ class Library:
                                 canonical_json(block["normalization"]),
                             ),
                         )
-            self.connection.execute("CREATE INDEX occurrences_digest ON occurrences(digest)")
+            if uids is None:
+                self.connection.execute("CREATE INDEX occurrences_digest ON occurrences(digest)")
+                self.connection.execute(
+                    "CREATE INDEX blocks_eligible_digest_chars ON blocks(eligible,digest,chars)"
+                )
+            else:
+                if check_callback:
+                    check_callback()
+                # put() removes stale occurrences as soon as current content changes.
+                # The digest index makes this anti-join bounded by derived block count;
+                # only unreferenced block rows are written, preserving COW savings.
+                self.connection.execute(
+                    "DELETE FROM blocks WHERE NOT EXISTS "
+                    "(SELECT 1 FROM occurrences WHERE occurrences.digest=blocks.digest)"
+                )
             self.connection.execute("RELEASE SAVEPOINT block_reindex")
-        return self.status()
+        return self.status(check_callback=check_callback)
 
     def block_text(self, digest: str) -> str:
         row = self.connection.execute(
@@ -498,7 +582,8 @@ class Library:
             "next_offset": offset + len(hits) if offset + len(hits) < total else None,
         }
 
-    def status(self) -> dict[str, Any]:
+    @_bounded_sql
+    def status(self, *, check_callback: Any = None) -> dict[str, Any]:
         counts = {
             table: self.connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in (
@@ -512,7 +597,9 @@ class Library:
             )
         }
         repeats = self.connection.execute(
-            "SELECT COUNT(*),COALESCE(SUM(n-1),0),COALESCE(SUM((n-1)*chars),0) FROM (SELECT b.digest,b.chars,COUNT(*) AS n FROM blocks b JOIN occurrences o ON o.digest=b.digest WHERE b.eligible=1 GROUP BY b.digest HAVING n>1)"
+            "SELECT COUNT(*),COALESCE(SUM(n-1),0),COALESCE(SUM((n-1)*b.chars),0) "
+            "FROM (SELECT digest,COUNT(*) AS n FROM occurrences GROUP BY digest HAVING COUNT(*)>1) repeated "
+            "JOIN blocks b ON b.digest=repeated.digest WHERE b.eligible=1"
         ).fetchone()
         counts.update(
             schema=LIBRARY_SCHEMA,
@@ -553,6 +640,7 @@ class Library:
                 digest.update(canonical_json(dict(row)).encode("utf-8") + b"\n")
         return digest.hexdigest()
 
+    @_bounded_sql
     def verify(self, *, full: bool = True, check_callback: Any = None) -> list[str]:
         problems = []
         integrity = self.connection.execute("PRAGMA integrity_check").fetchall()

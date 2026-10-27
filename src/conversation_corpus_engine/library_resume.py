@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
+import os
+import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +44,7 @@ def prepare_resume(
     max_database_bytes: int,
     *,
     check_callback: Any = None,
+    resume_mode: str = "ingested",
 ) -> dict[str, Any]:
     """Validate an immutable failed seed; the caller owns copying and new budgets.
 
@@ -46,6 +52,8 @@ def prepare_resume(
     exhausted source collection, not an explicit phase checkpoint. The receipt
     distinguishes that weaker proof. This never upgrades coverage or completion.
     """
+    if resume_mode not in {"ingested", "export", "indexed"}:
+        raise ValueError("unknown library resume mode")
     _count(max_database_bytes, "max_database_bytes")
     if not max_database_bytes:
         raise ValueError("resume database byte limit must be positive")
@@ -149,28 +157,35 @@ def prepare_resume(
         sidecar = database.with_name(database.name + suffix)
         if sidecar.exists() or sidecar.is_symlink():
             raise ValueError("resume source has a SQLite journal sidecar; cannot prove quiescence")
-    callback_errors: list[Exception] = []
-
-    def progress() -> int:
-        try:
-            check()
-            return 0
-        except Exception as error:
-            callback_errors.append(error)
-            return 1
-
-    with Library(database) as library:
-        library.connection.set_progress_handler(progress, 10000)
-        try:
-            problems = library.verify(full=True, check_callback=check)
-        except Exception:
-            if callback_errors:
-                raise callback_errors[0] from None
-            raise
-        finally:
-            library.connection.set_progress_handler(None, 0)
+    with Library(database) as library, library.sql_progress(check):
+        problems = library.verify(full=True, check_callback=check)
         if problems:
             raise ValueError("resume database verification failed: " + "; ".join(problems[:10]))
+        if resume_mode in {"export", "indexed"}:
+            if phase not in {"exporting", "verifying"}:
+                raise ValueError("resume mode requires a proven completed index")
+            status = library.status(check_callback=check)
+            if status != report.get("status"):
+                raise ValueError("resume completed index status differs from database")
+            record_fingerprint = digest_json(
+                [
+                    (row["uid"], row["current_digest"], row["current_version"])
+                    for row in library.rows()
+                ]
+            )
+            if record_fingerprint != report.get("record_fingerprint"):
+                raise ValueError("resume record fingerprint differs from database")
+            evidence_fingerprint = digest_json(
+                {
+                    "library": library.evidence_fingerprint(),
+                    "sources": report["sources"],
+                    "findings": report["findings"],
+                    "manifest": report["source_manifest_hash"],
+                    "resume_source": report.get("resume_source"),
+                }
+            )
+            if evidence_fingerprint != report.get("evidence_fingerprint"):
+                raise ValueError("resume evidence fingerprint differs from database")
     digest = hashlib.sha256()
     with database.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024**2), b""):
@@ -191,6 +206,7 @@ def prepare_resume(
         raise ValueError("resume receipts or current pointer changed during qualification")
     receipt = {
         "schema": "cce.library-resume.v1",
+        "resume_mode": resume_mode,
         "generation": str(generation),
         "database_sha256": digest.hexdigest(),
         "database_bytes": after.st_size,
@@ -211,4 +227,91 @@ def prepare_resume(
         "receipt": receipt,
         "receipt_json": serialized,
         "receipt_sha256": hashlib.sha256(serialized.encode()).hexdigest(),
+    }
+
+
+DISK_FLOOR = 1024**3
+
+
+def _clone_file(source: Path, destination: Path) -> None:
+    """Use the filesystem's exclusive native clone operation; never shell out."""
+    if sys.platform != "darwin":
+        raise OSError(errno.ENOTSUP, "native clone unavailable on this platform")
+    libc = ctypes.CDLL(None, use_errno=True)
+    clone = getattr(libc, "clonefile", None)
+    if clone is None:
+        raise OSError(errno.ENOSYS, "native clone unavailable")
+    clone.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
+    clone.restype = ctypes.c_int
+    if clone(os.fsencode(source), os.fsencode(destination), 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def copy_qualified_database(
+    source: Path,
+    destination: Path,
+    *,
+    max_output_bytes: int,
+    mutation_reserve: int = 0,
+    check_callback: Any = None,
+) -> dict[str, Any]:
+    """Clone into a fresh candidate, or copy only with full measured capacity.
+
+    Qualification and before/after source hashes belong to the caller. A COW
+    clone is accepted only when remaining logical outputs, mutation reserve and
+    a 1 GiB free-space floor fit. Fallback never assumes clone savings.
+    """
+    check = check_callback or (lambda: None)
+    _safe(source)
+    _safe(destination)
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError(destination)
+    size = source.stat().st_size
+    free_before = shutil.disk_usage(destination.parent).free
+    required = max(0, max_output_bytes - size) + mutation_reserve + DISK_FLOOR
+    if free_before < required:
+        raise ValueError(
+            "available storage does not cover COW remaining output budget and reserves"
+        )
+    check()
+    try:
+        _clone_file(source, destination)
+        method = "copy_on_write"
+    except OSError as error:
+        if error.errno not in {errno.ENOTSUP, errno.ENOSYS, errno.EXDEV, errno.EINVAL}:
+            raise
+        if destination.exists() or destination.is_symlink():
+            raise ValueError(
+                "failed native clone left a destination; refusing replacement"
+            ) from error
+        if shutil.disk_usage(destination.parent).free < max_output_bytes + DISK_FLOOR:
+            raise ValueError("ordinary copy requires full output budget plus 1 GiB") from error
+        with source.open("rb") as original, destination.open("xb") as copied:
+            destination.chmod(0o600)
+            while chunk := original.read(1024**2):
+                check()
+                if shutil.disk_usage(destination.parent).free < len(chunk) + DISK_FLOOR:
+                    raise ValueError("ordinary copy reached free-space floor") from error
+                copied.write(chunk)
+            copied.flush()
+            os.fsync(copied.fileno())
+        method = "bounded_copy"
+    destination.chmod(0o600)
+    free_after = shutil.disk_usage(destination.parent).free
+    if free_after < DISK_FLOOR:
+        raise ValueError("database copy reached free-space floor")
+    check()
+    stat = destination.stat()
+    if stat.st_size != size:
+        raise ValueError("copied database size differs from qualified source")
+    return {
+        "method": method,
+        "database_bytes": size,
+        "filesystem_allocated_bytes": stat.st_blocks * 512,
+        "free_bytes_before": free_before,
+        "free_bytes_after": free_after,
+        "required_free_bytes": required,
+        "mutation_reserve_bytes": mutation_reserve,
+        "free_space_floor_bytes": DISK_FLOOR,
     }

@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import html
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Literal, TypedDict
 from urllib.parse import quote, unquote, urlsplit
 
@@ -26,6 +26,7 @@ MIN_PROSE_CHARACTERS = 120
 _QUOTE_PREFIX = re.compile(r"^ {0,3}>[ \t]?")
 _INDENTED_CODE = re.compile(r"^(?: {4}|\t)")
 _TERMINAL_NEWLINES = re.compile(r"\n+$")
+_LINE_END = re.compile(r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
 class TextBlock(TypedDict):
@@ -109,7 +110,18 @@ def _block(
     }
 
 
-def split_blocks(text: str) -> list[TextBlock]:
+def _lines(text: str) -> Iterator[str]:
+    start = 0
+    for ending in _LINE_END.finditer(text):
+        yield text[start : ending.end()]
+        start = ending.end()
+    if start < len(text):
+        yield text[start:]
+
+
+def iter_blocks(
+    text: str, *, check_callback: Callable[[], object] | None = None
+) -> Iterator[TextBlock]:
     """Partition text into paragraphs, separators and protected code spans.
 
     Fenced code includes its delimiters and blank lines. The CommonMark fence
@@ -117,11 +129,12 @@ def split_blocks(text: str) -> list[TextBlock]:
     fences and indented lines are also protected. An unclosed fence protects
     the remainder rather than guessing where prose resumes.
     """
-    blocks: list[TextBlock] = []
     tracker = FenceTracker()
     start = position = 0
     previous: Literal["prose", "code", "separator"] | None = None
-    for line in text.splitlines(keepends=True):
+    for line in _lines(text):
+        if check_callback is not None:
+            check_callback()
         probe, _ = _unquote_line(line)
         fence_state = tracker.feed(probe)
         kind: Literal["prose", "code", "separator"]
@@ -132,13 +145,27 @@ def split_blocks(text: str) -> list[TextBlock]:
         else:
             kind = "prose"
         if previous is not None and kind != previous:
-            blocks.append(_block(text, start, position, previous))
+            yield _block(text, start, position, previous)
             start = position
         previous = kind
         position += len(line)
     if previous is not None:
-        blocks.append(_block(text, start, position, previous))
-    return blocks
+        if check_callback is not None:
+            check_callback()
+        yield _block(text, start, position, previous)
+
+
+def split_blocks(text: str) -> list[TextBlock]:
+    """Return the same exact spans as the lazy, optionally budgeted iterator."""
+    return list(iter_blocks(text))
+
+
+def _fenced_literal(text: str) -> str:
+    """Give indentation-based code an explicit boundary in every consumer."""
+    longest = max((len(run.group()) for run in re.finditer(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    ending = "" if text.endswith("\n") else "\n"
+    return f"\n{fence}text\n{text}{ending}{fence}\n"
 
 
 def _reference_href(href: str) -> str:
@@ -224,7 +251,15 @@ def render_blocks(blocks: Sequence[TextBlock], references: Mapping[str, BlockRef
         expected_start = block["end"]
         reference = references.get(block["digest"]) if block["eligible"] else None
         if reference is None:
-            output.append(_literal_markdown(raw))
+            first_line = next(_lines(raw), "")
+            explicit_fence = (
+                not _INDENTED_CODE.match(first_line) and FenceTracker().feed(first_line) == "open"
+            )
+            output.append(
+                _fenced_literal(raw)
+                if block["kind"] == "code" and not explicit_fence
+                else _literal_markdown(raw)
+            )
         else:
             href = _reference_href(reference["href"])
             label = _reference_label(reference["label"])

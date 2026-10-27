@@ -76,6 +76,23 @@ def test_build_publish_and_reopen_share_both_wings(tmp_path):
     assert (generation / "library.sqlite").stat().st_mode & 0o777 == 0o600
 
 
+def test_build_reuses_completed_index_summary(tmp_path, monkeypatch):
+    project, store, manifest = setup_sources(tmp_path)
+    original = Library.status
+    summaries = []
+
+    def observed_status(self, **kwargs):
+        result = original(self, **kwargs)
+        summaries.append(result)
+        return result
+
+    monkeypatch.setattr(Library, "status", observed_status)
+    result = build_library(manifest, project_root=project, store_root=store)
+    assert result["status"]["records"] == 2
+    assert len(summaries) == 1
+    assert result["status"] == summaries[0]
+
+
 def test_changed_source_adds_revision_and_retains_missing_source(tmp_path):
     project, store, manifest = setup_sources(tmp_path)
     first = build_library(manifest, project_root=project, store_root=store)

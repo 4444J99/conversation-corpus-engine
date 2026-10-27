@@ -54,7 +54,8 @@ def test_resume_compacts_seed_without_reading_original_sources_and_keeps_evidenc
         "schema": "cce.library-sources.v1",
         "resume_generation": str(seed),
         "documents": [{"id": "supplement", "root": str(supplement), "include": ["**/*.md"]}],
-        "limits": {"max_records": 3, "max_output_bytes": 16 * 1024**3, "max_seconds": 3600},
+        # Reserve for this three-record fixture; the real storage preflight stays active.
+        "limits": {"max_records": 3, "max_output_bytes": 16 * 1024**2, "max_seconds": 3600},
     }
     create = Library.create
     copied = []

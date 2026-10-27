@@ -30,6 +30,7 @@ cce library history RECORD_UID --store-root /private/store
 cce library read RECORD_UID --store-root /private/store --version 1.1.0
 cce library read RECORD_UID --store-root /private/store --digest SNAPSHOT_SHA256
 cce library read RECORD_UID --store-root /private/store --sequence alternate --message 0 --limit 12000
+cce library analyze lattice --output /private/store/derived/analysis/lattice --project-root /private/project --store-root /private/store --limit 5
 cce library verify --store-root /private/store
 ```
 
@@ -74,6 +75,10 @@ Condensation replaces repeated eligible prose blocks with a shared passage and b
 
 Each generation contains `vault/Home.md`, per-record notes, facet hubs, shared passages, `graph.jsonl`, `library-index.jsonl`, `records.csv`, `notion-import.zip`, and a small `agent-entry.md`. Open `vault` as an Obsidian folder. Import the ZIP or CSV through Notion's Markdown/CSV importer; ZIP parity is verified locally, while actual Notion link behavior requires account-side verification. Neither application is a new identity authority. Keep personal annotations outside generated generation directories.
 
-Other knowledge-universe components consume `library-index.jsonl` plus its referenced Markdown files. Each index row includes CCE UID, version, object digest, content digest, source reference, body coverage, and collection taxonomy. Preserve those fields in any derived atom, vector or wiki index; do not replace CCE identity with filenames or drop duplicate provenance. LingFrame and atomic-substrata may analyze these derivatives without owning the source ledger.
+Other knowledge-universe components consume `library-index.jsonl` plus its referenced Markdown files. Each index row includes CCE UID, version, object digest, content digest, source reference, body coverage, and collection taxonomy. Preserve those fields in any derived atom, vector or wiki index; do not replace CCE identity with filenames or drop duplicate provenance. My Knowledge Base consumes the verified reading index; native text-analysis inputs use the bounded revision bridge below.
+
+For native structural analysis, `library analyze` writes bounded original-revision inputs accepted by LingFrame and atomic-substrata, including main and alternate messages. It preserves exact block spans and source identities instead of analyzing display links. See [the native analysis bridge](knowledge-analysis-bridge.md) for model mappings, limits and the observed consumer serialization boundary.
+
+Indented and quoted code receives explicit code fences in reading notes. The wrapper is longer than any embedded backtick run, preserves the literal source text and keeps Markdown links inside code inert. Source revisions remain unchanged; export validation still rejects active unsafe links.
 
 Build receipts report source findings and `coverage_complete` separately from successful verification/publication. `coverage_complete=false` can be a valid, useful library with visibly incomplete source bodies. Builds have a wall deadline, record and output budgets, private permissions, and retained failure receipts. A successful code test or ZIP export does not establish exhaustive content recovery or a completed application import.

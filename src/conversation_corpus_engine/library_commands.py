@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .corpus_store import CorpusStoreError
+from .library_analysis import AnalysisLimits, export_analysis
 from .library_build import build_library, current_generation, publish_library, verify_candidate
 from .library_store import Library
 from .paths import default_project_root
@@ -153,6 +154,21 @@ def add_library_parser(subparsers: Any) -> None:
     history.add_argument("uid")
     history.add_argument("--offset", type=int, default=0)
     history.add_argument("--limit", type=int, default=50)
+    analyze = sub.add_parser(
+        "analyze", help="Export bounded original-source inputs for LingFrame and UAKS"
+    )
+    common(analyze)
+    selection = analyze.add_mutually_exclusive_group(required=True)
+    selection.add_argument("query", nargs="?")
+    selection.add_argument("--uid", action="append", default=[])
+    analyze.add_argument("--output", type=Path, required=True)
+    analyze.add_argument("--target", choices=("both", "lingframe", "uaks"), default="both")
+    analyze.add_argument("--limit", type=int, default=5)
+    defaults = AnalysisLimits()
+    analyze.add_argument("--max-source-bytes", type=int, default=defaults.max_source_bytes)
+    analyze.add_argument("--max-output-bytes", type=int, default=defaults.max_output_bytes)
+    analyze.add_argument("--max-atoms", type=int, default=defaults.max_atoms)
+    analyze.add_argument("--max-seconds", type=int, default=defaults.max_seconds)
 
 
 def _progress(value: dict[str, Any]) -> None:
@@ -191,7 +207,24 @@ def handle_library(args: argparse.Namespace) -> int:
         else:
             generation, library = open_library(store)
             with library:
-                if args.action == "search":
+                if args.action == "analyze":
+                    result = export_analysis(
+                        library,
+                        args.output,
+                        project_root=args.project_root,
+                        store_root=store,
+                        query=args.query,
+                        uids=args.uid,
+                        limit=args.limit,
+                        target=args.target,
+                        limits=AnalysisLimits(
+                            max_source_bytes=args.max_source_bytes,
+                            max_output_bytes=args.max_output_bytes,
+                            max_atoms=args.max_atoms,
+                            max_seconds=args.max_seconds,
+                        ),
+                    )
+                elif args.action == "search":
                     result = library.search(
                         args.query,
                         limit=args.limit,

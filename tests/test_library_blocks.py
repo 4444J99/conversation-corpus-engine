@@ -4,7 +4,7 @@ import hashlib
 
 import pytest
 
-from conversation_corpus_engine.library_blocks import render_blocks, split_blocks
+from conversation_corpus_engine.library_blocks import iter_blocks, render_blocks, split_blocks
 
 PARAGRAPH = (
     "Every source keeps its original identity, speaker, sequence and provenance. "
@@ -175,7 +175,37 @@ def test_reference_labels_and_paths_cannot_escape_the_generated_link() -> None:
 @pytest.mark.parametrize("prefix", ["    ", "\t", ">     "])
 def test_indented_code_remains_copyable_literal_text(prefix: str) -> None:
     text = prefix + "values[0] < 2 and ![literal](image.png)\n"
-    assert render_blocks(split_blocks(text), {}) == text
+    assert render_blocks(split_blocks(text), {}) == "\n```text\n" + text + "```\n"
+
+
+def test_indented_source_cannot_close_its_explicit_wrapper() -> None:
+    text = "    ````\n    [literal](https://example.invalid)\n    ```\n"
+    assert render_blocks(split_blocks(text), {}) == "\n`````text\n" + text + "`````\n"
+
+
+def test_lazy_blocks_preserve_all_python_line_boundaries() -> None:
+    text = "A\r\n\rB\v\vC\f\x1c\x1d\x1eD\x85\u2028\u2029End"
+    blocks = list(iter_blocks(text))
+    assert blocks == split_blocks(text)
+    assert "".join(block["text"] for block in blocks) == text
+    assert all(text[b["start"] : b["end"]] == b["text"] for b in blocks)
+
+
+def test_lazy_blocks_stop_before_materializing_the_remaining_source():
+    calls = 0
+
+    def limited():
+        nonlocal calls
+        calls += 1
+        if calls > 4:
+            raise TimeoutError("bounded source scan")
+
+    stream = iter_blocks("paragraph\n\n" * 100000, check_callback=limited)
+    assert iter(stream) is stream
+    assert next(stream)["text"] == "paragraph\n"
+    with pytest.raises(TimeoutError, match="bounded source scan"):
+        list(stream)
+    assert calls == 5
 
 
 def test_renderer_rejects_noncontiguous_or_modified_blocks() -> None:

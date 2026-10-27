@@ -220,3 +220,210 @@ def test_interrupted_block_rebuild_keeps_prior_rows_and_lookup_index(tmp_path):
         assert library.connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='index' AND name='occurrences_digest'"
         ).fetchone()
+
+
+def test_summary_queries_use_covering_metadata_and_keep_exact_counts(tmp_path):
+    passage = "A shared passage retains the original context and all its source observations. " * 5
+    with Library.create(tmp_path / "library.sqlite") as library:
+        library.put(record("one", passage))
+        library.put(record("two", passage))
+        library.index_blocks()
+        traced = []
+        library.connection.set_trace_callback(traced.append)
+        status = library.status()
+        library.connection.set_trace_callback(None)
+        assert status["repeated_blocks"] == 1
+        assert status["reference_occurrences"] == 1
+        assert status["repeated_characters"] == len(passage)
+        summary = next(sql for sql in traced if "SUM(n-1)" in sql)
+        plan = library.connection.execute("EXPLAIN QUERY PLAN " + summary).fetchall()
+        assert any("b USING COVERING INDEX" in row[3] for row in plan)
+
+
+def test_scoped_sql_cancellation_restores_outer_handler_and_clears_on_exit(tmp_path):
+    query = "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20000) SELECT sum(x) FROM n"
+    with Library.create(tmp_path / "library.sqlite") as library:
+        outer_calls = []
+
+        def outer():
+            outer_calls.append(True)
+
+        def cancel():
+            raise TimeoutError("inner SQL deadline")
+
+        with library.sql_progress(outer, instructions=100):
+            assert library.connection.execute(query).fetchone()[0] == 200010000
+            before = len(outer_calls)
+            assert before > 0
+            with (
+                pytest.raises(TimeoutError, match="inner SQL deadline"),
+                library.sql_progress(cancel, instructions=100),
+            ):
+                library.connection.execute(query).fetchone()
+            assert library.connection.execute(query).fetchone()[0] == 200010000
+            assert len(outer_calls) > before
+        after = len(outer_calls)
+        assert library.connection.execute(query).fetchone()[0] == 200010000
+        assert len(outer_calls) == after
+
+
+@pytest.mark.parametrize("method", ["status", "verify"])
+def test_sql_only_summary_and_verification_honor_cancellation(tmp_path, method):
+    with Library.create(tmp_path / "library.sqlite") as library:
+        item = record()
+        library.put(item)
+        library.connection.executemany(
+            "INSERT INTO blocks VALUES (?,zeroblob(1000),1000,1)",
+            ((f"{number:064x}",) for number in range(5000)),
+        )
+        library.connection.executemany(
+            "INSERT INTO occurrences VALUES (?,0,?,?,0,1000,'{}')",
+            ((item.uid, number, f"{number:064x}") for number in range(5000)),
+        )
+        library.connection.commit()
+        traced = []
+        library.connection.set_trace_callback(traced.append)
+
+        def cancel():
+            assert traced, "cancellation must run while SQL is executing"
+            raise TimeoutError("SQL budget exhausted")
+
+        kwargs = {"check_callback": cancel}
+        if method == "verify":
+            kwargs["full"] = False
+        with pytest.raises(TimeoutError, match="SQL budget exhausted"):
+            getattr(library, method)(**kwargs)
+        library.connection.set_trace_callback(None)
+        assert library.status()["blocks"] == 5000
+
+
+@pytest.mark.parametrize("index_name", ["occurrences_digest", "blocks_eligible_digest_chars"])
+def test_sql_cancellation_during_index_creation_restores_both_indexes(tmp_path, index_name):
+    text = "\n\n".join(
+        f"Passage {number} keeps its source evidence, original wording, and all observed context. "
+        * 3
+        for number in range(1500)
+    )
+    with Library.create(tmp_path / "library.sqlite") as library:
+        library.put(record(text=text))
+        library.index_blocks()
+        previous = [tuple(row) for row in library.connection.execute("SELECT * FROM occurrences")]
+        traced = []
+        library.connection.set_trace_callback(traced.append)
+
+        def cancel():
+            if traced and traced[-1].startswith("CREATE INDEX " + index_name):
+                raise TimeoutError("cancel SQL index construction")
+
+        with pytest.raises(TimeoutError, match="cancel SQL index construction"):
+            library.index_blocks(check_callback=cancel)
+        library.connection.set_trace_callback(None)
+        assert [
+            tuple(row) for row in library.connection.execute("SELECT * FROM occurrences")
+        ] == previous
+        indexes = {
+            row[0]
+            for row in library.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index'"
+            )
+        }
+        assert {"occurrences_digest", "blocks_eligible_digest_chars"} <= indexes
+        assert library.verify() == []
+
+
+def test_legacy_library_without_covering_index_remains_read_only_compatible(tmp_path):
+    path = tmp_path / "library.sqlite"
+    with Library.create(path) as library:
+        library.put(record(text="A historical passage retains context and source evidence. " * 4))
+        library.index_blocks()
+        library.connection.execute("DROP INDEX IF EXISTS blocks_eligible_digest_chars")
+        library.connection.commit()
+    before = hashlib.sha256(path.read_bytes()).hexdigest()
+    with Library(path) as library:
+        traced = []
+        library.connection.set_trace_callback(traced.append)
+        assert library.status()["blocks"] == 1
+        library.connection.set_trace_callback(None)
+        summary = next(sql for sql in traced if "SUM(n-1)" in sql)
+        plan = library.connection.execute("EXPLAIN QUERY PLAN " + summary).fetchall()
+        assert any("occurrences USING COVERING INDEX" in row[3] for row in plan)
+        assert not any("SCAN b " in row[3] for row in plan)
+        assert library.verify() == []
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == before
+
+
+def test_incremental_blocks_match_full_rebuild_and_preserve_unaffected_occurrences(tmp_path):
+    shared = (
+        "A shared detailed paragraph preserves source occurrence identity and stable context. " * 3
+    )
+    old = (
+        "An obsolete detailed paragraph is removed only after its last current occurrence changes. "
+        * 3
+    )
+    new = (
+        "Recovered detailed evidence becomes searchable while historical source objects stay retained. "
+        * 3
+    )
+    with Library.create(tmp_path / "library.sqlite") as library:
+        for item in (record("one", shared + "\n\n" + old), record("two", shared)):
+            library.put(item)
+        library.index_blocks()
+        untouched = [
+            tuple(row)
+            for row in library.connection.execute(
+                "SELECT * FROM occurrences WHERE uid='chatgpt-two'"
+            )
+        ]
+        library.put(record("one", shared + "\n\n" + new))
+        incremental = library.index_blocks(uids=["chatgpt-one"])
+        assert untouched == [
+            tuple(row)
+            for row in library.connection.execute(
+                "SELECT * FROM occurrences WHERE uid='chatgpt-two'"
+            )
+        ]
+        occurrences = [
+            tuple(row)
+            for row in library.connection.execute(
+                "SELECT * FROM occurrences ORDER BY uid,message_index,block_index"
+            )
+        ]
+        blocks = [
+            tuple(row) for row in library.connection.execute("SELECT * FROM blocks ORDER BY digest")
+        ]
+        assert library.index_blocks() == incremental
+        assert occurrences == [
+            tuple(row)
+            for row in library.connection.execute(
+                "SELECT * FROM occurrences ORDER BY uid,message_index,block_index"
+            )
+        ]
+        assert blocks == [
+            tuple(row) for row in library.connection.execute("SELECT * FROM blocks ORDER BY digest")
+        ]
+        assert len(library.history("chatgpt-one")) == 2
+
+
+def test_incremental_blocks_rollback_after_replacement_is_interrupted(tmp_path):
+    text = (
+        "A sufficiently detailed source paragraph remains intact when an incremental transaction stops. "
+        * 3
+    )
+    with Library.create(tmp_path / "library.sqlite") as library:
+        library.put(record("one", text))
+        library.index_blocks()
+        library.put(record("one", text + "Changed."))
+        before = [tuple(row) for row in library.connection.execute("SELECT * FROM occurrences")]
+        calls = 0
+
+        def stop():
+            nonlocal calls
+            calls += 1
+            if calls == 4:
+                raise ValueError("interrupted after inserting new occurrences")
+
+        with pytest.raises(ValueError, match="interrupted"):
+            library.index_blocks(uids=["chatgpt-one"], check_callback=stop)
+        assert before == [
+            tuple(row) for row in library.connection.execute("SELECT * FROM occurrences")
+        ]

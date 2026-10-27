@@ -14,6 +14,30 @@ from conversation_corpus_engine.library_store import Library
 REPEATED = "This is a shared paragraph explaining a recurring research idea, with enough precise original wording to remain a meaningful passage across independent records and source observations."
 
 
+@pytest.mark.parametrize("prefix", ["        ", "\t", ">     "])
+def test_source_links_in_indented_code_are_literal_and_pass_validation(tmp_path, prefix):
+    text = (
+        "{\n"
+        + prefix
+        + '"body": "[dashboard](https://example.invalid) ![pixel](https://example.invalid/pixel)"\n}\n'
+    )
+    with Library.create(tmp_path / "library.sqlite") as library:
+        source = Conversation(
+            provider="antigravity",
+            source_id="indented-code",
+            title="Indented source code",
+            messages=[Message(role="tool", text=text)],
+        )
+        library.put(source)
+        library.index_blocks()
+        destination = tmp_path / "export"
+        export_library(library, destination)
+        assert verify_export(destination) == []
+        assert library.record(source.uid)["messages"][0]["text"] == text
+        note = (destination / "vault/records" / (source.uid + ".md")).read_text()
+        assert prefix + '"body": "[dashboard](https://example.invalid)' in note
+
+
 def populate(tmp_path: Path) -> Library:
     library = Library.create(tmp_path / "library.sqlite")
     library.put(

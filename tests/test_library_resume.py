@@ -1,9 +1,12 @@
+import errno
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from conversation_corpus_engine import library_resume
 from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.library_resume import prepare_resume
 from conversation_corpus_engine.library_store import Library, digest_json
@@ -120,3 +123,51 @@ def test_corrupt_normalized_object_cannot_be_resumed(tmp_path):
         library.connection.commit()
     with pytest.raises(ValueError, match="verification"):
         prepare_resume(generation, tmp_path, None, 1024**2)
+
+
+def test_native_clone_failure_never_silently_uses_missing_full_copy_capacity(tmp_path, monkeypatch):
+
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.write_bytes(b"source")
+    budget = 1024**2
+    floor = library_resume.DISK_FLOOR
+    monkeypatch.setattr(
+        library_resume.shutil, "disk_usage", lambda _: SimpleNamespace(free=floor + budget - 1)
+    )
+
+    def unsupported(*args):
+        raise OSError(errno.ENOTSUP, "unsupported clone")
+
+    monkeypatch.setattr(library_resume, "_clone_file", unsupported)
+    with pytest.raises(ValueError, match="ordinary copy requires full"):
+        library_resume.copy_qualified_database(source, destination, max_output_bytes=budget)
+    assert not destination.exists()
+    monkeypatch.setattr(
+        library_resume.shutil, "disk_usage", lambda _: SimpleNamespace(free=floor + budget + 100)
+    )
+    result = library_resume.copy_qualified_database(source, destination, max_output_bytes=budget)
+    assert result["method"] == "bounded_copy"
+    assert destination.read_bytes() == source.read_bytes()
+    assert destination.stat().st_mode & 0o777 == 0o600
+
+
+def test_cow_admission_includes_mutation_reserve_and_preserves_existing_destination(
+    tmp_path, monkeypatch
+):
+
+    source, destination = tmp_path / "source", tmp_path / "destination"
+    source.write_bytes(b"source")
+    budget = 1024**2
+    floor = library_resume.DISK_FLOOR
+    monkeypatch.setattr(
+        library_resume.shutil, "disk_usage", lambda _: SimpleNamespace(free=floor + budget)
+    )
+    with pytest.raises(ValueError, match="COW remaining output"):
+        library_resume.copy_qualified_database(
+            source, destination, max_output_bytes=budget, mutation_reserve=floor
+        )
+    assert not destination.exists()
+    destination.write_bytes(b"preserved")
+    with pytest.raises(FileExistsError):
+        library_resume.copy_qualified_database(source, destination, max_output_bytes=budget)
+    assert destination.read_bytes() == b"preserved"

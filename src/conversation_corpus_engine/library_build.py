@@ -22,7 +22,7 @@ from .archive_model import Conversation, sha256_file
 from .corpus_store import authorize_corpus_write
 from .library_documents import iter_documents
 from .library_native import iter_estate
-from .library_resume import prepare_resume
+from .library_resume import DISK_FLOOR, copy_qualified_database, prepare_resume
 from .library_store import LIBRARY_SCHEMA, SCHEMA_SQL, Library, digest_json
 
 SOURCES_SCHEMA = "cce.library-sources.v1"
@@ -108,6 +108,16 @@ def _validate_manifest(manifest: dict[str, Any]) -> dict[str, int]:
         not isinstance(resume_generation, str) or not Path(resume_generation).is_absolute()
     ):
         raise ValueError("resume_generation must name an explicit absolute failed generation")
+    resume_mode = manifest.get("resume_mode", "ingested")
+    if resume_mode not in {"ingested", "export", "indexed"}:
+        raise ValueError("unknown library resume mode")
+    if resume_mode != "ingested" and resume_generation is None:
+        raise ValueError("indexed/export resume mode requires resume_generation")
+    if resume_mode == "export" and any(
+        manifest.get(key)
+        for key in ("archives", "snapshot_archives", "estate_databases", "documents")
+    ):
+        raise ValueError("export resume cannot include new source declarations")
     native_limit = manifest.get("native_max_source_bytes", 64 * 1024**2)
     if isinstance(native_limit, bool) or not isinstance(native_limit, int) or native_limit <= 0:
         raise ValueError("native_max_source_bytes must be positive")
@@ -163,6 +173,8 @@ def build_library(
 ) -> dict[str, Any]:
     """Build a private immutable candidate; publication is a separate explicit operation."""
     limits = _validate_manifest(manifest)
+    resume_mode = manifest.get("resume_mode", "ingested")
+    reuse_index = resume_mode in {"export", "indexed"}
     started = time.monotonic()
     working_budget = limits["max_output_bytes"] - FAILURE_RESERVE
     if working_budget <= 0:
@@ -192,7 +204,11 @@ def build_library(
         source_roots=sources,
         live_roots=[previous] if previous else [],
     )
-    if shutil.disk_usage(authorization.store_root).free < limits["max_output_bytes"] + 1024**3:
+    if (
+        not reuse_index
+        and shutil.disk_usage(authorization.store_root).free
+        < limits["max_output_bytes"] + DISK_FLOOR
+    ):
         raise ValueError(
             "available storage does not cover declared library output budget plus 1 GiB"
         )
@@ -213,6 +229,7 @@ def build_library(
             previous_pointer,
             limits["max_output_bytes"],
             check_callback=check_resume_deadline,
+            resume_mode=resume_mode,
         )
         if resume["report"]["accepted_observations"] > limits["max_records"]:
             raise ValueError("resume baseline exceeds declared record limit")
@@ -262,6 +279,8 @@ def build_library(
     measured_database_bytes = 0
     receipt_bytes = 0
     next_size_check = 0.0
+    free_bytes = shutil.disk_usage(authorization.store_root).free
+    changed_uids: set[str] = set()
 
     def write_receipt(filename: str, value: Any, *, failure: bool = False) -> None:
         nonlocal receipt_bytes, measured_database_bytes
@@ -281,7 +300,7 @@ def build_library(
         measured_database_bytes = database.stat().st_size if database.is_file() else 0
 
     def check_bound(*, record: bool = False, bytes_written: int = 0) -> None:
-        nonlocal planned_output_bytes, measured_database_bytes, next_size_check
+        nonlocal planned_output_bytes, measured_database_bytes, next_size_check, free_bytes
         now = time.monotonic()
         if now - started > limits["max_seconds"]:
             raise ValueError("library execution deadline exceeded")
@@ -289,8 +308,12 @@ def build_library(
             raise ValueError("library record limit exceeded")
         database = destination / "library.sqlite"
         if record or now >= next_size_check:
+            if reuse_index:
+                free_bytes = shutil.disk_usage(authorization.store_root).free
             measured_database_bytes = database.stat().st_size if database.exists() else 0
             next_size_check = now + 0.25
+        if reuse_index and free_bytes - bytes_written < DISK_FLOOR:
+            raise ValueError("library build reached free-space floor")
         if (
             measured_database_bytes + planned_output_bytes + bytes_written + receipt_bytes
             > working_budget
@@ -306,10 +329,11 @@ def build_library(
                 digest.update(chunk)
         return digest.hexdigest()
 
-    def assert_resume_unchanged() -> None:
+    def assert_resume_unchanged() -> dict[str, str]:
         if resume is None:
-            return
+            return {}
         seed = resume["database"].parent
+        observed_hashes = {}
         for filename, key in (
             ("library.sqlite", "database_sha256"),
             ("build-state.json", "build_state_sha256"),
@@ -318,15 +342,17 @@ def build_library(
             path = seed / filename
             if any(part.is_symlink() for part in (path, *path.parents)):
                 raise ValueError("resume seed became symlinked before or during copy")
-            if hash_file(path) != resume["receipt"][key]:
+            observed_hashes[filename] = hash_file(path)
+            if observed_hashes[filename] != resume["receipt"][key]:
                 raise ValueError("resume seed hash changed before or during copy")
         if _pointer(store_root) != previous_pointer:
             raise ValueError("current library pointer changed during resume copy")
+        return observed_hashes
 
     try:
         write_receipt("sources.json", manifest)
         write_receipt("build-state.json", {"state": "building", "report": report})
-        assert_resume_unchanged()
+        source_hashes_before_copy = assert_resume_unchanged()
         if resume is not None and progress:
             progress({"stage": "copy_resume", "generation": str(resume_generation)})
         database_source = (
@@ -350,120 +376,153 @@ def build_library(
                 )
         if initial_database_bytes + receipt_bytes > working_budget:
             raise ValueError("library output byte limit exceeded by database copy or schema")
-        with Library.create(
-            destination / "library.sqlite",
-            previous=resume["database"]
-            if resume is not None
-            else previous / "library.sqlite"
-            if previous
-            else None,
-            compact_previous=resume is not None,
-        ) as library:
-            assert_resume_unchanged()
+        if reuse_index:
+            report["resume_copy"] = copy_qualified_database(
+                resume["database"],
+                destination / "library.sqlite",
+                max_output_bytes=limits["max_output_bytes"],
+                mutation_reserve=DISK_FLOOR if resume_mode == "indexed" else 0,
+                check_callback=check_bound,
+            )
+            copied_database_sha256 = hash_file(destination / "library.sqlite")
+            if copied_database_sha256 != resume["receipt"]["database_sha256"]:
+                raise ValueError("copied database hash differs from qualified seed")
+            candidate = Library(destination / "library.sqlite", writable=resume_mode == "indexed")
+        else:
+            candidate = Library.create(
+                destination / "library.sqlite",
+                previous=database_source,
+                compact_previous=resume is not None,
+            )
+        with candidate as library, candidate.sql_progress(check_bound):
+            source_hashes_after_copy = assert_resume_unchanged()
+            if reuse_index:
+                report["resume_copy"].update(
+                    source_hashes_before=source_hashes_before_copy,
+                    source_hashes_after=source_hashes_after_copy,
+                    copied_database_sha256=copied_database_sha256,
+                )
             page_size = library.connection.execute("PRAGMA page_size").fetchone()[0]
-            library.connection.execute(
-                f"PRAGMA max_page_count={max(1, (working_budget - receipt_bytes) // page_size)}"
-            )
+            if resume_mode != "export":
+                library.connection.execute(
+                    f"PRAGMA max_page_count={max(1, (working_budget - receipt_bytes) // page_size)}"
+                )
 
-            def accept(item: Conversation, *, observation_only: bool = False) -> None:
-                check_bound(record=True)
-                change = library.put(item, reconcile=True, observation_only=observation_only)
-                report["accepted_observations"] += 1
-                if resume is not None:
-                    report["new_observations"] += 1
-                report["changed_records"] += int(change["changed"])
-                if progress and report["accepted_observations"] % 100 == 0:
-                    progress(
-                        {
-                            "accepted": report["accepted_observations"],
-                            "changed": report["changed_records"],
-                        }
-                    )
+            if resume_mode == "export":
+                report["sources"] = [{"kind": "documents", "report": {"counts": {}}}]
+                report["status"] = resume["report"]["status"]
+            else:
 
-            archive_sources = [(path, False) for path in manifest.get("archives", [])]
-            archive_sources.extend((path, True) for path in manifest.get("snapshot_archives", []))
-            for archive_name, observation_only in archive_sources:
-                archive = Path(archive_name)
-                if not archive.is_dir():
-                    report["findings"].append({"code": "archive_missing", "path": str(archive)})
-                    continue
-                files = sorted(archive.glob("provider-*/collection-*-conversations.jsonl"))
-                if not files:
-                    report["findings"].append({"code": "archive_empty", "path": str(archive)})
-                for source in files:
-                    if source.is_symlink() or source.parent.is_symlink():
-                        raise ValueError("normalized archive source must not be symlinked")
-                    before = source.stat()
-                    count = 0
-                    source_digest = hashlib.sha256()
-                    with source.open("rb") as stream:
-                        while raw_line := stream.readline(128 * 1024**2 + 1):
-                            check_bound()
-                            if len(raw_line) > 128 * 1024**2:
-                                raise ValueError("normalized archive row exceeds 128 MiB")
-                            source_digest.update(raw_line)
-                            if not raw_line.strip():
-                                continue
-                            item = Conversation.from_dict(json.loads(raw_line))
-                            item.extra.setdefault("wing", "ai")
-                            item.extra.setdefault("lane", "conversations")
-                            item.extra.setdefault(
-                                "body_status", "full" if item.messages else "metadata_only"
-                            )
-                            accept(item, observation_only=observation_only)
-                            count += 1
-                    after = source.stat()
-                    if (before.st_size, before.st_mtime_ns, before.st_ino) != (
-                        after.st_size,
-                        after.st_mtime_ns,
-                        after.st_ino,
+                def accept(item: Conversation, *, observation_only: bool = False) -> None:
+                    check_bound(record=True)
+                    change = library.put(item, reconcile=True, observation_only=observation_only)
+                    report["accepted_observations"] += 1
+                    if resume is not None:
+                        report["new_observations"] += 1
+                    report["changed_records"] += int(change["changed"])
+                    if change["changed"]:
+                        changed_uids.add(change["uid"])
+                    if progress and report["accepted_observations"] % 100 == 0:
+                        progress(
+                            {
+                                "accepted": report["accepted_observations"],
+                                "changed": report["changed_records"],
+                            }
+                        )
+
+                archive_sources = [(path, False) for path in manifest.get("archives", [])]
+                archive_sources.extend(
+                    (path, True) for path in manifest.get("snapshot_archives", [])
+                )
+                for archive_name, observation_only in archive_sources:
+                    archive = Path(archive_name)
+                    if not archive.is_dir():
+                        report["findings"].append({"code": "archive_missing", "path": str(archive)})
+                        continue
+                    files = sorted(archive.glob("provider-*/collection-*-conversations.jsonl"))
+                    if not files:
+                        report["findings"].append({"code": "archive_empty", "path": str(archive)})
+                    for source in files:
+                        if source.is_symlink() or source.parent.is_symlink():
+                            raise ValueError("normalized archive source must not be symlinked")
+                        before = source.stat()
+                        count = 0
+                        source_digest = hashlib.sha256()
+                        with source.open("rb") as stream:
+                            while raw_line := stream.readline(128 * 1024**2 + 1):
+                                check_bound()
+                                if len(raw_line) > 128 * 1024**2:
+                                    raise ValueError("normalized archive row exceeds 128 MiB")
+                                source_digest.update(raw_line)
+                                if not raw_line.strip():
+                                    continue
+                                item = Conversation.from_dict(json.loads(raw_line))
+                                item.extra.setdefault("wing", "ai")
+                                item.extra.setdefault("lane", "conversations")
+                                item.extra.setdefault(
+                                    "body_status", "full" if item.messages else "metadata_only"
+                                )
+                                accept(item, observation_only=observation_only)
+                                count += 1
+                        after = source.stat()
+                        if (before.st_size, before.st_mtime_ns, before.st_ino) != (
+                            after.st_size,
+                            after.st_mtime_ns,
+                            after.st_ino,
+                        ):
+                            raise ValueError("normalized archive source changed during read")
+                        report["sources"].append(
+                            {
+                                "kind": "snapshot_archive"
+                                if observation_only
+                                else "normalized_archive",
+                                "path": str(source),
+                                "records": count,
+                                "sha256": source_digest.hexdigest(),
+                            }
+                        )
+                for database_name in manifest.get("estate_databases", []):
+                    native_report: dict[str, Any] = {}
+                    for item in iter_estate(
+                        Path(database_name),
+                        report=native_report,
+                        max_source_bytes=manifest.get("native_max_source_bytes", 64 * 1024**2),
                     ):
-                        raise ValueError("normalized archive source changed during read")
+                        accept(item)
                     report["sources"].append(
-                        {
-                            "kind": "snapshot_archive"
-                            if observation_only
-                            else "normalized_archive",
-                            "path": str(source),
-                            "records": count,
-                            "sha256": source_digest.hexdigest(),
-                        }
+                        {"kind": "native_estate", "path": database_name, "report": native_report}
                     )
-            for database_name in manifest.get("estate_databases", []):
-                native_report: dict[str, Any] = {}
-                for item in iter_estate(
-                    Path(database_name),
-                    report=native_report,
-                    max_source_bytes=manifest.get("native_max_source_bytes", 64 * 1024**2),
-                ):
+                    report["findings"].extend(
+                        {
+                            "code": code,
+                            "count": count,
+                            "scope": "native_estate",
+                            "path": database_name,
+                        }
+                        for code, count in native_report.get("findings", {}).items()
+                    )
+                document_report: dict[str, Any] = {}
+                for item in iter_documents(manifest.get("documents", []), report=document_report):
                     accept(item)
-                report["sources"].append(
-                    {"kind": "native_estate", "path": database_name, "report": native_report}
+                report["sources"].append({"kind": "documents", "report": document_report})
+                report["findings"].extend(document_report.get("findings", []))
+                check_bound()
+                report["phase"] = "ingested"
+                write_receipt(
+                    "build-state.json",
+                    {"state": "building", "phase": "ingested", "report": report},
                 )
-                report["findings"].extend(
-                    {"code": code, "count": count, "scope": "native_estate", "path": database_name}
-                    for code, count in native_report.get("findings", {}).items()
+                library.connection.execute(
+                    f"PRAGMA max_page_count={max(1, (working_budget - receipt_bytes) // page_size)}"
                 )
-            document_report: dict[str, Any] = {}
-            for item in iter_documents(manifest.get("documents", []), report=document_report):
-                accept(item)
-            report["sources"].append({"kind": "documents", "report": document_report})
-            report["findings"].extend(document_report.get("findings", []))
-            check_bound()
-            report["phase"] = "ingested"
-            write_receipt(
-                "build-state.json",
-                {"state": "building", "phase": "ingested", "report": report},
-            )
-            library.connection.execute(
-                f"PRAGMA max_page_count={max(1, (working_budget - receipt_bytes) // page_size)}"
-            )
-            if progress:
-                progress({"stage": "index_blocks", "accepted": report["accepted_observations"]})
-            report["phase"] = "indexing"
-            library.index_blocks(check_callback=check_bound)
-            check_bound()
-            report["status"] = library.status()
+                if progress:
+                    progress({"stage": "index_blocks", "accepted": report["accepted_observations"]})
+                report["phase"] = "indexing"
+                report["status"] = library.index_blocks(
+                    check_callback=check_bound,
+                    **({"uids": sorted(changed_uids)} if resume_mode == "indexed" else {}),
+                )
+                check_bound()
             report["record_fingerprint"] = digest_json(
                 [
                     (row["uid"], row["current_digest"], row["current_version"])
@@ -479,7 +538,7 @@ def build_library(
                     "resume_source": report.get("resume_source"),
                 }
             )
-            problems = library.verify(check_callback=check_bound)
+            problems = [] if resume_mode == "export" else library.verify(check_callback=check_bound)
             if problems:
                 raise ValueError("library verification failed: " + "; ".join(problems[:10]))
             if progress:

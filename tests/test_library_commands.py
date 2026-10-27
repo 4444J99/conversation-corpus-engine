@@ -1,8 +1,11 @@
+import json
+
 import pytest
 
-from conversation_corpus_engine import library_mcp
+from conversation_corpus_engine import library_commands, library_mcp
 from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.cli import build_parser
+from conversation_corpus_engine.corpus_store import register_corpus_store
 from conversation_corpus_engine.library_commands import handle_library, read_record
 from conversation_corpus_engine.library_mcp import READ_TOOL, SEARCH_TOOL
 from conversation_corpus_engine.library_store import Library
@@ -129,3 +132,60 @@ def test_mcp_and_cli_expose_alternate_sequence_selector(tmp_path, monkeypatch):
     assert args.sequence == "alternate"
     with pytest.raises(ValueError, match="sequence"):
         library_mcp.call_tool(tmp_path, READ_TOOL, {"uid": item.uid, "sequence": []})
+
+
+def test_analysis_cli_writes_private_payloads_and_prints_only_receipt(
+    tmp_path, monkeypatch, capsys
+):
+    project, store = tmp_path / "project", tmp_path / "store"
+    project.mkdir()
+    store.mkdir()
+    register_corpus_store(project, store)
+    database = store / "library.sqlite"
+    original = "Leading prose about lattice research must reach both native consumers."
+    with Library.create(database) as library:
+        library.put(
+            Conversation(
+                provider="chatgpt",
+                source_id="analysis-cli",
+                title="Lattice source",
+                messages=[Message(role="user", text=original)],
+            )
+        )
+    monkeypatch.setattr(library_commands, "open_library", lambda root: (store, Library(database)))
+    output = store / "derived" / "analysis"
+    args = build_parser().parse_args(
+        [
+            "library",
+            "analyze",
+            "lattice",
+            "--output",
+            str(output),
+            "--project-root",
+            str(project),
+            "--store-root",
+            str(store),
+            "--limit",
+            "1",
+        ]
+    )
+    assert handle_library(args) == 0
+    captured = capsys.readouterr()
+    assert original not in captured.out
+    assert isinstance(json.loads(captured.out), dict)
+    for name in ("lingframe.json", "uaks.json", "receipt.json"):
+        assert (output / name).is_file()
+        assert (output / name).stat().st_mode & 0o777 == 0o600
+    assert original in (output / "lingframe.json").read_text()
+    assert original in (output / "uaks.json").read_text()
+
+
+def test_analysis_cli_requires_one_selection_and_explicit_output(tmp_path):
+    parser = build_parser()
+    for options in (
+        ["--output", str(tmp_path)],
+        ["lattice", "--uid", "chatgpt-one", "--output", str(tmp_path)],
+        ["lattice"],
+    ):
+        with pytest.raises(SystemExit):
+            parser.parse_args(["library", "analyze", *options])
