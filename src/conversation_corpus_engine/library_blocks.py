@@ -25,7 +25,7 @@ from .archive_vault import INLINE_CODE_RE, neutralize
 MIN_PROSE_CHARACTERS = 120
 _QUOTE_PREFIX = re.compile(r"^ {0,3}>[ \t]?")
 _INDENTED_CODE = re.compile(r"^(?: {4}|\t)")
-_TERMINAL_NEWLINES = re.compile(r"\n+$")
+_TERMINAL_NEWLINES = re.compile(r"(?:\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029])+$")
 _LINE_END = re.compile(r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
@@ -130,13 +130,23 @@ def iter_blocks(
     the remainder rather than guessing where prose resumes.
     """
     tracker = FenceTracker()
+    fence_quote_depth = 0
     start = position = 0
     previous: Literal["prose", "code", "separator"] | None = None
     for line in _lines(text):
         if check_callback is not None:
             check_callback()
-        probe, _ = _unquote_line(line)
+        probe, quote_depth = _unquote_line(line)
+        if tracker.opener:
+            probe = line
+            for _ in range(fence_quote_depth):
+                match = _QUOTE_PREFIX.match(probe)
+                if match is None:
+                    break
+                probe = probe[match.end() :]
         fence_state = tracker.feed(probe)
+        if fence_state == "open":
+            fence_quote_depth = quote_depth
         kind: Literal["prose", "code", "separator"]
         if fence_state or _INDENTED_CODE.match(probe):
             kind = "code"
@@ -199,8 +209,8 @@ def _reference_label(label: str) -> str:
 
 
 def _terminal_newlines(text: str) -> str:
-    match = _TERMINAL_NEWLINES.search(_lf(text))
-    return match.group() if match else ""
+    match = _TERMINAL_NEWLINES.search(text)
+    return "\n" * len(_LINE_END.findall(match.group())) if match else ""
 
 
 def _literal_markdown(text: str) -> str:

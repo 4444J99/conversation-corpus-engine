@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -248,3 +249,32 @@ def test_refuses_output_inside_a_different_canonical_generation(packer, tmp_path
     other.mkdir()
     with pytest.raises(ValueError, match="canonical generation"):
         packer.package(source, other / "derived")
+
+
+@pytest.mark.parametrize("ticks", ["`", "``", "```"])
+def test_split_inline_code_keeps_images_literal_in_every_part(packer, tmp_path, ticks):
+    image = "![pixel](https://example.invalid/tracker)"
+    raw = ("prefix " + ticks + "a" * 2047 + image + "b" * 2200 + ticks).encode()
+    _, output, _ = build(packer, tmp_path, {"note.md": raw})
+    found = 0
+    for path in sorted(output.glob("note.__part*.md")):
+        rendered = path.read_text()
+        runs = list(re.finditer(r"`+", rendered))
+        assert len(runs) == 2
+        assert runs[0][0] == runs[1][0] == ticks
+        assert packer.fence_state(rendered) is None
+        if image in rendered:
+            position = rendered.index(image)
+            assert runs[0].end() <= position < position + len(image) <= runs[1].start()
+            found += 1
+    assert found == 1
+    assert b"".join(packer.reconstruct(output, "note.md")) == raw
+
+
+def test_split_never_cuts_through_a_backtick_delimiter(packer, tmp_path):
+    raw = b"x" * 2046 + b"```" + b"body" * 1400 + b"```"
+    _, output, _ = build(packer, tmp_path, {"note.md": raw})
+    row = json.loads(output.joinpath(".cce-package/ledger.jsonl").read_text())
+    for piece in row["pieces"]:
+        assert piece["source_end"] not in {2047, 2048, len(raw) - 2, len(raw) - 1}
+    assert b"".join(packer.reconstruct(output, "note.md")) == raw

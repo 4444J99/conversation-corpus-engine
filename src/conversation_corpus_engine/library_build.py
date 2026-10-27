@@ -632,7 +632,16 @@ def verify_candidate(generation: Path) -> dict[str, Any]:
         "record_fingerprint"
     ):
         raise ValueError("candidate build state is not verified")
-    total = sum(path.stat().st_size for path in generation.rglob("*") if path.is_file())
+    allowed = set(report["artifacts"]) | {"report.json", "build-state.json"}
+    total = 0
+    for path in generation.rglob("*"):
+        relative = path.relative_to(generation).as_posix()
+        if path.is_symlink():
+            raise ValueError(f"candidate contains unexpected symlink: {relative}")
+        if path.is_file():
+            if relative not in allowed:
+                raise ValueError(f"candidate contains unexpected file: {relative}")
+            total += path.stat().st_size
     if total > report["limits"]["max_output_bytes"]:
         raise ValueError("candidate output byte limit exceeded including receipts")
     for relative, expected in report["artifacts"].items():

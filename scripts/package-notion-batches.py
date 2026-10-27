@@ -319,10 +319,9 @@ def package(
     _safe_path(output)
     if output.exists():
         raise FileExistsError(output)
-    if (
-        source.parent.parent.name == "generations"
-        and source.parent.parent.parent.name == "library-all"
-        and output.is_relative_to(source.parent)
+    if any(
+        ancestor.parent.name == "generations" and ancestor.parent.parent.name == "library-all"
+        for ancestor in (output, *output.parents)
     ):
         raise ValueError("derived output must stay outside the canonical generation")
     budget = Budget(output, max_output_bytes, max_seconds)
@@ -535,13 +534,24 @@ def package(
                 "source_sha256_before": source_hash,
                 "source_sha256_after": source_hash,
             }
-            with _private_binary(output / "run-receipt.json") as stream:
-                data = _json(receipt)
-                budget.charge(len(data))
-                stream.write(data)
-            with _private_binary(output / "manifest.json") as stream:
-                budget.charge(len(encoded))
-                stream.write(encoded)
+            receipt_data = _json(receipt)
+            budget.charge(len(receipt_data) + len(encoded))
+            completion_files = [
+                (output / "run-receipt.json", receipt_data),
+                (output / "manifest.json", encoded),
+            ]
+            # Neither completion name is visible until both complete payloads
+            # have been written and synced. Publish the manifest last.
+            for path, data in completion_files:
+                temporary = path.with_name("." + path.name + ".partial")
+                with _private_binary(temporary) as stream:
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            budget.check()
+            for path, _ in completion_files:
+                _require(not path.exists() and not path.is_symlink(), "completion file exists")
+                path.with_name("." + path.name + ".partial").rename(path)
             return manifest
         except BaseException as error:
             failure = _json(

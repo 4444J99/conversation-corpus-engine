@@ -129,6 +129,23 @@ def test_bounded_build_does_not_publish_partial_work(tmp_path):
     assert current_generation(store) is None
 
 
+@pytest.mark.parametrize("extra", ["file", "symlink", "directory_symlink"])
+def test_publication_refuses_unlisted_files_and_symlinks(tmp_path, extra):
+    project, store, manifest = setup_sources(tmp_path)
+    result = build_library(manifest, project_root=project, store_root=store)
+    generation = Path(result["generation"])
+    unexpected = generation / "vault" / "unverified.md"
+    if extra == "file":
+        unexpected.write_text("unverified source")
+    else:
+        unexpected.symlink_to(
+            generation / ("vault" if extra == "directory_symlink" else "sources.json")
+        )
+    with pytest.raises(ValueError, match="unexpected|symlink"):
+        publish_library(generation, project_root=project, store_root=store)
+    assert current_generation(store) is None
+
+
 def test_source_inventory_receipts_cannot_exceed_output_budget(tmp_path):
     project, store, manifest = setup_sources(tmp_path)
     document_root = Path(manifest["documents"][0]["root"])

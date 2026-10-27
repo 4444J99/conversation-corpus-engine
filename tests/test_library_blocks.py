@@ -183,6 +183,22 @@ def test_indented_source_cannot_close_its_explicit_wrapper() -> None:
     assert render_blocks(split_blocks(text), {}) == "\n`````text\n" + text + "`````\n"
 
 
+def test_literal_quote_fence_cannot_close_unquoted_code() -> None:
+    text = "~~~markdown\n> ~~~\nvalues[0] < 2\n~~~\n"
+    blocks = split_blocks(text)
+    assert len(blocks) == 1 and blocks[0]["kind"] == "code"
+    assert render_blocks(blocks, {}) == text
+
+
+@pytest.mark.parametrize(
+    "ending", ["\r\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+)
+def test_all_line_boundaries_keep_fences_and_paragraphs_separate(ending: str) -> None:
+    text = "para" + ending + "```\n![x](https://example.invalid/p.png)\n```\n"
+    assert render_blocks(split_blocks(text), {}) == text.replace(ending, "\n")
+    assert render_blocks(split_blocks("A" + ending + ending + "B"), {}) == "A\n\nB"
+
+
 def test_lazy_blocks_preserve_all_python_line_boundaries() -> None:
     text = "A\r\n\rB\v\vC\f\x1c\x1d\x1eD\x85\u2028\u2029End"
     blocks = list(iter_blocks(text))

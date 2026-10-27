@@ -6,6 +6,7 @@ import stat
 import sys
 import warnings
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -205,3 +206,92 @@ def test_derived_output_cannot_change_canonical_generation_inventory(tmp_path):
     with pytest.raises(ValueError, match="outside the canonical generation"):
         batches.package(source, generation / "batches")
     assert not (generation / "batches").exists()
+
+
+def test_other_generation_is_never_an_output_destination(tmp_path):
+    generations = tmp_path / "library-all/generations"
+    original = generations / "generation-original"
+    protected = generations / "generation-protected"
+    original.mkdir(parents=True)
+    protected.mkdir()
+    source = source_zip(original / "notion-import.zip", [("a.md", b"evidence")])
+    sentinel = protected / "existing.md"
+    sentinel.write_bytes(b"canonical evidence remains unchanged")
+    with pytest.raises(ValueError, match="outside the canonical generation"):
+        batches.package(source, protected / "batches")
+    assert not (protected / "batches").exists()
+    assert sentinel.read_bytes() == b"canonical evidence remains unchanged"
+
+
+def test_late_metadata_budget_refusal_leaves_no_completion_files(tmp_path, monkeypatch):
+    source = source_zip(tmp_path / "full.zip", [("a.md", b"original evidence")])
+    original = source.read_bytes()
+    output = tmp_path / "derived"
+    charge = batches.Budget.charge
+
+    def exhaust_at_completion(budget, amount):
+        readme = output / "README.md"
+        if readme.exists() and readme.stat().st_size:
+            budget.max_bytes = budget.written + amount + batches.FAILURE_RESERVE - 1
+        return charge(budget, amount)
+
+    monkeypatch.setattr(batches.Budget, "charge", exhaust_at_completion)
+    with pytest.raises(ValueError, match="output byte budget"):
+        batches.package(source, output)
+    assert source.read_bytes() == original
+    assert (output / "batch-000001.zip").is_file()
+    assert not (output / "run-receipt.json").exists()
+    assert not (output / "manifest.json").exists()
+    assert json.loads((output / "failure.json").read_bytes())["complete"] is False
+
+
+@pytest.mark.parametrize("name", ["run-receipt.json", "manifest.json"])
+def test_interrupted_completion_write_never_publishes_partial_marker(tmp_path, monkeypatch, name):
+    source = source_zip(tmp_path / "full.zip", [("a.md", b"original evidence")])
+    original = source.read_bytes()
+    output = tmp_path / "derived"
+    private_binary = batches._private_binary
+
+    class InterruptedWrite:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def write(self, data):
+            self.stream.write(data[:7])
+            self.stream.flush()
+            raise OSError("simulated interrupted completion write")
+
+    @contextmanager
+    def interrupt(path):
+        with private_binary(path) as stream:
+            yield (
+                InterruptedWrite(stream) if path.name in {name, "." + name + ".partial"} else stream
+            )
+
+    monkeypatch.setattr(batches, "_private_binary", interrupt)
+    with pytest.raises(OSError, match="interrupted completion write"):
+        batches.package(source, output)
+    assert source.read_bytes() == original
+    assert (output / "batch-000001.zip").is_file()
+    assert not (output / "run-receipt.json").exists()
+    assert not (output / "manifest.json").exists()
+    assert json.loads((output / "failure.json").read_bytes())["complete"] is False
+
+
+def test_completion_fsync_failure_prevents_published_manifest(tmp_path, monkeypatch):
+    source = source_zip(tmp_path / "full.zip", [("a.md", b"original evidence")])
+    output = tmp_path / "derived"
+    fsync = batches.os.fsync
+
+    def refuse_manifest_sync(descriptor):
+        temporary = output / ".manifest.json.partial"
+        if temporary.exists() and os.fstat(descriptor).st_ino == temporary.stat().st_ino:
+            raise OSError("simulated completion fsync failure")
+        return fsync(descriptor)
+
+    monkeypatch.setattr(batches.os, "fsync", refuse_manifest_sync)
+    with pytest.raises(OSError, match="completion fsync failure"):
+        batches.package(source, output)
+    assert not (output / "run-receipt.json").exists()
+    assert not (output / "manifest.json").exists()
+    assert json.loads((output / "failure.json").read_bytes())["complete"] is False

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import bisect
 import hashlib
 import json
 import os
@@ -32,6 +33,8 @@ FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\r\n]*)")
 HEADING = re.compile(r"^ {0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 LINK = re.compile(r"\]\((<?)([^\s<>\r\n)]+)(>?)\)")
 BACKTICKS = re.compile(r"`+")
+BYTE_BACKTICKS = re.compile(rb"`+")
+BYTE_LINES = re.compile(rb"[^\r\n]*(?:\r\n|\r|\n|$)")
 
 
 def require(condition, message):
@@ -176,6 +179,62 @@ def inline_spans(line):
     return spans
 
 
+def matched_inline_spans(raw):
+    """Matched source code spans, with exact byte offsets and delimiter runs."""
+    runs = list(BYTE_BACKTICKS.finditer(raw))
+    following = {}
+    next_equal = [None] * len(runs)
+    for index in range(len(runs) - 1, -1, -1):
+        size = len(runs[index][0])
+        next_equal[index] = following.get(size)
+        following[size] = index
+    index = 0
+    while index < len(runs):
+        opener = runs[index]
+        back = opener.start() - 1
+        while back >= 0 and raw[back] == 92:
+            back -= 1
+        if (opener.start() - 1 - back) % 2 or next_equal[index] is None:
+            index += 1
+            continue
+        closing = runs[next_equal[index]]
+        yield opener.start(), closing.end(), opener[0].decode()
+        index = next_equal[index] + 1
+
+
+def annotate_inline_boundaries(data, segments):
+    """Carry literal inline context across fragments without rewriting source bytes."""
+    cuts = [segment["end"] for segment in segments[:-1]]
+    state = None
+    for match in BYTE_LINES.finditer(data):
+        raw = match[0]
+        if not raw:
+            continue
+        line = raw.decode()
+        before = state
+        if before and unquote_line(line)[1] < unquote_line(before)[1]:
+            before = None
+        state = advance_fence(line, state)
+        if (
+            before is not None
+            or state is not None
+            or unquote_line(line)[0].startswith(("    ", "\t"))
+        ):
+            continue
+        left = bisect.bisect_right(cuts, match.start())
+        right = bisect.bisect_left(cuts, match.end())
+        if left == right:
+            continue
+        for start, end, marker in matched_inline_spans(raw):
+            span_start = start + match.start()
+            span_end = end + match.start()
+            for index in range(
+                bisect.bisect_right(cuts, span_start), bisect.bisect_left(cuts, span_end)
+            ):
+                segments[index]["inline_after"] = marker
+                segments[index + 1]["inline_before"] = marker
+
+
 def source_files(source, agent_entry=None):
     for root, directories, files in os.walk(source, followlinks=False):
         directories.sort()
@@ -292,6 +351,8 @@ def ranges(data, body_limit, *, relative=None, maximum=None):
         while True:
             end = offset + candidate
             while end < len(data) and data[end] & 0xC0 == 0x80:
+                end -= 1
+            while end < len(data) and end > offset and data[end - 1 : end + 1] == b"``":
                 end -= 1
             if end < len(data):
                 newline = data.rfind(b"\n", offset + candidate // 2, end)
@@ -437,10 +498,14 @@ def render_part(body, relative, number, count, segment):
     header = f"# Part {number} of {count}\n\n[Source note index]({filename})\n\n".encode()
     if segment["before"]:
         header += (segment["before"] + "\n").encode()
+    elif segment.get("inline_before"):
+        header += ("Inline code continued: " + segment["inline_before"] + " ").encode()
     footer = b""
     if segment["after"]:
         separator = "" if body.endswith((b"\n", b"\r")) else "\n"
         footer = (separator + segment["after"] + "\n").encode()
+    elif segment.get("inline_after"):
+        footer = (" " + segment["inline_after"] + "\n").encode()
     return header + body + footer, len(header)
 
 
@@ -661,6 +726,7 @@ def package(
                         segments = ranges(
                             raw, max_note_bytes // 2, relative=relative, maximum=max_note_bytes
                         )
+                        annotate_inline_boundaries(raw, segments)
                         plans[relative] = segments
                         database_limit(connection, budget, database_bytes)
                         populate_anchors(connection, relative, raw, segments)
@@ -740,6 +806,8 @@ def package(
                                 "body_start": start,
                                 "body_bytes": len(body),
                                 "edits": edits,
+                                "inline_before": segment.get("inline_before"),
+                                "inline_after": segment.get("inline_after"),
                             }
                         )
                         pieces.append(entry)
