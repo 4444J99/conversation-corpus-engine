@@ -25,7 +25,7 @@ from typing import Any
 
 from .archive_model import Conversation, Message, to_iso
 
-READER = "library-native@1.0.0"
+READER = "library-native@1.1.0"
 PROVIDERS = {
     "codex": "codex",
     "claude": "claudecode",
@@ -115,6 +115,12 @@ class _Body:
         entry = f"{code}:{path}" + (f":{detail}" if detail else "")
         if entry not in self.findings:
             self.findings.append(entry)
+
+    def identity(self, path: Path, evidence: dict[str, Any]) -> None:
+        """Keep the native evidence that binds a declared source to its inventory identity."""
+        for observation in self.observations:
+            if observation["source_path"] == str(path):
+                observation.setdefault("native_identity", evidence)
 
     def add(
         self, event: dict[str, Any], content: Any, role: str, locator: str, *, kind: str = ""
@@ -213,16 +219,57 @@ def _bytes(path: Path, body: _Body) -> tuple[bytes, str]:
     return raw, digest
 
 
+def _codex_parents(payload: dict[str, Any]) -> list[str]:
+    values = [payload.get(key) for key in ("parent_session_id", "forked_from_id", "parent_thread_id")]
+    source = payload.get("source")
+    if isinstance(source, dict):
+        subagent = source.get("subagent")
+        spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+        if isinstance(spawn, dict):
+            values.append(spawn.get("parent_thread_id"))
+    return list(dict.fromkeys(value for value in values if isinstance(value, str) and value))
+
+
 def _codex(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) -> None:
-    for _, record in records:
-        payload = record.get("payload", {})
-        if record.get("type") == "session_meta" and isinstance(payload, dict):
-            if payload.get("id") and payload["id"] != body.native_id:
+    headers = [
+        payload
+        for _, record in records
+        if record.get("type") == "session_meta"
+        and isinstance(payload := record.get("payload"), dict)
+        and (payload.get("id") or payload.get("session_id"))
+    ]
+    if headers:
+        primary = headers[0]
+        primary_id = primary.get("id") or primary.get("session_id")
+        if primary_id != body.native_id:
+            body.finding("identity_mismatch", path)
+            return
+        # Forks contain inherited session_meta rows. They are accepted only through
+        # parent edges explicitly declared by an already proven native header.
+        allowed = {body.native_id}
+        changed = True
+        while changed:
+            previous = len(allowed)
+            for header in headers:
+                if (header.get("id") or header.get("session_id")) in allowed:
+                    allowed.update(_codex_parents(header))
+            changed = len(allowed) != previous
+        inherited = set()
+        for header in headers:
+            identity = header.get("id") or header.get("session_id")
+            if identity not in allowed:
                 body.finding("identity_mismatch", path)
                 return
-            parent = payload.get("parent_session_id") or payload.get("forked_from_id")
-            if isinstance(parent, str):
-                body.parent = parent
+            if identity != body.native_id:
+                inherited.add(identity)
+        parents = _codex_parents(primary)
+        if parents:
+            body.parent = parents[0]
+        body.identity(path, {
+            "kind": "codex-session", "inventory_id": body.native_id,
+            "primary_id": primary_id, "declared_parent_ids": parents,
+            "inherited_ids": sorted(inherited),
+        })
     has_messages = any(r.get("type") == "response_item" for _, r in records)
     for line, record in records:
         payload = record.get("payload", record)
@@ -274,8 +321,26 @@ def _codex(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) -
 
 
 def _claude(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) -> None:
+    parent, separator, agent = body.native_id.partition("/agent/")
+    composite = bool(separator and parent and agent and "/" not in agent)
+    proven = composite and any(
+        record.get("sessionId") == parent and record.get("agentId") == agent
+        for _, record in records
+    )
+    if proven:
+        body.parent = parent
+        body.identity(path, {
+            "kind": "claude-subagent", "inventory_id": body.native_id,
+            "parent_session_id": parent, "agent_id": agent,
+        })
     for line, record in records:
-        if record.get("sessionId") and record["sessionId"] != body.native_id:
+        mismatch = (
+            not proven or (
+                bool(record.get("sessionId") or record.get("agentId"))
+                and (record.get("sessionId") != parent or record.get("agentId") != agent)
+            )
+        ) if composite else bool(record.get("sessionId") and record["sessionId"] != body.native_id)
+        if mismatch:
             body.finding("identity_mismatch", path, str(line))
             continue
         event = record.get("message", {})

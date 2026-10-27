@@ -21,6 +21,7 @@ from .archive_model import Conversation, sha256_file
 from .corpus_store import authorize_corpus_write
 from .library_documents import iter_documents
 from .library_native import iter_estate
+from .library_resume import prepare_resume
 from .library_store import Library, digest_json
 
 SOURCES_SCHEMA = "cce.library-sources.v1"
@@ -88,7 +89,7 @@ def current_generation(store_root: Path) -> Path | None:
 def _validate_manifest(manifest: dict[str, Any]) -> dict[str, int]:
     if manifest.get("schema") != SOURCES_SCHEMA:
         raise ValueError(f"source manifest must use {SOURCES_SCHEMA}")
-    for key in ("archives", "estate_databases"):
+    for key in ("archives", "snapshot_archives", "estate_databases"):
         values = manifest.get(key, [])
         if not isinstance(values, list) or any(
             not isinstance(value, str) or not Path(value).is_absolute() for value in values
@@ -96,6 +97,11 @@ def _validate_manifest(manifest: dict[str, Any]) -> dict[str, int]:
             raise ValueError(f"{key} must list explicit absolute source paths")
     if not isinstance(manifest.get("documents", []), list):
         raise ValueError("documents must be a list of explicit source declarations")
+    resume_generation = manifest.get("resume_generation")
+    if resume_generation is not None and (
+        not isinstance(resume_generation, str) or not Path(resume_generation).is_absolute()
+    ):
+        raise ValueError("resume_generation must name an explicit absolute failed generation")
     native_limit = manifest.get("native_max_source_bytes", 64 * 1024**2)
     if isinstance(native_limit, bool) or not isinstance(native_limit, int) or native_limit <= 0:
         raise ValueError("native_max_source_bytes must be positive")
@@ -160,9 +166,16 @@ def build_library(
     )
     destination = store_root / DIRECTORY / "generations" / name
     sources = [
-        Path(path) for key in ("archives", "estate_databases") for path in manifest.get(key, [])
+        Path(path)
+        for key in ("archives", "snapshot_archives", "estate_databases")
+        for path in manifest.get(key, [])
     ]
     sources.extend(Path(row["root"]).expanduser() for row in manifest.get("documents", []))
+    resume_generation = (
+        Path(manifest["resume_generation"]) if manifest.get("resume_generation") else None
+    )
+    if resume_generation is not None:
+        sources.append(resume_generation)
     authorization = authorize_corpus_write(
         project_root=project_root,
         corpus_store_root=store_root,
@@ -176,6 +189,24 @@ def build_library(
         )
     if previous and (previous / "library.sqlite").stat().st_size > limits["max_output_bytes"]:
         raise ValueError("previous library database exceeds declared output byte limit")
+    resume = None
+    if resume_generation is not None:
+        if progress:
+            progress({"stage": "qualify_resume", "generation": str(resume_generation)})
+
+        def check_resume_deadline() -> None:
+            if time.monotonic() - started > limits["max_seconds"]:
+                raise ValueError("library execution deadline exceeded")
+
+        resume = prepare_resume(
+            resume_generation,
+            store_root,
+            previous_pointer,
+            limits["max_output_bytes"],
+            check_callback=check_resume_deadline,
+        )
+        if resume["report"]["accepted_observations"] > limits["max_records"]:
+            raise ValueError("resume baseline exceeds declared record limit")
     destination = authorization.destination
     destination.mkdir(parents=True, mode=0o700)
     # Intermediate ancestors are private even with an ambient group-readable umask.
@@ -192,7 +223,32 @@ def build_library(
         "changed_records": 0,
         "limits": limits,
         "complete": False,
+        "phase": "ingesting",
     }
+    if previous:
+        inherited = json.loads((previous / "report.json").read_text(encoding="utf-8"))
+        report["inherited_report"] = {
+            "path": str(previous / "report.json"),
+            "sha256": sha256_file(previous / "report.json"),
+            "coverage_complete": inherited.get("coverage_complete", False),
+            "notice": "Prior source observations and unresolved coverage remain in this immutable report; absent source declarations do not delete retained records.",
+        }
+    if resume is not None:
+        seed_report = resume["report"]
+        report["accepted_observations"] = seed_report["accepted_observations"]
+        report["changed_records"] = seed_report.get("changed_records", 0)
+        report["baseline_accepted_observations"] = seed_report["accepted_observations"]
+        report["new_observations"] = 0
+        report["findings"] = json.loads(json.dumps(seed_report.get("findings", [])))
+        report["resume_source"] = {
+            "generation": str(resume_generation),
+            "receipt": resume["receipt"],
+            "receipt_sha256": resume["receipt_sha256"],
+            "report": seed_report,
+            "report_sha256": digest_json(seed_report),
+        }
+        if "inherited_report" in seed_report:
+            report["inherited_report"] = seed_report["inherited_report"]
     private_json(destination / "sources.json", manifest)
     private_json(destination / "build-state.json", {"state": "building", "report": report})
 
@@ -223,18 +279,48 @@ def build_library(
                 digest.update(chunk)
         return digest.hexdigest()
 
+    def assert_resume_unchanged() -> None:
+        if resume is None:
+            return
+        seed = resume["database"].parent
+        for filename, key in (
+            ("library.sqlite", "database_sha256"),
+            ("build-state.json", "build_state_sha256"),
+            ("sources.json", "sources_sha256"),
+        ):
+            path = seed / filename
+            if any(part.is_symlink() for part in (path, *path.parents)):
+                raise ValueError("resume seed became symlinked before or during copy")
+            if hash_file(path) != resume["receipt"][key]:
+                raise ValueError("resume seed hash changed before or during copy")
+        if _pointer(store_root) != previous_pointer:
+            raise ValueError("current library pointer changed during resume copy")
+
     try:
+        assert_resume_unchanged()
+        if resume is not None and progress:
+            progress({"stage": "copy_resume", "generation": str(resume_generation)})
         with Library.create(
             destination / "library.sqlite",
-            previous=previous / "library.sqlite" if previous else None,
+            previous=resume["database"]
+            if resume is not None
+            else previous / "library.sqlite"
+            if previous
+            else None,
+            compact_previous=resume is not None,
         ) as library:
+            assert_resume_unchanged()
             page_size = library.connection.execute("PRAGMA page_size").fetchone()[0]
-            library.connection.execute(f"PRAGMA max_page_count={max(1, limits['max_output_bytes'] // page_size)}")
+            library.connection.execute(
+                f"PRAGMA max_page_count={max(1, limits['max_output_bytes'] // page_size)}"
+            )
 
-            def accept(item: Conversation) -> None:
+            def accept(item: Conversation, *, observation_only: bool = False) -> None:
                 check_bound(record=True)
-                change = library.put(item, reconcile=True)
+                change = library.put(item, reconcile=True, observation_only=observation_only)
                 report["accepted_observations"] += 1
+                if resume is not None:
+                    report["new_observations"] += 1
                 report["changed_records"] += int(change["changed"])
                 if progress and report["accepted_observations"] % 100 == 0:
                     progress(
@@ -244,7 +330,9 @@ def build_library(
                         }
                     )
 
-            for archive_name in manifest.get("archives", []):
+            archive_sources = [(path, False) for path in manifest.get("archives", [])]
+            archive_sources.extend((path, True) for path in manifest.get("snapshot_archives", []))
+            for archive_name, observation_only in archive_sources:
                 archive = Path(archive_name)
                 if not archive.is_dir():
                     report["findings"].append({"code": "archive_missing", "path": str(archive)})
@@ -272,7 +360,7 @@ def build_library(
                             item.extra.setdefault(
                                 "body_status", "full" if item.messages else "metadata_only"
                             )
-                            accept(item)
+                            accept(item, observation_only=observation_only)
                             count += 1
                     after = source.stat()
                     if (before.st_size, before.st_mtime_ns, before.st_ino) != (
@@ -283,7 +371,9 @@ def build_library(
                         raise ValueError("normalized archive source changed during read")
                     report["sources"].append(
                         {
-                            "kind": "normalized_archive",
+                            "kind": "snapshot_archive"
+                            if observation_only
+                            else "normalized_archive",
                             "path": str(source),
                             "records": count,
                             "sha256": source_digest.hexdigest(),
@@ -310,8 +400,14 @@ def build_library(
             report["sources"].append({"kind": "documents", "report": document_report})
             report["findings"].extend(document_report.get("findings", []))
             check_bound()
+            report["phase"] = "ingested"
+            private_json(
+                destination / "build-state.json",
+                {"state": "building", "phase": "ingested", "report": report},
+            )
             if progress:
                 progress({"stage": "index_blocks", "accepted": report["accepted_observations"]})
+            report["phase"] = "indexing"
             library.index_blocks(check_callback=check_bound)
             check_bound()
             report["status"] = library.status()
@@ -327,6 +423,7 @@ def build_library(
                     "sources": report["sources"],
                     "findings": report["findings"],
                     "manifest": report["source_manifest_hash"],
+                    "resume_source": report.get("resume_source"),
                 }
             )
             problems = library.verify(check_callback=check_bound)
@@ -334,10 +431,12 @@ def build_library(
                 raise ValueError("library verification failed: " + "; ".join(problems[:10]))
             if progress:
                 progress({"stage": "export", "records": report["status"]["records"]})
+            report["phase"] = "exporting"
             report["exports"] = library_export.export_library(
                 library, destination, check_callback=check_bound
             )
         check_bound()
+        report["phase"] = "verifying"
         problems = library_export.verify_export(destination, check_callback=check_bound)
         if problems:
             raise ValueError("library export verification failed: " + "; ".join(problems[:10]))
@@ -359,10 +458,13 @@ def build_library(
         report["artifacts"] = artifacts
         report["coverage_complete"] = (
             not report["findings"]
+            and report.get("inherited_report", {}).get("coverage_complete", True)
+            and (resume is None or resume["report"].get("coverage_complete", True))
             and not report["status"]["by_body_status"].get("metadata_only", 0)
             and not report["status"]["by_body_status"].get("partial", 0)
         )
         report["complete"] = True
+        report["phase"] = "verified"
         report["elapsed_seconds"] = round(time.monotonic() - started, 3)
         private_json(destination / "report.json", report)
         private_json(

@@ -380,3 +380,81 @@ def test_decompressed_source_limit_is_enforced(tmp_path):
     item = next(iter_estate(estate(tmp_path, [("codex", "s", source)]), max_source_bytes=512))
     assert not item.messages
     assert any("source_too_large" in f for f in item.extra["findings"])
+
+
+def test_claude_subagent_composite_identity_requires_parent_and_agent(tmp_path):
+    source = jsonl(
+        tmp_path / "agent-a1.jsonl",
+        [{"sessionId": "parent", "agentId": "a1", "isSidechain": True,
+          "type": "user", "uuid": "u", "message": {"role": "user", "content": "child"}}],
+    )
+    item = next(iter_estate(estate(tmp_path, [("claude", "parent/agent/a1", source)])))
+    assert [m.text for m in item.messages] == ["child"]
+    assert item.source_id == "parent/agent/a1"
+    assert item.extra["parent_session_id"] == "parent"
+    assert item.extra["body_status"] == "full"
+    assert item.extra["source_observations"][0]["native_identity"]["agent_id"] == "a1"
+
+
+def test_claude_subagent_rejects_same_parent_with_wrong_agent(tmp_path):
+    source = jsonl(
+        tmp_path / "agent-a1.jsonl",
+        [{"sessionId": "parent", "agentId": "other", "isSidechain": True,
+          "type": "user", "uuid": "u", "message": {"role": "user", "content": "wrong"}}],
+    )
+    item = next(iter_estate(estate(tmp_path, [("claude", "parent/agent/a1", source)])))
+    assert not item.messages
+    assert item.extra["body_status"] == "metadata_only"
+    assert any("identity_mismatch" in f for f in item.extra["findings"])
+
+
+def test_codex_fork_accepts_only_explicitly_declared_ancestor_headers(tmp_path):
+    source = jsonl(
+        tmp_path / "rollout-child.jsonl",
+        [
+            {"type": "session_meta", "payload": {
+                "id": "child", "session_id": "parent", "forked_from_id": "parent",
+                "parent_thread_id": "parent", "subagent_history_start_ordinal": 15,
+            }},
+            {"type": "session_meta", "payload": {"id": "parent", "forked_from_id": "grandparent"}},
+            {"type": "session_meta", "payload": {"id": "grandparent"}},
+            codex_message("inherited", "parent context"),
+            codex_message("child-message", "child response", "assistant"),
+        ],
+    )
+    item = next(iter_estate(estate(tmp_path, [("codex", "child", source)])))
+    assert [m.text for m in item.messages] == ["parent context", "child response"]
+    assert item.source_id == "child"
+    assert item.extra["parent_session_id"] == "parent"
+    assert item.extra["body_status"] == "full"
+    identity = item.extra["source_observations"][0]["native_identity"]
+    assert identity["primary_id"] == "child"
+    assert identity["inherited_ids"] == ["grandparent", "parent"]
+
+
+def test_codex_fork_rejects_unrelated_header_even_with_matching_primary(tmp_path):
+    source = jsonl(
+        tmp_path / "rollout-child.jsonl",
+        [
+            {"type": "session_meta", "payload": {"id": "child", "forked_from_id": "parent"}},
+            {"type": "session_meta", "payload": {"id": "unrelated"}},
+            codex_message("wrong", "do not attach"),
+        ],
+    )
+    item = next(iter_estate(estate(tmp_path, [("codex", "child", source)])))
+    assert not item.messages
+    assert any("identity_mismatch" in f for f in item.extra["findings"])
+
+
+def test_codex_later_matching_header_cannot_override_wrong_primary(tmp_path):
+    source = jsonl(
+        tmp_path / "rollout-child.jsonl",
+        [
+            {"type": "session_meta", "payload": {"id": "other"}},
+            {"type": "session_meta", "payload": {"id": "child", "forked_from_id": "other"}},
+            codex_message("wrong", "do not attach"),
+        ],
+    )
+    item = next(iter_estate(estate(tmp_path, [("codex", "child", source)])))
+    assert not item.messages
+    assert any("identity_mismatch" in f for f in item.extra["findings"])

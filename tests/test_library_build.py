@@ -106,3 +106,31 @@ def test_bounded_build_does_not_publish_partial_work(tmp_path):
     with pytest.raises(ValueError, match="record limit"):
         build_library(manifest, project_root=project, store_root=store)
     assert current_generation(store) is None
+
+
+def test_historical_archive_adds_snapshot_without_replacing_current_body(tmp_path):
+    project, store, manifest = setup_sources(tmp_path)
+    first = build_library(manifest, project_root=project, store_root=store)
+    publish_library(Path(first["generation"]), project_root=project, store_root=store)
+    source = (
+        Path(manifest["archives"][0])
+        / "provider-chatgpt"
+        / "collection-chatgpt-conversations.jsonl"
+    )
+    historical = json.loads(source.read_text())
+    historical["messages"][0]["text"] = "An older source variant omitted by a first-wins importer."
+    source.write_text(json.dumps(historical) + "\n")
+    manifest["snapshot_archives"] = manifest.pop("archives")
+    second = build_library(manifest, project_root=project, store_root=store)
+    with Library(Path(second["generation"]) / "library.sqlite") as library:
+        uid = Conversation.from_dict(historical).uid
+        assert "lattice" in library.record(uid)["messages"][0]["text"]
+        assert len(library.history(uid)) == 1
+        snapshots = library.snapshots(uid)
+        assert len(snapshots) == 2
+        old = next(row for row in snapshots if row["disposition"] == "historical_snapshot")
+        assert (
+            "older source variant"
+            in library.record(uid, digest=old["digest"])["messages"][0]["text"]
+        )
+    assert second["inherited_report"]["path"] == str(Path(first["generation"]) / "report.json")

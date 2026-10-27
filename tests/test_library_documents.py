@@ -4,9 +4,11 @@ import hashlib
 import shutil
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from conversation_corpus_engine import library_documents
 from conversation_corpus_engine.library_documents import iter_documents
 
 
@@ -53,7 +55,7 @@ def test_unicode_text_and_original_reference_are_preserved(tmp_path: Path) -> No
     assert row.extra["body_status"] == "full"
 
 
-@pytest.mark.parametrize("suffix", [".tex", ".yaml", ".yml", ".org"])
+@pytest.mark.parametrize("suffix", [".tex", ".yaml", ".yml", ".org", ".csv", ".fountain"])
 def test_authored_source_formats_remain_literal_utf8(tmp_path: Path, suffix: str) -> None:
     # No TeX expansion, YAML constructors, or Org execution: these are evidence.
     raw = b"\\input{private}\n!!python/object:example\n#+begin_src sh\nfalse\n#+end_src\n"
@@ -64,6 +66,31 @@ def test_authored_source_formats_remain_literal_utf8(tmp_path: Path, suffix: str
     assert row.provenance["source_sha256"] == hashlib.sha256(raw).hexdigest()
     assert row.provenance["extractor"] == "utf8@1"
     assert row.extra["body_status"] == "full"
+
+
+def test_cloud_placeholder_stays_visible_without_reading_bytes(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "cloud.md"
+    path.write_text("This stands in for an unavailable cloud body")
+    original = Path.lstat
+
+    def flagged(item):
+        info = original(item)
+        if item == path:
+            values = {name: getattr(info, name) for name in dir(info) if name.startswith("st_")}
+            values["st_flags"] = getattr(library_documents.stat, "SF_DATALESS", 0x40000000)
+            return SimpleNamespace(**values)
+        return info
+
+    def no_read(*_args):
+        pytest.fail("a cloud placeholder must not be hydrated")
+
+    monkeypatch.setattr(Path, "lstat", flagged)
+    monkeypatch.setattr(library_documents, "_safe_bytes", no_read)
+    report = {}
+    rows = list(iter_documents([source(tmp_path)], report=report))
+    assert len(rows) == 1 and rows[0].messages == []
+    assert rows[0].extra["body_reason"] == "cloud_placeholder_not_hydrated"
+    assert any(f["code"] == "cloud_placeholder_not_hydrated" for f in report["findings"])
 
 
 def test_symlink_escape_is_accounted_without_reading_target(tmp_path: Path) -> None:
@@ -155,6 +182,113 @@ def test_docx_expansion_limit_does_not_accept_zip_bomb(tmp_path: Path) -> None:
         archive.writestr("word/document.xml", " " * 50000)
     row = list(iter_documents([source(tmp_path, max_bytes=1000)]))[0]
     assert row.extra["body_status"] == "metadata_only"
+    assert row.extra["body_reason"] == "extraction_error"
+
+
+def test_html_extracts_static_text_without_active_or_hidden_content(tmp_path: Path) -> None:
+    raw = b"""<!doctype html><html><head><title>Not body</title><style>CSS_SECRET</style></head>
+    <body><h1>Research &amp; writing</h1><p>First <b>visible</b> sentence.</p>
+    <script>NETWORK_SECRET</script><template>TEMPLATE_SECRET</template>
+    <p hidden>HIDDEN_SECRET</p><div style="display: none">STYLE_SECRET</div>
+    <p>Second<br>line <a href="https://example.invalid/never-fetch">link label</a>.</p></body></html>"""
+    path = tmp_path / "draft.html"
+    path.write_bytes(raw)
+    row = list(iter_documents([source(tmp_path)]))[0]
+    text = row.messages[0].text
+    assert "Research & writing" in text and "First visible sentence." in text
+    assert "Second\nline link label." in text
+    assert "SECRET" not in text and "Not body" not in text and "https://" not in text
+    assert row.provenance["source_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert path.read_bytes() == raw
+    assert row.provenance["extractor"] == "html-static-text@1"
+
+
+def test_fdx_preserves_paragraph_order_and_literal_unicode(tmp_path: Path) -> None:
+    raw = '<FinalDraft><Content><Paragraph Type="Scene Heading"><Text>INT. CAFÉ</Text></Paragraph><Paragraph Type="Action"><Text>A </Text><Text Style="Italic">quiet</Text><Text> room.</Text></Paragraph></Content></FinalDraft>'.encode()
+    (tmp_path / "script.fdx").write_bytes(raw)
+    row = list(iter_documents([source(tmp_path)]))[0]
+    assert row.messages[0].text == "INT. CAFÉ\n\nA quiet room."
+    assert row.provenance["source_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert row.provenance["extractor"] == "fdx-xml@1"
+
+
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-16"])
+def test_fdx_rejects_xml_entities_without_resolving_external_sources(
+    tmp_path: Path, encoding: str
+) -> None:
+    raw = (
+        '<?xml version="1.0"?><!DOCTYPE FinalDraft [<!ENTITY external SYSTEM "file:///never/read">]><FinalDraft><Content><Paragraph><Text>&external;</Text></Paragraph></Content></FinalDraft>'
+    ).encode(encoding)
+    (tmp_path / "unsafe.fdx").write_bytes(raw)
+    row = list(iter_documents([source(tmp_path)]))[0]
+    assert row.messages == []
+    assert row.extra["body_reason"] == "extraction_error"
+    assert row.provenance["source_sha256"] == hashlib.sha256(raw).hexdigest()
+
+
+def test_pages_text_preview_is_partial_and_keeps_the_source_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "draft.pages"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("QuickLook/Preview.txt", "A preserved preview.\n")
+        archive.writestr("Index/Document.iwa", b"native body remains opaque")
+    raw = path.read_bytes()
+    report = {}
+    row = list(iter_documents([source(tmp_path)], report=report))[0]
+    assert row.messages[0].text == "A preserved preview.\n"
+    assert row.extra["body_status"] == "partial"
+    assert row.extra["body_reason"] == "preview_only"
+    assert row.provenance["extraction_parts"] == ["QuickLook/Preview.txt"]
+    assert row.provenance["source_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert path.read_bytes() == raw
+    assert report["counts"]["partial"] == 1
+
+
+def test_pages_without_preview_remains_explicitly_unavailable(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    with zipfile.ZipFile(tmp_path / "opaque.pages", "w") as archive:
+        archive.writestr("Index/Document.iwa", b"do not invent a native decoder")
+        archive.writestr("preview.jpg", b"image is not text")
+    row = list(iter_documents([source(tmp_path)]))[0]
+    assert row.messages == []
+    assert row.extra["body_reason"] == "pages_native_extractor_unavailable"
+
+
+def test_pages_native_extraction_preserves_identity_and_labels_partial(
+    tmp_path: Path, monkeypatch
+) -> None:
+    converter = tmp_path / "converter"
+    converter.write_text("#!/bin/sh\nprintf 'Native document words.\\n'\n")
+    converter.chmod(0o700)
+    monkeypatch.setattr(shutil, "which", lambda name: str(converter))
+    path = tmp_path / "native.pages"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("Index/Document.iwa", b"synthetic native fixture")
+    raw = path.read_bytes()
+    row = list(iter_documents([source(tmp_path, include=["*.pages"])]))[0]
+    assert row.messages[0].text == "Native document words.\n"
+    assert row.extra["body_status"] == "partial"
+    assert row.extra["body_reason"] == "native_text_conversion_not_visually_verified"
+    assert row.provenance["source_sha256"] == hashlib.sha256(raw).hexdigest()
+    assert path.read_bytes() == raw
+
+
+def test_pages_native_converter_output_limit_is_enforced(tmp_path: Path, monkeypatch) -> None:
+    converter = tmp_path / "converter"
+    converter.write_text("#!/bin/sh\n/usr/bin/head -c 100000 /dev/zero\n")
+    converter.chmod(0o700)
+    monkeypatch.setattr(shutil, "which", lambda name: str(converter))
+    with zipfile.ZipFile(tmp_path / "native.pages", "w") as archive:
+        archive.writestr("Index/Document.iwa", b"synthetic native fixture")
+    row = list(iter_documents([source(tmp_path, include=["*.pages"], max_bytes=1000)]))[0]
+    assert row.messages == []
+    assert row.extra["body_reason"] == "extraction_error"
+
+
+def test_pages_preview_expansion_is_bounded(tmp_path: Path) -> None:
+    with zipfile.ZipFile(tmp_path / "bomb.pages", "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("QuickLook/Preview.txt", "x" * 50000)
+    row = list(iter_documents([source(tmp_path, max_bytes=1000)]))[0]
+    assert row.messages == []
     assert row.extra["body_reason"] == "extraction_error"
 
 

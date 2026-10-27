@@ -55,7 +55,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS record_fts USING fts5(
     uid UNINDEXED, title, body, tokenize='porter unicode61'
 );
 CREATE TABLE IF NOT EXISTS blocks (
-    digest TEXT PRIMARY KEY, text TEXT NOT NULL, chars INTEGER NOT NULL,
+    digest TEXT PRIMARY KEY, text BLOB NOT NULL, chars INTEGER NOT NULL,
     eligible INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS occurrences (
@@ -111,13 +111,16 @@ class Library:
         self.connection = sqlite3.connect(uri, uri=True)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA foreign_keys=ON")
+        self.connection.execute("PRAGMA cache_size=-32768")
         version = self.connection.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
         if version is None or version[0] != LIBRARY_SCHEMA:
             self.connection.close()
             raise ValueError("unsupported knowledge library schema")
 
     @classmethod
-    def create(cls, path: Path, *, previous: Path | None = None) -> Library:
+    def create(
+        cls, path: Path, *, previous: Path | None = None, compact_previous: bool = False
+    ) -> Library:
         """Create a new candidate, optionally inheriting the accepted immutable generation.
 
         The public builder must first authorize its destination through corpus_store. This
@@ -133,7 +136,10 @@ class Library:
         try:
             if previous is not None:
                 with cls(previous) as original:
-                    original.connection.backup(connection)
+                    if compact_previous:
+                        original.connection.execute("VACUUM main INTO ?", (str(path),))
+                    else:
+                        original.connection.backup(connection)
             connection.executescript(SCHEMA_SQL)
             connection.execute("INSERT OR IGNORE INTO meta VALUES ('schema', ?)", (LIBRARY_SCHEMA,))
             connection.commit()
@@ -154,7 +160,9 @@ class Library:
         if not self.writable:
             raise ValueError("knowledge library is read-only")
 
-    def put(self, conversation: Conversation, *, reconcile: bool = False) -> dict[str, Any]:
+    def put(
+        self, conversation: Conversation, *, reconcile: bool = False, observation_only: bool = False
+    ) -> dict[str, Any]:
         self._write()
         payload = conversation.to_dict()
         uid = conversation.uid
@@ -194,7 +202,12 @@ class Library:
         ).fetchone()
         quality = {"metadata_only": 0, "partial": 1, "full": 2}
         downgrade = previous is not None and quality[body_status] < quality[previous["body_status"]]
-        if previous is not None and (downgrade or (reconcile and observed)):
+        if previous is not None and (observation_only or downgrade or (reconcile and observed)):
+            disposition = (
+                "historical_snapshot"
+                if observation_only
+                else ("lower_body_coverage" if downgrade else "prior_observation")
+            )
             with self.connection:
                 self.connection.execute(
                     "INSERT OR IGNORE INTO objects VALUES (?,?,?)",
@@ -206,7 +219,7 @@ class Library:
                         uid,
                         digest,
                         body_status,
-                        "lower_body_coverage" if downgrade else "prior_observation",
+                        disposition,
                     ),
                 )
                 self._observations(uid, observations)
@@ -215,7 +228,7 @@ class Library:
                 "version": previous["current_version"],
                 "changed": False,
                 "digest": digest,
-                "disposition": "lower_body_coverage" if downgrade else "prior_observation",
+                "disposition": disposition,
             }
         change = "initial"
         if previous is not None:
@@ -369,6 +382,10 @@ class Library:
 
         # Rebuild only this candidate's derived occurrence view. Raw revisions remain intact.
         with self.connection:
+            # sqlite3 begins implicit transactions on DML, not DROP INDEX. Start
+            # explicitly so an interrupted rebuild restores both data and index.
+            self.connection.execute("SAVEPOINT block_reindex")
+            self.connection.execute("DROP INDEX IF EXISTS occurrences_digest")
             self.connection.execute("DELETE FROM occurrences")
             self.connection.execute("DELETE FROM blocks")
             for row in self.rows():
@@ -379,11 +396,16 @@ class Library:
                     for block_index, block in enumerate(split_blocks(message["text"])):
                         if check_callback and block_index % 500 == 0:
                             check_callback()
+                        # Only eligible prose participates in reference condensation.
+                        # Code and short fragments remain lossless in source revisions
+                        # and full-text search, without a second expanded SQL copy.
+                        if not block["eligible"]:
+                            continue
                         self.connection.execute(
                             "INSERT OR IGNORE INTO blocks VALUES (?,?,?,?)",
                             (
                                 block["digest"],
-                                block["canonical_text"],
+                                zlib.compress(block["canonical_text"].encode("utf-8")),
                                 len(block["canonical_text"]),
                                 int(block["eligible"]),
                             ),
@@ -400,7 +422,18 @@ class Library:
                                 canonical_json(block["normalization"]),
                             ),
                         )
+            self.connection.execute("CREATE INDEX occurrences_digest ON occurrences(digest)")
+            self.connection.execute("RELEASE SAVEPOINT block_reindex")
         return self.status()
+
+    def block_text(self, digest: str) -> str:
+        row = self.connection.execute(
+            "SELECT text FROM blocks WHERE digest=?", (digest,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(digest)
+        value = row[0]
+        return zlib.decompress(value).decode("utf-8") if isinstance(value, bytes) else value
 
     def search(
         self,

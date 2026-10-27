@@ -1,3 +1,5 @@
+import hashlib
+
 import pytest
 
 from conversation_corpus_engine.archive_model import Conversation, Message
@@ -154,3 +156,67 @@ def test_refuse_provider_path_escape(tmp_path):
         item.provider = "../escape"
         with pytest.raises(ValueError, match="safe stable identifiers"):
             library.put(item)
+
+
+def test_compressed_reference_index_preserves_originals_and_search(tmp_path):
+    passage = "The shared account keeps its exact provenance and original wording. " * 40
+    code = "```python\n" + "print('searchablecode')\n" * 20 + "```"
+    source = passage + "\n\n" + code + "\n\nA short searchabletail."
+    with Library.create(tmp_path / "library.sqlite") as library:
+        library.put(record("one", source))
+        library.put(record("two", "> " + passage))
+        library.index_blocks()
+        digest = hashlib.sha256(passage.encode()).hexdigest()
+        assert library.block_text(digest) == passage
+        assert library.status()["blocks"] == 1
+        assert library.status()["reference_occurrences"] == 1
+        assert library.search("searchablecode")["total"] == 1
+        assert library.search("searchabletail")["total"] == 1
+        assert library.record("chatgpt-one")["messages"][0]["text"] == source
+        stored_bytes = library.connection.execute("SELECT length(text) FROM blocks").fetchone()[0]
+        assert stored_bytes < len(passage.encode()) // 4
+
+
+def test_compacted_resume_copy_keeps_all_retained_evidence(tmp_path):
+    original = tmp_path / "original.sqlite"
+    with Library.create(original) as library:
+        item = record("retained", "Lattice version one.")
+        library.put(item)
+        item.messages[0].text = "Lattice version two."
+        library.put(item)
+        item.messages[0].text = "An older unselected lattice snapshot."
+        library.put(item, observation_only=True)
+        evidence = library.evidence_fingerprint()
+        library.connection.execute("CREATE TABLE temporary_space(payload BLOB)")
+        library.connection.execute("INSERT INTO temporary_space VALUES (zeroblob(1048576))")
+        library.connection.execute("DROP TABLE temporary_space")
+        library.connection.commit()
+    source_hash = hashlib.sha256(original.read_bytes()).hexdigest()
+    candidate_path = tmp_path / "candidate.sqlite"
+    with Library.create(candidate_path, previous=original, compact_previous=True) as candidate:
+        assert candidate.evidence_fingerprint() == evidence
+        assert len(candidate.history(item.uid)) == 2
+        assert len(candidate.snapshots(item.uid)) == 3
+        assert candidate.record(item.uid)["messages"][0]["text"] == "Lattice version two."
+        assert candidate.verify() == []
+    assert candidate_path.stat().st_size < original.stat().st_size
+    assert hashlib.sha256(original.read_bytes()).hexdigest() == source_hash
+
+
+def test_interrupted_block_rebuild_keeps_prior_rows_and_lookup_index(tmp_path):
+    with Library.create(tmp_path / "library.sqlite") as library:
+        library.put(record(text="A carefully retained passage with source and context. " * 4))
+        library.index_blocks()
+        previous = [tuple(row) for row in library.connection.execute("SELECT * FROM occurrences")]
+
+        def interrupt():
+            raise TimeoutError("bounded rebuild interrupted")
+
+        with pytest.raises(TimeoutError):
+            library.index_blocks(check_callback=interrupt)
+        assert [
+            tuple(row) for row in library.connection.execute("SELECT * FROM occurrences")
+        ] == previous
+        assert library.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='index' AND name='occurrences_digest'"
+        ).fetchone()

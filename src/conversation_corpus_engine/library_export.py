@@ -244,12 +244,10 @@ def _record_note(
 def _block_note(
     library: Library, digest: str, callback: Callable[..., Any] | None
 ) -> Iterator[str]:
-    block = library.connection.execute(
-        "SELECT text FROM blocks WHERE digest=?", (digest,)
-    ).fetchone()
+    text = library.block_text(digest)
     yield f"# Repeated passage {digest[:12]}\n\n{_EVIDENCE}\n\n[Library home](../Home.md)\n\n"
     yield "One canonical reading copy follows. Original message text and exact occurrence offsets remain in the revision store. Matching only normalizes line endings, terminal newlines and common Markdown quote depth.\n\n"
-    yield render_blocks(split_blocks(block["text"]), {}) + "\n\n## Source occurrences\n\n"
+    yield render_blocks(split_blocks(text), {}) + "\n\n## Source occurrences\n\n"
     for occurrence in library.connection.execute(
         "SELECT o.*,r.title FROM occurrences o JOIN records r ON r.uid=o.uid WHERE o.digest=? ORDER BY o.uid,o.message_index,o.block_index",
         (digest,),
