@@ -7,11 +7,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import __version__
+from . import __version__, library_mcp
 from .answering import build_answer, render_answer_text, search_documents_v4
 from .archive_database import open_database, search, search_titles
 from .archive_ingest import ArchivePaths
 from .federation import list_registered_corpora, validate_corpus_root
+from .library_commands import STORE_ENV
 from .paths import default_project_root as default_project_root_path
 from .paths import resolve_workspace_path
 from .surface_exports import build_mcp_context_payload
@@ -115,10 +116,12 @@ class CceMcpServer:
         default_project_root: Path | None = None,
         default_source_drop_root: Path | None = None,
         archive_root: Path | None = None,
+        library_store_root: Path | None = None,
     ) -> None:
         self.default_project_root = (default_project_root or default_project_root_path()).resolve()
         self.default_source_drop_root = default_source_drop_root
         self.archive_root = archive_root.resolve() if archive_root else None
+        self.library_store_root = library_store_root.absolute() if library_store_root else None
 
     def archive_tool_definition(self) -> dict[str, Any]:
         return {
@@ -156,6 +159,8 @@ class CceMcpServer:
         tools = self._core_tool_definitions()
         if self.archive_root is not None:
             tools.append(self.archive_tool_definition())
+        if self.library_store_root is not None:
+            tools.extend(library_mcp.tool_definitions())
         return tools
 
     def _core_tool_definitions(self) -> list[dict[str, Any]]:
@@ -254,7 +259,13 @@ class CceMcpServer:
                 return self.surface_context(args)
             if name == ARCHIVE_TOOL and self.archive_root is not None:
                 return self.archive_search(args)
-        except ValueError as exc:
+            if name in library_mcp.LIBRARY_TOOLS and self.library_store_root is not None:
+                try:
+                    result = library_mcp.call_tool(self.library_store_root, name, args)
+                except KeyError as exc:
+                    raise ValueError("library record, version or digest not found") from exc
+                return text_result(pretty_json(result), result)
+        except (ValueError, FileNotFoundError) as exc:
             return text_result(str(exc), {"error": str(exc)}, is_error=True)
         raise KeyError(name)
 
@@ -497,6 +508,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"enable {ARCHIVE_TOOL} over this archive root (or set {ARCHIVE_ROOT_ENV})",
     )
     parser.add_argument("--version", action="store_true")
+    parser.add_argument(
+        "--library-store-root",
+        type=Path,
+        default=Path(os.environ[STORE_ENV]) if os.environ.get(STORE_ENV) else None,
+        help="enable bounded unified-library search/read/history over this registered private store",
+    )
     return parser
 
 
@@ -510,6 +527,7 @@ def main() -> None:
         default_project_root=args.project_root,
         default_source_drop_root=args.source_drop_root,
         archive_root=args.archive_root,
+        library_store_root=args.library_store_root,
     )
     server.serve_stdio()
 

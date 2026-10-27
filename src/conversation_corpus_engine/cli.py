@@ -41,6 +41,7 @@ from .governance_candidates import (
 )
 from .governance_policy import load_or_create_promotion_policy
 from .governance_replay import build_policy_replay_payload, write_policy_replay_artifacts
+from .library_commands import add_library_parser, handle_library
 from .migration import migrate_corpus_v2, seed_registry_from_staging
 from .paths import default_project_root
 from .persona_extract import extract_persona_lexicon, write_persona_extract_artifacts
@@ -727,6 +728,7 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--json", action="store_true")
 
     add_archive_parser(subparsers)
+    add_library_parser(subparsers)
 
     return parser
 
@@ -737,6 +739,8 @@ def main() -> None:
 
     if args.group == "archive":
         raise SystemExit(handle_archive(args))
+    if args.group == "library":
+        raise SystemExit(handle_library(args))
 
     if args.group == "corpus" and args.action == "list":
         corpora = list_registered_corpora(args.project_root)
