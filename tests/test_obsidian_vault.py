@@ -298,3 +298,41 @@ def test_multiline_inline_code_preserves_literal_images_across_parts(packer, tmp
             assert token.type != "image"
             queue.extend(token.children or [])
     assert b"".join(packer.reconstruct(output, "note.md")) == raw
+
+
+def test_raw_unicode_navigation_targets_stay_within_rendered_byte_limit(packer, tmp_path):
+    target = "漢" * 50 + ".md"
+    files = {
+        target: ("# title\n" + "body " * 1000).encode(),
+        "links.md": (("[go](" + target + "#title)\n") * 40).encode(),
+    }
+    _, output, result = build(packer, tmp_path, files)
+    assert result["status"] == "verified"
+    assert all(path.stat().st_size <= 4096 for path in output.rglob("*.md"))
+    for relative, original in files.items():
+        assert b"".join(packer.reconstruct(output, relative)) == original
+    rendered = b"".join(path.read_bytes() for path in output.glob("links.__part*.md"))
+    assert b"%E6%BC%A2" in rendered
+    assert b".__part000001.md#title" in rendered
+
+
+def test_inline_suffix_after_newline_does_not_start_a_fence(packer, tmp_path):
+    raw = (
+        b"prefix ```\n[example](https://example.invalid/)\n"
+        + b"a" * 1000
+        + b"\n"
+        + b"b" * 1500
+        + b"\nend```\n"
+    )
+    _, output, result = build(packer, tmp_path, {"record.md": raw})
+    assert result["split_notes"] == 1
+    parser = MarkdownIt("commonmark", {"html": True})
+    for path in output.glob("record.__part*.md"):
+        tokens = parser.parse(path.read_text())
+        assert not any(token.type == "fence" for token in tokens)
+        assert not any(
+            child.type == "link_open" and child.attrGet("href") == "https://example.invalid/"
+            for token in tokens
+            for child in token.children or []
+        )
+    assert b"".join(packer.reconstruct(output, "record.md")) == raw

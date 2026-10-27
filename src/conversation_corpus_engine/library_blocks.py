@@ -25,7 +25,6 @@ from .archive_vault import INLINE_CODE_RE, neutralize
 MIN_PROSE_CHARACTERS = 120
 _QUOTE_PREFIX = re.compile(r"^ {0,3}>[ \t]?")
 _INDENTED_CODE = re.compile(r"^(?: {4}|\t)")
-_TERMINAL_NEWLINES = re.compile(r"(?:\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029])+$")
 _LINE_END = re.compile(r"\r\n|[\n\r\v\f\x1c-\x1e\x85\u2028\u2029]")
 
 
@@ -209,8 +208,17 @@ def _reference_label(label: str) -> str:
 
 
 def _terminal_newlines(text: str) -> str:
-    match = _TERMINAL_NEWLINES.search(text)
-    return "\n" * len(_LINE_END.findall(match.group())) if match else ""
+    index = len(text)
+    count = 0
+    while index:
+        if index >= 2 and text[index - 2 : index] == "\r\n":
+            index -= 2
+        elif text[index - 1] in "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029":
+            index -= 1
+        else:
+            break
+        count += 1
+    return "\n" * count
 
 
 def _literal_markdown(text: str) -> str:
@@ -221,6 +229,11 @@ def _literal_markdown(text: str) -> str:
     inert in both Obsidian and portable Markdown consumers. Bare URLs may remain
     clickable through a consumer's autolinking; they do not fetch automatically.
     """
+    # An escaped delimiter is literal source, not proof of a code span. Preserve
+    # the whole ambiguous example verbatim in a collision-safe literal block;
+    # the archive's legacy inline regex must not exempt its links from escaping.
+    if "\\`" in text:
+        return _fenced_literal(text)
     tracker = FenceTracker()
     lines: list[str] = []
     for raw in text.splitlines():

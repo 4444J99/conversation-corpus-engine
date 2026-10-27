@@ -108,6 +108,7 @@ class _StaticHTML(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.stack: list[tuple[str, bool]] = []
+        self.hidden_depth = 0
         self.pieces: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
@@ -122,7 +123,8 @@ class _StaticHTML(HTMLParser):
         )
         if tag not in self.void_tags:
             self.stack.append((tag, hidden))
-        if not hidden and not any(value for _, value in self.stack):
+            self.hidden_depth += hidden
+        if not hidden and not self.hidden_depth:
             if tag in self.breaks:
                 self.pieces.append("\n")
             elif tag in {"td", "th"}:
@@ -134,15 +136,16 @@ class _StaticHTML(HTMLParser):
             self.handle_endtag(tag)
 
     def handle_endtag(self, tag: str) -> None:
-        if not any(value for _, value in self.stack) and tag in self.breaks:
+        if not self.hidden_depth and tag in self.breaks:
             self.pieces.append("\n")
         for index in range(len(self.stack) - 1, -1, -1):
             if self.stack[index][0] == tag:
+                self.hidden_depth -= sum(value for _, value in self.stack[index:])
                 del self.stack[index:]
                 break
 
     def handle_data(self, data: str) -> None:
-        if not any(value for _, value in self.stack):
+        if not self.hidden_depth:
             self.pieces.append(data)
 
 

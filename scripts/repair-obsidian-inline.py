@@ -327,7 +327,11 @@ def repair(
                                 prefix = b"Inline code continued: " + delimiter + b" "
                             if span["span_start"] < piece["source_end"] < span["span_end"]:
                                 base.require(not suffix, "overlapping audit spans")
-                                suffix = b" " + delimiter + b"\n"
+                                suffix = base.inline_suffix(
+                                    delimiter,
+                                    at_line_start=raw[piece["source_end"] - 1 : piece["source_end"]]
+                                    in (b"\n", b"\r"),
+                                )
                         if not (prefix or suffix) and piece["path"] not in old_parts:
                             continue
                         path = output / piece["path"]

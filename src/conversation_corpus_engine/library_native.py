@@ -18,14 +18,16 @@ import sqlite3
 import subprocess
 import threading
 import time
-from collections import Counter, defaultdict
+import zlib
+from collections import Counter, defaultdict, deque
 from collections.abc import Iterator
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from .archive_model import Conversation, Message, to_iso
 
-READER = "library-native@1.1.1"
+READER = "library-native@1.1.2"
 PROVIDERS = {
     "codex": "codex",
     "claude": "claudecode",
@@ -229,6 +231,95 @@ def _codex_parents(payload: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(value for value in values if isinstance(value, str) and value))
 
 
+def _codex_event_mirrors(
+    records: list[tuple[int, dict[str, Any]]], path: Path
+) -> tuple[set[int], dict[tuple[int, int], dict[str, str]]]:
+    """Pair textual representations one-to-one within this source, never by text alone."""
+    by_id: dict[tuple[str, str, str], deque[tuple[int, int]]] = defaultdict(deque)
+    by_time: dict[tuple[str, str, str], deque[tuple[int, int]]] = defaultdict(deque)
+    anonymous_by_time: dict[tuple[str, str, str], deque[tuple[int, int]]] = defaultdict(deque)
+
+    def identity(payload: dict[str, Any]) -> str:
+        return str(payload.get("id") or payload.get("uuid") or payload.get("call_id") or "")
+
+    def timestamp(record: dict[str, Any], payload: dict[str, Any]) -> str:
+        value = (
+            record.get("timestamp", payload.get("timestamp"))
+            or payload.get("ts")
+            or payload.get("time_created")
+        )
+        if not isinstance(value, str) or not ("T" in value or " " in value):
+            return ""
+        try:
+            datetime.fromisoformat(value)
+        except ValueError:
+            return ""
+        # Keep the exact token, including fractional seconds and offset spelling.
+        # The legacy display timestamp formatter intentionally loses precision.
+        return value
+
+    for line, record in records:
+        payload = record.get("payload")
+        if (
+            record.get("type") != "response_item"
+            or not isinstance(payload, dict)
+            or payload.get("type") != "message"
+        ):
+            continue
+        native_id = identity(payload)
+        when = timestamp(record, payload)
+        for index, (role, channel, text, _) in enumerate(
+            _blocks(payload.get("content", ""), _role(payload.get("role")))
+        ):
+            if role not in {"user", "assistant"} or channel not in {"typed", "reply"} or not text:
+                continue
+            candidate = (line, index)
+            if native_id:
+                by_id[(native_id, role, text)].append(candidate)
+            if when:
+                by_time[(when, role, text)].append(candidate)
+                if not native_id:
+                    anonymous_by_time[(when, role, text)].append(candidate)
+
+    mirrors: dict[tuple[int, int], dict[str, str]] = {}
+    event_lines: set[int] = set()
+
+    def take(queue: deque[tuple[int, int]]) -> tuple[int, int] | None:
+        while queue:
+            candidate = queue.popleft()
+            if candidate not in mirrors:
+                return candidate
+        return None
+
+    for line, record in records:
+        payload = record.get("payload")
+        if record.get("type") != "event_msg" or not isinstance(payload, dict):
+            continue
+        kind = payload.get("type")
+        text = payload.get("message")
+        if kind not in {"user_message", "agent_message"} or not isinstance(text, str) or not text:
+            continue
+        role = "user" if kind == "user_message" else "assistant"
+        native_id = identity(payload)
+        when = timestamp(record, payload)
+        candidate = take(by_id[(native_id, role, text)]) if native_id else None
+        basis = "native_event_id"
+        if candidate is None and when:
+            # Conflicting explicit IDs are distinct even when their text/time agree.
+            candidates = anonymous_by_time if native_id else by_time
+            candidate = take(candidates[(when, role, text)])
+            basis = "role_text_timestamp"
+        if candidate is not None:
+            locator = f"{path}#line-{line}"
+            mirrors[candidate] = {
+                "source_locator": locator,
+                "native_event_id": native_id or locator,
+                "mirror_match_basis": basis,
+            }
+            event_lines.add(line)
+    return event_lines, mirrors
+
+
 def _codex(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) -> None:
     headers = [
         payload
@@ -274,7 +365,7 @@ def _codex(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) -
                 "inherited_ids": sorted(inherited),
             },
         )
-    has_messages = any(r.get("type") == "response_item" for _, r in records)
+    event_mirrors, response_locations = _codex_event_mirrors(records, path)
     for line, record in records:
         payload = record.get("payload", record)
         if not isinstance(payload, dict):
@@ -284,7 +375,13 @@ def _codex(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) -
         if record.get("type") == "response_item":
             kind = payload.get("type")
             if kind == "message":
-                body.add(event, payload.get("content", ""), _role(payload.get("role")), locator)
+                observed = body.add(
+                    event, payload.get("content", ""), _role(payload.get("role")), locator
+                )
+                for index, message in enumerate(observed):
+                    mirror = response_locations.get((line, index))
+                    if mirror and mirror not in message.meta["source_locations"]:
+                        message.meta["source_locations"].append(mirror)
             elif kind in {
                 "function_call",
                 "custom_tool_call",
@@ -309,13 +406,14 @@ def _codex(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) -
                     )
                 if payload.get("encrypted_content"):
                     body.finding("encrypted_reasoning_not_decoded", path)
-        elif record.get("type") == "event_msg" and not has_messages:
+        elif record.get("type") == "event_msg":
             kind = payload.get("type")
-            if kind in {"user_message", "agent_message"}:
+            role = "user" if kind == "user_message" else "assistant"
+            if kind in {"user_message", "agent_message"} and line not in event_mirrors:
                 body.add(
                     event,
                     payload.get("message", ""),
-                    "user" if kind == "user_message" else "assistant",
+                    role,
                     locator,
                 )
         elif record.get("type") == "compacted":
@@ -884,7 +982,15 @@ def _read_source(
             body.finding("text_artifact_not_native_transcript", path)
         else:
             body.finding("unsupported_source_format", path)
-    except (OSError, ValueError, TypeError, sqlite3.Error, subprocess.SubprocessError) as exc:
+    except (
+        OSError,
+        EOFError,
+        ValueError,
+        TypeError,
+        zlib.error,
+        sqlite3.Error,
+        subprocess.SubprocessError,
+    ) as exc:
         body.finding("source_error", path, str(exc))
 
 

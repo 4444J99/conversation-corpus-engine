@@ -287,6 +287,11 @@ def navigation_growth(text, relative, state=None, starts_line=True):
                 len(quote(Path(part_path(relative, 1)).name, safe="._-~"))
                 if not parsed.path
                 else 32
+                + max(
+                    0,
+                    len(quote(unquote(parsed.path), safe="/._-~").encode())
+                    - len(parsed.path.encode()),
+                )
             )
     return growth
 
@@ -444,6 +449,12 @@ def rewrite(raw, relative, segment, plans, connection, *, source, agent_entry):
     return b"".join(output), edits
 
 
+def inline_suffix(marker, *, at_line_start):
+    """Close inline code without starting a fenced block on a new line."""
+    prefix = b"Inline code continues: " if at_line_start and len(marker) >= 3 else b" "
+    return prefix + marker + b"\n"
+
+
 def render_part(body, relative, number, count, segment):
     filename = quote(Path(relative).name, safe="._-~")
     header = f"# Part {number} of {count}\n\n[Source note index]({filename})\n\n".encode()
@@ -456,7 +467,9 @@ def render_part(body, relative, number, count, segment):
         separator = "" if body.endswith((b"\n", b"\r")) else "\n"
         footer = (separator + segment["after"] + "\n").encode()
     elif segment.get("inline_after"):
-        footer = (" " + segment["inline_after"] + "\n").encode()
+        footer = inline_suffix(
+            segment["inline_after"].encode(), at_line_start=body.endswith((b"\n", b"\r"))
+        )
     return header + body + footer, len(header)
 
 

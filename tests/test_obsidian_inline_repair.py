@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from markdown_it import MarkdownIt
 
 
 @pytest.fixture
@@ -26,7 +27,7 @@ def repairer(monkeypatch):
     return module
 
 
-def fixture(module, tmp_path, ticks=2):
+def fixture(module, tmp_path, ticks=2, newline=None):
     base = module.base
     source = tmp_path / "v1"
     source.mkdir(mode=0o700)
@@ -40,6 +41,9 @@ def fixture(module, tmp_path, ticks=2):
         + b" after"
     )
     cut = len(raw) // 2
+    if newline is not None:
+        raw = raw[:cut] + newline + raw[cut:]
+        cut += len(newline)
     pieces = []
     for number, (start, end) in enumerate([(0, cut), (cut, len(raw))]):
         body = raw[start:end]
@@ -176,6 +180,21 @@ def test_long_inline_delimiters_cannot_become_block_fences(repairer, tmp_path, t
     text = output.joinpath("part1.md").read_text()
     assert f"Inline code continued: {'`' * ticks} " in text
     assert repairer.base.fence_state(text) is None
+    assert b"".join(repairer.base.reconstruct(output, "original.md")) == raw
+
+
+@pytest.mark.parametrize("ticks", [3, 4])
+@pytest.mark.parametrize("newline", [b"\n", b"\r", b"\r\n"])
+def test_inline_suffix_after_newline_keeps_source_images_inert(repairer, tmp_path, ticks, newline):
+    source, audit, raw = fixture(repairer, tmp_path, ticks=ticks, newline=newline)
+    output = tmp_path / "v2"
+    repairer.repair(source, output, audit)
+    parser = MarkdownIt("commonmark")
+    for number in (0, 1):
+        tokens = parser.parse(output.joinpath(f"part{number}.md").read_text())
+        assert not any(token.type == "fence" for token in tokens)
+        children = [child for token in tokens for child in token.children or []]
+        assert not any(child.type == "image" for child in children)
     assert b"".join(repairer.base.reconstruct(output, "original.md")) == raw
 
 

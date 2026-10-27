@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import subprocess
+import sys
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +12,20 @@ import pytest
 
 from conversation_corpus_engine import library_documents
 from conversation_corpus_engine.library_documents import iter_documents
+
+
+def test_deep_html_nesting_completes_within_deadline() -> None:
+    code = (
+        "from conversation_corpus_engine.library_documents import _html_text\n"
+        "text = ('<div>' * 60000 + 'visible' + '</div>' * 60000).encode()\n"
+        "assert _html_text(text)[0] == 'visible'\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=3)
+
+
+def test_hidden_html_depth_recovers_after_mismatched_closing_tags() -> None:
+    text = b"<section>before<div hidden><span>hidden</div>after</section><p>end</p>"
+    assert library_documents._html_text(text)[0] == "beforeafter\nend"
 
 
 def source(root: Path, **options: object) -> dict:

@@ -57,6 +57,189 @@ def codex_message(event_id, text, role="user"):
     }
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "function_call", "call_id": "tool", "arguments": "{}"},
+        {"type": "reasoning", "summary": [{"text": "reasoning"}]},
+        {"type": "message", "role": "developer", "content": "system context"},
+        {"type": "message", "role": "user", "content": [{"type": "input_image"}]},
+        {"type": "message", "role": "user", "content": []},
+        None,
+    ],
+)
+def test_codex_nonconversational_responses_keep_event_message_fallback(tmp_path, payload):
+    source = jsonl(
+        tmp_path / "rollout.jsonl",
+        [
+            {"type": "session_meta", "payload": {"id": "s"}},
+            {"type": "event_msg", "payload": {"type": "user_message", "message": "question"}},
+            {"type": "response_item", "payload": payload},
+            {"type": "event_msg", "payload": {"type": "agent_message", "message": "answer"}},
+        ],
+    )
+    item = next(iter_estate(estate(tmp_path, [("codex", "s", source)])))
+    assert [
+        (m.role, m.text)
+        for m in item.messages
+        if m.role in {"user", "assistant"} and m.channel != "thinking"
+    ] == [
+        ("user", "question"),
+        ("assistant", "answer"),
+    ]
+    assert item.extra["body_status"] == "full"
+
+
+@pytest.mark.parametrize("response_role", ["user", "assistant"])
+def test_codex_actual_response_suppresses_only_its_own_role_mirror(tmp_path, response_role):
+    source = jsonl(
+        tmp_path / "rollout.jsonl",
+        [
+            {
+                "type": "event_msg",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "payload": {"type": "user_message", "message": "question"},
+            },
+            codex_message(
+                "actual", "question" if response_role == "user" else "answer", response_role
+            ),
+            {
+                "type": "event_msg",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "payload": {"type": "agent_message", "message": "answer"},
+            },
+        ],
+    )
+    item = next(iter_estate(estate(tmp_path, [("codex", "s", source)])))
+    assert [(m.role, m.text) for m in item.messages] == [
+        ("user", "question"),
+        ("assistant", "answer"),
+    ]
+    mirrored = next(m for m in item.messages if m.role == response_role)
+    assert len(mirrored.meta["source_locations"]) == 2
+
+
+@pytest.mark.parametrize(
+    ("event_text", "event_id", "event_time", "response_id", "response_time", "expected"),
+    [
+        (
+            "different",
+            None,
+            "2026-01-01T00:00:00Z",
+            "r",
+            "2026-01-01T00:00:00Z",
+            ["different", "response"],
+        ),
+        (
+            "response",
+            "event",
+            "2026-01-01T00:00:00Z",
+            "other",
+            "2026-01-01T00:00:00Z",
+            ["response", "response"],
+        ),
+        ("response", None, None, None, None, ["response", "response"]),
+        (
+            "response",
+            None,
+            "2026-01-02T00:00:00Z",
+            None,
+            "2026-01-01T00:00:00Z",
+            ["response", "response"],
+        ),
+        ("response", "same", None, "same", None, ["response"]),
+        ("changed", "same", None, "same", None, ["changed", "response"]),
+        (
+            "response",
+            None,
+            "2026-01-01T00:00:00.100Z",
+            None,
+            "2026-01-01T00:00:00.900Z",
+            ["response", "response"],
+        ),
+        (
+            "response",
+            None,
+            "2026-01-01T00:00:00.100Z",
+            None,
+            "2026-01-01T00:00:00.100Z",
+            ["response"],
+        ),
+        ("response", None, "invalid", None, "invalid", ["response", "response"]),
+    ],
+)
+def test_codex_only_proven_corresponding_event_occurrences_are_mirrors(
+    tmp_path, *, event_text, event_id, event_time, response_id, response_time, expected
+):
+    response = codex_message(response_id, "response")
+    response["timestamp"] = response_time
+    source = jsonl(
+        tmp_path / "rollout.jsonl",
+        [
+            {
+                "type": "event_msg",
+                "timestamp": event_time,
+                "payload": {"type": "user_message", "id": event_id, "message": event_text},
+            },
+            response,
+        ],
+    )
+    item = next(iter_estate(estate(tmp_path, [("codex", "s", source)])))
+    assert [m.text for m in item.messages] == expected
+    if len(expected) == 1:
+        assert len(item.messages[0].meta["source_locations"]) == 2
+
+
+def test_codex_mirror_accounting_retains_repeated_event_occurrences(tmp_path):
+    event = {
+        "type": "event_msg",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "payload": {"type": "user_message", "message": "repeat"},
+    }
+    source = jsonl(tmp_path / "rollout.jsonl", [event, codex_message(None, "repeat"), event])
+    item = next(iter_estate(estate(tmp_path, [("codex", "s", source)])))
+    assert [m.text for m in item.messages] == ["repeat", "repeat"]
+    assert len({m.id for m in item.messages}) == 2
+    assert [len(m.meta["source_locations"]) for m in item.messages] == [2, 1]
+
+
+@pytest.mark.parametrize("damage", ["truncated", "invalid_deflate"])
+def test_gzip_decode_failure_preserves_identity_and_continues_inventory(tmp_path, damage):
+    source = tmp_path / "broken.jsonl.gz"
+    compressed = gzip.compress((json.dumps(codex_message("u", "unreadable")) + "\n").encode())
+    source.write_bytes(
+        compressed[:-5] if damage == "truncated" else compressed[:10] + b"\x06" + compressed[11:]
+    )
+    valid = jsonl(tmp_path / "valid.jsonl", [codex_message("u", "later session")])
+    report = {}
+    records = list(
+        iter_estate(
+            estate(tmp_path, [("codex", "a", source), ("codex", "b", valid)]), report=report
+        )
+    )
+    assert [record.source_id for record in records] == ["a", "b"]
+    assert records[0].extra["body_status"] == "metadata_only"
+    assert not records[0].messages
+    assert any(f.startswith("source_error:") for f in records[0].extra["findings"])
+    assert [m.text for m in records[1].messages] == ["later session"]
+    assert records[1].extra["body_status"] == "full"
+    assert report["records"] == 2
+    assert report["findings"]["source_error"] == 1
+
+
+def test_gzip_decode_failure_keeps_other_observations_for_same_identity(tmp_path):
+    source = tmp_path / "broken.jsonl.gz"
+    source.write_bytes(gzip.compress(b"unreadable")[:-4])
+    valid = jsonl(tmp_path / "valid.jsonl", [codex_message("u", "preserved observation")])
+    database = estate(
+        tmp_path, [("codex", "s", source)], [("codex", str(valid), "session_meta", "s")]
+    )
+    item = next(iter_estate(database))
+    assert [m.text for m in item.messages] == ["preserved observation"]
+    assert item.extra["body_status"] == "partial"
+    assert any(f.startswith("source_error:") for f in item.extra["findings"])
+
+
 def test_codex_nested_events_keep_repeated_text_and_tool_roles(tmp_path):
     source = jsonl(
         tmp_path / "rollout.jsonl",

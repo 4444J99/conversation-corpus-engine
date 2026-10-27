@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import subprocess
+import sys
 
 import pytest
+from markdown_it import MarkdownIt
 
 from conversation_corpus_engine.library_blocks import iter_blocks, render_blocks, split_blocks
 
@@ -132,6 +135,25 @@ def test_rendering_neutralizes_untrusted_links_images_html_and_wikilinks() -> No
 def test_rendering_preserves_code_and_balances_an_unclosed_fence() -> None:
     text = "```html\n<img src='https://tracker.example/x'>\n[[shell]]"
     assert render_blocks(split_blocks(text), {}) == text + "\n```"
+
+
+@pytest.mark.parametrize("delimiter", ["`", "``", "````"])
+def test_escaped_backticks_cannot_activate_literal_source_images(delimiter: str) -> None:
+    source = "\\" + delimiter + "![pixel](https://example.invalid/pixel)\\" + delimiter
+    rendered = render_blocks(split_blocks(source), {})
+    tokens = MarkdownIt("commonmark").parse(rendered)
+    assert len(tokens) == 1 and tokens[0].type == "fence"
+    assert tokens[0].content == source + "\n"
+
+
+def test_unclosed_fence_with_crlf_blank_lines_renders_within_deadline() -> None:
+    code = (
+        "from conversation_corpus_engine.library_blocks import render_blocks, split_blocks\n"
+        "text = '```text\\r\\n' + '\\r\\n' * 128 + 'literal'\n"
+        "assert render_blocks(split_blocks(text), {}) == "
+        "text.replace('\\r\\n', '\\n') + '\\n```'\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True, timeout=3)
 
 
 @pytest.mark.parametrize(
