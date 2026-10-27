@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shlex
+import sys
 import zipfile
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
@@ -391,9 +392,12 @@ def _agent_entry(destination: Path) -> str:
         if registered
         else "# Set STORE to the registered CCE store root before running these commands.\n"
     )
+    executable = Path(sys.executable).with_name("cce")
+    command = str(executable) if executable.is_file() else "cce"
     commands = (
         assignment
-        + 'cce library search TERM --store-root "$STORE" --limit 20 --offset 0\ncce library read UID --store-root "$STORE" --message 0 --offset 0 --limit 12000\ncce library history UID --store-root "$STORE" --offset 0 --limit 50\n'
+        + f"CCE={shlex.quote(command)}\n"
+        + '"$CCE" library search TERM --store-root "$STORE" --limit 20 --offset 0\n"$CCE" library read UID --store-root "$STORE" --message 0 --offset 0 --limit 12000\n"$CCE" library history UID --store-root "$STORE" --offset 0 --limit 50\n'
     )
     fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", commands)), default=0))
     text = (

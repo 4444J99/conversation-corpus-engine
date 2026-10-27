@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 import zipfile
 from pathlib import Path
 
 import pytest
 
 from conversation_corpus_engine.archive_model import Conversation, Message
-from conversation_corpus_engine.library_export import export_library, verify_export
+from conversation_corpus_engine.library_export import _agent_entry, export_library, verify_export
 from conversation_corpus_engine.library_store import Library
 
 REPEATED = "This is a shared paragraph explaining a recurring research idea, with enough precise original wording to remain a meaningful passage across independent records and source observations."
@@ -302,6 +303,17 @@ def test_agent_entry_uses_store_root_and_empty_wings_remain_visible(tmp_path: Pa
         assert (destination / "vault/hubs/wing-ai.md").exists()
         assert (destination / "vault/hubs/wing-authored.md").exists()
         assert verify_export(destination) == []
+
+
+def test_agent_entry_uses_current_installation_before_path(tmp_path: Path, monkeypatch) -> None:
+    binary = tmp_path / "tool environment/bin/cce"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("installed executable")
+    monkeypatch.setattr(sys, "executable", str(binary.with_name("python")))
+    entry = _agent_entry(tmp_path / "library-all/generations/generation-test")
+    assert f"CCE='{binary}'" in entry
+    assert '"$CCE" library search TERM' in entry
+    assert "cce library search TERM" not in entry
 
 
 def test_verifier_returns_findings_for_malformed_manifest(tmp_path: Path) -> None:
