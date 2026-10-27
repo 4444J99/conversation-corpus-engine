@@ -109,6 +109,18 @@ Perplexity, Copilot) into an Obsidian vault/wiki, a static archive site, a SQLit
 database and a graph, all inside the private corpus store. See
 [docs/archive-surfaces.md](docs/archive-surfaces.md).
 
+The unified private knowledge library extends this with versioned records from web archives,
+native coding sessions, and selected authored documents. It provides bounded CLI/MCP search,
+revision history, graph/index contracts, Obsidian-compatible Markdown, and a verified Notion
+import ZIP. See [docs/knowledge-library.md](docs/knowledge-library.md).
+
+Example:
+
+```bash
+cce library status --store-root /path/to/private-corpus-store
+cce library search "lattice" --store-root /path/to/private-corpus-store --limit 10
+```
+
 The Copilot reader takes SingleFile captures of Copilot web research pages from a `copilot/` folder,
 or from any folder with `--source copilot=/path/to/copilot-captures`. Each recognized page becomes
 one search-kind conversation. It reads the `.html`/`.htm` pages that carry a Copilot SingleFile
@@ -148,6 +160,9 @@ currently exposes:
 - `cce_archive_search`: full-text search the private AI archive search database. Only advertised
   when the server is started with `--archive-root` (or `CCE_ARCHIVE_ROOT`); the root is server
   configuration and is never a tool argument. Results are private conversation text.
+
+When started with `--library-store-root` (or `CCE_LIBRARY_STORE_ROOT`), it also exposes read-only
+`cce_library_search`, `cce_library_read`, and `cce_library_history`.
 
 ## Layout
 
@@ -193,4 +208,4 @@ Runtime state is written to `state/`, `federation/`, and `reports/`. Those direc
 
 ## Status
 
-This repo now serves as the canonical Organ I home of the conversation corpus system. The adjacent Meta consumer path is also live: `schema-definitions` canonizes the outward contracts, `organvm-engine` discovers and validates emitted surface bundles, and `organvm-mcp-server` exposes them to agent sessions. Operational hardening is underway: CI gates all pushes, ChatGPT is a first-class provider alongside Claude/Gemini/Grok/Perplexity/Copilot, and sanitized test fixtures document the expected export formats. Archive provider readers (including Copilot SingleFile research pages) are complete and CI-green on main. The next frontier is downstream dashboard consumption and additional provider adapters.
+This repo now serves as the canonical Organ I home of the conversation corpus system. The adjacent Meta consumer path is also live: `schema-definitions` canonizes the outward contracts, `organvm-engine` discovers and validates emitted surface bundles, and `organvm-mcp-server` exposes them to agent sessions. Operational hardening is underway: CI gates all pushes, ChatGPT is a first-class provider alongside Claude/Gemini/Grok/Perplexity/Copilot, and sanitized test fixtures document the expected export formats. Archive provider readers (including Copilot SingleFile research pages) are complete and CI-green on main. The unified private knowledge library (PR #86) adds versioned records, bounded retrieval, and portable exports over the existing archive and selected documents; see docs/knowledge-library.md. The next frontier is downstream dashboard consumption and additional provider adapters.
