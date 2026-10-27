@@ -213,7 +213,9 @@ def _record(path: Path, root: Path, source: dict, report: dict) -> Conversation 
     if created:
         provenance["created_at"] = created
     body, reason = "", ""
-    if info.st_size > maximum:
+    if getattr(info, "st_flags", 0) & getattr(stat, "SF_DATALESS", 0x40000000):
+        reason = "cloud_placeholder_not_hydrated"
+    elif info.st_size > maximum:
         reason = "size_limit"
     else:
         try:

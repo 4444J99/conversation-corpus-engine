@@ -273,7 +273,11 @@ class Library:
                 (uid, digest, body_status, "accepted_revision"),
             )
             self._observations(uid, observations)
-            self.connection.execute("DELETE FROM record_fts WHERE uid=?", (uid,))
+            record_rowid = self.connection.execute(
+                "SELECT rowid FROM records WHERE uid=?", (uid,)
+            ).fetchone()[0]
+            if previous is not None:
+                self.connection.execute("DELETE FROM record_fts WHERE rowid=?", (record_rowid,))
             # One FTS row per identity makes pagination independent of conversation length.
             # All channels remain searchable; excerpts and raw reads are explicitly bounded.
             body = "\n\n".join(dict.fromkeys(message.text for message in conversation.messages))
@@ -283,8 +287,8 @@ class Library:
                     str(m.get("text", "")) for m in alternates if isinstance(m, dict)
                 )
             self.connection.execute(
-                "INSERT INTO record_fts(uid,title,body) VALUES (?,?,?)",
-                (uid, conversation.title, body),
+                "INSERT INTO record_fts(rowid,uid,title,body) VALUES (?,?,?,?)",
+                (record_rowid, uid, conversation.title, body),
             )
             self.connection.execute("DELETE FROM occurrences WHERE uid=?", (uid,))
             self.connection.execute("DELETE FROM relations WHERE src=? AND kind='parent'", (uid,))
@@ -316,8 +320,17 @@ class Library:
                     (uid, hashlib.sha256(serialized.encode()).hexdigest(), serialized),
                 )
 
-    def record(self, uid: str, *, version: str | None = None) -> dict[str, Any]:
-        if version is None:
+    def record(
+        self, uid: str, *, version: str | None = None, digest: str | None = None
+    ) -> dict[str, Any]:
+        if version is not None and digest is not None:
+            raise ValueError("choose a version or a snapshot digest")
+        if digest is not None:
+            row = self.connection.execute(
+                "SELECT o.payload FROM snapshots s JOIN objects o ON o.digest=s.digest WHERE s.uid=? AND s.digest=?",
+                (uid, digest),
+            ).fetchone()
+        elif version is None:
             row = self.connection.execute(
                 "SELECT o.payload FROM records r JOIN objects o ON o.digest=r.current_digest WHERE r.uid=?",
                 (uid,),
@@ -438,6 +451,10 @@ class Library:
         hits = []
         for row in results:
             hit = dict(row)
+            hit["title"] = hit["title"][:512]
+            hit["source_ref"] = hit["source_ref"][:2048]
+            for key in ("kind", "lane"):
+                hit[key] = hit[key][:128]
             hit["excerpt"] = hit["excerpt"][:360]
             hit["path"] = f"vault/records/{hit['uid']}.md"
             hits.append(hit)

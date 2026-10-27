@@ -177,11 +177,12 @@ def _terminal_newlines(text: str) -> str:
 
 
 def _literal_markdown(text: str) -> str:
-    """Keep code literal and prevent source text from creating active links/HTML.
+    """Keep code literal and neutralize explicit source links, images and HTML.
 
     ``neutralize`` supplies the archive's heading, tag and open-fence handling.
     Entities additionally make ordinary Markdown links/images and raw HTML
-    inert in both Obsidian and portable Markdown consumers.
+    inert in both Obsidian and portable Markdown consumers. Bare URLs may remain
+    clickable through a consumer's autolinking; they do not fetch automatically.
     """
     tracker = FenceTracker()
     lines: list[str] = []
