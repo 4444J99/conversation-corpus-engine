@@ -139,6 +139,21 @@ def seed_minimal_corpus(
                 "adapter_type": adapter_type,
                 "corpus_id": corpus_id,
                 "name": name,
+                "generated_at": "2026-03-25T00:00:00+00:00",
+                "required_files": [
+                    "corpus/threads-index.json",
+                    "corpus/semantic-v3-index.json",
+                    "corpus/pairs-index.json",
+                    "corpus/doctrine-briefs.json",
+                    "corpus/family-dossiers.json",
+                ],
+                "counts": {
+                    "threads": thread_count,
+                    "families": thread_count,
+                    "actions": 0,
+                    "unresolved": 0,
+                    "entities": 0,
+                },
             }
         ),
         encoding="utf-8",
