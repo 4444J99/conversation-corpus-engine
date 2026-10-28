@@ -51,6 +51,17 @@ def test_to_iso_normalizes_every_supported_shape() -> None:
     assert to_iso(True) == ""
 
 
+@pytest.mark.parametrize(
+    "boundary_iso",
+    [
+        "9999-12-31T23:59:59-05:00",
+        "0001-01-01T00:30:00+01:00",
+    ],
+)
+def test_to_iso_handles_calendar_edges_without_overflow(boundary_iso: str) -> None:
+    assert to_iso(boundary_iso) == ""
+
+
 def test_stable_uid_keeps_plain_ids_and_hashes_the_rest() -> None:
     assert stable_uid("chatgpt", "abc-123") == "chatgpt-abc-123"
     odd = stable_uid("gemini", "Session 2025/06")
