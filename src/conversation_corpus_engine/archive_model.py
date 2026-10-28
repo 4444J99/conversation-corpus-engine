@@ -362,11 +362,11 @@ def to_iso(value: Any) -> str:
         return to_iso(float(text))
     try:
         moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (ValueError, OverflowError):
         return ""
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=UTC)
-    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def clean_text(value: Any) -> str:
