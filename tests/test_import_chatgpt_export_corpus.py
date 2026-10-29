@@ -61,8 +61,10 @@ class ImportChatGPTExportCorpusTests(unittest.TestCase):
             contract = json.loads(
                 (output_root / "corpus" / "contract.json").read_text(encoding="utf-8"),
             )
-            self.assertEqual(contract["adapter_type"], "chatgpt-export")
+            self.assertEqual(contract["adapter_type"], "archive-normalized")
+            self.assertEqual(contract["corpus_id"], "corpus-chatgpt-archive")
             self.assertEqual(contract["contract_name"], "conversation-corpus-engine.v2")
+            self.assertEqual(result["projector_corpus_id"], "corpus-chatgpt-archive")
 
             # Verify federation-required files exist
             corpus_dir = output_root / "corpus"
@@ -144,9 +146,9 @@ class ChatGPTProviderIntegrationTests(unittest.TestCase):
             self.assertGreaterEqual(result["import_result"]["thread_count"], 2)
 
 
+from conversation_corpus_engine.corpus_text import detect_near_duplicates  # noqa: E402
 from conversation_corpus_engine.import_chatgpt_export_corpus import (  # noqa: E402
     build_thread_audit,
-    detect_near_duplicates,
     extract_node_text,
 )
 
