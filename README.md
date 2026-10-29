@@ -178,6 +178,7 @@ When started with `--library-store-root` (or `CCE_LIBRARY_STORE_ROOT`), it also 
 - `src/conversation_corpus_engine/import_claude_export_corpus.py` — Claude bundle import
 - `src/conversation_corpus_engine/import_claude_local_session_corpus.py` — Claude local-session import
 - `src/conversation_corpus_engine/import_chatgpt_export_corpus.py` — ChatGPT conversations.json export import
+- `src/conversation_corpus_engine/export_projector.py` — shared rewire of legacy export importers through the archive corpus projector (see #78)
 - `src/conversation_corpus_engine/provider_discovery.py` — source-drop inbox discovery
 - `src/conversation_corpus_engine/provider_import.py` — provider import/onboarding orchestration
 - `src/conversation_corpus_engine/provider_refresh.py` — provider refresh orchestration over import, evaluation, and corpus promotion
