@@ -98,9 +98,7 @@ def test_a_manifest_left_inside_an_old_vault_is_read_once_and_removed(archive_en
 
 def test_vault_note_content_and_frontmatter(archive_env) -> None:
     _full_build(archive_env)
-    note = archive_env.paths.vault_note("chatgpt", "chatgpt-aaaa1111").read_text(
-        encoding="utf-8"
-    )
+    note = archive_env.paths.vault_note("chatgpt", "chatgpt-aaaa1111").read_text(encoding="utf-8")
     head, _, body = note.partition("\n---\n")
     assert head.startswith('---\nuid: "chatgpt-aaaa1111"')
     assert 'title: "Kubernetes rollout planning"' in head
@@ -202,7 +200,11 @@ def test_a_large_message_is_split_into_numbered_parts_and_nothing_is_dropped() -
             assert f"[[{names[index - 1]}|← Previous]]" in note
             assert "[[conversation-chatgpt-big|Start]]" in note
     for note in notes:
-        assert link_targets(note) and set(link_targets(note)) <= {*names, "provider-chatgpt", "month-all-202501"}
+        assert link_targets(note) and set(link_targets(note)) <= {
+            *names,
+            "provider-chatgpt",
+            "month-all-202501",
+        }
 
 
 def test_a_single_line_longer_than_the_cap_is_cut_on_a_character_boundary() -> None:

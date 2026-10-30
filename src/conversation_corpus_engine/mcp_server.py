@@ -7,9 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import __version__, library_mcp
+from . import __version__, archive_search, library_mcp
 from .answering import build_answer, render_answer_text, search_documents_v4
-from . import archive_search
 from .archive_ingest import ArchivePaths
 from .federation import list_registered_corpora, validate_corpus_root
 from .library_commands import STORE_ENV
@@ -146,6 +145,19 @@ class CceMcpServer:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Restrict to kinds: chat, search, activity, notebook, memory.",
+                    },
+                    "author": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["human", "machine"]},
+                        "description": (
+                            "Restrict to turns by an author: human (typed by the person) or "
+                            "machine (replies, reasoning, tool output, memories)."
+                        ),
+                    },
+                    "month": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict to months, e.g. ['202506'], or 'undated'.",
                     },
                     "titles_only": {"type": "boolean", "description": "Search titles only."},
                     "limit": {"type": "integer", "description": "Maximum conversations (25)."},
@@ -345,7 +357,7 @@ class CceMcpServer:
         limit = optional_limit(arguments, default=10, maximum=ARCHIVE_LIMIT_MAX)
         titles_only = optional_bool(arguments, "titles_only", default=False)
         filters: dict[str, list[str] | None] = {}
-        for key in ("provider", "kind"):
+        for key in ("provider", "kind", "author", "month"):
             value = arguments.get(key)
             if value is None:
                 filters[key] = None
@@ -356,17 +368,27 @@ class CceMcpServer:
         archive_paths = ArchivePaths(self.archive_root)
         try:
             if titles_only:
-                results = archive_search.search_titles(archive_paths, query, limit=limit)
+                results = archive_search.search_titles(
+                    archive_paths,
+                    query,
+                    providers=filters["provider"],
+                    months=filters["month"],
+                    limit=limit,
+                )
             else:
                 results = archive_search.search(
                     archive_paths,
                     query,
                     providers=filters["provider"],
                     kinds=filters["kind"],
+                    authors=filters["author"],
+                    months=filters["month"],
                     limit=limit,
                 )
         except FileNotFoundError as exc:
             raise ValueError(f"The archive search database is not built: {exc}") from exc
+        except archive_search.FilterNotSupported as exc:
+            raise ValueError(str(exc)) from exc
         structured = {"query": query, "count": len(results), "results": results}
         lines = [
             f"{hit['provider']} · {hit['created'][:10]} · {hit['title']} ({hit['uid']})"

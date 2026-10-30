@@ -157,7 +157,7 @@ def _front(
     if parts > 1:
         tags.append("split")
     authors = Counter(message.author for message in conversation.messages)
-    front = [
+    return [
         "---",
         f"uid: {yaml_text(conversation.uid)}",
         f"provider: {conversation.provider}",
@@ -180,7 +180,6 @@ def _front(
         f"tags: [{', '.join(tags)}]",
         "---",
     ]
-    return front
 
 
 def _first_head(
@@ -220,7 +219,9 @@ def _part_head(conversation: Conversation, topics: list[str], *, part: int, part
     front = _front(
         conversation, topics, part=part, parts=parts, title=f"{title} (part {part} of {parts})"
     )
-    return "\n".join(["\n".join(front), f"# {title} — part {part} of {parts}", "", READING_NOTE, ""])
+    return "\n".join(
+        ["\n".join(front), f"# {title} — part {part} of {parts}", "", READING_NOTE, ""]
+    )
 
 
 def _nav(names: list[str], index: int, anchor: str, labels: tuple[str, str, str]) -> str:

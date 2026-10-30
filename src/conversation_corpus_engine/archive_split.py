@@ -162,7 +162,9 @@ def pack(blocks: Sequence[str], first_budget: int, budget: int) -> list[list[str
     return parts
 
 
-def paginate_rows(head: Sequence[str], rows: Sequence[str], first_budget: int, budget: int) -> list[list[str]]:
+def paginate_rows(
+    head: Sequence[str], rows: Sequence[str], first_budget: int, budget: int
+) -> list[list[str]]:
     """Group list rows into pages: the first page opens with `head`, every row lands whole."""
     head_size = sum(utf8_size(line) + 1 for line in head)
     pages: list[list[str]] = [[]]

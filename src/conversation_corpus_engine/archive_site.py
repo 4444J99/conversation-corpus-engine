@@ -255,12 +255,24 @@ def page_paths(
     for position, number in enumerate(range(2, parts + 1)):
         sub = part_folder(position, parts - 1, folder_entries)
         name = layout.part_name(conversation.provider, number, anchor)
-        paths.append(f"{base}/{anchor}/{sub}/{name}.html" if sub else f"{base}/{anchor}/{name}.html")
+        paths.append(
+            f"{base}/{anchor}/{sub}/{name}.html" if sub else f"{base}/{anchor}/{name}.html"
+        )
     return paths
 
 
 def _relative(target: str, source: str) -> str:
     return posixpath.relpath(target, start=posixpath.dirname(source))
+
+
+def _href_from(source: str, page_of: Callable[[str], str | None]) -> Callable[[str], str]:
+    """A link resolver for a page at `source`: the relative path to another conversation's page."""
+
+    def href(uid: str) -> str:
+        target = page_of(uid)
+        return _relative(target, source) if target else "#"
+
+    return href
 
 
 def render_pages(
@@ -288,15 +300,7 @@ def render_pages(
             style_href=_relative(layout.SITE_STYLE_FILENAME, source),
             topics=topics,
             related_html=(
-                _related_html(
-                    related,
-                    titles,
-                    lambda uid, source=source: (
-                        _relative(target, source) if (target := page_of(uid)) else "#"
-                    ),
-                )
-                if index == 0
-                else ""
+                _related_html(related, titles, _href_from(source, page_of)) if index == 0 else ""
             ),
             body="\n".join(group),
             nav=_nav_html(hrefs, index, _relative(paths[0], source)),
@@ -323,7 +327,9 @@ def render_page(
     The pages sit in a single folder, so their links resolve against each other and the site root.
     """
     cap = note_bytes or Limits().note_bytes
-    groups = page_groups(conversation, related=related, topics=topics, titles=titles, note_bytes=cap)
+    groups = page_groups(
+        conversation, related=related, topics=topics, titles=titles, note_bytes=cap
+    )
     paths = page_paths(conversation, layout.UNDATED_DIRNAME, len(groups), Limits().folder_entries)
     return render_pages(
         conversation,
@@ -332,8 +338,10 @@ def render_page(
         related=related,
         topics=topics,
         titles=titles,
-        page_of=lambda uid: f"{layout.SITE_PAGES_DIRNAME}/{layout.UNDATED_DIRNAME}/"
-        f"{layout.conversation_note_for_uid(uid)}.html",
+        page_of=lambda uid: (
+            f"{layout.SITE_PAGES_DIRNAME}/{layout.UNDATED_DIRNAME}/"
+            f"{layout.conversation_note_for_uid(uid)}.html"
+        ),
         note_bytes=cap,
     )
 
@@ -451,15 +459,11 @@ def build_site(
         else:
             counts[conversation.uid] = len(groups_of(conversation))
     plan = plan_conversation_folders(
-        [
-            (uid, stamps.get(uid, ""), 1 if count == 1 else 2)
-            for uid, count in counts.items()
-        ],
+        [(uid, stamps.get(uid, ""), 1 if count == 1 else 2) for uid, count in counts.items()],
         limits.folder_entries,
     )
     first_page = {
-        uid: f"{layout.SITE_PAGES_DIRNAME}/{plan[uid]}/"
-        f"{layout.conversation_note_for_uid(uid)}.html"
+        uid: f"{layout.SITE_PAGES_DIRNAME}/{plan[uid]}/{layout.conversation_note_for_uid(uid)}.html"
         for uid in counts
     }
 
@@ -470,7 +474,9 @@ def build_site(
         name = layout.conversation_note(conversation.provider, conversation.uid)
         ledger.register(name, conversation.uid)
         groups = groups_of(conversation)
-        paths_ = page_paths(conversation, plan[conversation.uid], len(groups), limits.folder_entries)
+        paths_ = page_paths(
+            conversation, plan[conversation.uid], len(groups), limits.folder_entries
+        )
         rendered = render_pages(
             conversation,
             groups,

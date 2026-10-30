@@ -66,8 +66,34 @@ class Limits:
             problems.append("folder_ceiling may not be below folder_entries")
         if self.shard_bytes < MIB // 16:
             problems.append("shard_bytes must be at least 65536")
+        if self.shard_bytes > self.data_ceiling:
+            problems.append("shard_bytes may not exceed data_ceiling")
         if problems:
             raise ValueError("; ".join(problems))
+
+    @classmethod
+    def scaled(
+        cls,
+        *,
+        note_bytes: int | None = None,
+        folder_entries: int | None = None,
+        shard_bytes: int | None = None,
+    ) -> Limits:
+        """Limits for a chosen cut size, with the ceilings kept in the default proportion.
+
+        A census of a build made with `note_bytes=6144` should flag a note past 128 per cent of
+        that, not past the 128 KiB that belongs to the default.
+        """
+        base = cls()
+        note = note_bytes or base.note_bytes
+        folder = folder_entries or base.folder_entries
+        return cls(
+            note_bytes=note,
+            note_ceiling=max(note, round(note * base.note_ceiling / base.note_bytes)),
+            folder_entries=folder,
+            folder_ceiling=max(folder, round(folder * base.folder_ceiling / base.folder_entries)),
+            shard_bytes=shard_bytes or base.shard_bytes,
+        )
 
     def as_dict(self) -> dict[str, int]:
         return asdict(self)

@@ -84,15 +84,21 @@ def verify_layout(paths: ArchivePaths, manifest: dict[str, Any]) -> list[str]:
             problems.append(f"{name}: shard conversation counts do not sum to the manifest")
         on_disk = {shard_path.name: shard_path for shard_path in paths.shard_files(name)}
         if len(on_disk) != len(shards):
-            problems.append(f"{name}: {len(on_disk)} shard file(s) on disk, manifest lists {len(shards)}")
+            problems.append(
+                f"{name}: {len(on_disk)} shard file(s) on disk, manifest lists {len(shards)}"
+            )
         for shard in shards:
             path = paths.provider_dir(name) / layout.shard_filename(name, shard["subject"])
             if not path.is_file():
                 problems.append(f"{name}: shard {shard['subject']} is missing")
             elif path.stat().st_size != shard["bytes"]:
-                problems.append(f"{name}: shard {shard['subject']} differs in size from the manifest")
+                problems.append(
+                    f"{name}: shard {shard['subject']} differs in size from the manifest"
+                )
     totals = manifest["totals"]
-    problems += [f"totals: {item}" for item in reconcile(totals.get("authors", {}), totals["messages"])]
+    problems += [
+        f"totals: {item}" for item in reconcile(totals.get("authors", {}), totals["messages"])
+    ]
     return problems
 
 
@@ -139,12 +145,11 @@ def verify_archive(paths: ArchivePaths, limits: Limits | None = None) -> list[st
 
 def limits_from_args(args: argparse.Namespace) -> Limits:
     """The limits a command was asked for; anything left out keeps its default."""
-    chosen = {
-        key: getattr(args, key)
-        for key in ("note_bytes", "folder_entries", "shard_bytes")
-        if getattr(args, key, None) is not None
-    }
-    return Limits(**chosen)
+    return Limits.scaled(
+        note_bytes=getattr(args, "note_bytes", None),
+        folder_entries=getattr(args, "folder_entries", None),
+        shard_bytes=getattr(args, "shard_bytes", None),
+    )
 
 
 def run_stages(
@@ -296,7 +301,9 @@ def add_archive_parser(subparsers: Any) -> None:
         "census", help="Check a tree against the size and folder limits (exit 1 on a violation)"
     )
     census_parser.add_argument("--root", type=Path, required=True)
-    census_parser.add_argument("--deadline", type=float, help="stop the walk after this many seconds")
+    census_parser.add_argument(
+        "--deadline", type=float, help="stop the walk after this many seconds"
+    )
     census_parser.add_argument("--json", action="store_true")
     limit_args(census_parser)
 
@@ -318,6 +325,15 @@ def add_archive_parser(subparsers: Any) -> None:
         help="Write deterministic synthetic exports (two providers sharing one ask) for tests",
     )
     fixture_parser.add_argument("--out", type=Path, required=True)
+    fixture_parser.add_argument(
+        "--stress",
+        nargs="?",
+        type=int,
+        const=120,
+        default=0,
+        metavar="N",
+        help="also write one very long thread and N short conversations in one month (default 120)",
+    )
 
     project = sub.add_parser("project", help="Project the normalized archive into another shape")
     project_sub = project.add_subparsers(dest="target", required=True)
@@ -383,7 +399,7 @@ def handle_archive(args: argparse.Namespace) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if report["ok"] else 1
     if action == "fixture":
-        print(json.dumps(write_fixture(args.out), indent=2, sort_keys=True))
+        print(json.dumps(write_fixture(args.out, stress=args.stress), indent=2, sort_keys=True))
         return 0
     if action == "census":
         try:

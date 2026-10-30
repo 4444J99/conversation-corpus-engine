@@ -34,9 +34,8 @@ from archive_support import (
     write_copilot_page,
 )
 
-from conversation_corpus_engine import archive_read_copilot
+from conversation_corpus_engine import archive_read_copilot, archive_search
 from conversation_corpus_engine.archive_commands import add_archive_parser, verify_archive
-from conversation_corpus_engine import archive_search
 from conversation_corpus_engine.archive_feed import project_feed
 from conversation_corpus_engine.archive_ingest import (
     PROVIDER_SPECS,

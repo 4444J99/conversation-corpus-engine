@@ -136,6 +136,11 @@ class _ShardBuild:
         self.conversations.clear()
         self.turns.clear()
 
+    def discard(self) -> None:
+        """Drop a shard that received no turn: an empty database would only be clutter."""
+        self.connection.close()
+        self.path.unlink(missing_ok=True)
+
     def finish(self) -> None:
         self.flush()
         c = self.connection
@@ -160,7 +165,9 @@ def _shard_subject(shard_file: Path, provider: str) -> str:
     return stem[len(f"shard-{provider}-") :]
 
 
-def build_turn_store(paths: ArchivePaths, authorization: CorpusWriteAuthorization) -> dict[str, Any]:
+def build_turn_store(
+    paths: ArchivePaths, authorization: CorpusWriteAuthorization
+) -> dict[str, Any]:
     """Build both containers from the normalized shards, one SQLite shard per author per shard."""
     require_inside(authorization, paths.turns)
     manifest = load_manifest(paths)
@@ -224,6 +231,9 @@ def build_turn_store(paths: ArchivePaths, authorization: CorpusWriteAuthorizatio
                         counts[author] += 1
                         totals[author] += 1
                 for author, shard in builds.items():
+                    if shard.turn_count == 0:
+                        shard.discard()
+                        continue
                     shard.finish()
                     container = CONTAINER_BY_AUTHOR[author]
                     entries[container].append(
@@ -309,7 +319,9 @@ def verify_turn_store(paths: ArchivePaths) -> list[str]:
                 problems.append(f"shard size differs from the turn manifest: {item['path']}")
             counted = _count_turns(path)
             if counted != item["turns"]:
-                problems.append(f"{item['path']}: {counted} turn row(s), manifest says {item['turns']}")
+                problems.append(
+                    f"{item['path']}: {counted} turn row(s), manifest says {item['turns']}"
+                )
             found.setdefault(item["provider"], {HUMAN: 0, MACHINE: 0})[author] += counted
     for provider, authors in expected.items():
         for author in AUTHORS:

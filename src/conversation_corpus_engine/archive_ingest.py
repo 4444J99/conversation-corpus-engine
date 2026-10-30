@@ -32,7 +32,7 @@ from .archive_model import (
     write_json_atomic,
 )
 from .archive_naming import NAMING_VERSION, day_of
-from .archive_shard import ShardWriter, month_key, parse_shard_subject, shard_sort_key
+from .archive_shard import ShardWriter, month_key, shard_sort_key
 from .corpus_store import CorpusStoreError, CorpusWriteAuthorization, authorize_corpus_write
 
 MANIFEST_SCHEMA = "archive-manifest.v2"
@@ -433,8 +433,7 @@ def _ingest_provider(
                     json.dumps(conversation.to_dict(), sort_keys=True, ensure_ascii=False) + "\n"
                 ).encode("utf-8"),
                 (
-                    json.dumps(conversation.index_row(), sort_keys=True, ensure_ascii=False)
-                    + "\n"
+                    json.dumps(conversation.index_row(), sort_keys=True, ensure_ascii=False) + "\n"
                 ).encode("utf-8"),
             )
             _bump(totals, "conversations")

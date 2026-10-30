@@ -158,9 +158,7 @@ def _spill(members: list[tuple[str, int]], limit: int) -> dict[str, int]:
         buckets *= 2
 
 
-def plan_conversation_folders(
-    items: Iterable[tuple[str, str, int]], limit: int
-) -> dict[str, str]:
+def plan_conversation_folders(items: Iterable[tuple[str, str, int]], limit: int) -> dict[str, str]:
     """Place conversations in folders: uid -> relative folder path (POSIX separators).
 
     `items` are `(uid, stamp, weight)`: the weight is how many entries the conversation adds to its
