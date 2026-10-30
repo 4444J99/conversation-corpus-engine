@@ -29,7 +29,7 @@ Hashes were computed for every file of 90 MB or less (R1 17,100 of 17,107, R2 1,
 - `chatgpt-export-2026-10-16.zip` (3,716,726,167 bytes) and `chatgpt-bodies-20261017-delta.json` (90,879,501 bytes): R2 only. A name search over Archive4T, Scratch, Ingress and the CleanUnique image finds no other copy. The delta file is not a member of the zip.
 - R2's working set (1,753 files, 1,732 of them under `review/`): R2 only.
 - `knowledge-base-brainstorms-chatgpt.txt` (26,018 bytes): R1 only.
-- The ChatGPT extract in R1 (13,558 files) is the raw zip unpacked: all 13,554 zip members are present at the same size, plus four extras (two `.DS_Store`, one duplicate inventory file).
+- The ChatGPT extract in R1 (13,558 files) is the raw zip unpacked: all 13,554 zip members are present at the same size, plus four extras (three `.DS_Store`, one duplicate inventory file).
 - claude, gemini, grok, perplexity: two copies (R1, R3), same disk.
 
 ## What else covers them
@@ -52,7 +52,7 @@ Hashes were computed for every file of 90 MB or less (R1 17,100 of 17,107, R2 1,
 - `archive4t-chatgpt-replica/` is R2 whole (1,789 files, 4,139,223,379 bytes), keeping its read-only modes.
 - `_run/` holds the hash manifests taken from the originals before the transfer, the large-file lists, the inventory statistics and the check logs.
 
-Made with `rsync -a` (no `--delete`), 2026-10-30 21:24Z to 21:30Z, from the originals, which were only read. Read-back, with the manifests stored on the copy:
+Made with `rsync -a` (macOS openrsync, no `--delete`), 2026-10-30 21:24Z to 21:30Z, from the originals, which were only read. Read-back, with the manifests stored on the copy:
 
 - `shasum -a 256 -c` over R1's manifest: 17,100 OK, 0 failed. Over R2's manifest: 1,787 OK, 0 failed.
 - R2's own custody manifest (recorded 2026-10-17, covering the raw zip and the delta file): 1,784 OK, 0 failed.
