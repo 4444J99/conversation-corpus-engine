@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .answering import shorten, slugify
-from .archive_author import author_of
+from .archive_author import HUMAN, author_of
 from .archive_naming import (
     PROVIDER_SCOPES,
     InvalidName,
@@ -26,8 +26,20 @@ SCHEMA = "archive-conversation.v2"
 LEGACY_SCHEMA = "cce.archive.conversation.v1"
 ACCEPTED_SCHEMAS = frozenset({SCHEMA, LEGACY_SCHEMA})
 ROLES = ("user", "assistant", "system", "tool")
-KINDS = ("chat", "search", "activity", "notebook", "memory")
-CHANNELS = ("typed", "reply", "thinking", "tool", "system", "memory", "project")
+KINDS = (
+    "chat",
+    "search",
+    "activity",
+    "notebook",
+    "memory",
+    "session",
+    "note",
+    "document",
+    "plan",
+    "page",
+    "artifact",
+)
+CHANNELS = ("typed", "reply", "thinking", "tool", "system", "memory", "project", "written")
 SNIPPET_LIMIT = 240
 DERIVED_ID_PREFIX = "derived"
 _PLAIN_ID_RE = re.compile(r"[a-z0-9-]{1,64}")
@@ -146,8 +158,10 @@ class Conversation:
         return max(stamps) if stamps else (self.updated or self.created)
 
     def first_user_text(self) -> str:
+        """The first words the person themselves put in: a harness-injected turn or a prompt a
+        parent agent wrote (both user-role, neither human) never becomes a snippet."""
         for message in self.messages:
-            if message.role == "user" and message.text.strip():
+            if message.author == HUMAN and message.text.strip():
                 return message.text
         return ""
 

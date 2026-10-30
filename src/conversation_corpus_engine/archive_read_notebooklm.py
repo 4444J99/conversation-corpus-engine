@@ -6,11 +6,17 @@ from pathlib import Path
 from typing import Any
 
 from .archive_model import Attachment, Conversation, Message, SourceTracker, clean_text, to_iso
+from .archive_provenance import BASIS_KEY
 from .archive_text import html_to_text
 
 PROVIDER = "notebooklm"
-READER = "archive_read_notebooklm@1"
+READER = "archive_read_notebooklm@2"
 MEDIA_SUFFIXES = {".mp4", ".wav", ".mp3", ".m4a", ".png", ".jpg", ".jpeg", ".webp"}
+# A notebook's sources are what the account holder added to it and its notes are what they saved
+# in it, so both are the person's (channel `written`); a note may be a saved model reply, which
+# the export cannot tell apart from a typed one, and the basis keeps that doubt visible. The
+# transcript, the artifacts and the discovered sources are produced by the service.
+USER_KINDS = {"source": "user-supplied:source", "note": "user-saved:note"}
 
 
 def notebook_dirs(root: Path) -> list[Path]:
@@ -59,7 +65,11 @@ def _html_messages(folder: Path, kind: str, tracker: SourceTracker) -> list[Mess
             meta["source_meta"] = _scalars(_load(sidecar))
         text = html_to_text(page.read_text(encoding="utf-8", errors="replace"))
         tracker.provenance(page)
-        messages.append(Message(role="system", text=text, meta=meta))
+        if kind in USER_KINDS:
+            meta[BASIS_KEY] = USER_KINDS[kind]
+            messages.append(Message(role="user", text=text, channel="written", meta=meta))
+        else:
+            messages.append(Message(role="system", text=text, meta=meta))
     return messages
 
 

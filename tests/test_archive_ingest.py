@@ -43,10 +43,18 @@ def test_ingest_builds_store_manifest_and_denominators(archive_env) -> None:
         export_root=archive_env.export, paths=archive_env.paths, authorization=archive_env.auth
     )
     providers = manifest["providers"]
-    assert {n: i["status"] for n, i in providers.items()} == {
-        **dict.fromkeys(["chatgpt", "claude", "gemini", "notebooklm", "grok", "perplexity"], "ok"),
-        "copilot": "absent",
-    }
+    # The web providers read the export; every other family is absent without its own source.
+    statuses = {n: i["status"] for n, i in providers.items()}
+    assert [n for n, status in statuses.items() if status == "ok"] == [
+        "chatgpt",
+        "claude",
+        "gemini",
+        "notebooklm",
+        "grok",
+        "perplexity",
+    ]
+    assert set(statuses.values()) == {"ok", "absent"}
+    assert list(statuses) == list(PROVIDER_SPECS)
     assert providers["chatgpt"]["conversations"] == 3
     assert providers["chatgpt"]["empty_conversations"] == 1
     assert providers["claude"]["kinds"] == {"chat": 3, "memory": 1, "notebook": 1}

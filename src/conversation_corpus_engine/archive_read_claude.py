@@ -15,9 +15,10 @@ from .archive_model import (
     normalize_role,
     to_iso,
 )
+from .archive_provenance import BASIS_KEY
 
 PROVIDER = "claude"
-READER = "archive_read_claude@3"
+READER = "archive_read_claude@4"
 CONVERSATIONS = "conversations.json"
 TOOL_TEXT_LIMIT = 2000
 TOOL_INPUT_LIMIT = 200
@@ -199,24 +200,33 @@ def _zip_json(path: Path, prefix: str) -> Iterator[tuple[str, Any]]:
 def _project(
     raw: dict[str, Any], tracker: SourceTracker, source: Path, member: str
 ) -> Conversation:
+    # The instructions and knowledge documents of a project are text the account holder put into
+    # it, so they are the person's (channel `written`); the export cannot say whether a document
+    # was typed or saved from elsewhere, and that doubt is recorded in the basis.
     messages: list[Message] = []
     if raw.get("prompt_template"):
         messages.append(
             Message(
-                role="system",
+                role="user",
                 text=clean_text(raw["prompt_template"]),
                 ts=to_iso(raw.get("created_at")),
-                meta={"kind": "prompt-template"},
+                channel="written",
+                meta={"kind": "prompt-template", BASIS_KEY: "user-supplied:project-instructions"},
             )
         )
     for doc in raw.get("docs") or []:
         messages.append(
             Message(
-                role="system",
+                role="user",
                 text=clean_text(doc.get("content")),
                 ts=to_iso(doc.get("created_at")),
                 attachments=[Attachment(name=str(doc.get("filename") or ""), kind="doc")],
-                meta={"kind": "project-doc", "filename": str(doc.get("filename") or "")},
+                channel="written",
+                meta={
+                    "kind": "project-doc",
+                    "filename": str(doc.get("filename") or ""),
+                    BASIS_KEY: "user-supplied:project-document",
+                },
             )
         )
     return Conversation(

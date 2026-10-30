@@ -59,7 +59,10 @@ extension and never opened, so a folder of captures with other documents beside 
 place: `--source copilot=/path/to/copilot-captures`.
 
 `--export-root` expects one folder per provider: `chatgpt/`, `claude/`, `gemini/` (including
-`NotebookLM/`), `grok/`, `perplexity/`, `copilot/`. Override any with `--source provider=PATH`. A
+`NotebookLM/`), `grok/`, `perplexity/`, `copilot/` (the `copilotreports` provider reads the
+`.docx`/`.txt` files of the same folder) and `local-memory/` (the `localmemory` provider). The
+coding-CLI, notes, Drive, document and agent families come from `--library-root`. Override any with
+`--source provider=PATH`. A
 ChatGPT account export is a snapshot; pass the live delta with `--chatgpt-extra delta.json` (it wins
 over the same conversation in the export). Output defaults to `<store>/archive-all/`. Every name
 below is minted by `derive_name` (see *Naming contract*), so `cce archive verify-names` accepts a
@@ -91,6 +94,7 @@ limits, and `cce archive census` checks any tree against them.
 | `--folder-entries` | 1,800 (ceiling 2,000) | a month folder spills into one folder per day, a day into hash buckets |
 | `--shard-bytes` | 48 MiB (data ceiling 64 MiB) | a provider-month shard rolls to `-002`, `-003` |
 | SQLite files | exempt from the size ceiling | they are paged by their engine, never rendered, and sharded by provider and month anyway |
+| one oversize conversation | exempt, by name, from the data ceiling | a conversation is never cut, so a row larger than a shard is its own shard; the manifest marks it `oversize_row` and the census lists it under `violations.exempt` with the reason |
 
 - **Splitting is lossless.** A message that does not fit is cut at line boundaries; a fenced code
   block cut this way is closed at the end of the piece and reopened at the start of the next, so
@@ -104,20 +108,30 @@ limits, and `cce archive census` checks any tree against them.
 - **Folders.** `vault-all/conversations/month-all-202506/conversation-<uid>.md` (and the same under
   `site-all/conversations/`). The plan is a pure function of the conversations and their part
   counts, so a rebuild places every file where it was. Undated conversations go to `undated`.
-- `cce archive verify` fails on any file or folder past its ceiling, on a vault or site whose
-  conversation count differs from the manifest, and on author or shard counts that do not
-  reconcile. A first-generation store (no `layout_version`) is not held to the limits.
+- `cce archive verify` fails on any file or folder past its ceiling (except an oversize-row shard
+  the manifest names), on a vault or site whose conversation count differs from the manifest, on
+  author or shard counts that do not reconcile, and on a family whose counts differ from its
+  source's own (the library's record and message counts; local memory's file accounting and the
+  proof that every folded conversation is already in its owning provider). A first-generation
+  store (no `layout_version`) is not held to the limits.
 
 ### The two containers
 
 The atom is the **turn**: one message. Every turn has exactly one author:
 
-- `human` — the person typed it: role `user`, channel `typed` (the prompt feed's own rule, so the
-  human count of a provider equals its feed rows, less abandoned-branch asks, plus the typed turns
-  the feed skipped for holding no text);
-- `machine` — everything else: replies, reasoning, tool output, system text, project documents
-  and memories. An export cannot prove the person wrote a project document or a memory, so the
-  author is not claimed for them.
+- `human` — the person typed or wrote it: role `user`, channel `typed` (a prompt typed into a chat
+  or a coding CLI; the prompt feed's own rule, so the human count of a chat provider equals its feed
+  rows, less abandoned-branch asks, plus the typed turns the feed skipped for holding no text, plus
+  the `written` turns) or channel `written` (text the person authored or supplied outside a chat:
+  a note, a Drive document, a file they wrote, a project instruction, a notebook source);
+- `machine` — everything else: replies, reasoning, tool output, system text, memories and plans an
+  agent wrote, text a harness injected into a user turn, and every prompt a parent agent wrote
+  for a subagent.
+
+An author is claimed where the source proves it. Where it cannot, the reader classifies by
+provenance (who put the text into the system) and records the basis in the turn's
+`meta.author_basis`; the manifest counts the bases per provider (`author_basis`), so the doubt is
+visible and countable instead of silent.
 
 `author` is derived from the stored `role` and `channel`, so no conversation row changes. The turn
 store holds each turn once, in the container of its author:
@@ -148,6 +162,56 @@ cce archive fixture --out /tmp/fx --stress 120               # a 380 KB reply an
 `cce_archive_search` takes `author` and `month`. A store built before the turn store answers from
 its single database and reports that it cannot filter by author or month.
 
+### Every family, one atom
+
+The store is two containers of one atom whatever the source: a chat turn, a coding-CLI turn, a
+note, a Drive document, a file and an agent memory are all a turn with an author, a provider (the
+source family), a source id, an ordinal and a timestamp, sharded and bounded the same way.
+
+| Provider (family) | Source | Human (container 1) | Machine (container 2) |
+|---|---|---|---|
+| `chatgpt` `claude` `gemini` `grok` `perplexity` `notebooklm` `copilot` | account exports, saved pages | typed prompts; project instructions and documents, notebook sources and notes, a Grok personality (`written`) | replies, reasoning, tool output, memories, notebook chat history and artifacts |
+| `claudecode` `codex` `opencode` `antigravity` `geminicli` `copilotcli` | library generation | what the person typed, a slash or shell command, pasted text | subagent prompts, harness-injected text, replies, reasoning, tool output |
+| `applenotes` `googledrive` | library generation | every turn (note body, table cells, document text) | — |
+| `documents` | library generation (authored files) | every turn (`written`) | — |
+| `agentmemory` `agentplans` | library generation (agent memory trees, plans, Codex outputs) | — | every turn |
+| `copilotreports` | the `.docx`/`.txt` reports saved beside Copilot pages | — | every turn |
+| `localmemory` | the local-session memory folders | — | every record (conversation payloads are folded into their provider, account files excluded) |
+
+**The library bridge.** `cce library build` is the capture pipeline: it reads the coding CLIs'
+native stores, the notes and Drive captures and the document roots, merges what several captures
+say about one identity, and publishes a verified generation. `cce archive ingest --library-root
+<store|library-all|generation>` streams that generation's records into the archive providers
+above (`archive_read_library.py`), so nothing is re-read from an original and the archive's counts
+are held to the library's own: `verify` fails when a family's conversations plus folded
+duplicates differ from the library's record count, or the messages read differ from the library's
+message count. The library keeps every document under one provider; the bridge splits them by
+provenance into `documents`, `agentmemory` and `agentplans`. The ChatGPT pages the library holds
+beyond the account export join `chatgpt` (an id the export already has is folded, the export's
+version staying).
+
+**Who typed a CLI turn.** A coding CLI writes everything the model sees as a user turn
+(`archive_provenance.py`). A turn is human only in a root session and only when its text is not a
+harness wrapper: every user turn of a `subagent` session is a prompt the parent agent wrote, and
+a turn that opens with a known injected tag (`system-reminder`, `task-notification`,
+`environment_context`, `session_context`, …) or a known harness template (a compaction summary, a
+skill body, hook feedback) is machine. A slash command, a shell command and pasted text are the
+person's. A tag the rules do not know is machine and counted as `unclassified-tag:<name>`; a
+plain-text template the rules do not list stays human, so a CLI family's human count is an upper
+bound that the manifest's `author_basis` lets a reader audit. Antigravity's text is recovered from
+protobuf leaves with no role, so all of it is machine.
+
+```bash
+cce archive ingest --export-root "$EXPORTS" --library-root "$OLD_STORE" --provider claudecode --merge
+```
+
+`--merge` keeps the manifest entries of providers a call does not read, so a store this size is
+built one provider at a time and a failed one is read again alone; without it the manifest lists
+exactly the providers of the call. A conversation larger than a shard (one Antigravity session is
+about 170 MiB) is never cut: its shard is that one row, the manifest marks it `oversize_row`, and
+the census lists the file under `violations.exempt` with the reason instead of ignoring the
+ceiling — a data file past the ceiling that the manifest does not name is still a violation.
+
 ### The normalized layer (version 2)
 
 Conversations carry the schema string `archive-conversation.v2`; the manifest carries
@@ -159,8 +223,9 @@ those two commands exit non-zero and ask for `cce archive build`.
 - Each **message** has an `id`: the vendor message id where the export has one (the ChatGPT node
   id, the Claude message uuid), otherwise `message-<provider>-<16hex>` over provider, conversation
   uid, role, timestamp and text, with an ordinal inside the hashed string for exact repeats. It
-  also has a `channel` (`typed`, `reply`, `thinking`, `tool`, `system`, `memory` or `project`) and
-  `typed_chars`, the characters the person typed before any appended attachment text.
+  also has a `channel` (`typed`, `reply`, `thinking`, `tool`, `system`, `memory`, `project` or
+  `written`) and `typed_chars`, the characters the person typed before any appended attachment
+  text.
 - A conversation with **no vendor id** (or one the naming contract cannot express) gets
   `derived-<16hex>` over provider, creation stamp and the first three messages' text. The manifest
   counts `derived_ids`, and `unnameable_ids` for the subset that had a vendor id the contract
@@ -296,7 +361,7 @@ it. The conversation name is `conversation-` plus today's `stable_uid`, so exist
 reproduced byte for byte. One disclosed deviation from "`stable_uid` is frozen": a vendor id that
 is valid for `stable_uid` but that the contract cannot express as a name (an edge or doubled
 hyphen, or a name over 80 characters) is replaced by a derived id, with the original kept in
-`extra.vendor_id`, and the manifest counts it in `unnameable_ids`. `NAMING_VERSION` is recorded in every receipt; adding a kind or widening one bumps it (1: the first table; 2: the `manifest` kind accepts an optional subject; 3: the kinds `shard`, `part`, `day`, `bucket` and `container`, and the structural folder word `undated`), and names minted under an earlier version stay valid.
+`extra.vendor_id`, and the manifest counts it in `unnameable_ids`. `NAMING_VERSION` is recorded in every receipt; adding a kind or widening one bumps it (1: the first table; 2: the `manifest` kind accepts an optional subject; 3: the kinds `shard`, `part`, `day`, `bucket` and `container`, and the structural folder word `undated`; 4: the provider words of the families that are not web chat exports: `claudecode`, `codex`, `opencode`, `antigravity`, `geminicli`, `copilotcli`, `applenotes`, `googledrive`, `documents`, `agentmemory`, `agentplans`, `copilotreports`, `localmemory`), and names minted under an earlier version stay valid.
 `cce archive names --json` prints the full table and `cce archive verify-names` checks a tree. Only
 four plain folder words are outside the grammar (`conversations`, `hubs`, `meta`, `undated`); everything
 else a build writes is a minted name, which `verify-names` confirms on a whole archive folder.

@@ -10,7 +10,8 @@ A name is a kind word followed by up to four more segments, joined by single hyp
   earlier version stay valid under a later one.
   Version notes: 1 the first table; 2 the `manifest` kind accepts an optional subject; 3 the
   bounded layout adds the kinds `shard`, `part`, `day`, `bucket` and `container`, and the
-  structural folder word `undated`.
+  structural folder word `undated`; 4 adds the provider words of the families that are not web
+  chat exports (the coding CLIs, notes, Drive, documents, agent memory and plans, local memory).
 * scope: a provider word (see PROVIDER_SCOPES) or the word `all`.
 * subject: lowercase words `[a-z0-9]+` joined by hyphens, at most 32 characters. A subject is
   validated, never transformed: a title, prompt text or free text is not a subject.
@@ -45,7 +46,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-NAMING_VERSION = 3
+NAMING_VERSION = 4
 
 MAX_NAME_LENGTH = 80
 MAX_SUBJECT_LENGTH = 32
@@ -60,14 +61,27 @@ SCOPE_ALL = "all"
 # Every provider the engine knows: the provider catalog plus archive-only readers. A test holds
 # this list to be a superset of both, so adding a provider forces a conscious edit here.
 PROVIDER_SCOPES: tuple[str, ...] = (
+    "agentmemory",
+    "agentplans",
+    "antigravity",
+    "applenotes",
     "chatgpt",
     "claude",
+    "claudecode",
+    "codex",
     "copilot",
+    "copilotcli",
+    "copilotreports",
     "deepseek",
+    "documents",
     "gemini",
+    "geminicli",
+    "googledrive",
     "grok",
+    "localmemory",
     "mistral",
     "notebooklm",
+    "opencode",
     "perplexity",
 )
 SCOPES: tuple[str, ...] = (*PROVIDER_SCOPES, SCOPE_ALL)

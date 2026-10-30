@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from collections.abc import Callable
@@ -9,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from . import archive_layout as layout
-from . import archive_search
+from . import archive_read_library, archive_search
 from .archive_author import AUTHORS, reconcile
 from .archive_corpus import CorpusProjectionError, project_corpus
 from .archive_feed import FeedError, project_feed
@@ -47,6 +48,22 @@ class ArchiveContext:
     paths: ArchivePaths
     authorization: CorpusWriteAuthorization
     export_root: Path | None
+    library_root: Path | None = None
+
+
+def library_source_folder(library_root: Path) -> Path:
+    """The folder custody must treat as the library source: the narrowest one that holds it.
+
+    A library is often built in the same store the archive is written to (`<store>/library-all`
+    beside `<store>/archive-all`); handing custody the store itself would make the source an
+    ancestor of the destination. So the source is the `library-all` folder (or the generation),
+    not the store that contains it.
+    """
+    try:
+        database, pointer = archive_read_library.locate(library_root)
+    except (OSError, ValueError, KeyError):
+        return library_root
+    return pointer.parent if pointer is not None else database.parent
 
 
 def open_context(
@@ -55,19 +72,97 @@ def open_context(
     corpus_store_root: Path | None,
     archive_root: Path | None,
     export_root: Path | None = None,
+    library_root: Path | None = None,
+    source_overrides: tuple[Path, ...] = (),
 ) -> ArchiveContext:
     store = resolve_configured_corpus_store_root(corpus_store_root)
+    sources = [
+        *([export_root] if export_root else []),
+        *([library_source_folder(library_root)] if library_root else []),
+    ]
     authorization = authorize_archive(
         project_root=project_root,
         archive_root=archive_root or store / DEFAULT_ARCHIVE_DIRNAME,
         corpus_store_root=store,
-        source_roots=(export_root.resolve(),) if export_root else (),
+        source_roots=tuple(path.resolve() for path in [*sources, *source_overrides]),
     )
-    return ArchiveContext(ArchivePaths(authorization.destination), authorization, export_root)
+    return ArchiveContext(
+        ArchivePaths(authorization.destination), authorization, export_root, library_root
+    )
 
 
 def _say(message: str) -> None:
     print(f"[archive] {message}", file=sys.stderr, flush=True)
+
+
+def oversize_row_files(manifest: dict[str, Any]) -> frozenset[str]:
+    """The normalized shards that are one conversation larger than a shard, by relative path.
+
+    The manifest records each one at ingest (`oversize_row`); the census exempts exactly these
+    files from the data ceiling and lists them with the reason.
+    """
+    return frozenset(
+        f"{layout.provider_dirname(name)}/{layout.shard_filename(name, shard['subject'])}"
+        for name, info in manifest.get("providers", {}).items()
+        for shard in info.get("layout", {}).get("shards", [])
+        if shard.get("oversize_row")
+    )
+
+
+def reconcile_source(name: str, info: dict[str, Any]) -> list[str]:
+    """Hold a provider's counts to its source's own account of itself.
+
+    A library family must have read every record and message the library lists for it, and
+    `conversations + folded duplicates` must equal that record count (a ChatGPT page the export
+    already held is folded, never lost). Local memory must account for every file as a record,
+    a folded conversation payload or a deliberate exclusion.
+    """
+    counters = info.get("reader_counters", {})
+    problems: list[str] = []
+    if counters.get("library_unclaimed"):
+        problems.append(
+            f"{counters['library_unclaimed']} library record(s) belong to no family and were "
+            "not read"
+        )
+    if "library_records" in counters:
+        for read, listed in (
+            ("bridge_records", "library_records"),
+            ("bridge_messages", "library_messages"),
+        ):
+            if counters.get(read, 0) != counters[listed]:
+                problems.append(
+                    f"read {counters.get(read, 0)} {read.split('_')[1]} of the "
+                    f"{counters[listed]} the library lists"
+                )
+        if name != "chatgpt":
+            held = info["conversations"] + info.get("duplicates_folded", 0)
+            if held != counters["library_records"]:
+                problems.append(
+                    f"{info['conversations']} conversation(s) + {info.get('duplicates_folded', 0)} "
+                    f"folded != {counters['library_records']} library record(s)"
+                )
+    if counters.get("folded_ids_missing"):
+        problems.append(
+            f"{counters['folded_ids_missing']} folded conversation id(s) are not conversations "
+            "of the owning provider"
+        )
+    if counters.get("folded_ids_unowned"):
+        problems.append(
+            f"{counters['folded_ids_unowned']} folded conversation id(s) sit in a capture folder "
+            "no provider owns"
+        )
+    if "files_seen" in counters:
+        accounted = (
+            info["conversations"]
+            + counters.get("files_folded", 0)
+            + counters.get("files_excluded", 0)
+        )
+        if accounted != counters["files_seen"]:
+            problems.append(
+                f"{counters['files_seen']} file(s) seen, {accounted} accounted for as records, "
+                "folded payloads or exclusions"
+            )
+    return problems
 
 
 def verify_layout(paths: ArchivePaths, manifest: dict[str, Any]) -> list[str]:
@@ -79,6 +174,7 @@ def verify_layout(paths: ArchivePaths, manifest: dict[str, Any]) -> list[str]:
         problems += [
             f"{name}: {item}" for item in reconcile(info.get("authors", {}), info["messages"])
         ]
+        problems += [f"{name}: {item}" for item in reconcile_source(name, info)]
         shards = info.get("layout", {}).get("shards", [])
         if sum(shard["conversations"] for shard in shards) != info["conversations"]:
             problems.append(f"{name}: shard conversation counts do not sum to the manifest")
@@ -139,7 +235,9 @@ def verify_archive(paths: ArchivePaths, limits: Limits | None = None) -> list[st
         problems.append(f"site has {pages} conversation page(s), manifest has {total}")
     if has_bounded_layout(manifest):
         problems += verify_layout(paths, manifest)
-        problems += census_problems(take_census(paths.root, limits))
+        problems += census_problems(
+            take_census(paths.root, limits, exempt=oversize_row_files(manifest))
+        )
     return problems
 
 
@@ -160,6 +258,7 @@ def run_stages(
     overrides: dict[str, Path] | None = None,
     options: dict[str, Any] | None = None,
     limits: Limits | None = None,
+    merge: bool = False,
 ) -> dict[str, Any]:
     paths, authorization = context.paths, context.authorization
     limits = limits or Limits()
@@ -184,6 +283,8 @@ def run_stages(
                 providers=providers,
                 overrides=overrides,
                 options=options,
+                library_root=context.library_root,
+                merge=merge,
             )
             result[stage] = {
                 "totals": manifest["totals"],
@@ -245,6 +346,18 @@ def add_archive_parser(subparsers: Any) -> None:
             help="extra ChatGPT conversation JSON (live delta); wins over export shards",
         )
         parser.add_argument("--include-attachment-text", action="store_true")
+        parser.add_argument(
+            "--library-root",
+            type=Path,
+            help="a knowledge-library store, `library-all` folder or generation: the source of "
+            "the coding-CLI, notes, Drive, document, agent memory and plan families",
+        )
+        parser.add_argument(
+            "--merge",
+            action="store_true",
+            help="keep the manifest entries of providers this call does not read, so a store "
+            "is built one provider at a time",
+        )
 
     ingest_parser = sub.add_parser("ingest", help="Read raw exports into the normalized store")
     common(ingest_parser)
@@ -402,8 +515,13 @@ def handle_archive(args: argparse.Namespace) -> int:
         print(json.dumps(write_fixture(args.out, stress=args.stress), indent=2, sort_keys=True))
         return 0
     if action == "census":
+        exempt: frozenset[str] = frozenset()
+        with contextlib.suppress(FileNotFoundError, ValueError):
+            exempt = oversize_row_files(load_manifest(ArchivePaths(args.root)))
         try:
-            report = take_census(args.root, limits_from_args(args), deadline_seconds=args.deadline)
+            report = take_census(
+                args.root, limits_from_args(args), deadline_seconds=args.deadline, exempt=exempt
+            )
         except NotADirectoryError:
             print(f"census root not found: {args.root}", file=sys.stderr)
             return 2
@@ -414,12 +532,15 @@ def handle_archive(args: argparse.Namespace) -> int:
         return _handle_project(args)
 
     export_root = getattr(args, "export_root", None)
+    library_root = getattr(args, "library_root", None)
     try:
         context = open_context(
             project_root=args.project_root,
             corpus_store_root=args.corpus_store_root,
             archive_root=args.archive_root,
             export_root=export_root,
+            library_root=library_root,
+            source_overrides=tuple(_overrides(getattr(args, "source", [])).values()),
         )
     except CorpusStoreError as exc:
         print(f"archive custody refused: {exc}", file=sys.stderr)
@@ -445,6 +566,7 @@ def handle_archive(args: argparse.Namespace) -> int:
             overrides=_overrides(args.source),
             options=options,
             limits=limits,
+            merge=args.merge,
         )
         problems = verify_archive(paths, limits) if action == "build" else []
         failed = [n for n, i in result["ingest"]["providers"].items() if i["status"] == "failed"]

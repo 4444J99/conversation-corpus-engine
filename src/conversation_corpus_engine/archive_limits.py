@@ -116,13 +116,27 @@ def _bump(summary: dict[str, dict[str, int]], kind: str, size: int) -> None:
     entry["max_bytes"] = max(entry["max_bytes"], size)
 
 
+OVERSIZE_ROW_REASON = (
+    "one conversation row larger than the data ceiling; a conversation is never cut, "
+    "so its shard is the row"
+)
+
+
 def take_census(
-    root: Path, limits: Limits | None = None, *, deadline_seconds: float | None = None
+    root: Path,
+    limits: Limits | None = None,
+    *,
+    deadline_seconds: float | None = None,
+    exempt: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Walk `root` once and report sizes, fan-out and every violation of the ceilings.
 
     Only metadata is read. `complete` is false when the deadline stopped the walk early; a
     partial census never claims the tree is within its limits.
+
+    `exempt` names data files (relative to `root`, POSIX separators) that hold one conversation
+    row larger than the ceiling. They are listed under `violations.exempt` with the reason and do
+    not count as violations; a data file past the ceiling that is not named still does.
     """
     limits = limits or Limits()
     root = Path(root)
@@ -132,6 +146,7 @@ def take_census(
     classes: dict[str, dict[str, int]] = {}
     over_notes: list[dict[str, Any]] = []
     over_data: list[dict[str, Any]] = []
+    exempted: list[dict[str, Any]] = []
     over_folders: list[dict[str, Any]] = []
     counts = {"notes": 0, "data": 0, "folders": 0}
     largest: list[tuple[int, str]] = []
@@ -167,6 +182,11 @@ def take_census(
                     if len(over_notes) < REPORTED_VIOLATIONS:
                         over_notes.append({"path": relative, "bytes": size})
                 elif kind == DATA and size > limits.data_ceiling:
+                    if Path(relative).as_posix() in exempt:
+                        exempted.append(
+                            {"path": relative, "bytes": size, "reason": OVERSIZE_ROW_REASON}
+                        )
+                        continue
                     counts["data"] += 1
                     if len(over_data) < REPORTED_VIOLATIONS:
                         over_data.append({"path": relative, "bytes": size})
@@ -194,6 +214,7 @@ def take_census(
             "notes": over_notes,
             "data": over_data,
             "folders": over_folders,
+            "exempt": sorted(exempted, key=lambda item: item["path"]),
         },
         "limits": limits.as_dict(),
         "ok": complete and not any(counts.values()),
@@ -229,6 +250,12 @@ def census_problems(report: dict[str, Any]) -> list[str]:
 
 
 def verify_limits(
-    root: Path, limits: Limits | None = None, *, deadline_seconds: float | None = None
+    root: Path,
+    limits: Limits | None = None,
+    *,
+    deadline_seconds: float | None = None,
+    exempt: frozenset[str] = frozenset(),
 ) -> list[str]:
-    return census_problems(take_census(root, limits, deadline_seconds=deadline_seconds))
+    return census_problems(
+        take_census(root, limits, deadline_seconds=deadline_seconds, exempt=exempt)
+    )

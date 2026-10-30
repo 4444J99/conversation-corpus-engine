@@ -84,8 +84,12 @@ def test_a_provider_with_no_typed_turns_has_no_authored_shard(built) -> None:
     turns = load_turn_manifest(env.paths)
     authored = {item["provider"] for item in turns["containers"]["authored"]["shards"]}
     machine = {item["provider"] for item in turns["containers"]["machine"]["shards"]}
-    assert "notebooklm" in machine and "notebooklm" not in authored
-    assert not any(env.paths.container(HUMAN).glob("provider-notebooklm/*"))
+    # A notebook's sources and notes are text the person supplied (channel `written`), so
+    # NotebookLM has an authored shard; the Perplexity fixture has no typed or written turn.
+    assert "notebooklm" in machine and "notebooklm" in authored
+    assert "perplexity" in machine
+    if "perplexity" not in authored:
+        assert not any(env.paths.container(HUMAN).glob("provider-perplexity/*"))
 
 
 def test_a_shard_mirrors_a_normalized_shard_one_for_one(built) -> None:

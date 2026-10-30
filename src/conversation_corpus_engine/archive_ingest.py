@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import shutil
+import sqlite3
+import zlib
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -11,11 +14,14 @@ from typing import Any
 
 from . import archive_layout as layout
 from . import (
+    archive_read_captures,
     archive_read_chatgpt,
     archive_read_claude,
     archive_read_copilot,
     archive_read_gemini,
     archive_read_grok,
+    archive_read_library,
+    archive_read_localmemory,
     archive_read_notebooklm,
     archive_read_perplexity,
 )
@@ -51,18 +57,65 @@ DEFAULT_ARCHIVE_DIRNAME = layout.ARCHIVE_DIRNAME
 FINGERPRINT_EXCLUDED_KEYS = frozenset({"source_root", "error"})
 
 
+SOURCE_EXPORT = "export"
+SOURCE_LIBRARY = "library"
+
+
 @dataclass(frozen=True)
 class ProviderSpec:
+    """One provider (a source family) and how to open its source.
+
+    `source` says where the root comes from: a folder of a provider's export under the export
+    root (`export`), or a published knowledge-library generation given by `--library-root`
+    (`library`). A `--source PROVIDER=PATH` override wins over both.
+    """
+
     name: str
     display: str
     default_rel: str
     module: Any
     open_reader: Callable[[Path, SourceTracker, dict[str, Any]], Iterator[Conversation]]
+    source: str = SOURCE_EXPORT
+    # A second source that makes the provider present even when its own folder is not: the
+    # options say whether it has anything (the ChatGPT pages a library holds).
+    supplement: Callable[[dict[str, Any]], bool] | None = None
+
+
+def _library_pages(options: dict[str, Any]) -> bool:
+    """True when `--library-root` names a library that holds ChatGPT pages."""
+    library_root = options.get("library_root")
+    if library_root is None or not archive_read_library.detect(Path(library_root)):
+        return False
+    return bool(
+        archive_read_library.expected(Path(library_root), archive_read_library.CHATGPT_PAGES)[
+            "records"
+        ]
+    )
 
 
 def _chatgpt(root: Path, tracker: SourceTracker, options: dict[str, Any]) -> Iterator[Conversation]:
-    return archive_read_chatgpt.iter_conversations(
-        root, tracker, extra_files=options.get("chatgpt_extra_files", ())
+    export: Iterator[Conversation] = iter(())
+    if root.exists() and archive_read_chatgpt.detect(root):
+        export = archive_read_chatgpt.iter_conversations(
+            root, tracker, extra_files=options.get("chatgpt_extra_files", ())
+        )
+    if not _library_pages(options):
+        return export
+    # The library also holds ChatGPT pages the account export lacks; an id the export already has
+    # is folded by the ingest (the export's version stays).
+    return itertools.chain(
+        export,
+        archive_read_library.iter_family(
+            Path(options["library_root"]), tracker, archive_read_library.CHATGPT_PAGES
+        ),
+    )
+
+
+def _localmemory(
+    root: Path, tracker: SourceTracker, options: dict[str, Any]
+) -> Iterator[Conversation]:
+    return archive_read_localmemory.iter_conversations(
+        root, tracker, known_uids=options.get("known_uids")
     )
 
 
@@ -81,10 +134,32 @@ def _plain(module: Any) -> Callable[[Path, SourceTracker, dict[str, Any]], Itera
     return opener
 
 
+def _library_spec(family: archive_read_library.Family) -> ProviderSpec:
+    reader = archive_read_library.reader_for(family.name)
+    return ProviderSpec(
+        family.name,
+        family.display,
+        "library-all",
+        reader,
+        _plain(reader),
+        source=SOURCE_LIBRARY,
+    )
+
+
+# The seven web providers come from account exports; the rest of the families come from a
+# knowledge-library generation (the coding CLIs, notes, Drive, documents, agent memory and
+# plans) or from their own capture folders (Copilot captures, local-session memory).
 PROVIDER_SPECS: dict[str, ProviderSpec] = {
     spec.name: spec
     for spec in (
-        ProviderSpec("chatgpt", "ChatGPT", "chatgpt", archive_read_chatgpt, _chatgpt),
+        ProviderSpec(
+            "chatgpt",
+            "ChatGPT",
+            "chatgpt",
+            archive_read_chatgpt,
+            _chatgpt,
+            supplement=_library_pages,
+        ),
         ProviderSpec("claude", "Claude", "claude", archive_read_claude, _claude),
         ProviderSpec(
             "gemini", "Gemini", "gemini", archive_read_gemini, _plain(archive_read_gemini)
@@ -106,6 +181,21 @@ PROVIDER_SPECS: dict[str, ProviderSpec] = {
         ),
         ProviderSpec(
             "copilot", "Copilot", "copilot", archive_read_copilot, _plain(archive_read_copilot)
+        ),
+        *(_library_spec(family) for family in archive_read_library.FAMILIES),
+        ProviderSpec(
+            "copilotreports",
+            "Copilot reports",
+            "copilot",
+            archive_read_captures,
+            _plain(archive_read_captures),
+        ),
+        ProviderSpec(
+            "localmemory",
+            "Local memory",
+            "local-memory",
+            archive_read_localmemory,
+            _localmemory,
         ),
     )
 }
@@ -336,16 +426,23 @@ def require_inside(authorization: CorpusWriteAuthorization, path: Path) -> Path:
 
 
 def resolve_sources(
-    export_root: Path, providers: list[str] | None, overrides: dict[str, Path] | None = None
+    export_root: Path,
+    providers: list[str] | None,
+    overrides: dict[str, Path] | None = None,
+    library_root: Path | None = None,
 ) -> dict[str, Path]:
+    """Where each chosen provider is read from: an override, else the library root for a library
+    family, else the provider's folder under the export root."""
     chosen = providers or list(PROVIDER_SPECS)
     unknown = [name for name in chosen if name not in PROVIDER_SPECS]
     if unknown:
         raise KeyError(f"Unknown archive provider(s): {', '.join(unknown)}")
     sources: dict[str, Path] = {}
     for name in chosen:
-        override = (overrides or {}).get(name)
-        sources[name] = (override or export_root / PROVIDER_SPECS[name].default_rel).resolve()
+        spec = PROVIDER_SPECS[name]
+        base = library_root if spec.source == SOURCE_LIBRARY and library_root else None
+        override = (overrides or {}).get(name) or base
+        sources[name] = (override or export_root / spec.default_rel).resolve()
     return sources
 
 
@@ -387,10 +484,24 @@ def _publish_shards(paths: ArchivePaths, provider: str, build: Path) -> None:
     build.rmdir()
 
 
+def _safe_channels(spec: ProviderSpec, root: Path) -> dict[str, list[str]]:
+    """The reader's account of its source, or the reason it cannot give one (a damaged library)."""
+    try:
+        return spec.module.channels(root)
+    except (OSError, ValueError, KeyError, sqlite3.Error, zlib.error) as exc:
+        return {"read": [], "not_read": [f"source unreadable: {type(exc).__name__}: {exc}"]}
+
+
+def known_uids(paths: ArchivePaths, provider: str) -> set[str]:
+    """The uids a provider already holds in this store, from its index shards."""
+    return {str(row["uid"]) for path in paths.index_files(provider) for row in iter_jsonl(path)}
+
+
 def _ingest_provider(
     spec: ProviderSpec, root: Path, paths: ArchivePaths, options: dict[str, Any]
 ) -> dict[str, Any]:
-    if not root.exists() or not spec.module.detect(root):
+    own = root.exists() and spec.module.detect(root)
+    if not own and not (spec.supplement is not None and spec.supplement(options)):
         return {
             "status": "absent",
             "source_root": str(root),
@@ -400,6 +511,7 @@ def _ingest_provider(
     seen: dict[str, str] = {}
     kinds: Counter[str] = Counter()
     roles: Counter[str] = Counter()
+    turn_channels: Counter[str] = Counter()
     authors: Counter[str] = Counter()
     totals: Counter[str] = Counter()
     created: list[str] = []
@@ -445,13 +557,23 @@ def _ingest_provider(
             _bump(totals, "attachments", conversation.attachment_count)
             for message in conversation.messages:
                 _bump(roles, message.role)
+                _bump(turn_channels, message.channel)
                 _bump(authors, author_of(message.role, message.channel))
             if conversation.created:
                 created.append(conversation.created)
             if conversation.last_activity:
                 activity.append(conversation.last_activity)
         shards = writer.close()
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        IndexError,
+        sqlite3.Error,
+        zlib.error,
+    ) as exc:
         error = f"{type(exc).__name__}: {exc}"
     if error:
         writer.close()
@@ -460,13 +582,14 @@ def _ingest_provider(
             "status": "failed",
             "error": error,
             "source_root": str(root),
-            "channels": spec.module.channels(root),
+            "channels": _safe_channels(spec, root),
         }
     _publish_shards(paths, spec.name, build)
     for shard in shards:
         shard["sha256"] = sha256_file(
             directory / layout.shard_filename(spec.name, shard["subject"])
         )
+    basis = archive_read_library.counter_report(dict(tracker.counters))
     return {
         "status": "ok",
         "source_root": str(root),
@@ -482,7 +605,9 @@ def _ingest_provider(
         "attachments": totals["attachments"],
         "kinds": dict(sorted(kinds.items())),
         "roles": dict(sorted(roles.items())),
+        "turn_channels": dict(sorted(turn_channels.items())),
         "authors": {author: authors[author] for author in AUTHORS},
+        **({"author_basis": basis} if any(basis.values()) else {}),
         "created_min": min(created) if created else "",
         "last_activity_max": max(activity) if activity else "",
         "reader": spec.module.READER,
@@ -501,14 +626,32 @@ def ingest(
     providers: list[str] | None = None,
     overrides: dict[str, Path] | None = None,
     options: dict[str, Any] | None = None,
+    library_root: Path | None = None,
+    merge: bool = False,
 ) -> dict[str, Any]:
+    """Read the chosen providers into the normalized shards and write the archive manifest.
+
+    With `merge`, the providers the manifest already lists and this call does not touch keep
+    their entries, so a store is built one provider at a time and a failed one is re-read alone.
+    Without it the manifest lists exactly the providers of this call.
+    """
     require_inside(authorization, paths.root)
     options = dict(options or {})
-    sources = resolve_sources(export_root, providers, overrides)
+    options.setdefault("known_uids", lambda provider: known_uids(paths, provider))
+    if library_root is not None:
+        options["library_root"] = library_root.resolve()
+    sources = resolve_sources(export_root, providers, overrides, library_root)
     report: dict[str, Any] = {}
+    if merge and paths.manifest.is_file():
+        report.update(load_manifest(paths)["providers"])
     for name, root in sources.items():
         report[name] = _ingest_provider(PROVIDER_SPECS[name], root, paths, options)
-    reader_versions = {name: PROVIDER_SPECS[name].module.READER for name in report}
+    report = {name: report[name] for name in PROVIDER_SPECS if name in report}
+    # A provider carried over by `merge` keeps the reader version it was read with.
+    reader_versions = {
+        name: info.get("reader") or PROVIDER_SPECS[name].module.READER
+        for name, info in report.items()
+    }
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "conversation_schema": SCHEMA,
