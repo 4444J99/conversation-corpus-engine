@@ -26,7 +26,7 @@ Repository = "https://github.com/organvm-i-theoria/conversation-corpus-engine"
 Issues = "https://github.com/organvm-i-theoria/conversation-corpus-engine/issues"
 
 [project.optional-dependencies]
-dev = ["pytest>=9.0.3", "ruff>=0.15.8,<0.16", "mypy>=1.10.0", "markdown-it-py==4.2.0"]
+dev = ["pytest>=9.0.3", "ruff>=0.15.8,<0.18", "mypy>=1.10.0", "markdown-it-py==4.2.0"]
 mcp = []
 obsidian = ["markdown-it-py==4.2.0"]
 
