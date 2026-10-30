@@ -9,7 +9,7 @@ from typing import Any
 
 from . import __version__, library_mcp
 from .answering import build_answer, render_answer_text, search_documents_v4
-from .archive_database import open_database, search, search_titles
+from . import archive_search
 from .archive_ingest import ArchivePaths
 from .federation import list_registered_corpora, validate_corpus_root
 from .library_commands import STORE_ENV
@@ -353,23 +353,20 @@ class CceMcpServer:
                 filters[key] = value or None
             else:
                 raise ValueError(f"{key} must be an array of strings")
-        try:
-            connection = open_database(ArchivePaths(self.archive_root))
-        except FileNotFoundError as exc:
-            raise ValueError(f"The archive search database is not built: {exc}") from exc
+        archive_paths = ArchivePaths(self.archive_root)
         try:
             if titles_only:
-                results = search_titles(connection, query, limit=limit)
+                results = archive_search.search_titles(archive_paths, query, limit=limit)
             else:
-                results = search(
-                    connection,
+                results = archive_search.search(
+                    archive_paths,
                     query,
                     providers=filters["provider"],
                     kinds=filters["kind"],
                     limit=limit,
                 )
-        finally:
-            connection.close()
+        except FileNotFoundError as exc:
+            raise ValueError(f"The archive search database is not built: {exc}") from exc
         structured = {"query": query, "count": len(results), "results": results}
         lines = [
             f"{hit['provider']} · {hit['created'][:10]} · {hit['title']} ({hit['uid']})"

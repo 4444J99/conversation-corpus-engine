@@ -4,15 +4,17 @@ import json
 import re
 from pathlib import Path
 
+import pytest
 from archive_support import conv, topical_corpus, write_store
 
 from conversation_corpus_engine.archive_ingest import ingest
 from conversation_corpus_engine.archive_model import Message, write_jsonl_atomic
-from conversation_corpus_engine.archive_naming import verify_names
+from conversation_corpus_engine.archive_naming import validate_name, verify_names
 from conversation_corpus_engine.archive_topics import build_analysis
 from conversation_corpus_engine.archive_vault import (
     RETIRED_VAULT_MANIFEST,
     build_vault,
+    conversation_part_names,
     link_targets,
     neutralize,
     plain_title,
@@ -53,7 +55,9 @@ def test_vault_from_synthetic_export_has_resolvable_links(archive_env) -> None:
     assert (root / "home-all.md").is_file()
     assert (root / "meta" / "coverage-all.md").is_file()
     assert (root / "hubs" / "provider-chatgpt.md").is_file()
-    assert (root / "conversations" / "conversation-chatgpt-aaaa1111.md").is_file()
+    note = archive_env.paths.vault_note("chatgpt", "chatgpt-aaaa1111")
+    assert note.is_file() and note.parent.parent == root / "conversations"
+    assert note.parent.name == "month-all-202311"
     assert _assert_links_resolve(root) > 30
     graph = json.loads((root / ".obsidian" / "graph.json").read_text(encoding="utf-8"))
     assert {g["query"] for g in graph["colorGroups"]} >= {
@@ -94,7 +98,7 @@ def test_a_manifest_left_inside_an_old_vault_is_read_once_and_removed(archive_en
 
 def test_vault_note_content_and_frontmatter(archive_env) -> None:
     _full_build(archive_env)
-    note = (archive_env.paths.vault_conversations / "conversation-chatgpt-aaaa1111.md").read_text(
+    note = archive_env.paths.vault_note("chatgpt", "chatgpt-aaaa1111").read_text(
         encoding="utf-8"
     )
     head, _, body = note.partition("\n---\n")
@@ -170,22 +174,62 @@ def test_reasoning_and_tool_messages_are_collapsed_callouts() -> None:
             meta={"kind": "reasoning"},
         )
     )
-    text, _ = render_conversation(
+    (text,) = render_conversation(
         conversation, related=[], topics=[], titles={}, collection_link=""
     )
     assert "> [!quote]- Assistant · reasoning · 2025-01-01 00:00\n> line one\n> line two" in text
 
 
-def test_large_messages_and_notes_are_capped_with_a_marker() -> None:
-    conversation = conv("chatgpt", "big", "Big", [("user", "x" * 500), ("assistant", "y" * 500)])
-    text, truncated = render_conversation(
-        conversation, related=[], topics=[], titles={}, collection_link="", message_limit=100
+def test_a_large_message_is_split_into_numbered_parts_and_nothing_is_dropped() -> None:
+    body = "\n".join(f"line {number:05d} " + "x" * 60 for number in range(1500))
+    conversation = conv("chatgpt", "big", "Big", [("user", "short ask"), ("assistant", body)])
+    notes = render_conversation(
+        conversation, related=[], topics=[], titles={}, collection_link="", note_bytes=8192
     )
-    assert truncated and "400 characters omitted" in text
-    text, truncated = render_conversation(
-        conversation, related=[], topics=[], titles={}, collection_link="", note_limit=1200
+    assert len(notes) > 5
+    assert all(len(note.encode("utf-8")) <= 8192 for note in notes)
+    joined = "\n".join(notes)
+    assert all(f"line {number:05d} " in joined for number in range(1500)), "text was dropped"
+    assert "short ask" in notes[0]
+    names = conversation_part_names(conversation, len(notes))
+    assert names[0] == "conversation-chatgpt-big"
+    assert all(validate_name(name) == [] for name in names)
+    for index, note in enumerate(notes):
+        assert f"part: {index + 1}\nparts: {len(notes)}\n" in note
+        if index + 1 < len(notes):
+            assert f"[[{names[index + 1]}|Next →]]" in note
+        if index:
+            assert f"[[{names[index - 1]}|← Previous]]" in note
+            assert "[[conversation-chatgpt-big|Start]]" in note
+    for note in notes:
+        assert link_targets(note) and set(link_targets(note)) <= {*names, "provider-chatgpt", "month-all-202501"}
+
+
+def test_a_single_line_longer_than_the_cap_is_cut_on_a_character_boundary() -> None:
+    line = "é" * 20000  # two bytes a character, no newline to cut at
+    conversation = conv("grok", "wide", "Wide", [("user", "q"), ("assistant", line)])
+    notes = render_conversation(
+        conversation, related=[], topics=[], titles={}, collection_link="", note_bytes=4096
     )
-    assert truncated and "further message(s) omitted" in text
+    assert all(len(note.encode("utf-8")) <= 4096 for note in notes)
+    assert sum(note.count("é") for note in notes) == 20000
+
+
+def test_a_note_that_fits_is_one_note_with_no_part_chrome() -> None:
+    conversation = conv("grok", "tiny", "Tiny")
+    (note,) = render_conversation(
+        conversation, related=[], topics=[], titles={}, collection_link=""
+    )
+    assert "part: 1\nparts: 1\n" in note
+    assert "Next →" not in note and "← Previous" not in note
+
+
+def test_a_note_cap_too_small_for_its_own_header_is_refused() -> None:
+    conversation = conv("grok", "tiny", "Tiny")
+    with pytest.raises(ValueError, match="leaves no room"):
+        render_conversation(
+            conversation, related=[], topics=[], titles={}, collection_link="", note_bytes=2100
+        )
 
 
 def test_rebuild_is_stable_prunes_stale_notes_and_keeps_user_notes(archive_env) -> None:
@@ -266,29 +310,31 @@ def test_nested_and_unterminated_fences_cannot_leak_links_or_swallow_the_note() 
     open_ended = neutralize("```py\nprint(1)\n[[x]]")
     assert open_ended.endswith("\n```"), "an open fence is closed so later messages render"
     assert link_targets(open_ended + "\n[[after]]") == ["after"]
-    truncated, _ = render_conversation(
+    parts = render_conversation(
         conv(
             "chatgpt",
             "cut",
             "Cut",
-            [("user", "```\n" + "line\n" * 50), ("assistant", "[[next]] ok")],
+            [("user", "```\n" + "line\n" * 2000), ("assistant", "[[next]] ok")],
         ),
         related=[],
         topics=[],
         titles={},
         collection_link="",
-        message_limit=40,
+        note_bytes=4096,
     )
-    assert "\\[\\[next\\]\\]" in truncated, (
-        "a fence cut by truncation must not swallow the next turn"
+    assert len(parts) > 2
+    assert any("\\[\\[next\\]\\]" in part for part in parts), (
+        "a fence cut by a split must not swallow the next turn"
     )
+    assert not any("next" in link_targets(part) for part in parts)
 
 
 def test_bracketed_titles_cannot_mint_links() -> None:
     assert plain_title("  [[AI Prompt]]   template \n") == "((AI Prompt)) template"
     assert plain_title("[]") == "()"
     assert plain_title("   ") == "Untitled"
-    note, _ = render_conversation(
+    (note,) = render_conversation(
         conv("grok", "t", "[[Decision: Adopt X]]"),
         related=[],
         topics=[],
@@ -353,9 +399,9 @@ def test_undated_conversations_get_no_month_link_and_unnameable_topics_stay_plai
     ]
     write_jsonl_atomic(archive_env.paths.enrichment, rows)
     summary = build_vault(archive_env.paths, archive_env.auth)
-    undated = (archive_env.paths.vault_conversations / "conversation-grok-u1.md").read_text(
-        encoding="utf-8"
-    )
+    undated_note = archive_env.paths.vault_note("grok", "grok-u1")
+    assert undated_note.parent.name == "undated"
+    undated = undated_note.read_text(encoding="utf-8")
     assert "**Month**" not in undated and "month-all" not in undated
     assert "[[topic-all-kubernetes|kubernetes]]" in undated
     assert "well-known" in undated and "topic-all-well-known" not in undated

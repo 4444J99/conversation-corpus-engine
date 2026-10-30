@@ -16,8 +16,11 @@ from .archive_ingest import (
     require_inside,
 )
 from .archive_layout import wikilink
+from .archive_limits import Limits
 from .archive_model import Conversation, Message, write_json_atomic, write_text_atomic
 from .archive_naming import NameLedger
+from .archive_shard import part_folder, plan_conversation_folders, plan_flat_folders
+from .archive_split import fit_blocks, pack, paginate_rows, utf8_size
 from .archive_text import FenceTracker
 from .archive_topics import load_enrichment
 from .corpus_store import CorpusWriteAuthorization
@@ -25,8 +28,6 @@ from .corpus_store import CorpusWriteAuthorization
 # Where earlier builds kept the list of generated files, inside the vault. It is only read and
 # deleted now; the live list is `ArchivePaths.vault_manifest`, beside the archive manifest.
 RETIRED_VAULT_MANIFEST = ".cce-vault-manifest.json"
-MESSAGE_CHARS = 60_000
-NOTE_CHARS = 400_000
 ROLE_LABELS = {"user": "User", "assistant": "Assistant", "system": "System", "tool": "Tool"}
 COLLAPSED_KINDS = {"reasoning", "tool", "source"}
 PALETTE = {
@@ -43,6 +44,15 @@ TAG_RE = re.compile(r"(?<![\w&\\/])#(?=[\w/-])")
 READING_NOTE = (
     "*Conversation record — statements here are speech acts that were typed, not verified events.*"
 )
+# Room kept in every part for the navigation line, and the longest title a header repeats. The full
+# title stays in the search store; a header only needs enough of it to be read.
+NAV_RESERVE = 1024
+TITLE_CHARS = 300
+# Text more than this many times its byte size cannot grow past a part even after escaping, so a
+# conversation under it is known to be one note without rendering it twice (neutralizing at worst
+# doubles a line, and the header and navigation fit well inside the margin).
+ESCAPE_GROWTH = 2
+SINGLE_PART_MARGIN = 8192
 
 
 def yaml_text(value: Any) -> str:
@@ -51,7 +61,10 @@ def yaml_text(value: Any) -> str:
 
 def plain_title(title: str) -> str:
     """A note title with no bracket characters, so a pasted `[[Template]]` cannot mint a link."""
-    return " ".join(title.split()).replace("[", "(").replace("]", ")") or "Untitled"
+    cleaned = " ".join(title.split()).replace("[", "(").replace("]", ")") or "Untitled"
+    if len(cleaned) > TITLE_CHARS:
+        cleaned = cleaned[: TITLE_CHARS - 1].rstrip() + "…"
+    return cleaned
 
 
 def link_label(text: str) -> str:
@@ -94,70 +107,98 @@ def _stamp(ts: str) -> str:
     return ts[:16].replace("T", " ") if ts else "undated"
 
 
-def render_message(message: Message, limit: int) -> tuple[str, bool]:
-    text = message.text
-    cut = len(text) > limit
-    if cut:
-        text = text[:limit] + f"\n\n…[{len(message.text) - limit} characters omitted in the vault]"
-    body = neutralize(text)
-    label = ROLE_LABELS.get(message.role, message.role.title())
+def message_blocks(message: Message, max_block: int) -> list[str]:
+    """One message as blocks that each fit `max_block` bytes: whole, or split into numbered pieces.
+
+    Nothing is dropped. A message too large for a block is cut at line boundaries (a fence cut
+    this way is closed and reopened), and each piece says which piece of how many it is.
+    """
     kind = str(message.meta.get("kind") or "text")
+    label = ROLE_LABELS.get(message.role, message.role.title())
     if kind not in {"text", "code"}:
         label = f"{label} · {kind}"
-    if message.attachments:
-        names = ", ".join(f"`{a.name}`" for a in message.attachments if a.name)
-        if names:
+    names = ", ".join(f"`{a.name}`" for a in message.attachments if a.name)
+
+    def render(piece: str, index: int, total: int) -> str:
+        body = neutralize(piece)
+        if index == 0 and names:
             body = f"{body}\n\n*Attachments (names only):* {names}".strip()
-    if kind in COLLAPSED_KINDS:
-        return f"> [!quote]- {label} · {_stamp(message.ts)}\n{_quote(body)}\n", cut
-    return f"### {label} · {_stamp(message.ts)}\n\n{body}\n", cut
+        tag = f"{label} · piece {index + 1}/{total}" if total > 1 else label
+        if kind in COLLAPSED_KINDS:
+            return f"> [!quote]- {tag} · {_stamp(message.ts)}\n{_quote(body)}\n"
+        return f"### {tag} · {_stamp(message.ts)}\n\n{body}\n"
+
+    return fit_blocks(message.text, render, max_block)
 
 
-def render_conversation(
-    conversation: Conversation,
-    *,
-    related: list[dict[str, Any]],
-    topics: list[str],
-    titles: dict[str, str],
-    collection_link: str,
-    message_limit: int = MESSAGE_CHARS,
-    note_limit: int = NOTE_CHARS,
-) -> tuple[str, bool]:
+def render_message(message: Message, limit: int) -> list[str]:
+    """The blocks of one message under a block budget of `limit` bytes."""
+    return message_blocks(message, limit)
+
+
+def _facts(conversation: Conversation, collection_link: str) -> str:
+    created = conversation.created or conversation.last_activity
+    facts = [f"**Provider** {wikilink(layout.provider_note(conversation.provider))}"]
+    month = layout.month_note(created)
+    if month:
+        facts.append(f"**Month** {wikilink(month)}")
+    if collection_link:
+        facts.append(f"**Collection** {collection_link}")
+    return " · ".join(facts)
+
+
+def _front(
+    conversation: Conversation, topics: list[str], *, part: int, parts: int, title: str
+) -> list[str]:
     created = conversation.created or conversation.last_activity
     year = created[:4] if created else "undated"
     tags = [f"provider/{conversation.provider}", f"kind/{conversation.kind}", f"year/{year}"]
     tags += [f"topic/{term}" for term in topics if layout.topic_note(term)]
+    if parts > 1:
+        tags.append("split")
+    authors = Counter(message.author for message in conversation.messages)
     front = [
         "---",
         f"uid: {yaml_text(conversation.uid)}",
         f"provider: {conversation.provider}",
         f"kind: {conversation.kind}",
-        f"title: {yaml_text(plain_title(conversation.title))}",
+        f"title: {yaml_text(title)}",
         f"aliases: [{yaml_text(plain_title(conversation.title))}]",
         f"created: {conversation.created or 'null'}",
         f"last_activity: {conversation.last_activity or 'null'}",
         f"messages: {conversation.message_count}",
+        f"human_turns: {authors['human']}",
+        f"machine_turns: {authors['machine']}",
         f"words: {conversation.word_count}",
         f"model: {yaml_text(conversation.model)}",
         f"archived: {str(conversation.archived).lower()}",
         f"collection: {yaml_text(conversation.collection)}",
         f"source_file: {yaml_text(conversation.provenance.get('source_file', ''))}",
         f"source_sha256: {yaml_text(conversation.provenance.get('source_sha256', ''))}",
+        f"part: {part}",
+        f"parts: {parts}",
         f"tags: [{', '.join(tags)}]",
         "---",
     ]
-    month = layout.month_note(created)
-    facts = [f"**Provider** {wikilink(layout.provider_note(conversation.provider))}"]
-    if month:
-        facts.append(f"**Month** {wikilink(month)}")
-    if collection_link:
-        facts.append(f"**Collection** {collection_link}")
+    return front
+
+
+def _first_head(
+    conversation: Conversation,
+    *,
+    related: list[dict[str, Any]],
+    topics: list[str],
+    titles: dict[str, str],
+    collection_link: str,
+    parts: int,
+) -> str:
+    title = plain_title(conversation.title)
     header = [
-        f"# {plain_title(conversation.title)}",
+        f"# {title}",
         "",
         READING_NOTE,
         "",
-        " · ".join(facts),
+        _facts(conversation, collection_link),
     ]
     if topics:
         header.append("**Topics** " + " · ".join(_topic_label(term) for term in topics))
@@ -170,20 +211,105 @@ def render_conversation(
                 for row in related
             )
         )
-    parts = ["\n".join(front), "\n".join(header), ""]
-    truncated = False
-    used = sum(len(part) for part in parts)
-    for index, message in enumerate(conversation.messages):
-        block, cut = render_message(message, message_limit)
-        truncated = truncated or cut
-        used += len(block)
-        if used > note_limit:
-            omitted = conversation.message_count - index
-            parts.append(f"\n*…{omitted} further message(s) omitted from this note (size cap).*\n")
-            truncated = True
-            break
-        parts.append(block)
-    return "\n".join(parts).rstrip() + "\n", truncated
+    front = _front(conversation, topics, part=1, parts=parts, title=title)
+    return "\n".join(["\n".join(front), "\n".join(header), ""])
+
+
+def _part_head(conversation: Conversation, topics: list[str], *, part: int, parts: int) -> str:
+    title = plain_title(conversation.title)
+    front = _front(
+        conversation, topics, part=part, parts=parts, title=f"{title} (part {part} of {parts})"
+    )
+    return "\n".join(["\n".join(front), f"# {title} — part {part} of {parts}", "", READING_NOTE, ""])
+
+
+def _nav(names: list[str], index: int, anchor: str, labels: tuple[str, str, str]) -> str:
+    """The line that walks a split note: previous, the first part, next."""
+    back, start, forward = labels
+    pieces = []
+    if index > 0:
+        pieces.append(wikilink(names[index - 1], back))
+    if index != 0:
+        pieces.append(wikilink(anchor, start))
+    if index + 1 < len(names):
+        pieces.append(wikilink(names[index + 1], forward))
+    return " · ".join(pieces)
+
+
+def _single_part_certain(conversation: Conversation, cap: int) -> bool:
+    raw = sum(utf8_size(message.text) for message in conversation.messages)
+    return raw * ESCAPE_GROWTH + SINGLE_PART_MARGIN + 1024 * len(conversation.messages) < cap
+
+
+def conversation_part_names(conversation: Conversation, parts: int) -> list[str]:
+    """The note names of a conversation's parts: the conversation note, then `part-...` names."""
+    anchor = layout.conversation_note(conversation.provider, conversation.uid)
+    return [anchor] + [
+        layout.part_name(conversation.provider, number, anchor) for number in range(2, parts + 1)
+    ]
+
+
+def render_conversation(
+    conversation: Conversation,
+    *,
+    related: list[dict[str, Any]],
+    topics: list[str],
+    titles: dict[str, str],
+    collection_link: str,
+    note_bytes: int | None = None,
+) -> list[str]:
+    """The conversation as notes of at most `note_bytes` bytes: the conversation note, then parts.
+
+    Every message is present in full. A thread that does not fit one note continues in numbered
+    parts linked from each other, so the first note is always a readable start and none of the
+    text is cut.
+    """
+    cap = note_bytes or Limits().note_bytes
+    # Sizes are measured on the header as it will be written, once parts are known to be 1 and
+    # again with the real count (the digits are the only thing that moves).
+    head = _first_head(
+        conversation,
+        related=related,
+        topics=topics,
+        titles=titles,
+        collection_link=collection_link,
+        parts=1,
+    )
+    part_head = _part_head(conversation, topics, part=2, parts=99999)
+    first_budget = cap - utf8_size(head) - NAV_RESERVE - 16
+    budget = cap - utf8_size(part_head) - NAV_RESERVE - 16
+    if budget < 1024:
+        raise ValueError(f"note_bytes {cap} leaves no room for content beside the header")
+    blocks = [
+        block for message in conversation.messages for block in message_blocks(message, budget)
+    ]
+    grouped = pack(blocks, first_budget, budget)
+    total = len(grouped)
+    names = conversation_part_names(conversation, total)
+    labels = ("← Previous", "Start", "Next →")
+    notes: list[str] = []
+    for index, group in enumerate(grouped):
+        if index == 0:
+            text = _first_head(
+                conversation,
+                related=related,
+                topics=topics,
+                titles=titles,
+                collection_link=collection_link,
+                parts=total,
+            )
+        else:
+            text = _part_head(conversation, topics, part=index + 1, parts=total)
+        pieces = [text.rstrip("\n"), "", "\n".join(group).rstrip("\n")]
+        if total > 1:
+            pieces += ["", _nav(names, index, names[0], labels)]
+        note = "\n".join(pieces).rstrip() + "\n"
+        if utf8_size(note) > cap:
+            raise ValueError(
+                f"{conversation.uid}: note {index + 1} is {utf8_size(note)} bytes, cap is {cap}"
+            )
+        notes.append(note)
+    return notes
 
 
 def _topic_label(term: str) -> str:
@@ -192,16 +318,38 @@ def _topic_label(term: str) -> str:
     return wikilink(note, term) if note else term
 
 
-def _hub(title: str, intro: str, rows: list[dict[str, Any]]) -> str:
-    lines = [f"# {title}", "", intro, ""]
-    for row in sorted(
-        rows, key=lambda r: (r.get("created") or r.get("last_activity") or "", r["uid"])
-    ):
-        lines.append(
-            f"- {conversation_link(row['uid'], row['title'])} — {row['provider']} · "
-            f"{row['message_count']} msg · {(row.get('created') or '')[:10] or 'undated'}"
+def _hub_rows(rows: list[dict[str, Any]]) -> list[str]:
+    return [
+        f"- {conversation_link(row['uid'], row['title'])} — {row['provider']} · "
+        f"{row['message_count']} msg · {(row.get('created') or '')[:10] or 'undated'}"
+        for row in sorted(
+            rows, key=lambda r: (r.get("created") or r.get("last_activity") or "", r["uid"])
         )
-    return "\n".join(lines) + "\n"
+    ]
+
+
+def hub_pages(
+    name: str, title: str, intro: str, rows: list[dict[str, Any]], note_bytes: int
+) -> list[tuple[str, str]]:
+    """A hub as (note name, text) pages of at most `note_bytes`: the hub, then `part-...` pages.
+
+    Every row lands on some page whole; the hub's own name stays the first page, so every
+    existing link to it still resolves.
+    """
+    lines = _hub_rows(rows)
+    head = [f"# {title}", "", intro, ""]
+    later_head = [f"# {title} — continued", ""]
+    first_budget = note_bytes - sum(utf8_size(line) + 1 for line in head) - NAV_RESERVE
+    budget = note_bytes - sum(utf8_size(line) + 1 for line in later_head) - NAV_RESERVE
+    pages = paginate_rows([], lines, first_budget, budget)
+    names = [name] + [layout.part_name("all", number, name) for number in range(2, len(pages) + 1)]
+    out: list[tuple[str, str]] = []
+    for index, group in enumerate(pages):
+        header = head if index == 0 else later_head
+        nav = _nav(names, index, name, ("← Previous", "Start", "Next →")) if len(pages) > 1 else ""
+        text = "\n".join([*header, *group] + ([""] + [nav] if nav else [])) + "\n"
+        out.append((names[index], text))
+    return out
 
 
 def _collection_names(rows: list[dict[str, Any]]) -> dict[tuple[str, str], str]:
@@ -213,14 +361,24 @@ def _collection_names(rows: list[dict[str, Any]]) -> dict[tuple[str, str], str]:
 
 
 def _home(manifest: dict[str, Any], rows: list[dict[str, Any]], hub_count: int) -> str:
+    totals = manifest["totals"]
+    authors = totals.get("authors")
     lines = [
         "# AI Archive",
         "",
         READING_NOTE,
         "",
         f"Source fingerprint `{manifest['source_fingerprint'][:16]}…` · "
-        f"{manifest['totals']['conversations']} conversations · "
-        f"{manifest['totals']['messages']} messages · {manifest['totals']['words']} words.",
+        f"{totals['conversations']} conversations · "
+        f"{totals['messages']} messages · {totals['words']} words.",
+    ]
+    if authors:
+        lines += [
+            "",
+            f"Turns by author: {authors.get('human', 0)} typed by the person (the authored "
+            f"container) · {authors.get('machine', 0)} by the machine (the machine container).",
+        ]
+    lines += [
         "",
         "| Provider | Conversations | Empty | Messages | Words | First | Last activity |",
         "|---|---:|---:|---:|---:|---|---|",
@@ -267,6 +425,8 @@ def _coverage(manifest: dict[str, Any]) -> str:
                 f"- kinds: {info['kinds']}",
                 f"- reader: `{info['reader']}`; counters: {info['reader_counters'] or 'none'}",
             ]
+            if info.get("authors"):
+                lines.append(f"- authors: {info['authors']}")
         if info.get("error"):
             lines.append(f"- error: `{info['error']}`")
         channels = info.get("channels") or {"read": [], "not_read": []}
@@ -287,6 +447,13 @@ READING_GUIDE = """# Reading guide
 - Notes are *derived*: regenerate them with `cce archive vault`; edits inside generated notes
   are overwritten. Add your own notes anywhere outside the generated paths — they are never
   touched.
+- **Nothing is cut.** A thread too long for one note continues in numbered parts (`part-...`
+  notes in a folder beside the conversation note); each part links to the previous and next.
+  Conversations sit in a folder per month, and a month that outgrew the folder limit is spread
+  over folders per day.
+- Each note's frontmatter counts its turns by author: `human_turns` were typed by the person,
+  `machine_turns` are everything else. `cce archive search --author human` searches only the
+  first.
 - Colour in the graph view is by provider. Topic hubs (`topic-all-*`) bridge providers; the
   *Related* line on each note lists its nearest neighbours by TF-IDF cosine similarity.
 - Attachments are referenced by file name only; their bytes are not part of the vault.
@@ -316,6 +483,12 @@ def _obsidian_config() -> dict[str, str]:
     }
 
 
+def _prune_empty_directories(root: Path) -> None:
+    for directory in sorted((p for p in root.rglob("*") if p.is_dir()), reverse=True):
+        if not any(directory.iterdir()):
+            directory.rmdir()
+
+
 def _sync_manifest(paths: ArchivePaths, root: Path, written: set[str]) -> int:
     """Record the generated files beside the archive manifest and prune what the last build wrote
     and this one did not. A manifest an earlier build left inside the vault is read once for its
@@ -335,6 +508,7 @@ def _sync_manifest(paths: ArchivePaths, root: Path, written: set[str]) -> int:
             if target.is_file():
                 target.unlink()
                 removed += 1
+    _prune_empty_directories(root)
     write_json_atomic(path, {"files": sorted(written)})
     return removed
 
@@ -371,13 +545,18 @@ def verify_vault(paths: ArchivePaths) -> list[str]:
     return problems
 
 
+def count_conversation_notes(paths: ArchivePaths) -> int:
+    """Conversation notes in the vault (a split conversation counts once, not per part)."""
+    return sum(1 for _ in paths.vault_conversations.rglob("conversation-*.md"))
+
+
 def build_vault(
     paths: ArchivePaths,
     authorization: CorpusWriteAuthorization,
     *,
-    message_chars: int = MESSAGE_CHARS,
-    note_chars: int = NOTE_CHARS,
+    limits: Limits | None = None,
 ) -> dict[str, Any]:
+    limits = limits or Limits()
     root = require_inside(authorization, paths.vault)
     manifest = load_manifest(paths)
     rows = load_index(paths)
@@ -419,66 +598,102 @@ def build_vault(
         name = collection_names.get((provider, collection), collection)
         return wikilink(layout.collection_note(provider, collection), link_label(name))
 
-    truncated = notes = 0
-    for conversation in iter_store(paths):
+    def render(conversation: Conversation) -> list[str]:
         extra = enrichment.get(conversation.uid, {})
-        text, cut = render_conversation(
+        return render_conversation(
             conversation,
             related=extra.get("similar", []),
             topics=extra.get("topics", []),
             titles=titles,
             collection_link=collection_link(conversation.provider, conversation.collection),
-            message_limit=message_chars,
-            note_limit=note_chars,
+            note_bytes=limits.note_bytes,
         )
-        emit(
-            layout.VAULT_CONVERSATIONS_DIRNAME,
-            layout.conversation_note(conversation.provider, conversation.uid),
-            f"conversation:{conversation.uid}",
-            text,
-        )
-        truncated += int(cut)
+
+    # Pass one: how many files each conversation takes, so the folder plan is exact. A
+    # conversation that cannot reach the cap is known to be one note and is not rendered twice.
+    stamps = {row["uid"]: row["created"] or row["last_activity"] for row in rows}
+    weights: dict[str, int] = {}
+    for conversation in iter_store(paths):
+        if _single_part_certain(conversation, limits.note_bytes):
+            weights[conversation.uid] = 1
+        else:
+            weights[conversation.uid] = 1 if len(render(conversation)) == 1 else 2
+    plan = plan_conversation_folders(
+        [(uid, stamps.get(uid, ""), weight) for uid, weight in weights.items()],
+        limits.folder_entries,
+    )
+
+    # Pass two: write.
+    notes = split_notes = parts_written = 0
+    for conversation in iter_store(paths):
+        rendered = render(conversation)
+        names = conversation_part_names(conversation, len(rendered))
+        folder = f"{layout.VAULT_CONVERSATIONS_DIRNAME}/{plan[conversation.uid]}"
+        emit(folder, names[0], f"conversation:{conversation.uid}", rendered[0])
         notes += 1
+        if len(rendered) > 1:
+            split_notes += 1
+            parts_folder = f"{folder}/{names[0]}"
+            for position, (name, text) in enumerate(zip(names[1:], rendered[1:], strict=True)):
+                sub = part_folder(position, len(rendered) - 1, limits.folder_entries)
+                emit(
+                    f"{parts_folder}/{sub}" if sub else parts_folder,
+                    name,
+                    f"conversation:{conversation.uid}:{name}",
+                    text,
+                )
+                parts_written += 1
 
     hubs = layout.VAULT_HUBS_DIRNAME
+    hub_notes: list[tuple[str, str, str]] = []  # (name, identity, text)
+
+    def add_hub(name: str, identity: str, title: str, intro: str, hub_rows: list[dict]) -> None:
+        for page_name, text in hub_pages(name, title, intro, hub_rows, limits.note_bytes):
+            page_identity = identity if page_name == name else f"{identity}:{page_name}"
+            hub_notes.append((page_name, page_identity, text))
+
     for name, items in by_provider.items():
-        emit(
-            hubs,
+        add_hub(
             layout.provider_note(name),
             f"provider:{name}",
-            _hub(PROVIDER_SPECS[name].display, f"{len(items)} conversations.", items),
+            PROVIDER_SPECS[name].display,
+            f"{len(items)} conversations.",
+            items,
         )
     for month, items in by_month.items():
         digits = month.rsplit("-", 1)[-1]
-        emit(
-            hubs,
+        add_hub(
             month,
             f"month:{digits}",
-            _hub(f"{digits[:4]}-{digits[4:]}", f"{len(items)} conversations started.", items),
+            f"{digits[:4]}-{digits[4:]}",
+            f"{len(items)} conversations started.",
+            items,
         )
     for term, items in by_topic.items():
         note = layout.topic_note(term)
         if note is None:  # by_topic only holds named terms; this keeps the type honest
             continue
-        emit(
-            hubs,
+        add_hub(
             note,
             f"topic:{term}",
-            _hub(
-                f"Topic: {term}",
-                f"{len(items)} conversations across "
-                f"{len({r['provider'] for r in items})} provider(s).",
-                items,
-            ),
+            f"Topic: {term}",
+            f"{len(items)} conversations across {len({r['provider'] for r in items})} provider(s).",
+            items,
         )
     for (provider, collection), items in by_collection.items():
         name = collection_names.get((provider, collection), collection)
-        emit(
-            hubs,
+        add_hub(
             layout.collection_note(provider, collection),
             f"collection:{provider}\0{collection}",
-            _hub(f"{PROVIDER_SPECS[provider].display}: {name}", f"{len(items)} item(s).", items),
+            f"{PROVIDER_SPECS[provider].display}: {name}",
+            f"{len(items)} item(s).",
+            items,
         )
+    hub_folders = plan_flat_folders([name for name, _, _ in hub_notes], limits.folder_entries)
+    for name, identity, text in hub_notes:
+        sub = hub_folders[name]
+        emit(f"{hubs}/{sub}" if sub else hubs, name, identity, text)
+
     emit("", layout.HOME_NOTE, "home", _home(manifest, rows, len(by_topic)))
     emit(layout.VAULT_META_DIRNAME, layout.COVERAGE_NOTE, "coverage", _coverage(manifest))
     emit(layout.VAULT_META_DIRNAME, layout.GUIDE_NOTE, "guide", READING_GUIDE)
@@ -488,11 +703,11 @@ def build_vault(
         written.add(rel)
     require_inside(authorization, paths.vault_manifest)
     removed = _sync_manifest(paths, root, written)
-    hub_notes = sum(1 for rel in written if rel.startswith(f"{hubs}/"))
     return {
         "notes": notes,
-        "hubs": hub_notes,
-        "truncated_notes": truncated,
+        "split_notes": split_notes,
+        "parts": parts_written,
+        "hubs": len(hub_notes),
         "removed_stale": removed,
         "files": len(written),
         "topics_without_hub": len(unnamed_topics),

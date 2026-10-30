@@ -69,7 +69,7 @@ def test_verify_search_and_titles_commands(cli_env, monkeypatch, capsys) -> None
 def test_verify_detects_tampering_across_surfaces(cli_env, monkeypatch, capsys) -> None:
     env, common, _, _, _ = cli_env
     next(env.paths.vault.rglob("conversation-chatgpt-aaaa1111.md")).unlink()
-    next(env.paths.site_pages.glob("conversation-grok-*.html")).unlink()
+    next(env.paths.site_pages.rglob("conversation-grok-*.html")).unlink()
     code, out, _ = _cce(monkeypatch, capsys, "archive", "verify", *common)
     problems = json.loads(out)["problems"]
     assert code == 1

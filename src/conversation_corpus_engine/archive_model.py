@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .answering import shorten, slugify
+from .archive_author import author_of
 from .archive_naming import (
     PROVIDER_SCOPES,
     InvalidName,
@@ -75,6 +76,11 @@ class Message:
     def __post_init__(self) -> None:
         if self.typed_chars is None:
             self.typed_chars = len(self.text)
+
+    @property
+    def author(self) -> str:
+        """`human` for a typed user turn, `machine` for every other (see `archive_author`)."""
+        return author_of(self.role, self.channel)
 
     def to_dict(self) -> dict[str, Any]:
         return {

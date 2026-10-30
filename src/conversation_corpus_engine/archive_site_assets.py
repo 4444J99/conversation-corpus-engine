@@ -190,7 +190,8 @@ APP_JS = """\
 (function () {
   'use strict';
   var D = window.CCE;
-  var COL = { uid: 0, provider: 1, kind: 2, title: 3, created: 4, msgs: 5, snippet: 6, topics: 7 };
+  var COL = { uid: 0, provider: 1, kind: 2, title: 3, created: 4, msgs: 5, snippet: 6, topics: 7, page: 8 };
+  var PAGE_OF = {};
   var PAGE = 100;
   var rows = D.index;
   var state = { q: '', p: [], k: '', y: '', t: '', s: 'new', fts: false };
@@ -210,7 +211,9 @@ APP_JS = """\
     (kids || []).forEach(function (kid) { node.appendChild(kid); });
     return node;
   }
-  function pageHref(uid) { return '__PAGES__/__PAGE_PREFIX__' + encodeURIComponent(uid) + '.html'; }
+  function pageHref(uid) {
+    return PAGE_OF[uid] || ('__PAGES__/__PAGE_PREFIX__' + encodeURIComponent(uid) + '.html');
+  }
 
   function readHash() {
     var out = { q: '', p: [], k: '', y: '', t: '', s: 'new', fts: false };
@@ -327,6 +330,7 @@ APP_JS = """\
   function init() {
     var counts = {}; var kinds = {}; var years = {};
     rows.forEach(function (row) {
+      if (row[COL.page]) { PAGE_OF[row[COL.uid]] = row[COL.page]; }
       counts[row[COL.provider]] = (counts[row[COL.provider]] || 0) + 1;
       kinds[row[COL.kind]] = 1;
       years[row[COL.created].slice(0, 4)] = 1;

@@ -75,13 +75,74 @@ def provider_dirname(provider: str) -> str:
 
 
 def conversations_filename(provider: str) -> str:
-    """The provider's full normalized conversations, one JSON row each."""
+    """The provider's full normalized conversations, one JSON row each (the first-generation
+    layout, kept so a store written before the bounded layout still reads)."""
     return derive_name("collection", scope=provider, subject="conversations") + ".jsonl"
 
 
 def index_filename(provider: str) -> str:
-    """The provider's light conversation index, one summary row each."""
+    """The provider's light conversation index, one summary row each (first-generation layout)."""
     return derive_name("index", scope=provider, subject="conversations") + ".jsonl"
+
+
+def shard_filename(provider: str, subject: str) -> str:
+    """One provider-month slice of the normalized conversations: `shard-<provider>-<yyyymm>`.
+
+    A month that outgrows the shard size rolls to `<yyyymm>-002`, `<yyyymm>-003`, and a
+    conversation with no real month goes to `undated`.
+    """
+    return derive_name("shard", scope=provider, subject=subject) + ".jsonl"
+
+
+def index_shard_filename(provider: str, subject: str) -> str:
+    """The light index rows of the conversations in the matching shard."""
+    return derive_name("index", scope=provider, subject=subject) + ".jsonl"
+
+
+def turn_shard_filename(provider: str, subject: str) -> str:
+    """One provider-month slice of the turn store, an SQLite database."""
+    return derive_name("shard", scope=provider, subject=subject) + ".sqlite"
+
+
+# --- the turn store: two containers, one atomic unit -----------------------------------------
+
+TURNS_DIRNAME = derive_name("database", scope="all", subject="turns")
+TURNS_MANIFEST_FILENAME = derive_name("manifest", scope="all", subject="turns") + ".json"
+UNDATED_DIRNAME = "undated"
+
+
+def container_dirname(container: str) -> str:
+    """`container-all-authored` or `container-all-machine`, a top-level partition by author."""
+    return derive_name("container", scope="all", subject=container)
+
+
+# --- the bounded folders and the parts of a split note ----------------------------------------
+
+
+def month_folder(month: str) -> str:
+    """`month-all-<yyyymm>`, or the structural `undated` for a conversation with no real month."""
+    if month == UNDATED_DIRNAME:
+        return UNDATED_DIRNAME
+    return derive_name("month", scope="all", subject=month)
+
+
+def day_folder(day: str) -> str:
+    """`day-all-<yyyymmdd>`: one calendar day inside a month that outgrew the folder limit."""
+    return derive_name("day", scope="all", date=day)
+
+
+def bucket_folder(number: int) -> str:
+    """`bucket-all-b<NNN>`: a deterministic spill folder inside a full folder."""
+    return derive_name("bucket", scope="all", subject=f"b{number:03d}")
+
+
+def part_name(scope: str, number: int, anchor: str) -> str:
+    """`part-<scope>-p<NNN>-<hex>`: part `number` of the note named `anchor`.
+
+    The identity hashes the anchor's name, so two notes never share a part name and a part name
+    never moves when another note is added.
+    """
+    return derive_name("part", scope=scope, subject=f"p{number:03d}", identity=anchor)
 
 
 def feed_filename(provider: str) -> str:

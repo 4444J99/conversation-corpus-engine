@@ -184,7 +184,7 @@ def test_a_full_build_writes_only_names_the_contract_accepts(full_build) -> None
     assert verify_archive(env.paths) == []
     top = sorted(path.name for path in env.paths.root.iterdir())
     assert top == [
-        "database-all-search.sqlite",
+        "database-all-turns",
         "graph-all",
         "index-all-enrichment.jsonl",
         "manifest-all-vault.json",
@@ -210,8 +210,8 @@ def test_derived_ids_flow_through_every_surface(full_build) -> None:
     for conversation in derived:
         name = layout.conversation_note(conversation.provider, conversation.uid)
         assert re.fullmatch(r"conversation-chatgpt-derived-[0-9a-f]{16}", name)
-        assert (env.paths.vault_conversations / f"{name}.md").is_file()
-        assert (env.paths.site_pages / f"{name}.html").is_file()
+        assert env.paths.vault_note(conversation.provider, conversation.uid).is_file()
+        assert env.paths.site_page(conversation.provider, conversation.uid).is_file()
     assert result["site"]["pages"] == result["ingest"]["totals"]["conversations"] == 26
 
 

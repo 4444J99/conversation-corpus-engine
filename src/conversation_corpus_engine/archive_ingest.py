@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ from . import (
     archive_read_notebooklm,
     archive_read_perplexity,
 )
+from .archive_author import AUTHORS, author_of, container_of
+from .archive_limits import SHARD_BYTES
 from .archive_model import (
     SCHEMA,
     Conversation,
@@ -25,15 +28,23 @@ from .archive_model import (
     finalize_conversation,
     iter_conversations,
     iter_jsonl,
+    sha256_file,
     write_json_atomic,
 )
 from .archive_naming import NAMING_VERSION, day_of
+from .archive_shard import ShardWriter, month_key, parse_shard_subject, shard_sort_key
 from .corpus_store import CorpusStoreError, CorpusWriteAuthorization, authorize_corpus_write
 
 MANIFEST_SCHEMA = "archive-manifest.v2"
 LEGACY_MANIFEST_SCHEMA = "cce.archive.manifest.v1"
 ACCEPTED_MANIFEST_SCHEMAS = frozenset({MANIFEST_SCHEMA, LEGACY_MANIFEST_SCHEMA})
 SCHEMA_VERSION = 2
+# The layout of the folders and files, not of the rows: 3 is the bounded layout (provider-month
+# shards, an author count on every provider, parts and fan-out limits in the vault and site). A
+# manifest with no `layout_version` is a first-generation layout and still reads.
+LAYOUT_VERSION = 3
+# Where a provider's shards are written before they replace the previous ones.
+BUILD_DIRNAME = ".build"
 DEFAULT_ARCHIVE_DIRNAME = layout.ARCHIVE_DIRNAME
 # Per-provider manifest keys that hold absolute paths or host-specific error text; they are
 # dropped from the copy the source fingerprint hashes.
@@ -147,10 +158,51 @@ class ArchivePaths:
         return self.root / layout.provider_dirname(provider)
 
     def conversations(self, provider: str) -> Path:
+        """The first-generation single file of a provider's conversations (read-only legacy)."""
         return self.provider_dir(provider) / layout.conversations_filename(provider)
 
     def index(self, provider: str) -> Path:
+        """The first-generation single index file of a provider (read-only legacy)."""
         return self.provider_dir(provider) / layout.index_filename(provider)
+
+    def _shards(self, provider: str, prefix: str) -> list[Path]:
+        directory = self.provider_dir(provider)
+        if not directory.is_dir():
+            return []
+        stem = f"{prefix}-{provider}-"
+        found: list[tuple[tuple[int, str, int], Path]] = []
+        for path in directory.glob(f"{stem}*.jsonl"):
+            try:
+                found.append((shard_sort_key(path.name[len(stem) : -len(".jsonl")]), path))
+            except ValueError:
+                continue
+        return [path for _, path in sorted(found)]
+
+    def shard_files(self, provider: str) -> list[Path]:
+        """The provider's conversation shards in reading order (months, then `undated`)."""
+        return self._shards(provider, "shard")
+
+    def index_shard_files(self, provider: str) -> list[Path]:
+        """The index rows of the same shards, in the same order."""
+        return self._shards(provider, "index")
+
+    def conversation_files(self, provider: str) -> list[Path]:
+        """Where a provider's conversations are: its shards, else the first-generation file."""
+        shards = self.shard_files(provider)
+        if shards:
+            return shards
+        legacy = self.conversations(provider)
+        return [legacy] if legacy.is_file() else []
+
+    def index_files(self, provider: str) -> list[Path]:
+        shards = self.index_shard_files(provider)
+        if shards:
+            return shards
+        legacy = self.index(provider)
+        return [legacy] if legacy.is_file() else []
+
+    def provider_present(self, provider: str) -> bool:
+        return bool(self.conversation_files(provider))
 
     def feed(self, provider: str) -> Path:
         return self.root / layout.feed_filename(provider)
@@ -159,7 +211,27 @@ class ArchivePaths:
         return self.root / layout.receipt_filename(provider, fingerprint, day)
 
     def providers_present(self) -> list[str]:
-        return [name for name in PROVIDER_SPECS if self.conversations(name).is_file()]
+        return [name for name in PROVIDER_SPECS if self.provider_present(name)]
+
+    # --- the turn store: one container per author ---
+
+    @property
+    def turns(self) -> Path:
+        return self.root / layout.TURNS_DIRNAME
+
+    @property
+    def turns_manifest(self) -> Path:
+        return self.turns / layout.TURNS_MANIFEST_FILENAME
+
+    def container(self, author: str) -> Path:
+        return self.turns / layout.container_dirname(container_of(author))
+
+    def turn_shard(self, author: str, provider: str, subject: str) -> Path:
+        return (
+            self.container(author)
+            / layout.provider_dirname(provider)
+            / layout.turn_shard_filename(provider, subject)
+        )
 
     # --- the vault ---
 
@@ -204,7 +276,24 @@ class ArchivePaths:
         return self.site / layout.SITE_HOME_FILENAME
 
     def site_page(self, provider: str, uid: str) -> Path:
-        return self.site_pages / f"{layout.conversation_note(provider, uid)}.html"
+        """The first page of a conversation. Pages sit in month folders (and deeper when a month
+        outgrew the folder limit), so the page is found by its name; a conversation not yet built
+        answers with the flat path a first-generation site used."""
+        name = f"{layout.conversation_note(provider, uid)}.html"
+        if self.site_pages.is_dir():
+            found = next(self.site_pages.rglob(name), None)
+            if found is not None:
+                return found
+        return self.site_pages / name
+
+    def vault_note(self, provider: str, uid: str) -> Path:
+        """The conversation note, found by name for the same reason as `site_page`."""
+        name = f"{layout.conversation_note(provider, uid)}.md"
+        if self.vault_conversations.is_dir():
+            found = next(self.vault_conversations.rglob(name), None)
+            if found is not None:
+                return found
+        return self.vault_conversations / name
 
 
 def latest_activity_day(manifest: dict[str, Any]) -> str:
@@ -274,6 +363,30 @@ def content_digest(conversation: Conversation) -> str:
     ).hexdigest()
 
 
+def conversation_stamp(conversation: Conversation) -> str:
+    """The timestamp that decides a conversation's month: when it began, else its last activity."""
+    return conversation.created or conversation.last_activity
+
+
+def _publish_shards(paths: ArchivePaths, provider: str, build: Path) -> None:
+    """Replace a provider's previous conversation files with the freshly built shards.
+
+    Everything the previous build (or the first-generation layout) left is removed only after
+    the new shards are complete, so a failed ingest leaves the previous store readable.
+    """
+    directory = paths.provider_dir(provider)
+    for stale in [
+        *paths.shard_files(provider),
+        *paths.index_shard_files(provider),
+        paths.conversations(provider),
+        paths.index(provider),
+    ]:
+        stale.unlink(missing_ok=True)
+    for built in sorted(build.iterdir()):
+        built.replace(directory / built.name)
+    build.rmdir()
+
+
 def _ingest_provider(
     spec: ProviderSpec, root: Path, paths: ArchivePaths, options: dict[str, Any]
 ) -> dict[str, Any]:
@@ -287,68 +400,74 @@ def _ingest_provider(
     seen: dict[str, str] = {}
     kinds: Counter[str] = Counter()
     roles: Counter[str] = Counter()
+    authors: Counter[str] = Counter()
     totals: Counter[str] = Counter()
     created: list[str] = []
     activity: list[str] = []
-    conv_path = paths.conversations(spec.name)
-    index_path = paths.index(spec.name)
-    conv_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_conv = conv_path.with_name(f".{conv_path.name}.tmp")
-    temp_index = index_path.with_name(f".{index_path.name}.tmp")
+    shard_bytes = int(options.get("shard_bytes") or SHARD_BYTES)
+    directory = paths.provider_dir(spec.name)
+    directory.mkdir(parents=True, exist_ok=True)
+    build = directory / BUILD_DIRNAME
+    shutil.rmtree(build, ignore_errors=True)
+    writer = ShardWriter(build, spec.name, shard_bytes=shard_bytes)
     error = ""
+    shards: list[dict[str, Any]] = []
     try:
-        with (
-            temp_conv.open("w", encoding="utf-8") as conv_out,
-            temp_index.open("w", encoding="utf-8") as index_out,
-        ):
-            for conversation in spec.open_reader(root, tracker, options):
-                derived = finalize_conversation(conversation)
-                uid = conversation.uid
-                content = content_digest(conversation)
-                if uid in seen:
-                    _bump(totals, "duplicates_folded")
-                    kept = "identical" if seen[uid] == content else "differing"
-                    _bump(totals, f"duplicates_folded_{kept}")
-                    continue
-                seen[uid] = content
-                if derived:
-                    _bump(totals, "derived_ids")
-                    if derived == "unnameable":
-                        _bump(totals, "unnameable_ids")
-                conv_out.write(
-                    json.dumps(conversation.to_dict(), sort_keys=True, ensure_ascii=False)
-                )
-                conv_out.write("\n")
-                index_out.write(
+        for conversation in spec.open_reader(root, tracker, options):
+            derived = finalize_conversation(conversation)
+            uid = conversation.uid
+            content = content_digest(conversation)
+            if uid in seen:
+                _bump(totals, "duplicates_folded")
+                kept = "identical" if seen[uid] == content else "differing"
+                _bump(totals, f"duplicates_folded_{kept}")
+                continue
+            seen[uid] = content
+            if derived:
+                _bump(totals, "derived_ids")
+                if derived == "unnameable":
+                    _bump(totals, "unnameable_ids")
+            writer.add(
+                month_key(conversation_stamp(conversation)),
+                (
+                    json.dumps(conversation.to_dict(), sort_keys=True, ensure_ascii=False) + "\n"
+                ).encode("utf-8"),
+                (
                     json.dumps(conversation.index_row(), sort_keys=True, ensure_ascii=False)
-                )
-                index_out.write("\n")
-                _bump(totals, "conversations")
-                _bump(kinds, conversation.kind)
-                if not conversation.messages:
-                    _bump(totals, "empty_conversations")
-                _bump(totals, "messages", conversation.message_count)
-                _bump(totals, "words", conversation.word_count)
-                _bump(totals, "attachments", conversation.attachment_count)
-                for message in conversation.messages:
-                    _bump(roles, message.role)
-                if conversation.created:
-                    created.append(conversation.created)
-                if conversation.last_activity:
-                    activity.append(conversation.last_activity)
+                    + "\n"
+                ).encode("utf-8"),
+            )
+            _bump(totals, "conversations")
+            _bump(kinds, conversation.kind)
+            if not conversation.messages:
+                _bump(totals, "empty_conversations")
+            _bump(totals, "messages", conversation.message_count)
+            _bump(totals, "words", conversation.word_count)
+            _bump(totals, "attachments", conversation.attachment_count)
+            for message in conversation.messages:
+                _bump(roles, message.role)
+                _bump(authors, author_of(message.role, message.channel))
+            if conversation.created:
+                created.append(conversation.created)
+            if conversation.last_activity:
+                activity.append(conversation.last_activity)
+        shards = writer.close()
     except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
         error = f"{type(exc).__name__}: {exc}"
     if error:
-        temp_conv.unlink(missing_ok=True)
-        temp_index.unlink(missing_ok=True)
+        writer.close()
+        shutil.rmtree(build, ignore_errors=True)
         return {
             "status": "failed",
             "error": error,
             "source_root": str(root),
             "channels": spec.module.channels(root),
         }
-    temp_conv.replace(conv_path)
-    temp_index.replace(index_path)
+    _publish_shards(paths, spec.name, build)
+    for shard in shards:
+        shard["sha256"] = sha256_file(
+            directory / layout.shard_filename(spec.name, shard["subject"])
+        )
     return {
         "status": "ok",
         "source_root": str(root),
@@ -364,12 +483,14 @@ def _ingest_provider(
         "attachments": totals["attachments"],
         "kinds": dict(sorted(kinds.items())),
         "roles": dict(sorted(roles.items())),
+        "authors": {author: authors[author] for author in AUTHORS},
         "created_min": min(created) if created else "",
         "last_activity_max": max(activity) if activity else "",
         "reader": spec.module.READER,
         "reader_counters": dict(sorted(tracker.counters.items())),
         "channels": spec.module.channels(root),
         "source_files": tracker.hashes(),
+        "layout": {"version": LAYOUT_VERSION, "shard_bytes": shard_bytes, "shards": shards},
     }
 
 
@@ -398,11 +519,16 @@ def ingest(
         "source_fingerprint": source_fingerprint(
             report, reader_versions=reader_versions, naming_version=NAMING_VERSION
         ),
+        "layout_version": LAYOUT_VERSION,
         "providers": report,
         "totals": {
             "conversations": sum(info.get("conversations", 0) for info in report.values()),
             "messages": sum(info.get("messages", 0) for info in report.values()),
             "words": sum(info.get("words", 0) for info in report.values()),
+            "authors": {
+                author: sum(info.get("authors", {}).get(author, 0) for info in report.values())
+                for author in AUTHORS
+            },
         },
     }
     write_json_atomic(paths.manifest, manifest)
@@ -439,18 +565,21 @@ def source_fingerprint(
 def iter_store(paths: ArchivePaths, providers: list[str] | None = None) -> Iterator[Conversation]:
     """Stream every normalized conversation in provider-registry then file order."""
     for name in providers or paths.providers_present():
-        path = paths.conversations(name)
-        if path.is_file():
+        for path in paths.conversation_files(name):
             yield from iter_conversations(path)
 
 
 def load_index(paths: ArchivePaths, providers: list[str] | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for name in providers or paths.providers_present():
-        path = paths.index(name)
-        if path.is_file():
+        for path in paths.index_files(name):
             rows.extend(iter_jsonl(path))
     return rows
+
+
+def has_bounded_layout(manifest: dict[str, Any]) -> bool:
+    """True for a manifest written by the bounded layout (shards, author counts, limits)."""
+    return int(manifest.get("layout_version") or 0) >= LAYOUT_VERSION
 
 
 def load_manifest(paths: ArchivePaths) -> dict[str, Any]:

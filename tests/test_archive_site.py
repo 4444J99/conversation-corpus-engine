@@ -54,8 +54,9 @@ def test_site_has_shell_data_and_one_page_per_conversation(built) -> None:
         "index-all-topic-graph.js",
     ):
         assert (root / name).is_file(), name
-    page = root / "conversations" / "conversation-chatgpt-aaaa1111.html"
-    assert page.is_file() and page == env.paths.site_page("chatgpt", "chatgpt-aaaa1111")
+    page = env.paths.site_page("chatgpt", "chatgpt-aaaa1111")
+    assert page.is_file() and page.parent.parent == root / "conversations"
+    assert page.parent.name == "month-all-202311"
     payload = (root / "index-all-conversations.js").read_text(encoding="utf-8")
     assert payload.startswith("window.CCE = ")
     data = json.loads(payload.removeprefix("window.CCE = ").rstrip(";\n"))
@@ -131,7 +132,7 @@ def test_collapsed_kinds_use_details_and_hostile_titles_are_escaped() -> None:
     )
     assert "<details><summary>Assistant · reasoning" in render_message_html(message)
     conversation = conv("grok", "t", '"><img src=x onerror=alert(1)>')
-    page = render_page(conversation, related=[], topics=['x"><b>'], titles={})
+    page = "\n".join(render_page(conversation, related=[], topics=['x"><b>'], titles={}))
     assert "<img" not in page and "onerror=alert" not in page.replace(
         "&quot;&gt;&lt;img src=x onerror=alert(1)&gt;", ""
     )
@@ -189,7 +190,8 @@ def test_server_serves_static_pages_and_security_headers(server) -> None:
     assert headers["Cache-Control"] == "no-store"
     status, headers, _ = _get(server, "/home-all.js")
     assert status == 200 and headers["Content-Type"].startswith("text/javascript")
-    assert _get(server, "/conversations/conversation-chatgpt-aaaa1111.html")[0] == 200
+    page = server.paths.site_page("chatgpt", "chatgpt-aaaa1111")
+    assert _get(server, "/" + page.relative_to(server.paths.site).as_posix())[0] == 200
     assert _get(server, "/index.html")[0] == 404, "the old entry-point name is gone"
 
 
@@ -254,6 +256,6 @@ def test_api_reports_missing_search_database(archive_env) -> None:
 def test_pages_survive_empty_conversations_and_missing_fields() -> None:
     conversation = conv("grok", "e", "")
     conversation.messages = []
-    page = render_page(conversation, related=[], topics=[], titles={})
+    (page,) = render_page(conversation, related=[], topics=[], titles={})
     assert "<title>Untitled</title>" in page
     assert "0 messages" in page
