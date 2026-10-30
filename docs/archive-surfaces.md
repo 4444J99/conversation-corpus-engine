@@ -209,9 +209,15 @@ text, so `--out` must be outside any Git work tree or ignored by it; otherwise t
   ordinal in the feed, `text_index` = 0, `text`, `timestamp`, `source_locator` =
   `<uid>#<event_ref>`, `body_kind` = `direct`, `provenance` = `unknown_user_input`. The writer has
   no provenance parameter: a vendor export can never claim to be operator-typed input.
-- **Determinism.** Rows are written in conversation order, then message order, with sorted keys,
-  so two runs give identical bytes. A repeated `event_ref` aborts the whole write and leaves no
-  file behind. A store that disagrees with its manifest is refused.
+- **Determinism.** Rows are written in the store's reading order (conversation shards oldest
+  month first, `undated` last, the reader's order inside a shard), then message order, with sorted
+  keys, so two runs over one store give identical bytes. A repeated `event_ref` aborts the whole
+  write and leaves no file behind. A store that disagrees with its manifest is refused.
+- **Order is not identity.** A first-generation store kept conversations in the reader's emission
+  order, so the feed of a rebuilt (sharded) store holds the same rows (same `session_ref`,
+  `event_ref`, `text`, `timestamp`, `source_locator`) at other positions: `event_index` and the
+  feed's sha256 change, nothing else does. A consumer keys a row on `(session_ref, event_ref)`
+  and treats `event_index` as the row's place in this one file.
 - **The receipt** holds counts and digests, never text: the feed's sha256, the row count, the
   alternate-branch count, the number of asks trimmed of attachment text, the excluded messages
   counted by reason (`kind-notebook`, `kind-memory`, `role-assistant`, `role-tool`, `empty-text`,
