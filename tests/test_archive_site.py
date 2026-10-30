@@ -48,6 +48,16 @@ def test_page_navigation_resolves_only_the_neighbours(monkeypatch) -> None:
     assert '<a href="page-006.html">Next →</a>' in pages[5]
 
 
+def test_a_small_page_cap_still_holds_a_conversation_that_fits_one_page() -> None:
+    pages = render_page(
+        conv("chatgpt", "tiny", "test"), related=[], topics=[], titles={}, note_bytes=4096
+    )
+    assert len(pages) == 1 and len(pages[0].encode("utf-8")) <= 4096
+    heavy = conv("chatgpt", "heavy", "test", [("user", "word " * 2000), ("assistant", "ok")])
+    with pytest.raises(ValueError, match="no room"):
+        render_page(heavy, related=[], topics=[], titles={}, note_bytes=4096)
+
+
 class _Scripts(HTMLParser):
     def __init__(self) -> None:
         super().__init__()

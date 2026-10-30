@@ -324,11 +324,20 @@ def verify_turn_store(paths: ArchivePaths) -> list[str]:
                 continue
             if path.stat().st_size != item["bytes"]:
                 problems.append(f"shard size differs from the turn manifest: {item['path']}")
-            counted = _count_turns(path)
+            if item.get("sha256") and sha256_file(path) != item["sha256"]:
+                problems.append(f"shard checksum differs from the turn manifest: {item['path']}")
+            counted, conversations, orphans = _shard_facts(path)
             if counted != item["turns"]:
                 problems.append(
                     f"{item['path']}: {counted} turn row(s), manifest says {item['turns']}"
                 )
+            if conversations != item["conversations"]:
+                problems.append(
+                    f"{item['path']}: {conversations} conversation row(s), manifest says "
+                    f"{item['conversations']}"
+                )
+            if orphans:
+                problems.append(f"{item['path']}: {orphans} turn(s) with no conversation row")
             found.setdefault(item["provider"], {HUMAN: 0, MACHINE: 0})[author] += counted
     for provider, authors in expected.items():
         for author in AUTHORS:
@@ -342,10 +351,19 @@ def verify_turn_store(paths: ArchivePaths) -> list[str]:
     return problems
 
 
-def _count_turns(path: Path) -> int:
+def _shard_facts(path: Path) -> tuple[int, int, int]:
+    """(turn rows, conversation rows, turns whose conversation row is missing) of a shard."""
     connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        return int(connection.execute("SELECT COUNT(*) FROM turns").fetchone()[0])
+        turns = int(connection.execute("SELECT COUNT(*) FROM turns").fetchone()[0])
+        conversations = int(connection.execute("SELECT COUNT(*) FROM conversations").fetchone()[0])
+        orphans = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM turns t LEFT JOIN conversations c ON c.uid = t.uid "
+                "WHERE c.uid IS NULL"
+            ).fetchone()[0]
+        )
+        return turns, conversations, orphans
     finally:
         connection.close()
 

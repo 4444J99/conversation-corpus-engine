@@ -3,9 +3,9 @@
 Every message of the normalized layer is one *turn*, and every turn has exactly one author:
 
 * `human`: the person typed it. This is the channel `typed` on the role `user`, the same rule the
-  prompt feed uses for an ask, so the human count of a provider equals the feed's rows plus its
-  alternate-branch rows plus the asks the feed excluded for kind (notebooks and memories have no
-  typed channel, so none).
+  prompt feed uses for an ask, so the human count of a provider equals the feed's rows, less the
+  rows the feed took from abandoned branches (those sit in `extra.alternate_messages`, not in the
+  messages), plus the typed turns the feed skipped for holding no text (`empty-text`).
 * `machine`: everything else. Replies, reasoning, tool output, system text, project documents
   and memories. A project document or a memory may well have been written by the person, but the
   export cannot say so, and an author is only claimed where the export proves it.

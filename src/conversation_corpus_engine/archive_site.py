@@ -238,6 +238,32 @@ def page_groups(
     first_budget = note_bytes - utf8_size(first) - NAV_RESERVE
     budget = note_bytes - utf8_size(later) - NAV_RESERVE
     if budget < 1024:
+        # Too small to split into linked pages, so it can only hold a conversation that fits one
+        # page: measured without the split reserve (a lone page carries no navigation).
+        alone = _shell(
+            conversation,
+            part=1,
+            parts=1,
+            home_href=worst_home,
+            style_href=worst_style,
+            topics=topics,
+            related_html=_related_html(related, titles, lambda _uid: worst_link),
+            body="",
+            nav="",
+        )
+        room = note_bytes - utf8_size(alone)
+        if room >= 1024:
+            single = pack(
+                [
+                    block
+                    for message in conversation.messages
+                    for block in message_html_blocks(message, room)
+                ],
+                room,
+                room,
+            )
+            if len(single) <= 1:
+                return single
         raise ValueError(f"note_bytes {note_bytes} leaves no room for content beside the page")
     blocks = [
         block for message in conversation.messages for block in message_html_blocks(message, budget)

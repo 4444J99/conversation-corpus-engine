@@ -137,20 +137,43 @@ def test_a_full_month_spills_into_day_folders_and_a_full_day_into_buckets() -> N
     assert all(validate_name(part) == [] for folder in sizes for part in folder.split("/"))
 
 
+def _assert_fanout(folders: list[str], limit: int) -> None:
+    """No folder on any level of the given paths has more than `limit` sub-folders."""
+    children: dict[str, set[str]] = {}
+    for folder in set(folders):
+        parts = folder.split("/")
+        for depth in range(1, len(parts) + 1):
+            parent = "/".join(parts[: depth - 1])
+            children.setdefault(parent, set()).add("/".join(parts[:depth]))
+    assert max(len(kids) for kids in children.values()) <= limit
+    assert all(validate_name(part) == [] for folder in folders for part in folder.split("/"))
+
+
 def test_day_folders_that_outnumber_a_tiny_limit_sit_in_buckets_too() -> None:
     items = []
     for day in range(1, 32):
         items += [(f"u-{day:02d}-{n}", f"2025-01-{day:02d}T00:00:00Z", 1) for n in range(2)]
     plan = plan_conversation_folders(items, 24)
     assert max(Counter(plan.values()).values()) <= 24
-    children: dict[str, set[str]] = {}
-    for folder in set(plan.values()):
-        parts = folder.split("/")
-        for depth in range(1, len(parts) + 1):
-            parent = "/".join(parts[: depth - 1])
-            children.setdefault(parent, set()).add("/".join(parts[:depth]))
-    assert max(len(kids) for kids in children.values()) <= 24
-    assert all(validate_name(part) == [] for folder in plan.values() for part in folder.split("/"))
+    _assert_fanout(list(plan.values()), 24)
+
+
+def test_a_day_with_more_buckets_than_the_limit_nests_them() -> None:
+    items = [(f"u-{n:05d}", "2025-01-01T00:00:00Z", 1) for n in range(1000)]
+    plan = plan_conversation_folders(items, 24)
+    assert max(Counter(plan.values()).values()) <= 24
+    _assert_fanout(list(plan.values()), 24)
+    assert any(folder.count("bucket-all-") == 2 for folder in plan.values())
+    flat = plan_flat_folders([f"topic-all-t{n:05d}" for n in range(1000)], 24)
+    assert max(Counter(flat.values()).values()) <= 24
+    _assert_fanout(list(flat.values()), 24)
+
+
+def test_parts_nest_their_folders_when_a_tiny_limit_would_overflow_one_level() -> None:
+    folders = [part_folder(position, 800, 24) for position in range(800)]
+    assert max(Counter(folders).values()) <= 24
+    _assert_fanout(folders, 24)
+    assert part_folder(0, 24, 24) == "" and part_folder(23, 800, 24).startswith("bucket-all-b")
 
 
 def test_undated_conversations_get_the_structural_folder_and_spill_to_buckets() -> None:

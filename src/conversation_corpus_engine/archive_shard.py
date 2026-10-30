@@ -143,8 +143,30 @@ def _bucket_index(uid: str, buckets: int) -> int:
     return int(hashlib.sha256(uid.encode("utf-8")).hexdigest()[:8], 16) % buckets
 
 
-def _spill(members: list[tuple[str, int]], limit: int) -> dict[str, int]:
-    """Assign members (uid, weight) to hash buckets so no bucket's weight passes `limit`."""
+def _bucket_path(index: int, buckets: int, limit: int) -> str:
+    """The folder path of leaf bucket `index` among `buckets`, no level holding more than `limit`.
+
+    One level while the buckets fit `limit`; otherwise the index is written in base `limit`, one
+    bucket folder per digit, so even a tiny limit keeps every folder inside it.
+    """
+    base = max(limit, 2)
+    digits: list[int] = []
+    remaining, span = index, buckets
+    while True:
+        digits.append(remaining % base)
+        remaining //= base
+        span = math.ceil(span / base)
+        if span <= 1:
+            break
+    return "/".join(layout.bucket_folder(digit) for digit in reversed(digits))
+
+
+def _spill(members: list[tuple[str, int]], limit: int) -> dict[str, str]:
+    """Assign members (uid, weight) to hash buckets so no bucket's weight passes `limit`.
+
+    Returns uid -> the bucket's folder path (`bucket-…`, or nested ones when there are more
+    buckets than `limit`).
+    """
     total = sum(weight for _, weight in members)
     buckets = max(2, math.ceil(total / (limit * BUCKET_FILL)))
     while True:
@@ -155,7 +177,7 @@ def _spill(members: list[tuple[str, int]], limit: int) -> dict[str, int]:
             assignment[uid] = index
             loads[index] += weight
         if max(loads.values()) <= limit:
-            return assignment
+            return {uid: _bucket_path(index, buckets, limit) for uid, index in assignment.items()}
         buckets *= 2
 
 
@@ -188,16 +210,16 @@ def plan_conversation_folders(items: Iterable[tuple[str, str, int]], limit: int)
         days = sorted(day for day in by_day if day)
         day_parent: dict[str, str] = {}
         if len(days) > limit:
-            for day, index in _spill([(day, 1) for day in days], limit).items():
-                day_parent[day] = f"{folder}/{layout.bucket_folder(index)}"
+            for day, bucket in _spill([(day, 1) for day in days], limit).items():
+                day_parent[day] = f"{folder}/{bucket}"
         for day, group in sorted(by_day.items()):
             parent = day_parent.get(day, folder)
             where = f"{parent}/{layout.day_folder(day)}" if day else folder
             if sum(weight for _, weight in group) <= limit:
                 plan.update({uid: where for uid, _ in group})
                 continue
-            for uid, index in _spill(group, limit).items():
-                plan[uid] = f"{where}/{layout.bucket_folder(index)}"
+            for uid, bucket in _spill(group, limit).items():
+                plan[uid] = f"{where}/{bucket}"
     return plan
 
 
@@ -206,12 +228,11 @@ def plan_flat_folders(names: Iterable[str], limit: int) -> dict[str, str]:
     unique = sorted(set(names))
     if len(unique) <= limit:
         return {name: "" for name in unique}
-    assignment = _spill([(name, 1) for name in unique], limit)
-    return {name: layout.bucket_folder(index) for name, index in assignment.items()}
+    return _spill([(name, 1) for name in unique], limit)
 
 
 def part_folder(position: int, total: int, limit: int) -> str:
     """The sub-folder of part `position` (0-based) among `total`: `` while they fit `limit`."""
     if total <= limit:
         return ""
-    return layout.bucket_folder(position // limit)
+    return _bucket_path(position // limit, math.ceil(total / limit), limit)

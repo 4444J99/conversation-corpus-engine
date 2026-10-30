@@ -123,6 +123,20 @@ def test_tampering_with_a_shard_is_detected(built) -> None:
     assert any("missing shard file" in p for p in verify_turn_store(env.paths))
 
 
+def test_a_shard_that_lost_its_conversation_rows_is_detected(built) -> None:
+    env, _ = built
+    first = load_turn_manifest(env.paths)["containers"]["authored"]["shards"][0]
+    path = env.paths.turns / first["path"]
+    connection = sqlite3.connect(path)
+    connection.execute("DELETE FROM conversations")
+    connection.commit()
+    connection.close()
+    problems = verify_turn_store(env.paths)
+    assert any("conversation row" in p for p in problems), problems
+    assert any("no conversation row" in p for p in problems), problems
+    assert any("checksum differs" in p for p in problems), problems
+
+
 def test_a_store_built_from_a_different_fingerprint_is_refused(built) -> None:
     env, _ = built
     document = load_turn_manifest(env.paths)
