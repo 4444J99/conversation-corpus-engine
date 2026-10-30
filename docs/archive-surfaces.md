@@ -349,6 +349,14 @@ tracker for provenance (`tracker.provenance(path)`) and for counters (`tracker.n
 Register it in `PROVIDER_SPECS` in `archive_ingest.py` and give it a synthetic fixture in
 `tests/archive_support.py` — never a real export.
 
+## Custody of the raw exports
+
+The raw provider exports this layer reads have their own custody record:
+[`custody/ai-exports-custody.md`](custody/ai-exports-custody.md) and its receipt. It replaces the Custody
+section of the archived `4444J99/limen` architecture page, which is stale and frozen. Read it before building
+a store from, or deleting anything derived from, the raw exports: it says where they live, which files exist
+only once, and which independent copy has been verified.
+
 ## Known limits
 
 - Topic hubs are lexical (TF-IDF); they are a navigation aid, not a semantic ontology.
