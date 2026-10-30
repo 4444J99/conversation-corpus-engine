@@ -15,7 +15,7 @@
     "receipt_file_sha256": "3f83e679c169bd612cb95e7b6f19dac6ad65d2779a9401e4d82ec2bbddb90ed1",
     "doc_section": "docs/architecture/ai-exports-archive.md, section Custody",
     "claims_found_false_on_2026-10-30": [
-      "independent_physical_devices: true, destination /Volumes/T7Recovery: no volume with the recorded UUID 0287E02B-989A-419B-A7CA-B4BCE4ECA1FF is mounted; the 1 TB disk that held it is now the volume TimeMachine (UUID 9E589481-02AB-473E-9289-E016C07279B6, disk6)",
+      "independent_physical_devices: true, destination /Volumes/T7Recovery: no volume with the recorded UUID 0287E02B-989A-419B-A7CA-B4BCE4ECA1FF is mounted; the only T7 attached (diskutil: Device / Media Name PSSD T7, 1.0 TB, disk6) now carries the volume TimeMachine (UUID 9E589481-02AB-473E-9289-E016C07279B6), and its former content sits in Archive4T/t7-absorbed-20261025",
       "excluded.chatgpt: 'account export already replicated on two independent devices': the only remaining replica of the raw ChatGPT zip and the delta file is on Archive4T, the same physical disk as Scratch",
       "doc: 'Only the T7Recovery copy is independent': it no longer exists as an independent copy"
     ],
@@ -71,7 +71,8 @@
     "t7_recovery": {
       "status": "absent",
       "recorded_uuid": "0287E02B-989A-419B-A7CA-B4BCE4ECA1FF",
-      "successor": "volume TimeMachine on disk6"
+      "successor": "volume TimeMachine on disk6 (diskutil: Device / Media Name PSSD T7, 1.0 TB, USB)",
+      "basis": "the volume name T7Recovery and the single attached T7; that the recorded volume was the one on this disk is inferred from the name and from Archive4T/t7-absorbed-20261025, not from a retained volume UUID"
     },
     "independent_physical_devices": true,
     "independence_scope": "different physical disks only (disk0 internal, disk8 external). Both disks sit with the same Mac, so this is not an offsite or versioned copy"

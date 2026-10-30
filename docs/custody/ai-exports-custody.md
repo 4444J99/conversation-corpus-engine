@@ -6,7 +6,7 @@ This page is the current Custody record for the raw AI chat exports (ChatGPT, Cl
 
 The old receipt said `independent_physical_devices: true`, with the second copy on a volume named T7Recovery. On 2026-10-30:
 
-- No mounted volume carries T7Recovery's recorded UUID. The 1 TB disk that held it is now the volume `TimeMachine` (disk6), used only for Time Machine.
+- No mounted volume carries T7Recovery's recorded UUID. The only T7 attached (`diskutil`: media name PSSD T7, 1.0 TB, disk6) now carries the volume `TimeMachine`, used only for Time Machine, and the content it held was absorbed into `/Volumes/Archive4T/t7-absorbed-20261025`. That T7Recovery was this disk is inferred from the name and that folder, not from a retained UUID.
 - Scratch, Archive4T and Ingress are volumes of one APFS container on one physical disk (disk8). Time Machine excludes Scratch and Archive4T.
 - The receipt's exclusion "ChatGPT is already replicated on two independent devices" also leaned on T7Recovery. The raw ChatGPT zip and the later delta file existed once, on Archive4T.
 
