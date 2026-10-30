@@ -41,6 +41,21 @@ def test_shard_subjects_round_trip_and_sort_in_reading_order() -> None:
         parse_shard_subject("conversations")
 
 
+def test_a_month_may_pass_shard_999(tmp_path: Path) -> None:
+    assert shard_subject("202506", 1000) == "202506-1000"
+    assert parse_shard_subject("202506-1000") == ("202506", 1000)
+    ordered = ["202506-002", "202506-999", "202506-1000"]
+    assert sorted(reversed(ordered), key=shard_sort_key) == ordered
+    assert validate_name(layout.shard_filename("chatgpt", "202506-1000").rsplit(".", 1)[0]) == []
+    # a row larger than the shard size takes a shard of its own, so 1,001 rows roll 1,001 shards
+    writer = ShardWriter(tmp_path / "build", "grok", shard_bytes=10)
+    for _ in range(1001):
+        writer.add("202506", b"0123456789\n", b"{}\n")
+    shards = writer.close()
+    assert len(shards) == 1001
+    assert shards[-1]["subject"] == "202506-1001"
+
+
 def test_shard_file_names_are_valid_contract_names() -> None:
     for subject in ("202506", "202506-002", UNDATED):
         for name in (
@@ -120,6 +135,22 @@ def test_a_full_month_spills_into_day_folders_and_a_full_day_into_buckets() -> N
     assert "month-all-202506/day-all-20250601" in sizes
     assert any("/bucket-all-b" in folder for folder in sizes)
     assert all(validate_name(part) == [] for folder in sizes for part in folder.split("/"))
+
+
+def test_day_folders_that_outnumber_a_tiny_limit_sit_in_buckets_too() -> None:
+    items = []
+    for day in range(1, 32):
+        items += [(f"u-{day:02d}-{n}", f"2025-01-{day:02d}T00:00:00Z", 1) for n in range(2)]
+    plan = plan_conversation_folders(items, 24)
+    assert max(Counter(plan.values()).values()) <= 24
+    children: dict[str, set[str]] = {}
+    for folder in set(plan.values()):
+        parts = folder.split("/")
+        for depth in range(1, len(parts) + 1):
+            parent = "/".join(parts[: depth - 1])
+            children.setdefault(parent, set()).add("/".join(parts[:depth]))
+    assert max(len(kids) for kids in children.values()) <= 24
+    assert all(validate_name(part) == [] for folder in plan.values() for part in folder.split("/"))
 
 
 def test_undated_conversations_get_the_structural_folder_and_spill_to_buckets() -> None:

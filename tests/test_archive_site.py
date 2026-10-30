@@ -10,12 +10,42 @@ from html.parser import HTMLParser
 import pytest
 from archive_support import XSS, conv, topical_corpus, write_store
 
+from conversation_corpus_engine import archive_site
 from conversation_corpus_engine.archive_database import build_database
 from conversation_corpus_engine.archive_ingest import ingest
+from conversation_corpus_engine.archive_limits import Limits
 from conversation_corpus_engine.archive_model import Message
 from conversation_corpus_engine.archive_serve import ArchiveServer, start_in_thread
 from conversation_corpus_engine.archive_site import build_site, render_message_html, render_page
 from conversation_corpus_engine.archive_topics import build_analysis
+
+
+def test_page_navigation_resolves_only_the_neighbours(monkeypatch) -> None:
+    calls: list[int] = []
+    real = archive_site._relative
+
+    def counting(target: str, source: str) -> str:
+        calls.append(1)
+        return real(target, source)
+
+    monkeypatch.setattr(archive_site, "_relative", counting)
+    count = 60
+    pages = archive_site.render_pages(
+        conv("chatgpt", "long", "Long thread"),
+        [[f"<p>{number}</p>"] for number in range(count)],
+        [f"pages/undated/page-{number:03d}.html" for number in range(count)],
+        related=[],
+        topics=[],
+        titles={},
+        page_of=lambda _uid: None,
+        note_bytes=Limits().note_bytes,
+    )
+    assert len(pages) == count
+    assert len(calls) <= 6 * count, "navigation links must not cost a path per page per page"
+    assert "Previous" not in pages[0] and "Next" in pages[0]
+    assert "Next" not in pages[-1] and "Previous" in pages[-1]
+    assert '<a href="page-004.html">← Previous</a>' in pages[5]
+    assert '<a href="page-006.html">Next →</a>' in pages[5]
 
 
 class _Scripts(HTMLParser):

@@ -20,6 +20,7 @@ across shards, which is enough to order the best hit of each conversation.
 
 from __future__ import annotations
 
+import heapq
 import json
 import shutil
 import sqlite3
@@ -32,11 +33,11 @@ from .archive_author import AUTHOR_BY_CONTAINER, AUTHORS, CONTAINER_BY_AUTHOR, H
 from .archive_database import fts_query
 from .archive_ingest import ArchivePaths, load_manifest, require_inside
 from .archive_model import Conversation, iter_conversations, sha256_file, write_json_atomic
-from .archive_shard import UNDATED, parse_shard_subject
+from .archive_shard import UNDATED, parse_shard_subject, shard_sort_key
 from .archive_topics import load_enrichment
 from .corpus_store import CorpusWriteAuthorization
 
-TURNS_SCHEMA = "archive-turns.v1"
+TURNS_SCHEMA = "archive-turns.v2"
 BATCH = 500
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -50,7 +51,8 @@ CREATE TABLE conversations (
 );
 CREATE TABLE turns (
     id INTEGER PRIMARY KEY, uid TEXT NOT NULL REFERENCES conversations(uid),
-    ordinal INTEGER NOT NULL, turn_id TEXT NOT NULL, author TEXT NOT NULL, role TEXT NOT NULL,
+    cseq INTEGER NOT NULL, ordinal INTEGER NOT NULL, turn_id TEXT NOT NULL,
+    author TEXT NOT NULL, role TEXT NOT NULL,
     channel TEXT NOT NULL, ts TEXT NOT NULL, mkind TEXT NOT NULL, typed_chars INTEGER NOT NULL,
     text TEXT NOT NULL
 );
@@ -129,15 +131,15 @@ class _ShardBuild:
             self.conversations,
         )
         self.connection.executemany(
-            "INSERT INTO turns(uid, ordinal, turn_id, author, role, channel, ts, mkind, "
-            "typed_chars, text) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO turns(uid, cseq, ordinal, turn_id, author, role, channel, ts, mkind, "
+            "typed_chars, text) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             self.turns,
         )
         self.conversations.clear()
         self.turns.clear()
 
     def discard(self) -> None:
-        """Drop a shard that received no turn: an empty database would only be clutter."""
+        """Drop a shard that received neither a turn nor a conversation: it would be clutter."""
         self.connection.close()
         self.path.unlink(missing_ok=True)
 
@@ -204,11 +206,15 @@ def build_turn_store(
                             "schema": TURNS_SCHEMA,
                         },
                     )
-                for conversation in iter_conversations(shard_file):
+                for cseq, conversation in enumerate(iter_conversations(shard_file)):
                     conversations += 1
                     topics = enrichment.get(conversation.uid, {}).get("topics", [])
                     row = _row(conversation, topics)
                     present: set[str] = set()
+                    if not conversation.messages:
+                        # No turn to hold it, but the conversation stays findable by title; with
+                        # nothing typed in it, its metadata belongs to the machine container.
+                        builds[MACHINE].add_conversation(row)
                     for ordinal, message in enumerate(conversation.messages):
                         author = message.author
                         if author not in present:
@@ -217,6 +223,7 @@ def build_turn_store(
                         builds[author].add_turn(
                             (
                                 conversation.uid,
+                                cseq,
                                 ordinal,
                                 message.id,
                                 author,
@@ -231,7 +238,7 @@ def build_turn_store(
                         counts[author] += 1
                         totals[author] += 1
                 for author, shard in builds.items():
-                    if shard.turn_count == 0:
+                    if shard.turn_count == 0 and shard.conversation_count == 0:
                         shard.discard()
                         continue
                     shard.finish()
@@ -476,34 +483,52 @@ def list_turns(
     limit: int = 20,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
-    """Turns of the named slice in reading order (shard, conversation, ordinal), paged."""
+    """Turns of the named slice in reading order (shard, conversation, ordinal), paged.
+
+    A provider-month holds one shard per author. Without an author filter their rows are merged
+    by conversation and ordinal, so a conversation reads user, assistant, user, assistant, not
+    every typed turn first.
+    """
     clauses = ["1=1"]
     params: list[Any] = []
     if uid:
         clauses.append("t.uid = ?")
         params.append(uid)
     sql = (
-        "SELECT t.uid, t.ordinal, t.turn_id, t.author, t.role, t.channel, t.ts, t.typed_chars, "
-        "t.text, c.provider, c.title, c.created FROM turns t JOIN conversations c ON c.uid = t.uid "
+        "SELECT t.uid, t.cseq, t.ordinal, t.turn_id, t.author, t.role, t.channel, t.ts, "
+        "t.typed_chars, t.text, c.provider, c.title, c.created "
+        "FROM turns t JOIN conversations c ON c.uid = t.uid "
         f"WHERE {' AND '.join(clauses)} ORDER BY t.id LIMIT ?"
     )
-    rows: list[dict[str, Any]] = []
-    skip = offset
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for _author, item in select_shards(
         paths,
         authors=[author] if author else None,
         providers=[provider] if provider else None,
         months=[month] if month else None,
     ):
-        connection = _open(paths, item)
+        groups.setdefault((item["provider"], item["subject"]), []).append(item)
+    provider_rank = {name: rank for rank, name in enumerate(load_turn_manifest(paths)["providers"])}
+    rows: list[dict[str, Any]] = []
+    skip = offset
+    for key in sorted(
+        groups, key=lambda k: (provider_rank.get(k[0], len(provider_rank)), shard_sort_key(k[1]))
+    ):
+        connections = [_open(paths, item) for item in groups[key]]
         try:
-            for row in connection.execute(sql, [*params, limit + skip]):
+            streams = [
+                (dict(row) for row in connection.execute(sql, [*params, limit + skip]))
+                for connection in connections
+            ]
+            for row in heapq.merge(*streams, key=lambda r: (r["cseq"], r["ordinal"])):
                 if skip:
                     skip -= 1
                     continue
-                rows.append(dict(row))
+                del row["cseq"]
+                rows.append(row)
                 if len(rows) >= limit:
                     return rows
         finally:
-            connection.close()
+            for connection in connections:
+                connection.close()
     return rows

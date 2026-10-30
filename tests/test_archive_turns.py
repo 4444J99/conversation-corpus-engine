@@ -188,6 +188,64 @@ def test_list_turns_pages_in_reading_order_across_shards(built) -> None:
     assert {r["uid"] for r in one} == {"chatgpt-aaaa1111"}
 
 
+def _write_minimal_manifest(env) -> None:
+    env.paths.manifest.write_text(
+        json.dumps({"source_fingerprint": "e" * 64, "totals": {}, "providers": {}}),
+        encoding="utf-8",
+    )
+
+
+def test_an_unfiltered_listing_keeps_each_conversation_in_turn_order(archive_env) -> None:
+    first = conv(
+        "chatgpt",
+        "ord1",
+        "Ordered one",
+        [("user", "q0"), ("assistant", "a1"), ("user", "q2"), ("assistant", "a3")],
+    )
+    second = conv("chatgpt", "ord2", "Ordered two", [("user", "r0"), ("assistant", "b1")])
+    write_sharded_store(archive_env.paths, [first, second])
+    _write_minimal_manifest(archive_env)
+    build_turn_store(archive_env.paths, archive_env.auth)
+
+    one = list_turns(archive_env.paths, uid=first.uid, limit=50)
+    assert [r["ordinal"] for r in one] == [0, 1, 2, 3]
+    assert [r["author"] for r in one] == [HUMAN, MACHINE, HUMAN, MACHINE]
+    expected = [(first.uid, n) for n in range(4)] + [(second.uid, 0), (second.uid, 1)]
+    everything = list_turns(archive_env.paths, limit=50)
+    assert [(r["uid"], r["ordinal"]) for r in everything] == expected
+    page = list_turns(archive_env.paths, limit=2, offset=3)
+    assert [(r["uid"], r["ordinal"]) for r in page] == expected[3:5]
+    assert "cseq" not in everything[0]
+    only_human = list_turns(archive_env.paths, author=HUMAN, limit=50)
+    assert [(r["uid"], r["ordinal"]) for r in only_human] == [
+        (first.uid, 0),
+        (first.uid, 2),
+        (second.uid, 0),
+    ]
+
+
+def test_a_conversation_with_no_messages_is_still_found_by_title(archive_env) -> None:
+    quiet = conv("claude", "e1", "Zeppelin inventory", [("user", "x")])
+    quiet.messages.clear()
+    alone = conv("claude", "e2", "Quokka register", [("user", "y")], created="2024-03-05T00:00:00Z")
+    alone.messages.clear()
+    typed = conv("claude", "t1", "Plain talk", [("user", "hello world"), ("assistant", "hi")])
+    write_sharded_store(archive_env.paths, [quiet, alone, typed])
+    _write_minimal_manifest(archive_env)
+    summary = build_turn_store(archive_env.paths, archive_env.auth)
+
+    assert summary["turns"] == 2 and summary["conversations"] == 3
+    assert [h["uid"] for h in archive_turns.search_turn_titles(archive_env.paths, "zeppelin")] == [
+        quiet.uid
+    ]
+    assert [h["uid"] for h in archive_turns.search_turn_titles(archive_env.paths, "quokka")] == [
+        alone.uid
+    ]
+    assert len(list_turns(archive_env.paths, limit=50)) == 2
+    machine = load_turn_manifest(archive_env.paths)["containers"]["machine"]["shards"]
+    assert any(item["subject"] == "202403" and item["turns"] == 0 for item in machine)
+
+
 def test_reasoning_and_tool_turns_are_hidden_unless_asked_for(archive_env) -> None:
     conversation = conv("chatgpt", "r", "R", [("user", "hello")])
     conversation.messages.append(

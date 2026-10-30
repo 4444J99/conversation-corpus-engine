@@ -130,7 +130,11 @@ database-all-turns/
 ```
 
 A shard holds its author's turns, their conversation rows, and FTS5 indexes over text and titles.
-`human + machine == messages` per provider and in total (checked by `verify`).
+`human + machine == messages` per provider and in total (checked by `verify`). Each turn carries
+the position of its conversation in the normalized shard (`cseq`), so `archive turns` without an
+author merges the two authors of a provider-month back into reading order: shard, conversation,
+turn. A conversation with no messages has no turn to hold, so its row goes to the machine
+container and it stays findable by title.
 
 ```bash
 cce archive search "lantern wick" --author human          # what I typed

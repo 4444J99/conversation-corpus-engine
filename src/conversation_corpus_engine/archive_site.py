@@ -177,17 +177,21 @@ def _related_html(
     return f'<section class="related"><h2>Related</h2><ul>{items}</ul></section>'
 
 
-def _nav_html(hrefs: list[str], index: int, start: str) -> str:
-    """The links that walk a split conversation: previous, the first page, next."""
-    if len(hrefs) < 2:
+def _nav_html(total: int, index: int, start: str, previous: str, following: str) -> str:
+    """The links that walk a split conversation: previous, the first page, next.
+
+    Only the two neighbours and the first page are resolved by the caller, so a conversation of
+    P pages costs P path computations, not P squared.
+    """
+    if total < 2:
         return ""
     pieces = []
     if index > 0:
-        pieces.append(f'<a href="{_esc(hrefs[index - 1])}">← Previous</a>')
+        pieces.append(f'<a href="{_esc(previous)}">← Previous</a>')
     if index != 0:
         pieces.append(f'<a href="{_esc(start)}">Start</a>')
-    if index + 1 < len(hrefs):
-        pieces.append(f'<a href="{_esc(hrefs[index + 1])}">Next →</a>')
+    if index + 1 < total:
+        pieces.append(f'<a href="{_esc(following)}">Next →</a>')
     return f'<nav class="parts">{" · ".join(pieces)}</nav>'
 
 
@@ -207,7 +211,8 @@ def page_groups(
     """
     worst_home = f"{WORST_PREFIX}{layout.SITE_HOME_FILENAME}"
     worst_style = f"{WORST_PREFIX}{layout.SITE_STYLE_FILENAME}"
-    worst_nav = _nav_html([WORST_PREFIX + WORST_PATH] * 3, 1, WORST_PREFIX + WORST_PATH)
+    worst_link = WORST_PREFIX + WORST_PATH
+    worst_nav = _nav_html(3, 1, worst_link, worst_link, worst_link)
     first = _shell(
         conversation,
         part=1,
@@ -291,7 +296,8 @@ def render_pages(
     pages: list[str] = []
     for index, group in enumerate(groups):
         source = paths[index]
-        hrefs = [_relative(target, source) for target in paths]
+        previous = _relative(paths[index - 1], source) if index > 0 else ""
+        following = _relative(paths[index + 1], source) if index + 1 < total else ""
         page = _shell(
             conversation,
             part=index + 1,
@@ -303,7 +309,7 @@ def render_pages(
                 _related_html(related, titles, _href_from(source, page_of)) if index == 0 else ""
             ),
             body="\n".join(group),
-            nav=_nav_html(hrefs, index, _relative(paths[0], source)),
+            nav=_nav_html(total, index, _relative(paths[0], source), previous, following),
         )
         if utf8_size(page) > note_bytes:
             raise ValueError(

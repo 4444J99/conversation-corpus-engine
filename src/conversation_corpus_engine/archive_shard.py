@@ -26,7 +26,8 @@ from . import archive_layout as layout
 UNDATED = layout.UNDATED_DIRNAME
 _MONTH_STAMP_RE = re.compile(r"^(\d{4})-(\d{2})")
 _DAY_STAMP_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})")
-_SEQUENCE_RE = re.compile(r"^(?P<month>\d{6}|undated)(?:-(?P<sequence>\d{3}))?$")
+# `shard_subject` pads to three digits but never caps the number, so a month may pass shard 999.
+_SEQUENCE_RE = re.compile(r"^(?P<month>\d{6}|undated)(?:-(?P<sequence>\d{3,}))?$")
 MAX_OPEN_SHARDS = 16
 # A bucket is planned at this share of the folder limit, so hash imbalance rarely forces a retry.
 BUCKET_FILL = 0.7
@@ -182,8 +183,16 @@ def plan_conversation_folders(items: Iterable[tuple[str, str, int]], limit: int)
         else:
             for uid, stamp, weight in members:
                 by_day[day_key(stamp)].append((uid, weight))
+        # A month has at most 31 days, so day folders only outgrow `limit` under a tiny limit;
+        # then they sit one level down in hash buckets so the month folder stays inside it.
+        days = sorted(day for day in by_day if day)
+        day_parent: dict[str, str] = {}
+        if len(days) > limit:
+            for day, index in _spill([(day, 1) for day in days], limit).items():
+                day_parent[day] = f"{folder}/{layout.bucket_folder(index)}"
         for day, group in sorted(by_day.items()):
-            where = f"{folder}/{layout.day_folder(day)}" if day else folder
+            parent = day_parent.get(day, folder)
+            where = f"{parent}/{layout.day_folder(day)}" if day else folder
             if sum(weight for _, weight in group) <= limit:
                 plan.update({uid: where for uid, _ in group})
                 continue
