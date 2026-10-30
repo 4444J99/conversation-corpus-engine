@@ -193,7 +193,7 @@ def test_derive_is_pure_and_repeatable() -> None:
 
 def test_kind_table_is_the_closed_spec_list_in_order() -> None:
     assert list(KINDS) == SPEC_KINDS
-    assert NAMING_VERSION == 3
+    assert NAMING_VERSION == 4
 
 
 def test_every_kind_is_one_lowercase_word_and_not_a_scope() -> None:

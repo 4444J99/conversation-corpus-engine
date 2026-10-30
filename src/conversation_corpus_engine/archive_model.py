@@ -26,8 +26,20 @@ SCHEMA = "archive-conversation.v2"
 LEGACY_SCHEMA = "cce.archive.conversation.v1"
 ACCEPTED_SCHEMAS = frozenset({SCHEMA, LEGACY_SCHEMA})
 ROLES = ("user", "assistant", "system", "tool")
-KINDS = ("chat", "search", "activity", "notebook", "memory")
-CHANNELS = ("typed", "reply", "thinking", "tool", "system", "memory", "project")
+KINDS = (
+    "chat",
+    "search",
+    "activity",
+    "notebook",
+    "memory",
+    "session",
+    "note",
+    "document",
+    "plan",
+    "page",
+    "artifact",
+)
+CHANNELS = ("typed", "reply", "thinking", "tool", "system", "memory", "project", "written")
 SNIPPET_LIMIT = 240
 DERIVED_ID_PREFIX = "derived"
 _PLAIN_ID_RE = re.compile(r"[a-z0-9-]{1,64}")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import shutil
 from collections import Counter
@@ -11,11 +12,14 @@ from typing import Any
 
 from . import archive_layout as layout
 from . import (
+    archive_read_captures,
     archive_read_chatgpt,
     archive_read_claude,
     archive_read_copilot,
     archive_read_gemini,
     archive_read_grok,
+    archive_read_library,
+    archive_read_localmemory,
     archive_read_notebooklm,
     archive_read_perplexity,
 )
@@ -51,18 +55,41 @@ DEFAULT_ARCHIVE_DIRNAME = layout.ARCHIVE_DIRNAME
 FINGERPRINT_EXCLUDED_KEYS = frozenset({"source_root", "error"})
 
 
+SOURCE_EXPORT = "export"
+SOURCE_LIBRARY = "library"
+
+
 @dataclass(frozen=True)
 class ProviderSpec:
+    """One provider (a source family) and how to open its source.
+
+    `source` says where the root comes from: a folder of a provider's export under the export
+    root (`export`), or a published knowledge-library generation given by `--library-root`
+    (`library`). A `--source PROVIDER=PATH` override wins over both.
+    """
+
     name: str
     display: str
     default_rel: str
     module: Any
     open_reader: Callable[[Path, SourceTracker, dict[str, Any]], Iterator[Conversation]]
+    source: str = SOURCE_EXPORT
 
 
 def _chatgpt(root: Path, tracker: SourceTracker, options: dict[str, Any]) -> Iterator[Conversation]:
-    return archive_read_chatgpt.iter_conversations(
+    export = archive_read_chatgpt.iter_conversations(
         root, tracker, extra_files=options.get("chatgpt_extra_files", ())
+    )
+    library_root = options.get("library_root")
+    if library_root is None:
+        return export
+    # The library also holds ChatGPT pages the account export lacks; an id the export already has
+    # is folded by the ingest (the export's version stays).
+    return itertools.chain(
+        export,
+        archive_read_library.iter_family(
+            Path(library_root), tracker, archive_read_library.CHATGPT_PAGES
+        ),
     )
 
 
@@ -81,6 +108,21 @@ def _plain(module: Any) -> Callable[[Path, SourceTracker, dict[str, Any]], Itera
     return opener
 
 
+def _library_spec(family: archive_read_library.Family) -> ProviderSpec:
+    reader = archive_read_library.reader_for(family.name)
+    return ProviderSpec(
+        family.name,
+        family.display,
+        "library-all",
+        reader,
+        _plain(reader),
+        source=SOURCE_LIBRARY,
+    )
+
+
+# The seven web providers come from account exports; the rest of the families come from a
+# knowledge-library generation (the coding CLIs, notes, Drive, documents, agent memory and
+# plans) or from their own capture folders (Copilot captures, local-session memory).
 PROVIDER_SPECS: dict[str, ProviderSpec] = {
     spec.name: spec
     for spec in (
@@ -106,6 +148,21 @@ PROVIDER_SPECS: dict[str, ProviderSpec] = {
         ),
         ProviderSpec(
             "copilot", "Copilot", "copilot", archive_read_copilot, _plain(archive_read_copilot)
+        ),
+        *(_library_spec(family) for family in archive_read_library.FAMILIES),
+        ProviderSpec(
+            "copilotreports",
+            "Copilot reports",
+            "copilot",
+            archive_read_captures,
+            _plain(archive_read_captures),
+        ),
+        ProviderSpec(
+            "localmemory",
+            "Local memory",
+            "local-memory",
+            archive_read_localmemory,
+            _plain(archive_read_localmemory),
         ),
     )
 }
@@ -336,16 +393,23 @@ def require_inside(authorization: CorpusWriteAuthorization, path: Path) -> Path:
 
 
 def resolve_sources(
-    export_root: Path, providers: list[str] | None, overrides: dict[str, Path] | None = None
+    export_root: Path,
+    providers: list[str] | None,
+    overrides: dict[str, Path] | None = None,
+    library_root: Path | None = None,
 ) -> dict[str, Path]:
+    """Where each chosen provider is read from: an override, else the library root for a library
+    family, else the provider's folder under the export root."""
     chosen = providers or list(PROVIDER_SPECS)
     unknown = [name for name in chosen if name not in PROVIDER_SPECS]
     if unknown:
         raise KeyError(f"Unknown archive provider(s): {', '.join(unknown)}")
     sources: dict[str, Path] = {}
     for name in chosen:
-        override = (overrides or {}).get(name)
-        sources[name] = (override or export_root / PROVIDER_SPECS[name].default_rel).resolve()
+        spec = PROVIDER_SPECS[name]
+        base = library_root if spec.source == SOURCE_LIBRARY and library_root else None
+        override = (overrides or {}).get(name) or base
+        sources[name] = (override or export_root / spec.default_rel).resolve()
     return sources
 
 
@@ -400,6 +464,7 @@ def _ingest_provider(
     seen: dict[str, str] = {}
     kinds: Counter[str] = Counter()
     roles: Counter[str] = Counter()
+    turn_channels: Counter[str] = Counter()
     authors: Counter[str] = Counter()
     totals: Counter[str] = Counter()
     created: list[str] = []
@@ -445,6 +510,7 @@ def _ingest_provider(
             _bump(totals, "attachments", conversation.attachment_count)
             for message in conversation.messages:
                 _bump(roles, message.role)
+                _bump(turn_channels, message.channel)
                 _bump(authors, author_of(message.role, message.channel))
             if conversation.created:
                 created.append(conversation.created)
@@ -467,6 +533,7 @@ def _ingest_provider(
         shard["sha256"] = sha256_file(
             directory / layout.shard_filename(spec.name, shard["subject"])
         )
+    basis = archive_read_library.counter_report(dict(tracker.counters))
     return {
         "status": "ok",
         "source_root": str(root),
@@ -482,7 +549,9 @@ def _ingest_provider(
         "attachments": totals["attachments"],
         "kinds": dict(sorted(kinds.items())),
         "roles": dict(sorted(roles.items())),
+        "turn_channels": dict(sorted(turn_channels.items())),
         "authors": {author: authors[author] for author in AUTHORS},
+        **({"author_basis": basis} if any(basis.values()) else {}),
         "created_min": min(created) if created else "",
         "last_activity_max": max(activity) if activity else "",
         "reader": spec.module.READER,
@@ -501,13 +570,26 @@ def ingest(
     providers: list[str] | None = None,
     overrides: dict[str, Path] | None = None,
     options: dict[str, Any] | None = None,
+    library_root: Path | None = None,
+    merge: bool = False,
 ) -> dict[str, Any]:
+    """Read the chosen providers into the normalized shards and write the archive manifest.
+
+    With `merge`, the providers the manifest already lists and this call does not touch keep
+    their entries, so a store is built one provider at a time and a failed one is re-read alone.
+    Without it the manifest lists exactly the providers of this call.
+    """
     require_inside(authorization, paths.root)
     options = dict(options or {})
-    sources = resolve_sources(export_root, providers, overrides)
+    if library_root is not None:
+        options["library_root"] = library_root.resolve()
+    sources = resolve_sources(export_root, providers, overrides, library_root)
     report: dict[str, Any] = {}
+    if merge and paths.manifest.is_file():
+        report.update(load_manifest(paths)["providers"])
     for name, root in sources.items():
         report[name] = _ingest_provider(PROVIDER_SPECS[name], root, paths, options)
+    report = {name: report[name] for name in PROVIDER_SPECS if name in report}
     reader_versions = {name: PROVIDER_SPECS[name].module.READER for name in report}
     manifest = {
         "schema": MANIFEST_SCHEMA,

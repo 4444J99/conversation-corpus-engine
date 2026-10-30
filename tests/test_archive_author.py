@@ -110,7 +110,10 @@ def test_the_human_count_of_a_build_equals_the_asks_the_feed_reads(tmp_path) -> 
         human = info["authors"][HUMAN]
         feed = summary[provider]
         asks = feed["rows"] - feed["alternate_rows"] + feed["excluded"].get("empty-text", 0)
-        assert human == asks, (provider, human, feed)
+        # Text the person wrote outside a chat (a project instruction, an uploaded document) is
+        # human but is not an ask the feed reads.
+        written = info["turn_channels"].get("written", 0)
+        assert human == asks + written, (provider, human, feed)
         assert reconcile(info["authors"], info["messages"]) == []
     assert manifest["totals"]["authors"][HUMAN] == sum(
         info["authors"][HUMAN] for info in manifest["providers"].values() if info["status"] == "ok"

@@ -130,6 +130,15 @@ class ShardWriter:
                 "subject": shard_subject(month, sequence),
                 "conversations": self._rows[(month, sequence)],
                 "bytes": self._bytes[(month, sequence)],
+                # A lone row past the shard size is a conversation that is larger than a shard;
+                # a conversation is never cut, so its shard is the row. The manifest says so and
+                # the census exempts the file by name instead of ignoring the ceiling.
+                **(
+                    {"oversize_row": True}
+                    if self._rows[(month, sequence)] == 1
+                    and self._bytes[(month, sequence)] > self.shard_bytes
+                    else {}
+                ),
             }
             for month, sequence in self._rows
         ]

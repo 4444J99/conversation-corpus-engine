@@ -1780,7 +1780,8 @@ def test_an_id_with_uppercase_underscore_and_hyphen_survives_finalize_and_naming
 
 
 def test_copilot_is_registered_last(tmp_path: Path) -> None:
-    assert list(PROVIDER_SPECS) == [
+    # The seven web providers come first and in this order; the other families follow them.
+    assert list(PROVIDER_SPECS)[:7] == [
         "chatgpt",
         "claude",
         "gemini",

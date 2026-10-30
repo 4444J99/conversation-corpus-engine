@@ -2,17 +2,24 @@
 
 Every message of the normalized layer is one *turn*, and every turn has exactly one author:
 
-* `human`: the person typed it. This is the channel `typed` on the role `user`, the same rule the
-  prompt feed uses for an ask, so the human count of a provider equals the feed's rows, less the
-  rows the feed took from abandoned branches (those sit in `extra.alternate_messages`, not in the
-  messages), plus the typed turns the feed skipped for holding no text (`empty-text`).
-* `machine`: everything else. Replies, reasoning, tool output, system text, project documents
-  and memories. A project document or a memory may well have been written by the person, but the
-  export cannot say so, and an author is only claimed where the export proves it.
+* `human`: the person typed or wrote it. That is the role `user` on the channel `typed` (a
+  prompt typed into a chat or a coding CLI, the same rule the prompt feed uses for an ask, so the
+  human count of a provider equals the feed's rows, less the rows the feed took from abandoned
+  branches, plus the typed turns the feed skipped for holding no text) or on the channel
+  `written` (text the person authored or supplied outside a chat: a note, a Drive document, a
+  file they wrote, a project instruction or a knowledge document they uploaded).
+* `machine`: everything else. Replies, reasoning, tool output, system text, memories and plans an
+  agent wrote, text a harness injected into a user message, and every prompt a parent agent wrote
+  for a subagent.
+
+An author is claimed where the source proves it. Where a source cannot prove who wrote a class
+of text, the reader classifies by provenance (who put the text into the system) and records the
+basis in the turn's `meta.author_basis`, so the doubt stays visible and countable.
 
 The two values name the two containers of the turn store (`authored` and `machine`). The rule is a
 pure function of the stored `role` and `channel`, so it never changes a conversation row: an
-archive written before this module existed derives the same author for every old message.
+archive written before the `written` channel existed derives the same author for every old
+message.
 """
 
 from __future__ import annotations
@@ -30,12 +37,15 @@ CONTAINER_BY_AUTHOR: dict[str, str] = {HUMAN: "authored", MACHINE: "machine"}
 AUTHOR_BY_CONTAINER: dict[str, str] = {name: author for author, name in CONTAINER_BY_AUTHOR.items()}
 
 TYPED_CHANNEL = "typed"
+WRITTEN_CHANNEL = "written"
 USER_ROLE = "user"
+# The channels on which a user turn is the person's own words.
+HUMAN_CHANNELS: frozenset[str] = frozenset({TYPED_CHANNEL, WRITTEN_CHANNEL})
 
 
 def author_of(role: str, channel: str) -> str:
     """The author of a turn from its role and channel."""
-    return HUMAN if role == USER_ROLE and channel == TYPED_CHANNEL else MACHINE
+    return HUMAN if role == USER_ROLE and channel in HUMAN_CHANNELS else MACHINE
 
 
 def container_of(author: str) -> str:
