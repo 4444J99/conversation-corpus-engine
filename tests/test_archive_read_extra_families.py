@@ -40,33 +40,64 @@ def _write(path: Path, content: str | bytes) -> Path:
     return path
 
 
-def _local_memory(root: Path) -> Path:
-    corpus = root / "claude-local-session-memory"
+def _local_memory(
+    root: Path, ids: tuple[str, str] = ("a", "b"), folder: str = "claude-local-session-memory"
+) -> Path:
+    first, second = ids
+    corpus = root / folder
     _write(corpus / "README.md", "# Local session memory\nNotes about the capture.")
     _write(corpus / "import-manifest.json", json.dumps({"files": 3}))
     _write(corpus / "corpus" / "threads-index.json", json.dumps([{"title": "a thread"}]))
     _write(corpus / "eval" / "scorecard.json", json.dumps({"gate": "pass"}))
     _write(corpus / "source" / "projects.json", json.dumps([{"name": "Bread"}]))
-    _write(corpus / "source" / "conversations.json", json.dumps([{"uuid": "a"}, {"uuid": "b"}]))
+    _write(
+        corpus / "source" / "conversations.json",
+        json.dumps([{"uuid": first}, {"uuid": second}]),
+    )
     _write(corpus / "source" / "conversation-summaries.json", json.dumps([]))
-    _write(corpus / "source" / "conversation-cache" / "a.json", json.dumps({"uuid": "a"}))
-    _write(corpus / "source" / "conversation-details" / "b.json", json.dumps({"uuid": "b"}))
+    _write(corpus / "source" / "conversation-cache" / f"{first}.json", json.dumps({"uuid": first}))
+    _write(
+        corpus / "source" / "conversation-details" / f"{second}.json", json.dumps({"uuid": second})
+    )
     _write(corpus / "source" / "users.json", json.dumps([{"email": "x@example.com"}]))
     _write(corpus / "source" / "blob.json", b"\x00\x01binary")
     return root
 
 
-def test_local_memory_accounts_for_every_file_as_a_record_a_fold_or_an_exclusion(
-    archive_env, tmp_path: Path
-) -> None:
-    root = _local_memory(tmp_path / "local-memory")
-    manifest = ingest(
+def _ingest_claude_then(archive_env, root: Path) -> dict:
+    """Read the export's Claude first, so the folded ids have an owner to be found in."""
+    ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["claude"],
+    )
+    return ingest(
         export_root=archive_env.export,
         paths=archive_env.paths,
         authorization=archive_env.auth,
         providers=["localmemory"],
         overrides={"localmemory": root},
+        merge=True,
     )
+
+
+def _claude_ids(archive_env) -> tuple[str, str]:
+    ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["claude"],
+    )
+    chats = [c.source_id for c in iter_store(archive_env.paths, ["claude"]) if c.kind == "chat"]
+    return chats[0], chats[1]
+
+
+def test_local_memory_accounts_for_every_file_as_a_record_a_fold_or_an_exclusion(
+    archive_env, tmp_path: Path
+) -> None:
+    root = _local_memory(tmp_path / "local-memory", _claude_ids(archive_env))
+    manifest = _ingest_claude_then(archive_env, root)
     info = manifest["providers"]["localmemory"]
     counters = info["reader_counters"]
     assert counters["files_seen"] == 11
@@ -78,6 +109,8 @@ def test_local_memory_accounts_for_every_file_as_a_record_a_fold_or_an_exclusion
     assert info["kinds"] == {"memory": 6}
     assert info["authors"] == {HUMAN: 0, MACHINE: 5}
     assert reconcile(info["authors"], info["messages"]) == []
+    # Both folded ids are conversations the Claude export already holds.
+    assert counters["folded_ids"] == 2 and counters["folded_ids_missing"] == 0
     assert reconcile_source("localmemory", info) == []
     stored = list(iter_store(archive_env.paths, ["localmemory"]))
     assert {c.title for c in stored} >= {"claude-local-session-memory/README.md"}
@@ -87,14 +120,42 @@ def test_local_memory_accounts_for_every_file_as_a_record_a_fold_or_an_exclusion
     assert "accounted for" in reconcile_source("localmemory", broken)[0]
 
 
+def test_a_folded_conversation_the_owner_lacks_fails_verify_instead_of_vanishing(
+    archive_env, tmp_path: Path
+) -> None:
+    known, _ = _claude_ids(archive_env)
+    root = _local_memory(tmp_path / "local-memory", (known, "never-exported-uuid"))
+    info = _ingest_claude_then(archive_env, root)["providers"]["localmemory"]
+    assert info["reader_counters"]["folded_ids"] == 2
+    assert info["reader_counters"]["folded_ids_missing"] == 1
+    (problem,) = reconcile_source("localmemory", info)
+    assert problem.startswith("1 folded conversation id(s) are not conversations")
+
+
+def test_a_payload_in_a_folder_no_provider_owns_is_flagged(archive_env, tmp_path: Path) -> None:
+    root = _local_memory(tmp_path / "local-memory", folder="mystery-memory")
+    info = ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["localmemory"],
+        overrides={"localmemory": root},
+    )["providers"]["localmemory"]
+    assert info["reader_counters"]["folded_ids_unowned"] == 2
+    assert "no provider owns" in "".join(reconcile_source("localmemory", info))
+
+
 def test_local_memory_detect_and_channels(tmp_path: Path) -> None:
     assert not archive_read_localmemory.detect(tmp_path / "missing")
     root = _local_memory(tmp_path / "local-memory")
+    _write(root / ".DS_Store", b"finder")
+    (root / "link.json").symlink_to(root / "claude-local-session-memory" / "README.md")
     assert archive_read_localmemory.detect(root)
     described = archive_read_localmemory.channels(root)
     assert described["read"] == ["6 file(s), one machine record each"]
     assert any("4 conversation payload file(s)" in item for item in described["not_read"])
     assert any("1 account file(s)" in item for item in described["not_read"])
+    assert any("2 hidden file(s) or link(s)" in item for item in described["not_read"])
 
 
 def _captures(root: Path) -> Path:
@@ -133,6 +194,11 @@ def test_copilot_reports_are_machine_documents_one_per_file(archive_env, tmp_pat
         ("assistant", "reply")
     }
     assert all(c.provider == "copilotreports" for c in stored.values())
+    # Nothing host-specific (where the folder was, when the host touched the file) is stored.
+    for conversation in stored.values():
+        assert not set(archive_read_captures.HOST_KEYS) & set(conversation.provenance)
+        assert "original_refs" not in conversation.extra
+        assert conversation.provenance["source_file"].endswith((".docx", ".txt"))
 
 
 def test_a_notebooks_sources_and_notes_are_the_persons_the_rest_is_the_services(

@@ -155,6 +155,33 @@ def _rows(library: Any, family: Family) -> list[dict[str, Any]]:
     return [row for row in library.rows() if family.selects(row)]
 
 
+# Library providers whose records the web exports already cover (and the archive reads from the
+# exports, not the library): a record of these is never an orphan.
+WEB_EXPORT_PROVIDERS: frozenset[str] = frozenset(
+    {"chatgpt", "claude", "gemini", "grok", "notebooklm", "perplexity"}
+)
+
+
+def _claimed(row: dict[str, Any]) -> bool:
+    return (
+        row["provider"] in WEB_EXPORT_PROVIDERS
+        or CHATGPT_PAGES.selects(row)
+        or any(family.selects(row) for family in FAMILIES)
+    )
+
+
+def unclaimed(root: Path) -> int:
+    """Library records that no family reads and no web export covers.
+
+    A library can hold a record the family table has no selector for (a document source with a
+    wing or kind of its own, a provider this table never learned). Counting them is what keeps
+    such a record from being dropped without a trace: `verify` fails while the count is not 0.
+    """
+    database, _ = locate(root)
+    with _open(database) as library:
+        return sum(1 for row in library.rows() if not _claimed(row))
+
+
 def expected(root: Path, family: Family) -> dict[str, int]:
     """What the library itself says the family holds: records, messages and empty records."""
     database, _ = locate(root)
@@ -183,7 +210,13 @@ def describe(root: Path, family: Family) -> dict[str, list[str]]:
             read.append(f"library {key}: {current.get(key)}")
     else:
         read.append(f"library database: {database.parent.name}")
-    return {"read": read, "not_read": []}
+    orphans = unclaimed(root)
+    not_read = (
+        [f"{orphans} library record(s) belong to no family and are not read by any provider"]
+        if orphans
+        else []
+    )
+    return {"read": read, "not_read": not_read}
 
 
 def _convert(row: dict[str, Any], payload: dict[str, Any], family: Family) -> Conversation:
@@ -228,6 +261,7 @@ def iter_family(root: Path, tracker: SourceTracker, family: Family) -> Iterator[
     tracker.note("library_records", counts["records"])
     tracker.note("library_messages", counts["messages"])
     tracker.note("library_empty_records", counts["empty_records"])
+    tracker.note("library_unclaimed", unclaimed(root))
     with _open(database) as library:
         for row in _rows(library, family):
             payload = library.record(row["uid"])

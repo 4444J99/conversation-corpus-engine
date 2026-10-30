@@ -8,13 +8,18 @@ count reconciles:
 * a conversation payload (`conversations.json`, `conversation-summaries.json`, the
   `conversation-cache/` and `conversation-details/` folders) is *folded*: its conversations are the
   threads the account export already holds under the same ids, and a second copy would only make
-  every search answer twice. The reader counts the files and the conversations they carry; the
-  ingest's own manifest for the owning provider proves the ids are present;
+  every search answer twice. Folding is a claim, so it is checked: every conversation id found in a
+  folded payload must already be a conversation of the owning provider (the folder's name says
+  which) in this store. An id that is not is counted as missing, and `verify` fails on it, so a
+  captured conversation the export lacks can never be dropped without a trace;
 * an account file (users, organizations, bootstrap) is *excluded* on purpose, as the other
   readers exclude account data;
 * everything else (the derived corpus, the evaluation scorecards, the project and memory
   documents, the notes) is one machine record: the engine wrote it, or it is a record the app
   kept about the account's own memory.
+
+Hidden files and symbolic links are not read; they are counted (`files_skipped`) so the folder's
+file count still adds up.
 """
 
 from __future__ import annotations
@@ -22,31 +27,41 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
-from .archive_model import Conversation, Message, SourceTracker, to_iso
+from .archive_model import Conversation, Message, SourceTracker, stable_uid, to_iso
 
 PROVIDER = "localmemory"
-READER = "archive_read_localmemory@1"
+READER = "archive_read_localmemory@2"
 FOLDED_FILES = frozenset({"conversations.json", "conversation-summaries.json"})
 FOLDED_DIRS = frozenset({"conversation-cache", "conversation-details"})
 EXCLUDED_FILES = frozenset({"users.json", "user.json", "organizations.json", "bootstrap.json"})
 TEXT_SUFFIXES = frozenset({".json", ".md", ".txt", ".yaml", ".yml", ".csv", ".html"})
 MAX_BYTES = 20 * 1024 * 1024
+MAX_PAYLOAD_BYTES = 256 * 1024 * 1024
+# The provider a capture folder belongs to, by the first word of the folder's name.
+OWNERS = frozenset({"claude", "chatgpt"})
+ID_KEYS = ("uuid", "conversation_id", "id")
 
 
-def _files(root: Path) -> list[Path]:
+def _files(root: Path) -> tuple[list[Path], int]:
+    """(files in reading order, how many hidden files and links were skipped)."""
     found: list[Path] = []
+    skipped = 0
     if not root.is_dir():
-        return found
+        return found, skipped
     for directory, dirs, names in os.walk(root, followlinks=False):
-        dirs[:] = sorted(name for name in dirs if not name.startswith("."))
+        kept = sorted(name for name in dirs if not name.startswith("."))
+        skipped += len(dirs) - len(kept)
+        dirs[:] = kept
         for name in sorted(names):
             path = Path(directory) / name
-            if not name.startswith(".") and not path.is_symlink():
+            if name.startswith(".") or path.is_symlink():
+                skipped += 1
+            else:
                 found.append(path)
-    return found
+    return found, skipped
 
 
 def _disposition(root: Path, path: Path) -> str:
@@ -59,28 +74,48 @@ def _disposition(root: Path, path: Path) -> str:
 
 
 def detect(root: Path) -> bool:
-    return bool(_files(root))
+    return bool(_files(root)[0])
 
 
 def channels(root: Path) -> dict[str, list[str]]:
+    files, skipped = _files(root)
     counts: dict[str, int] = {"record": 0, "folded": 0, "excluded": 0}
-    for path in _files(root):
+    for path in files:
         counts[_disposition(root, path)] += 1
     return {
         "read": [f"{counts['record']} file(s), one machine record each"],
         "not_read": [
             f"{counts['folded']} conversation payload file(s) — folded into the owning provider",
             f"{counts['excluded']} account file(s) — deliberately excluded",
+            f"{skipped} hidden file(s) or link(s) — not read",
         ],
     }
 
 
-def _conversation_count(path: Path) -> int:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return 0
-    return len(payload) if isinstance(payload, list) else 0
+def _owner(root: Path, path: Path) -> str:
+    """The provider a folded payload belongs to, from its capture folder's name ('' if none)."""
+    word = path.relative_to(root).parts[0].split("-", 1)[0]
+    return word if word in OWNERS else ""
+
+
+def _payload_ids(path: Path) -> set[str]:
+    """The conversation ids a folded payload carries: its list items, or its own file name."""
+    if path.name in FOLDED_FILES:
+        if path.stat().st_size > MAX_PAYLOAD_BYTES:
+            return set()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return set()
+        if not isinstance(payload, list):
+            return set()
+        ids = (
+            next((str(item[key]) for key in ID_KEYS if item.get(key)), "")
+            for item in payload
+            if isinstance(item, dict)
+        )
+        return {item for item in ids if item}
+    return {path.stem}
 
 
 def _record(root: Path, path: Path, tracker: SourceTracker) -> Conversation:
@@ -125,8 +160,35 @@ def _record(root: Path, path: Path, tracker: SourceTracker) -> Conversation:
     )
 
 
-def iter_conversations(root: Path, tracker: SourceTracker) -> Iterator[Conversation]:
-    for path in _files(root):
+def _fold_check(
+    owner_ids: dict[str, set[str]],
+    tracker: SourceTracker,
+    known_uids: Callable[[str], set[str]] | None,
+) -> None:
+    """Hold every folded conversation id to the owning provider's conversations."""
+    for owner, ids in sorted(owner_ids.items()):
+        tracker.note("folded_ids", len(ids))
+        if not owner:
+            tracker.note("folded_ids_unowned", len(ids))
+        elif known_uids is None:
+            tracker.note("folded_ids_unchecked", len(ids))
+        else:
+            known = known_uids(owner)
+            tracker.note(
+                "folded_ids_missing", sum(1 for i in ids if stable_uid(owner, i) not in known)
+            )
+
+
+def iter_conversations(
+    root: Path,
+    tracker: SourceTracker,
+    *,
+    known_uids: Callable[[str], set[str]] | None = None,
+) -> Iterator[Conversation]:
+    files, skipped = _files(root)
+    tracker.note("files_skipped", skipped)
+    owner_ids: dict[str, set[str]] = {}
+    for path in files:
         tracker.note("files_seen")
         disposition = _disposition(root, path)
         if disposition == "excluded":
@@ -134,7 +196,10 @@ def iter_conversations(root: Path, tracker: SourceTracker) -> Iterator[Conversat
         elif disposition == "folded":
             tracker.note("files_folded")
             tracker.provenance(path)
+            ids = _payload_ids(path)
             if path.name == "conversations.json":
-                tracker.note("conversations_folded", _conversation_count(path))
+                tracker.note("conversations_folded", len(ids))
+            owner_ids.setdefault(_owner(root, path), set()).update(ids)
         else:
             yield _record(root, path, tracker)
+    _fold_check(owner_ids, tracker, known_uids)

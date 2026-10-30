@@ -10,7 +10,7 @@ import pytest
 
 from conversation_corpus_engine import archive_read_library as bridge
 from conversation_corpus_engine.archive_author import HUMAN, MACHINE, reconcile
-from conversation_corpus_engine.archive_commands import reconcile_source
+from conversation_corpus_engine.archive_commands import open_context, reconcile_source
 from conversation_corpus_engine.archive_ingest import (
     PROVIDER_SPECS,
     SOURCE_LIBRARY,
@@ -20,6 +20,7 @@ from conversation_corpus_engine.archive_ingest import (
     resolve_sources,
 )
 from conversation_corpus_engine.archive_model import Conversation, Message, SourceTracker
+from conversation_corpus_engine.corpus_store import register_corpus_store
 from conversation_corpus_engine.library_store import Library
 
 GENERATION = "generations/generation-test-aaaa"
@@ -395,3 +396,107 @@ def test_family_reader_follows_the_provider_reader_contract(library_root: Path) 
     (conversation,) = reader.iter_conversations(library_root, tracker)
     assert conversation.provider == "agentmemory" and conversation.kind == "memory"
     assert tracker.counters["bridge_records"] == 1
+
+
+def test_a_library_record_no_family_reads_is_counted_and_fails_verify(
+    archive_env, library_root: Path
+) -> None:
+    database = library_root / GENERATION / "library.sqlite"
+    with Library(database, writable=True) as library:
+        # A document source with a wing of its own and the default kind: no family selects it.
+        library.put(
+            _conversation(
+                "documents",
+                "file-orphan",
+                [_turn("user", "text nobody reads", "project", 1)],
+                kind="document",
+                wing="ai",
+                lane="support",
+            )
+        )
+    assert bridge.unclaimed(library_root) == 1
+    assert any(
+        "belong to no family" in item
+        for item in bridge.describe(library_root, bridge.FAMILY_BY_NAME["codex"])["not_read"]
+    )
+    info = _ingest(archive_env, library_root, ["codex"])["providers"]["codex"]
+    assert info["reader_counters"]["library_unclaimed"] == 1
+    (problem,) = reconcile_source("codex", info)
+    assert problem == "1 library record(s) belong to no family and were not read"
+
+
+def test_a_damaged_library_fails_that_provider_and_not_the_whole_ingest(
+    archive_env, library_root: Path
+) -> None:
+    ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["chatgpt"],
+    )
+    (library_root / GENERATION / "library.sqlite").write_bytes(b"this is not a database" * 100)
+    manifest = _ingest(archive_env, library_root, ["codex", "applenotes"], merge=True)
+    for name in ("codex", "applenotes"):
+        info = manifest["providers"][name]
+        assert info["status"] == "failed" and "DatabaseError" in info["error"]
+        assert info["channels"]["not_read"][0].startswith("source unreadable")
+    # The provider read earlier keeps its entry; the manifest was written.
+    assert manifest["providers"]["chatgpt"]["status"] == "ok"
+    assert load_manifest(archive_env.paths) == manifest
+
+
+def test_chatgpt_pages_are_read_even_when_the_export_has_no_chatgpt_folder(
+    archive_env, library_root: Path, tmp_path: Path
+) -> None:
+    empty_export = tmp_path / "empty-export"
+    empty_export.mkdir()
+    manifest = ingest(
+        export_root=empty_export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["chatgpt"],
+        library_root=library_root,
+    )
+    info = manifest["providers"]["chatgpt"]
+    assert info["status"] == "ok" and info["conversations"] == 1 and info["kinds"] == {"page": 1}
+    assert reconcile_source("chatgpt", info) == []
+
+
+def test_a_library_built_in_the_archives_own_store_is_not_an_ancestor_of_it(
+    tmp_path: Path,
+) -> None:
+    store = tmp_path / "shared-store"
+    database = store / "library-all" / GENERATION / "library.sqlite"
+    database.parent.mkdir(parents=True)
+    with Library.create(database) as library:
+        library.put(_records()[0])
+    (store / "library-all" / "current.json").write_text(
+        json.dumps({"generation": GENERATION}), encoding="utf-8"
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+    register_corpus_store(project, store)
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    # The store holds both the library and the archive: naming the store as the library root
+    # must not make custody see the whole store as a source that contains the destination.
+    context = open_context(
+        project_root=project,
+        corpus_store_root=store,
+        archive_root=None,
+        export_root=exports,
+        library_root=store,
+    )
+    assert context.paths.root == (store / "archive-all").resolve()
+    assert context.library_root == store
+
+
+def test_a_snippet_is_the_first_thing_the_person_wrote_not_a_harness_turn(
+    archive_env, library_root: Path
+) -> None:
+    _ingest(archive_env, library_root, ["codex", "claudecode"])
+    by_uid = {c.uid: c for c in iter_store(archive_env.paths, ["codex", "claudecode"])}
+    assert by_uid["codex-cx-1"].index_row()["snippet"] == "run the tests"
+    assert by_uid["claudecode-root-1"].index_row()["snippet"] == "please refactor the parser"
+    # A subagent session has no human turn at all, so it has no snippet to borrow.
+    assert by_uid["claudecode-sub-1"].index_row()["snippet"] == ""

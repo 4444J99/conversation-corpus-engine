@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .answering import shorten, slugify
-from .archive_author import author_of
+from .archive_author import HUMAN, author_of
 from .archive_naming import (
     PROVIDER_SCOPES,
     InvalidName,
@@ -158,8 +158,10 @@ class Conversation:
         return max(stamps) if stamps else (self.updated or self.created)
 
     def first_user_text(self) -> str:
+        """The first words the person themselves put in: a harness-injected turn or a prompt a
+        parent agent wrote (both user-role, neither human) never becomes a snippet."""
         for message in self.messages:
-            if message.role == "user" and message.text.strip():
+            if message.author == HUMAN and message.text.strip():
                 return message.text
         return ""
 

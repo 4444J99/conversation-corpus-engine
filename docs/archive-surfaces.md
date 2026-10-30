@@ -59,7 +59,10 @@ extension and never opened, so a folder of captures with other documents beside 
 place: `--source copilot=/path/to/copilot-captures`.
 
 `--export-root` expects one folder per provider: `chatgpt/`, `claude/`, `gemini/` (including
-`NotebookLM/`), `grok/`, `perplexity/`, `copilot/`. Override any with `--source provider=PATH`. A
+`NotebookLM/`), `grok/`, `perplexity/`, `copilot/` (the `copilotreports` provider reads the
+`.docx`/`.txt` files of the same folder) and `local-memory/` (the `localmemory` provider). The
+coding-CLI, notes, Drive, document and agent families come from `--library-root`. Override any with
+`--source provider=PATH`. A
 ChatGPT account export is a snapshot; pass the live delta with `--chatgpt-extra delta.json` (it wins
 over the same conversation in the export). Output defaults to `<store>/archive-all/`. Every name
 below is minted by `derive_name` (see *Naming contract*), so `cce archive verify-names` accepts a
@@ -91,6 +94,7 @@ limits, and `cce archive census` checks any tree against them.
 | `--folder-entries` | 1,800 (ceiling 2,000) | a month folder spills into one folder per day, a day into hash buckets |
 | `--shard-bytes` | 48 MiB (data ceiling 64 MiB) | a provider-month shard rolls to `-002`, `-003` |
 | SQLite files | exempt from the size ceiling | they are paged by their engine, never rendered, and sharded by provider and month anyway |
+| one oversize conversation | exempt, by name, from the data ceiling | a conversation is never cut, so a row larger than a shard is its own shard; the manifest marks it `oversize_row` and the census lists it under `violations.exempt` with the reason |
 
 - **Splitting is lossless.** A message that does not fit is cut at line boundaries; a fenced code
   block cut this way is closed at the end of the piece and reopened at the start of the next, so
@@ -104,9 +108,12 @@ limits, and `cce archive census` checks any tree against them.
 - **Folders.** `vault-all/conversations/month-all-202506/conversation-<uid>.md` (and the same under
   `site-all/conversations/`). The plan is a pure function of the conversations and their part
   counts, so a rebuild places every file where it was. Undated conversations go to `undated`.
-- `cce archive verify` fails on any file or folder past its ceiling, on a vault or site whose
-  conversation count differs from the manifest, and on author or shard counts that do not
-  reconcile. A first-generation store (no `layout_version`) is not held to the limits.
+- `cce archive verify` fails on any file or folder past its ceiling (except an oversize-row shard
+  the manifest names), on a vault or site whose conversation count differs from the manifest, on
+  author or shard counts that do not reconcile, and on a family whose counts differ from its
+  source's own (the library's record and message counts; local memory's file accounting and the
+  proof that every folded conversation is already in its owning provider). A first-generation
+  store (no `layout_version`) is not held to the limits.
 
 ### The two containers
 
@@ -354,7 +361,7 @@ it. The conversation name is `conversation-` plus today's `stable_uid`, so exist
 reproduced byte for byte. One disclosed deviation from "`stable_uid` is frozen": a vendor id that
 is valid for `stable_uid` but that the contract cannot express as a name (an edge or doubled
 hyphen, or a name over 80 characters) is replaced by a derived id, with the original kept in
-`extra.vendor_id`, and the manifest counts it in `unnameable_ids`. `NAMING_VERSION` is recorded in every receipt; adding a kind or widening one bumps it (1: the first table; 2: the `manifest` kind accepts an optional subject; 3: the kinds `shard`, `part`, `day`, `bucket` and `container`, and the structural folder word `undated`), and names minted under an earlier version stay valid.
+`extra.vendor_id`, and the manifest counts it in `unnameable_ids`. `NAMING_VERSION` is recorded in every receipt; adding a kind or widening one bumps it (1: the first table; 2: the `manifest` kind accepts an optional subject; 3: the kinds `shard`, `part`, `day`, `bucket` and `container`, and the structural folder word `undated`; 4: the provider words of the families that are not web chat exports: `claudecode`, `codex`, `opencode`, `antigravity`, `geminicli`, `copilotcli`, `applenotes`, `googledrive`, `documents`, `agentmemory`, `agentplans`, `copilotreports`, `localmemory`), and names minted under an earlier version stay valid.
 `cce archive names --json` prints the full table and `cce archive verify-names` checks a tree. Only
 four plain folder words are outside the grammar (`conversations`, `hubs`, `meta`, `undated`); everything
 else a build writes is a minted name, which `verify-names` confirms on a whole archive folder.

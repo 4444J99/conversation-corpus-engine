@@ -23,6 +23,9 @@ from .library_documents import iter_documents
 PROVIDER = "copilotreports"
 READER = "archive_read_captures@1"
 REPORT_SUFFIXES = (".docx", ".txt")
+# Where the file was and when the host last touched it: kept out of the row so the same reports
+# copied to another folder read to the same content (the relative `source_file` stays).
+HOST_KEYS = ("source_path", "source_root", "source_uri", "modified_ns")
 
 
 def _reports(root: Path) -> list[Path]:
@@ -77,5 +80,8 @@ def iter_conversations(root: Path, tracker: SourceTracker) -> Iterator[Conversat
     for conversation in iter_documents([_source(root)], report=counters):
         tracker.note("report_files")
         tracker.provenance(Path(conversation.provenance["source_path"]))
+        for key in HOST_KEYS:
+            conversation.provenance.pop(key, None)
+        conversation.extra.pop("original_refs", None)
         yield _report(conversation)
     tracker.note("report_files_unread", counters.get("counts", {}).get("metadata_only", 0))

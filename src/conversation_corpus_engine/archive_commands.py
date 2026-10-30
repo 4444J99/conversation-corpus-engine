@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from . import archive_layout as layout
-from . import archive_search
+from . import archive_read_library, archive_search
 from .archive_author import AUTHORS, reconcile
 from .archive_corpus import CorpusProjectionError, project_corpus
 from .archive_feed import FeedError, project_feed
@@ -51,6 +51,21 @@ class ArchiveContext:
     library_root: Path | None = None
 
 
+def library_source_folder(library_root: Path) -> Path:
+    """The folder custody must treat as the library source: the narrowest one that holds it.
+
+    A library is often built in the same store the archive is written to (`<store>/library-all`
+    beside `<store>/archive-all`); handing custody the store itself would make the source an
+    ancestor of the destination. So the source is the `library-all` folder (or the generation),
+    not the store that contains it.
+    """
+    try:
+        database, pointer = archive_read_library.locate(library_root)
+    except (OSError, ValueError, KeyError):
+        return library_root
+    return pointer.parent if pointer is not None else database.parent
+
+
 def open_context(
     *,
     project_root: Path,
@@ -61,7 +76,10 @@ def open_context(
     source_overrides: tuple[Path, ...] = (),
 ) -> ArchiveContext:
     store = resolve_configured_corpus_store_root(corpus_store_root)
-    sources = [*([export_root] if export_root else []), *([library_root] if library_root else [])]
+    sources = [
+        *([export_root] if export_root else []),
+        *([library_source_folder(library_root)] if library_root else []),
+    ]
     authorization = authorize_archive(
         project_root=project_root,
         archive_root=archive_root or store / DEFAULT_ARCHIVE_DIRNAME,
@@ -101,6 +119,11 @@ def reconcile_source(name: str, info: dict[str, Any]) -> list[str]:
     """
     counters = info.get("reader_counters", {})
     problems: list[str] = []
+    if counters.get("library_unclaimed"):
+        problems.append(
+            f"{counters['library_unclaimed']} library record(s) belong to no family and were "
+            "not read"
+        )
     if "library_records" in counters:
         for read, listed in (
             ("bridge_records", "library_records"),
@@ -118,6 +141,16 @@ def reconcile_source(name: str, info: dict[str, Any]) -> list[str]:
                     f"{info['conversations']} conversation(s) + {info.get('duplicates_folded', 0)} "
                     f"folded != {counters['library_records']} library record(s)"
                 )
+    if counters.get("folded_ids_missing"):
+        problems.append(
+            f"{counters['folded_ids_missing']} folded conversation id(s) are not conversations "
+            "of the owning provider"
+        )
+    if counters.get("folded_ids_unowned"):
+        problems.append(
+            f"{counters['folded_ids_unowned']} folded conversation id(s) sit in a capture folder "
+            "no provider owns"
+        )
     if "files_seen" in counters:
         accounted = (
             info["conversations"]

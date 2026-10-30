@@ -4,6 +4,8 @@ import hashlib
 import itertools
 import json
 import shutil
+import sqlite3
+import zlib
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -74,22 +76,46 @@ class ProviderSpec:
     module: Any
     open_reader: Callable[[Path, SourceTracker, dict[str, Any]], Iterator[Conversation]]
     source: str = SOURCE_EXPORT
+    # A second source that makes the provider present even when its own folder is not: the
+    # options say whether it has anything (the ChatGPT pages a library holds).
+    supplement: Callable[[dict[str, Any]], bool] | None = None
+
+
+def _library_pages(options: dict[str, Any]) -> bool:
+    """True when `--library-root` names a library that holds ChatGPT pages."""
+    library_root = options.get("library_root")
+    if library_root is None or not archive_read_library.detect(Path(library_root)):
+        return False
+    return bool(
+        archive_read_library.expected(Path(library_root), archive_read_library.CHATGPT_PAGES)[
+            "records"
+        ]
+    )
 
 
 def _chatgpt(root: Path, tracker: SourceTracker, options: dict[str, Any]) -> Iterator[Conversation]:
-    export = archive_read_chatgpt.iter_conversations(
-        root, tracker, extra_files=options.get("chatgpt_extra_files", ())
-    )
-    library_root = options.get("library_root")
-    if library_root is None or not archive_read_library.detect(Path(library_root)):
+    export: Iterator[Conversation] = iter(())
+    if root.exists() and archive_read_chatgpt.detect(root):
+        export = archive_read_chatgpt.iter_conversations(
+            root, tracker, extra_files=options.get("chatgpt_extra_files", ())
+        )
+    if not _library_pages(options):
         return export
     # The library also holds ChatGPT pages the account export lacks; an id the export already has
     # is folded by the ingest (the export's version stays).
     return itertools.chain(
         export,
         archive_read_library.iter_family(
-            Path(library_root), tracker, archive_read_library.CHATGPT_PAGES
+            Path(options["library_root"]), tracker, archive_read_library.CHATGPT_PAGES
         ),
+    )
+
+
+def _localmemory(
+    root: Path, tracker: SourceTracker, options: dict[str, Any]
+) -> Iterator[Conversation]:
+    return archive_read_localmemory.iter_conversations(
+        root, tracker, known_uids=options.get("known_uids")
     )
 
 
@@ -126,7 +152,14 @@ def _library_spec(family: archive_read_library.Family) -> ProviderSpec:
 PROVIDER_SPECS: dict[str, ProviderSpec] = {
     spec.name: spec
     for spec in (
-        ProviderSpec("chatgpt", "ChatGPT", "chatgpt", archive_read_chatgpt, _chatgpt),
+        ProviderSpec(
+            "chatgpt",
+            "ChatGPT",
+            "chatgpt",
+            archive_read_chatgpt,
+            _chatgpt,
+            supplement=_library_pages,
+        ),
         ProviderSpec("claude", "Claude", "claude", archive_read_claude, _claude),
         ProviderSpec(
             "gemini", "Gemini", "gemini", archive_read_gemini, _plain(archive_read_gemini)
@@ -162,7 +195,7 @@ PROVIDER_SPECS: dict[str, ProviderSpec] = {
             "Local memory",
             "local-memory",
             archive_read_localmemory,
-            _plain(archive_read_localmemory),
+            _localmemory,
         ),
     )
 }
@@ -451,10 +484,24 @@ def _publish_shards(paths: ArchivePaths, provider: str, build: Path) -> None:
     build.rmdir()
 
 
+def _safe_channels(spec: ProviderSpec, root: Path) -> dict[str, list[str]]:
+    """The reader's account of its source, or the reason it cannot give one (a damaged library)."""
+    try:
+        return spec.module.channels(root)
+    except (OSError, ValueError, KeyError, sqlite3.Error, zlib.error) as exc:
+        return {"read": [], "not_read": [f"source unreadable: {type(exc).__name__}: {exc}"]}
+
+
+def known_uids(paths: ArchivePaths, provider: str) -> set[str]:
+    """The uids a provider already holds in this store, from its index shards."""
+    return {str(row["uid"]) for path in paths.index_files(provider) for row in iter_jsonl(path)}
+
+
 def _ingest_provider(
     spec: ProviderSpec, root: Path, paths: ArchivePaths, options: dict[str, Any]
 ) -> dict[str, Any]:
-    if not root.exists() or not spec.module.detect(root):
+    own = root.exists() and spec.module.detect(root)
+    if not own and not (spec.supplement is not None and spec.supplement(options)):
         return {
             "status": "absent",
             "source_root": str(root),
@@ -517,7 +564,16 @@ def _ingest_provider(
             if conversation.last_activity:
                 activity.append(conversation.last_activity)
         shards = writer.close()
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        IndexError,
+        sqlite3.Error,
+        zlib.error,
+    ) as exc:
         error = f"{type(exc).__name__}: {exc}"
     if error:
         writer.close()
@@ -526,7 +582,7 @@ def _ingest_provider(
             "status": "failed",
             "error": error,
             "source_root": str(root),
-            "channels": spec.module.channels(root),
+            "channels": _safe_channels(spec, root),
         }
     _publish_shards(paths, spec.name, build)
     for shard in shards:
@@ -581,6 +637,7 @@ def ingest(
     """
     require_inside(authorization, paths.root)
     options = dict(options or {})
+    options.setdefault("known_uids", lambda provider: known_uids(paths, provider))
     if library_root is not None:
         options["library_root"] = library_root.resolve()
     sources = resolve_sources(export_root, providers, overrides, library_root)
