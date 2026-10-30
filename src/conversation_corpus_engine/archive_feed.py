@@ -37,6 +37,7 @@ from . import archive_layout as layout
 from .archive_ingest import (
     ArchivePaths,
     LegacyArchiveStore,
+    iter_store,
     latest_activity_day,
     load_manifest,
     require_current_store,
@@ -44,7 +45,6 @@ from .archive_ingest import (
 from .archive_model import (
     Conversation,
     Message,
-    iter_conversations,
     message_reference,
     write_json_atomic,
 )
@@ -169,7 +169,7 @@ def _stage_provider(
 
     try:
         with temp.open("wb") as handle:
-            for conversation in iter_conversations(paths.conversations(provider)):
+            for conversation in iter_store(paths, [provider]):
                 conversations += 1
                 kinds[conversation.kind] += 1
                 main_messages += len(conversation.messages)
@@ -286,7 +286,7 @@ def project_feed(
     ready = [
         name
         for name, info in manifest["providers"].items()
-        if info.get("status") == "ok" and paths.conversations(name).is_file()
+        if info.get("status") == "ok" and paths.provider_present(name)
     ]
     chosen = providers or ready
     unready = [name for name in chosen if name not in ready]

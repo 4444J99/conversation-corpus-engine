@@ -34,6 +34,7 @@ SPEC_KINDS = [
     *("archive", "conversation", "message", "thread", "family", "pair", "action", "question"),
     *("feed", "receipt", "corpus", "index", "pattern", "manifest", "report", "vault", "site"),
     *("graph", "database", "check", "fixture", "provider", "month", "topic", "collection"),
+    *("shard", "part", "day", "bucket", "container"),
     *("home", "coverage", "guide"),
 ]
 
@@ -41,6 +42,7 @@ MESSAGE_HASH = "737b1cd5b47a52da"  # sha256 of "chatgpt-abc-123\x00node-1", firs
 RECEIPT_HASH = "81a7594f4ff50691"  # sha256 of "fingerprint-one", first 16 hex
 PATTERN_HASH = "28150a37a11e3d43"  # sha256 of "lineage-one", first 16 hex
 ALIVE_HASH = "6574840ed2698ddf"  # sha256 of "knowledge-alive-fingerprint", first 16 hex
+PART_HASH = "8cd98ff390001b88"  # sha256 of "conversation-chatgpt-abc-123", first 16 hex
 
 # (expected name, derive_name arguments). Every vector in the build spec is here.
 GOLDEN: list[tuple[str, dict]] = [
@@ -111,6 +113,22 @@ GOLDEN: list[tuple[str, dict]] = [
         },
     ),
     ("fixture-chatgpt-exports", {"kind": "fixture", "scope": "chatgpt", "subject": "exports"}),
+    # The bounded layout (naming version 3): shards, split parts, spill folders, containers.
+    ("shard-chatgpt-202506", {"kind": "shard", "scope": "chatgpt", "subject": "202506"}),
+    ("shard-claude-202506-002", {"kind": "shard", "scope": "claude", "subject": "202506-002"}),
+    ("shard-grok-undated", {"kind": "shard", "scope": "grok", "subject": "undated"}),
+    (
+        f"part-chatgpt-p002-{PART_HASH}",
+        {
+            "kind": "part",
+            "scope": "chatgpt",
+            "subject": "p002",
+            "identity": "conversation-chatgpt-abc-123",
+        },
+    ),
+    ("day-all-20250614", {"kind": "day", "scope": "all", "date": "20250614"}),
+    ("bucket-all-b007", {"kind": "bucket", "scope": "all", "subject": "b007"}),
+    ("container-all-authored", {"kind": "container", "scope": "all", "subject": "authored"}),
     # The two names Limen mints, which it checks by shape; they are valid under the grammar too.
     ("check-knowledge-alive", {"kind": "check", "subject": "knowledge-alive"}),
     (
@@ -156,6 +174,7 @@ def test_golden_hash_literals_match_their_inputs() -> None:
     assert hash_identity("fingerprint-one") == RECEIPT_HASH
     assert hash_identity("lineage-one") == PATTERN_HASH
     assert hash_identity("knowledge-alive-fingerprint") == ALIVE_HASH
+    assert hash_identity("conversation-chatgpt-abc-123") == PART_HASH
     expected = hashlib.sha256(b"fingerprint-one").hexdigest()[:16]
     assert hash_identity("fingerprint-one") == expected
 
@@ -174,7 +193,7 @@ def test_derive_is_pure_and_repeatable() -> None:
 
 def test_kind_table_is_the_closed_spec_list_in_order() -> None:
     assert list(KINDS) == SPEC_KINDS
-    assert NAMING_VERSION == 2
+    assert NAMING_VERSION == 3
 
 
 def test_every_kind_is_one_lowercase_word_and_not_a_scope() -> None:

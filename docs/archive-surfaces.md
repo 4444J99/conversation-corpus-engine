@@ -43,6 +43,9 @@ cce corpus-store register --root /path/to/cce-corpus-store --project-root /path/
 cce archive build --export-root /path/to/ai-exports \
   --project-root /path/to/cce-site --corpus-store-root /path/to/cce-corpus-store
 
+# the same, with the limits spelled out (these are the defaults)
+cce archive build ... --note-bytes 102400 --folder-entries 1800 --shard-bytes 50331648
+
 cce archive search "kubernetes ingress" --provider claude --project-root … --corpus-store-root …
 cce archive serve --project-root … --corpus-store-root …      # http://127.0.0.1:8765/
 ```
@@ -64,15 +67,86 @@ whole build:
 
 | Path | What |
 |---|---|
-| `manifest-all.json` | per-provider counts, denominators (`derived_ids`, `unnameable_ids`, `duplicates_folded`, `duplicates_folded_identical`, `duplicates_folded_differing`), channels read / not read, source sha256, naming / schema / reader versions, source fingerprint |
-| `provider-<p>/collection-<p>-conversations.jsonl`, `provider-<p>/index-<p>-conversations.jsonl` | the provider-neutral store: full conversations, and one light summary row each |
+| `manifest-all.json` | per-provider counts, denominators (`derived_ids`, `unnameable_ids`, `duplicates_folded`, `duplicates_folded_identical`, `duplicates_folded_differing`), turns by author (`authors`), the shard list with sizes and sha256 (`layout`), channels read / not read, source sha256, naming / schema / reader versions, source fingerprint |
+| `provider-<p>/shard-<p>-<yyyymm>.jsonl`, `provider-<p>/index-<p>-<yyyymm>.jsonl` | the provider-neutral store, sliced by provider and month: full conversations, and one light summary row each. A month that outgrows `--shard-bytes` rolls to `-002`, `-003`; a conversation with no real month goes to `undated` |
 | `index-all-enrichment.jsonl`, `report-all-topics.json` | topics and nearest neighbours per conversation; the topic hub table |
-| `vault-all/` | open this folder in Obsidian |
+| `vault-all/` | open this folder in Obsidian; conversations sit in a folder per month (see *The bounded layout*) |
 | `manifest-all-vault.json` | the files the vault build generated, kept beside the manifest so the vault holds only notes and Obsidian's own settings; a rebuild prunes what it no longer writes, and removes the `.cce-vault-manifest.json` an earlier build left inside the vault |
-| `database-all-search.sqlite` | FTS5 search database |
+| `database-all-turns/` | the turn store: SQLite shards by author (`container-all-authored`, `container-all-machine`), provider and month, each with two FTS5 indexes (see *The two containers*) |
 | `graph-all/` | `index-all-nodes.jsonl`, `index-all-edges.jsonl`, `graph-all.graphml`, `report-all-graph.json` |
-| `site-all/` | open `home-all.html` directly, or use `cce archive serve` |
+| `site-all/` | open `home-all.html` directly, or use `cce archive serve`; pages sit in the same month folders as the vault |
 | `feed-<p>-prompts.jsonl`, `receipt-<p>-prompts-<16hex>-<yyyymmdd>.json` | the prompt feed and its receipt, written by `cce archive project feed` (see *The prompt feed*) |
+
+### The bounded layout (layout version 3)
+
+An archive that cannot be opened is as lost as one that cannot be read. Two failures ruled it out:
+a handful of files so large that no editor, browser or indexer survives them (a 42 MB page for
+one thread, a 334 MB search database, 164 MB of ChatGPT in one file), and folders with thousands of
+entries (a custody walk over a million files before a server may start). Every surface now keeps to
+limits, and `cce archive census` checks any tree against them.
+
+| Limit | Default | What happens past it |
+|---|---|---|
+| `--note-bytes` | 102,400 (ceiling 131,072) | a note, page or hub page is **split into numbered parts**; nothing is truncated |
+| `--folder-entries` | 1,800 (ceiling 2,000) | a month folder spills into one folder per day, a day into hash buckets |
+| `--shard-bytes` | 48 MiB (data ceiling 64 MiB) | a provider-month shard rolls to `-002`, `-003` |
+| SQLite files | exempt from the size ceiling | they are paged by their engine, never rendered, and sharded by provider and month anyway |
+
+- **Splitting is lossless.** A message that does not fit is cut at line boundaries; a fenced code
+  block cut this way is closed at the end of the piece and reopened at the start of the next, so
+  each piece renders alone; one line longer than the cap is cut on a character boundary. Parts are
+  `part-<provider>-p002-<hex>` (the hex hashes the name of the note they continue) in a folder named
+  like the conversation note, each linking to the previous part, the start and the next. The
+  conversation note stays the first part, so every existing `[[wikilink]]` still resolves.
+  `archive_split.rejoin` returns the original text byte for byte, which the tests assert.
+- **Hubs paginate too.** A provider, month, topic or collection hub that outgrows a note continues
+  on `part-all-p002-<hex>` pages; the hub keeps its own name for page one.
+- **Folders.** `vault-all/conversations/month-all-202506/conversation-<uid>.md` (and the same under
+  `site-all/conversations/`). The plan is a pure function of the conversations and their part
+  counts, so a rebuild places every file where it was. Undated conversations go to `undated`.
+- `cce archive verify` fails on any file or folder past its ceiling, on a vault or site whose
+  conversation count differs from the manifest, and on author or shard counts that do not
+  reconcile. A first-generation store (no `layout_version`) is not held to the limits.
+
+### The two containers
+
+The atom is the **turn**: one message. Every turn has exactly one author:
+
+- `human` — the person typed it: role `user`, channel `typed` (the prompt feed's own rule, so the
+  human count of a provider equals its feed rows, less abandoned-branch asks, plus the typed turns
+  the feed skipped for holding no text);
+- `machine` — everything else: replies, reasoning, tool output, system text, project documents
+  and memories. An export cannot prove the person wrote a project document or a memory, so the
+  author is not claimed for them.
+
+`author` is derived from the stored `role` and `channel`, so no conversation row changes. The turn
+store holds each turn once, in the container of its author:
+
+```
+database-all-turns/
+  manifest-all-turns.json
+  container-all-authored/provider-chatgpt/shard-chatgpt-202506.sqlite
+  container-all-machine/provider-chatgpt/shard-chatgpt-202506.sqlite
+```
+
+A shard holds its author's turns, their conversation rows, and FTS5 indexes over text and titles.
+`human + machine == messages` per provider and in total (checked by `verify`). Each turn carries
+the position of its conversation in the normalized shard (`cseq`), so `archive turns` without an
+author merges the two authors of a provider-month back into reading order: shard, conversation,
+turn. A conversation with no messages has no turn to hold, so its row goes to the machine
+container and it stays findable by title.
+
+```bash
+cce archive search "lantern wick" --author human          # what I typed
+cce archive search "lantern wick" --author machine --month 202506 --provider chatgpt
+cce archive turns --author human --provider chatgpt --month 202506 --limit 20
+cce archive census --root "$STORE/archive-all"              # sizes and fan-out, exit 1 on a violation
+cce archive fixture --out /tmp/fx --stress 120               # a 380 KB reply and 120 short conversations in one month
+```
+
+`/api/search` takes `author` and `month` as well as `provider` and `kind`; the MCP tool
+`cce_archive_search` takes `author` and `month`. A store built before the turn store answers from
+its single database and reports that it cannot filter by author or month.
 
 ### The normalized layer (version 2)
 
@@ -107,16 +181,18 @@ those two commands exit non-zero and ask for `cce archive build`.
 |---|---|
 | `cce archive ingest` | read raw exports into the normalized store and write the manifest |
 | `cce archive analyze` | topic hubs and similarity |
-| `cce archive vault / database / graph / site` | one emitter each |
+| `cce archive vault / database / graph / site` | one emitter each (`database` builds the turn store) |
 | `cce archive build` | every stage, then `verify` |
 | `cce archive verify` | cross-check every surface against the manifest denominators |
-| `cce archive search QUERY` | FTS5 search (`--provider`, `--kind`, `--limit`, `--titles`, `--json`) |
+| `cce archive search QUERY` | FTS5 search (`--provider`, `--kind`, `--author`, `--month`, `--limit`, `--titles`, `--json`) |
+| `cce archive turns` | list the turns of a slice in reading order (`--author`, `--provider`, `--month`, `--uid`, `--limit`, `--offset`) |
+| `cce archive census --root DIR` | check a tree against the size and folder limits; exit 1 on a violation |
 | `cce archive serve` | site + `/api/search` on `127.0.0.1` (read-only) |
 | `cce archive names` | print the naming contract: kinds, scopes, version (`--json`) |
 | `cce archive verify-names --root DIR` | check every file and directory under `DIR` against the naming contract |
 | `cce archive project feed --root ARCHIVE --out DIR` | write each provider's prompt feed and receipt (`--provider` to pick) |
 | `cce archive project corpus --root ARCHIVE --out DIR` | write each provider's engine corpus folder for the federation (`--provider` to pick) |
-| `cce archive fixture --out DIR` | write deterministic synthetic ChatGPT and Claude exports that share one ask |
+| `cce archive fixture --out DIR [--stress N]` | write deterministic synthetic ChatGPT and Claude exports that share one ask; `--stress` adds one very long thread and N short conversations in one month |
 
 ## The prompt feed
 
@@ -137,9 +213,15 @@ text, so `--out` must be outside any Git work tree or ignored by it; otherwise t
   ordinal in the feed, `text_index` = 0, `text`, `timestamp`, `source_locator` =
   `<uid>#<event_ref>`, `body_kind` = `direct`, `provenance` = `unknown_user_input`. The writer has
   no provenance parameter: a vendor export can never claim to be operator-typed input.
-- **Determinism.** Rows are written in conversation order, then message order, with sorted keys,
-  so two runs give identical bytes. A repeated `event_ref` aborts the whole write and leaves no
-  file behind. A store that disagrees with its manifest is refused.
+- **Determinism.** Rows are written in the store's reading order (conversation shards oldest
+  month first, `undated` last, the reader's order inside a shard), then message order, with sorted
+  keys, so two runs over one store give identical bytes. A repeated `event_ref` aborts the whole
+  write and leaves no file behind. A store that disagrees with its manifest is refused.
+- **Order is not identity.** A first-generation store kept conversations in the reader's emission
+  order, so the feed of a rebuilt (sharded) store holds the same rows (same `session_ref`,
+  `event_ref`, `text`, `timestamp`, `source_locator`) at other positions: `event_index` and the
+  feed's sha256 change, nothing else does. A consumer keys a row on `(session_ref, event_ref)`
+  and treats `event_index` as the row's place in this one file.
 - **The receipt** holds counts and digests, never text: the feed's sha256, the row count, the
   alternate-branch count, the number of asks trimmed of attachment text, the excluded messages
   counted by reason (`kind-notebook`, `kind-memory`, `role-assistant`, `role-tool`, `empty-text`,
@@ -214,19 +296,22 @@ it. The conversation name is `conversation-` plus today's `stable_uid`, so exist
 reproduced byte for byte. One disclosed deviation from "`stable_uid` is frozen": a vendor id that
 is valid for `stable_uid` but that the contract cannot express as a name (an edge or doubled
 hyphen, or a name over 80 characters) is replaced by a derived id, with the original kept in
-`extra.vendor_id`, and the manifest counts it in `unnameable_ids`. `NAMING_VERSION` is recorded in every receipt; adding a kind or widening one bumps it (1: the first table; 2: the `manifest` kind accepts an optional subject), and names minted under an earlier version stay valid.
+`extra.vendor_id`, and the manifest counts it in `unnameable_ids`. `NAMING_VERSION` is recorded in every receipt; adding a kind or widening one bumps it (1: the first table; 2: the `manifest` kind accepts an optional subject; 3: the kinds `shard`, `part`, `day`, `bucket` and `container`, and the structural folder word `undated`), and names minted under an earlier version stay valid.
 `cce archive names --json` prints the full table and `cce archive verify-names` checks a tree. Only
-three plain folder words are outside the grammar (`conversations`, `hubs`, `meta`); everything
+four plain folder words are outside the grammar (`conversations`, `hubs`, `meta`, `undated`); everything
 else a build writes is a minted name, which `verify-names` confirms on a whole archive folder.
 
 `build` and `verify` exit non-zero if a provider failed to read, a vault wikilink dangles, the
-search database disagrees with the manifest, or the site has a different number of conversation
-pages than the manifest has conversations. A failing provider never stops the others.
+turn store disagrees with the manifest, the vault or the site has a different number of
+conversation notes or pages than the manifest has conversations, the author or shard counts do not
+reconcile, or a file or folder is past its ceiling. A failing provider never stops the others.
 
 ## The vault is the wiki
 
 The vault layout is lowercase throughout: `conversations/` (one `conversation-<uid>.md` per
-conversation), `hubs/`, `meta/`, and `home-all.md` at the top. `home-all.md` states the
+conversation, in a folder per month such as `month-all-202506/`, or in `undated/`; a thread too
+long for one note continues in `part-...` notes in a folder named like the note), `hubs/`, `meta/`,
+and `home-all.md` at the top. `home-all.md` states the
 denominators. `hubs/` holds one note per provider (`provider-chatgpt`), month
 (`month-all-202506`), topic (`topic-all-<term>`) and collection (`collection-<provider>-<subject>`;
 a project, notebook or GPT whose identifier is not a valid subject word is named by its 16 hex

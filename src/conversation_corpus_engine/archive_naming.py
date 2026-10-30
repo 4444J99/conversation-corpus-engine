@@ -8,7 +8,9 @@ A name is a kind word followed by up to four more segments, joined by single hyp
   segments are required, optional or forbidden. Adding a kind, or widening what a kind
   accepts, bumps NAMING_VERSION; removing or renaming one is forbidden. Names minted under an
   earlier version stay valid under a later one.
-  Version notes: 1 the first table; 2 the `manifest` kind accepts an optional subject.
+  Version notes: 1 the first table; 2 the `manifest` kind accepts an optional subject; 3 the
+  bounded layout adds the kinds `shard`, `part`, `day`, `bucket` and `container`, and the
+  structural folder word `undated`.
 * scope: a provider word (see PROVIDER_SCOPES) or the word `all`.
 * subject: lowercase words `[a-z0-9]+` joined by hyphens, at most 32 characters. A subject is
   validated, never transformed: a title, prompt text or free text is not a subject.
@@ -43,7 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-NAMING_VERSION = 2
+NAMING_VERSION = 3
 
 MAX_NAME_LENGTH = 80
 MAX_SUBJECT_LENGTH = 32
@@ -70,8 +72,9 @@ PROVIDER_SCOPES: tuple[str, ...] = (
 )
 SCOPES: tuple[str, ...] = (*PROVIDER_SCOPES, SCOPE_ALL)
 
-# Directory names that organize a layout without being minted names (vault folders).
-STRUCTURAL_NAMES: frozenset[str] = frozenset({"conversations", "hubs", "meta"})
+# Directory names that organize a layout without being minted names (vault folders). `undated`
+# holds the conversations whose export gave no real month; inventing one would be a fake month.
+STRUCTURAL_NAMES: frozenset[str] = frozenset({"conversations", "hubs", "meta", "undated"})
 
 _NAME_RE = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
 _SUBJECT_RE = re.compile(r"[a-z0-9]+(-[a-z0-9]+)*")
@@ -208,6 +211,34 @@ KIND_TABLE: dict[str, KindRule] = {
         note="vault hub note; subject is one validated word",
     ),
     "collection": KindRule(scope_values=SCOPE_PROVIDER, subject=REQUIRED),
+    "shard": KindRule(
+        scope_values=SCOPE_PROVIDER,
+        subject=REQUIRED,
+        note="one provider-month slice of a store; the subject is yyyymm or undated, then an "
+        "optional -NNN when a month outgrows the data-file ceiling",
+    ),
+    "part": KindRule(
+        subject=REQUIRED,
+        identity=REQUIRED,
+        identity_form=IDENTITY_HASH,
+        note="part N of a split note or page; the subject is pNNN, the identity hashes the "
+        "name of the note it continues",
+    ),
+    "day": KindRule(
+        scope_values=SCOPE_ONLY_ALL,
+        date=REQUIRED,
+        note="folder: one calendar day inside a month that outgrew the folder limit",
+    ),
+    "bucket": KindRule(
+        scope_values=SCOPE_ONLY_ALL,
+        subject=REQUIRED,
+        note="folder: a deterministic hash bucket inside a folder that outgrew the folder limit",
+    ),
+    "container": KindRule(
+        scope_values=SCOPE_ONLY_ALL,
+        subject=REQUIRED,
+        note="top-level partition of the turn store by author (authored or machine)",
+    ),
     "home": KindRule(scope_values=SCOPE_ONLY_ALL),
     "coverage": KindRule(scope_values=SCOPE_ONLY_ALL),
     "guide": KindRule(scope_values=SCOPE_ONLY_ALL),
