@@ -81,7 +81,7 @@ def _chatgpt(root: Path, tracker: SourceTracker, options: dict[str, Any]) -> Ite
         root, tracker, extra_files=options.get("chatgpt_extra_files", ())
     )
     library_root = options.get("library_root")
-    if library_root is None:
+    if library_root is None or not archive_read_library.detect(Path(library_root)):
         return export
     # The library also holds ChatGPT pages the account export lacks; an id the export already has
     # is folded by the ingest (the export's version stays).
@@ -590,7 +590,11 @@ def ingest(
     for name, root in sources.items():
         report[name] = _ingest_provider(PROVIDER_SPECS[name], root, paths, options)
     report = {name: report[name] for name in PROVIDER_SPECS if name in report}
-    reader_versions = {name: PROVIDER_SPECS[name].module.READER for name in report}
+    # A provider carried over by `merge` keeps the reader version it was read with.
+    reader_versions = {
+        name: info.get("reader") or PROVIDER_SPECS[name].module.READER
+        for name, info in report.items()
+    }
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "conversation_schema": SCHEMA,

@@ -354,6 +354,31 @@ def test_merge_keeps_the_providers_a_call_does_not_read(archive_env, library_roo
     assert set(replaced["providers"]) == {"applenotes"}
 
 
+def test_merge_keeps_the_reader_version_a_provider_was_read_with(
+    archive_env, library_root: Path
+) -> None:
+    _ingest(archive_env, library_root, ["codex"])
+    stored = json.loads(archive_env.paths.manifest.read_text(encoding="utf-8"))
+    stored["providers"]["codex"]["reader"] = "archive_read_library@0"
+    archive_env.paths.manifest.write_text(json.dumps(stored), encoding="utf-8")
+    merged = _ingest(archive_env, library_root, ["applenotes"], merge=True)
+    assert merged["reader_versions"]["codex"] == "archive_read_library@0"
+    assert merged["reader_versions"]["applenotes"] == bridge.READER
+
+
+def test_chatgpt_reads_its_export_alone_when_the_library_root_is_not_a_library(
+    archive_env, tmp_path: Path
+) -> None:
+    info = ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["chatgpt"],
+        library_root=tmp_path / "nowhere",
+    )["providers"]["chatgpt"]
+    assert info["status"] == "ok" and "page" not in info["kinds"]
+
+
 def test_the_reader_counters_group_the_basis_by_author() -> None:
     grouped = bridge.counter_report(
         {"basis:human:typed": 3, "basis:machine:subagent-prompt": 2, "bridge_records": 9}
