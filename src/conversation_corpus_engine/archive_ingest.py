@@ -261,7 +261,13 @@ class ArchivePaths:
             return []
         stem = f"{prefix}-{provider}-"
         found: list[tuple[tuple[int, str, int], Path]] = []
-        for path in directory.glob(f"{stem}*.jsonl"):
+        # Flat (legacy) layout, plus one level of grouping (e.g. by year) so a
+        # provider with enough shards to exceed the folder limit stays readable.
+        candidates = list(directory.glob(f"{stem}*.jsonl"))
+        for child in directory.iterdir():
+            if child.is_dir():
+                candidates.extend(child.glob(f"{stem}*.jsonl"))
+        for path in candidates:
             try:
                 found.append((shard_sort_key(path.name[len(stem) : -len(".jsonl")]), path))
             except ValueError:
@@ -292,6 +298,17 @@ class ArchivePaths:
         return [legacy] if legacy.is_file() else []
 
     def provider_present(self, provider: str) -> bool:
+        # A provider re-ingested with zero conversations still counts as present
+        # when the manifest records it as ingested successfully, so its (empty)
+        # feed and receipt are written instead of silently reusing the old ones.
+        try:
+            manifest = load_manifest(self)
+        except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError):
+            manifest = None
+        if isinstance(manifest, dict):
+            info = manifest.get("providers", {}).get(provider)
+            if isinstance(info, dict) and "status" in info:
+                return info.get("status") == "ok"
         return bool(self.conversation_files(provider))
 
     def feed(self, provider: str) -> Path:

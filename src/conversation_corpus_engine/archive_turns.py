@@ -146,7 +146,13 @@ class _ShardBuild:
     def finish(self) -> None:
         self.flush()
         c = self.connection
-        c.execute("INSERT INTO turn_fts(rowid, text) SELECT id, text FROM turns")
+        author = self.meta.get("author")
+        if author == "human":
+            c.execute(
+                "INSERT INTO turn_fts(rowid, text) SELECT id, substr(text, 1, typed_chars) FROM turns"
+            )
+        else:
+            c.execute("INSERT INTO turn_fts(rowid, text) SELECT id, text FROM turns")
         c.execute(
             "INSERT INTO title_fts(rowid, title, snippet) "
             "SELECT rowid, title, snippet FROM conversations"
