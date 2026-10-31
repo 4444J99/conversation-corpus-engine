@@ -23,6 +23,11 @@ archive_layout.py mints every file, folder and note name (and every wikilink) wi
 - Raw exports are read, never written, moved or deduplicated. Output may not overlap a source root.
 - Every write goes through `authorize_corpus_write`: the destination must be a strict descendant of
   a registered, non-symlinked, non-Git corpus store (see `cce corpus-store register`).
+- Commands that only read an archive (`search`, `turns`, `serve`) attach through
+  `authorize_corpus_read`: the same registration, path, symlink-on-the-way and Git-privacy checks,
+  without the two whole-store walks (nested Git metadata, symlinks) that write custody adds and
+  that cost tens of seconds on a large store. It returns a `CorpusReadAuthorization`, which no write
+  path accepts. `verify` and every command that writes keep the full write custody.
 - **Attachment bytes are never ingested.** Attachments appear as file names (and sizes) only.
   Claude's `extracted_content` is dropped unless `--include-attachment-text` is passed.
 - Account identity, billing, login history and settings files are listed as *not read*, on purpose.

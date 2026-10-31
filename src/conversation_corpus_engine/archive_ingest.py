@@ -39,7 +39,12 @@ from .archive_model import (
 )
 from .archive_naming import NAMING_VERSION, day_of
 from .archive_shard import ShardWriter, month_key, shard_sort_key
-from .corpus_store import CorpusStoreError, CorpusWriteAuthorization, authorize_corpus_write
+from .corpus_store import (
+    CorpusStoreError,
+    CorpusWriteAuthorization,
+    authorize_corpus_write,
+    require_write_authorization,
+)
 
 MANIFEST_SCHEMA = "archive-manifest.v2"
 LEGACY_MANIFEST_SCHEMA = "cce.archive.manifest.v1"
@@ -443,6 +448,7 @@ def authorize_archive(
 
 
 def require_inside(authorization: CorpusWriteAuthorization, path: Path) -> Path:
+    require_write_authorization(authorization)  # a read-only attachment never reaches a write
     resolved = path.resolve(strict=False)
     try:
         resolved.relative_to(authorization.destination)
