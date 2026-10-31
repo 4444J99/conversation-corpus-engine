@@ -78,6 +78,27 @@ def test_export_resume_preserves_seed_without_ingestion_or_reindex(tmp_path, mon
     )
 
 
+def test_export_resume_progress_skips_indexing_and_verification_phases(tmp_path, monkeypatch):
+    project, store, _, seed = failed_export(tmp_path, monkeypatch)
+    events = []
+    library_build.build_library(
+        export_manifest(seed), project_root=project, store_root=store, progress=events.append
+    )
+    assert [event["stage"] for event in events] == [
+        "qualify_resume",
+        "copy_resume",
+        "fingerprint",
+        "export",
+        "verify_export",
+        "artifacts",
+    ]
+    assert all(isinstance(event["elapsed_seconds"], float) for event in events)
+    assert events[0]["generation"] == str(seed) == events[1]["generation"]
+    assert [event["elapsed_seconds"] for event in events] == sorted(
+        event["elapsed_seconds"] for event in events
+    )
+
+
 @pytest.mark.parametrize(
     "field", ["archives", "snapshot_archives", "estate_databases", "documents"]
 )
