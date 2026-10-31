@@ -265,7 +265,7 @@ class ArchivePaths:
         # provider with enough shards to exceed the folder limit stays readable.
         candidates = list(directory.glob(f"{stem}*.jsonl"))
         for child in directory.iterdir():
-            if child.is_dir():
+            if child.is_dir() and child.name != BUILD_DIRNAME:
                 candidates.extend(child.glob(f"{stem}*.jsonl"))
         for path in candidates:
             try:
@@ -777,3 +777,4 @@ def require_current_store(manifest: dict[str, Any]) -> None:
 
 def failed_providers(manifest: dict[str, Any]) -> list[str]:
     return [name for name, info in manifest["providers"].items() if info.get("status") == "failed"]
+
