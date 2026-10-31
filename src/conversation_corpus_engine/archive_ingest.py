@@ -264,24 +264,22 @@ class ArchivePaths:
         # Flat (legacy) layout, plus one level of grouping (e.g. by year) so a
         # provider with enough shards to exceed the folder limit stays readable.
         candidates = list(directory.glob(f"{stem}*.jsonl"))
+        # Descend into non-hidden sub-directories (grouped/bucketed layouts).
         for child in directory.iterdir():
-            # Never descend into build/hidden directories; those hold in-flight or
-            # private artifacts, not published shards.
             if child.is_dir() and not child.name.startswith("."):
-                candidates.extend(child.glob(f"{stem}*.jsonl"))
+                for p in child.rglob(f"{stem}*.jsonl"):
+                    if not any(part.startswith(".") for part in p.relative_to(directory).parts):
+                        candidates.append(p)
         for path in candidates:
             subject = path.name[len(stem) : -len(".jsonl")]
             try:
                 found.append((shard_sort_key(subject), path))
-            except ValueError:
-                # A file whose name starts like a shard but whose subject does not
-                # parse is almost certainly foreign; warn loudly instead of skipping.
-                import sys as _sys
-
-                print(
-                    f"archive: skipping shard-like file with unparseable subject: {path}",
-                    file=_sys.stderr,
-                )
+            except ValueError as exc:
+                # Only fail loudly for names that look like real shard subjects
+                # (they start with a digit, e.g. 202506). Legacy monoliths such as
+                # `conversations` and arbitrary foreign files are skipped quietly.
+                if subject and subject[0].isdigit():
+                    raise ValueError(f"unparseable shard-like file {path}: {exc}") from exc
                 continue
         return [path for _, path in sorted(found)]
 
@@ -493,7 +491,9 @@ def conversation_stamp(conversation: Conversation) -> str:
     return conversation.created or conversation.last_activity
 
 
-def _publish_shards(paths: ArchivePaths, provider: str, build: Path) -> None:
+def _publish_shards(
+    paths: ArchivePaths, provider: str, build: Path, folder_entries: int | None = None
+) -> None:
     """Replace a provider's previous conversation files with the freshly built shards.
 
     Everything the previous build (or the first-generation layout) left is removed only after
@@ -507,8 +507,54 @@ def _publish_shards(paths: ArchivePaths, provider: str, build: Path) -> None:
         paths.index(provider),
     ]:
         stale.unlink(missing_ok=True)
-    for built in sorted(build.iterdir()):
-        built.replace(directory / built.name)
+    built_files = sorted(build.iterdir())
+    limit = folder_entries if folder_entries is not None else None
+    # Number of shard subjects (each contributes two files).
+    subjects = []
+    for built in built_files:
+        name = built.name
+        for prefix in (f"shard-{provider}-", f"index-{provider}-"):
+            if name.startswith(prefix):
+                name = name[len(prefix):].replace(".jsonl", "")
+                break
+        if name not in subjects and not name.startswith("index-"):
+            subjects.append(name)
+    # Actually collect unique subjects from shard files only.
+    subjects = []
+    for built in built_files:
+        name = built.name
+        if not name.startswith(f"shard-{provider}-"):
+            continue
+        subj = name[len(f"shard-{provider}-"):].replace(".jsonl", "")
+        if subj not in subjects:
+            subjects.append(subj)
+    nshards = len(subjects)
+    # Flat while it fits; otherwise spill subjects into (possibly nested) buckets.
+    if limit is None or (nshards * 2) <= limit:
+        targets = [(built, directory / built.name) for built in built_files]
+    else:
+        from .archive_shard import plan_flat_folders
+
+        folder_plan = plan_flat_folders(subjects, limit // 2 if limit // 2 > 0 else 1)
+        # plan_flat_folders returns subject -> relative folder (may be nested).
+        targets = []
+        for built in built_files:
+            name = built.name
+            is_index = name.startswith(f"index-{provider}-")
+            subj = name
+            for prefix in (f"shard-{provider}-", f"index-{provider}-"):
+                if subj.startswith(prefix):
+                    subj = subj[len(prefix):].replace(".jsonl", "")
+                    break
+            rel = folder_plan.get(subj, "")
+            dest_dir = directory
+            if rel:
+                dest_dir = directory.joinpath(*rel.split("/"))
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            targets.append((built, dest_dir / built.name))
+    for built, target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        built.replace(target)
     build.rmdir()
 
 
@@ -612,11 +658,15 @@ def _ingest_provider(
             "source_root": str(root),
             "channels": _safe_channels(spec, root),
         }
-    _publish_shards(paths, spec.name, build)
+    _publish_shards(paths, spec.name, build, folder_entries=options.get("folder_entries"))
+    # Resolve each shard's on-disk path (flat or grouped) for its checksum.
+    on_disk = {p.name: p for p in paths.shard_files(spec.name)}
     for shard in shards:
-        shard["sha256"] = sha256_file(
-            directory / layout.shard_filename(spec.name, shard["subject"])
-        )
+        filename = layout.shard_filename(spec.name, shard["subject"])
+        target = on_disk.get(filename)
+        if target is None:
+            raise FileNotFoundError(f"published shard missing: {filename}")
+        shard["sha256"] = sha256_file(target)
     basis = archive_read_library.counter_report(dict(tracker.counters))
     return {
         "status": "ok",
@@ -656,6 +706,7 @@ def ingest(
     options: dict[str, Any] | None = None,
     library_root: Path | None = None,
     merge: bool = False,
+    folder_entries: int | None = None,
 ) -> dict[str, Any]:
     """Read the chosen providers into the normalized shards and write the archive manifest.
 
@@ -665,6 +716,8 @@ def ingest(
     """
     require_inside(authorization, paths.root)
     options = dict(options or {})
+    if folder_entries is not None:
+        options.setdefault("folder_entries", folder_entries)
     options.setdefault("known_uids", lambda provider: known_uids(paths, provider))
     if library_root is not None:
         options["library_root"] = library_root.resolve()
