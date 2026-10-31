@@ -262,7 +262,11 @@ def run_stages(
 ) -> dict[str, Any]:
     paths, authorization = context.paths, context.authorization
     limits = limits or Limits()
-    options = {"shard_bytes": limits.shard_bytes, "folder_entries": limits.folder_entries, **(options or {})}
+    options = {
+        "shard_bytes": limits.shard_bytes,
+        "folder_entries": limits.folder_entries,
+        **(options or {}),
+    }
     result: dict[str, Any] = {}
     runners: dict[str, Callable[[], dict[str, Any]]] = {
         "analyze": lambda: build_analysis(paths),
