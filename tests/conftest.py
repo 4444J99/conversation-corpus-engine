@@ -15,6 +15,21 @@ from conversation_corpus_engine.archive_ingest import (
 from conversation_corpus_engine.corpus_store import register_corpus_store
 
 
+@pytest.fixture(autouse=True)
+def isolate_cce_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear CCE_* environment variables to prevent local shell leaks into tests."""
+    cce_env_vars = (
+        "CCE_CORPUS_STORE_ROOT",
+        "CCE_LIBRARY_STORE_ROOT",
+        "CCE_ARCHIVE_ROOT",
+        "CCE_WORKSPACE_ROOT",
+        "CCE_PROJECT_ROOT",
+        "CCE_SOURCE_DROP_ROOT",
+    )
+    for var in cce_env_vars:
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
     """Isolated workspace root with project and source-drop subdirectories."""
