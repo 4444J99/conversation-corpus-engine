@@ -10,10 +10,11 @@ from pathlib import Path
 from conftest import CCE_ENVIRONMENT_VARIABLES
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-# Both assert behaviour that an exported CCE_* variable would change if it reached the test.
+# Each fails if an exported CCE_* variable reaches it (verified against the unfixed suite: the first
+# through CCE_CORPUS_STORE_ROOT, the second through CCE_SOURCE_DROP_ROOT).
 ENVIRONMENT_SENSITIVE_TESTS = (
     "tests/test_corpus_store.py::test_missing_configuration_and_unregistered_root_create_nothing",
-    "tests/test_archive_mcp.py::test_archive_root_comes_from_server_configuration_only",
+    "tests/test_provider_catalog.py::test_default_source_drop_root_uses_project_parent_when_no_override",
 )
 
 
