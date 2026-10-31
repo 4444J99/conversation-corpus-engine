@@ -34,21 +34,31 @@ from .archive_topics import build_analysis
 from .archive_turns import list_turns
 from .archive_vault import build_vault, count_conversation_notes, verify_vault
 from .corpus_store import (
+    CorpusReadAuthorization,
     CorpusStoreError,
+    CorpusStoreUnavailableError,
     CorpusWriteAuthorization,
+    authorize_corpus_read,
+    require_write_authorization,
     resolve_configured_corpus_store_root,
 )
 from .paths import default_project_root
 
 STAGES = ("ingest", "analyze", "vault", "database", "graph", "site")
+# The actions that only read an archive: they attach without the write-custody tree walks.
+READ_ONLY_ACTIONS = frozenset({"search", "turns", "serve"})
 
 
 @dataclass(frozen=True)
 class ArchiveContext:
     paths: ArchivePaths
-    authorization: CorpusWriteAuthorization
+    authorization: CorpusWriteAuthorization | CorpusReadAuthorization
     export_root: Path | None
     library_root: Path | None = None
+
+    def write_authorization(self) -> CorpusWriteAuthorization:
+        """The write custody a stage needs; refused when the context was opened read-only."""
+        return require_write_authorization(self.authorization)
 
 
 def library_source_folder(library_root: Path) -> Path:
@@ -74,15 +84,28 @@ def open_context(
     export_root: Path | None = None,
     library_root: Path | None = None,
     source_overrides: tuple[Path, ...] = (),
+    read_only: bool = False,
 ) -> ArchiveContext:
+    """Attach to the archive under the custody the command's effect calls for.
+
+    `read_only` is for a command that writes nothing: it keeps every cheap custody property and
+    skips the two whole-store tree walks that write custody runs. The context it returns holds a
+    `CorpusReadAuthorization`, which no stage can write with.
+    """
     store = resolve_configured_corpus_store_root(corpus_store_root)
+    archive = archive_root or store / DEFAULT_ARCHIVE_DIRNAME
+    if read_only:
+        if export_root or library_root or source_overrides:
+            raise ValueError("a read-only archive context takes no source roots")
+        read = authorize_corpus_read(project_root, archive, store)
+        return ArchiveContext(ArchivePaths(read.destination), read, None, None)
     sources = [
         *([export_root] if export_root else []),
         *([library_source_folder(library_root)] if library_root else []),
     ]
     authorization = authorize_archive(
         project_root=project_root,
-        archive_root=archive_root or store / DEFAULT_ARCHIVE_DIRNAME,
+        archive_root=archive,
         corpus_store_root=store,
         source_roots=tuple(path.resolve() for path in [*sources, *source_overrides]),
     )
@@ -260,7 +283,7 @@ def run_stages(
     limits: Limits | None = None,
     merge: bool = False,
 ) -> dict[str, Any]:
-    paths, authorization = context.paths, context.authorization
+    paths, authorization = context.paths, context.write_authorization()
     limits = limits or Limits()
     options = {"shard_bytes": limits.shard_bytes, "folder_entries": limits.folder_entries, **(options or {})}
     result: dict[str, Any] = {}
@@ -541,13 +564,21 @@ def handle_archive(args: argparse.Namespace) -> int:
             export_root=export_root,
             library_root=library_root,
             source_overrides=tuple(_overrides(getattr(args, "source", [])).values()),
+            read_only=action in READ_ONLY_ACTIONS,
         )
     except CorpusStoreError as exc:
         print(f"archive custody refused: {exc}", file=sys.stderr)
-        print(
-            "Register a private store first: cce corpus-store register --root <dir>",
-            file=sys.stderr,
-        )
+        if isinstance(exc, CorpusStoreUnavailableError):
+            print(
+                "Check that the store's volume is mounted and that the store and archive "
+                "roots exist.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Register a private store first: cce corpus-store register --root <dir>",
+                file=sys.stderr,
+            )
         return 2
     paths = context.paths
 
