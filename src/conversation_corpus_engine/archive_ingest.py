@@ -263,9 +263,11 @@ class ArchivePaths:
         found: list[tuple[tuple[int, str, int], Path]] = []
         # Flat (legacy) layout, plus one level of grouping (e.g. by year) so a
         # provider with enough shards to exceed the folder limit stays readable.
+        # Skip the temporary .build directory so a just-written shard is not
+        # treated as a stale nested one and deleted before it is published.
         candidates = list(directory.glob(f"{stem}*.jsonl"))
         for child in directory.iterdir():
-            if child.is_dir():
+            if child.is_dir() and child.name != BUILD_DIRNAME:
                 candidates.extend(child.glob(f"{stem}*.jsonl"))
         for path in candidates:
             try:
