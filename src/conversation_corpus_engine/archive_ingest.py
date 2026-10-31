@@ -265,12 +265,23 @@ class ArchivePaths:
         # provider with enough shards to exceed the folder limit stays readable.
         candidates = list(directory.glob(f"{stem}*.jsonl"))
         for child in directory.iterdir():
-            if child.is_dir():
+            # Never descend into build/hidden directories; those hold in-flight or
+            # private artifacts, not published shards.
+            if child.is_dir() and not child.name.startswith("."):
                 candidates.extend(child.glob(f"{stem}*.jsonl"))
         for path in candidates:
+            subject = path.name[len(stem) : -len(".jsonl")]
             try:
-                found.append((shard_sort_key(path.name[len(stem) : -len(".jsonl")]), path))
+                found.append((shard_sort_key(subject), path))
             except ValueError:
+                # A file whose name starts like a shard but whose subject does not
+                # parse is almost certainly foreign; warn loudly instead of skipping.
+                import sys as _sys
+
+                print(
+                    f"archive: skipping shard-like file with unparseable subject: {path}",
+                    file=_sys.stderr,
+                )
                 continue
         return [path for _, path in sorted(found)]
 
