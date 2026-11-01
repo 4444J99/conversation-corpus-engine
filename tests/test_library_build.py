@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -91,6 +92,105 @@ def test_build_reuses_completed_index_summary(tmp_path, monkeypatch):
     assert result["status"]["records"] == 2
     assert len(summaries) == 1
     assert result["status"] == summaries[0]
+
+
+def test_progress_events_cover_every_phase_in_order_with_elapsed_time(tmp_path):
+    project, store, manifest = setup_sources(tmp_path)
+    events = []
+    result = build_library(manifest, project_root=project, store_root=store, progress=events.append)
+    assert [event["stage"] for event in events] == [
+        "index_blocks",
+        "fingerprint",
+        "verify",
+        "export",
+        "verify_export",
+        "artifacts",
+    ]
+    elapsed = [event["elapsed_seconds"] for event in events]
+    assert all(isinstance(value, float) and value >= 0 for value in elapsed)
+    assert elapsed == sorted(elapsed)
+    assert elapsed[-1] <= result["elapsed_seconds"]
+    # Additive: the keys earlier consumers read are still present and unchanged.
+    by_stage = {event["stage"]: event for event in events}
+    assert by_stage["index_blocks"]["accepted"] == result["accepted_observations"] == 2
+    for stage in ("fingerprint", "verify", "export"):
+        assert by_stage[stage]["records"] == result["status"]["records"] == 2
+    exported = by_stage["verify_export"]
+    assert exported["working_budget"] == result["limits"]["max_output_bytes"] - 4096
+    assert 0 < exported["database_bytes"] <= exported["working_budget"]
+    assert exported["planned_output_bytes"] > 0
+    # Events carry counts and timings only, never record text, titles or paths.
+    serialized = json.dumps(events)
+    assert "Lattice" not in serialized and str(tmp_path) not in serialized
+
+
+def test_accepted_events_keep_legacy_keys_and_gain_elapsed_time(tmp_path):
+    project, store, manifest = setup_sources(tmp_path)
+    source = Path(manifest["archives"][0]) / "provider-chatgpt"
+    rows = []
+    for index in range(100):
+        item = Conversation(
+            provider="chatgpt",
+            source_id=f"bulk-{index}",
+            title=f"Synthetic {index}",
+            messages=[Message(role="user", text=f"Synthetic body {index} about a lattice.")],
+        )
+        rows.append(json.dumps(item.to_dict()))
+    (source / "collection-chatgpt-conversations.jsonl").write_text("\n".join(rows) + "\n")
+    events = []
+    build_library(manifest, project_root=project, store_root=store, progress=events.append)
+    counted = [event for event in events if "stage" not in event]
+    assert [event["accepted"] for event in counted] == [100]
+    assert set(counted[0]) == {"accepted", "changed", "elapsed_seconds"}
+    assert counted[0]["changed"] == 100
+    assert events.index(counted[0]) < next(
+        index for index, event in enumerate(events) if event.get("stage") == "index_blocks"
+    )
+
+
+def test_output_byte_limit_error_carries_the_measured_numbers(tmp_path, monkeypatch):
+    project, store, manifest = setup_sources(tmp_path)
+    manifest["limits"] = {"max_output_bytes": 262144}
+    planned = 262144 + 1
+
+    def over_budget(*args, check_callback=None, **kwargs):
+        check_callback(bytes_written=planned)
+        pytest.fail("exporter exceeded the byte budget without interruption")
+
+    monkeypatch.setattr(library_build.library_export, "export_library", over_budget)
+    with pytest.raises(ValueError, match="library output byte limit exceeded") as caught:
+        build_library(manifest, project_root=project, store_root=store)
+    numbers = re.fullmatch(
+        r"library output byte limit exceeded: database=(\d+) planned=(\d+) writing=(\d+) "
+        r"receipts=(\d+) budget=(\d+) max_output_bytes=(\d+)",
+        str(caught.value),
+    )
+    assert numbers, str(caught.value)
+    database, charged, writing, receipts, budget, maximum = map(int, numbers.groups())
+    assert (writing, budget, maximum) == (planned, 262144 - 4096, 262144)
+    assert database > 0 and receipts > 0 and charged >= 0
+    generation = next((store / "library-all/generations").iterdir())
+    state = json.loads((generation / "build-state.json").read_text())
+    assert state["state"] == "failed"
+    assert state["error"].startswith(f"library output byte limit exceeded: database={database}")
+    assert f"writing={planned}" in state["error"]
+    assert current_generation(store) is None
+
+
+def test_other_byte_limit_errors_name_their_numbers(tmp_path):
+    project, store, manifest = setup_sources(tmp_path)
+    manifest["description"] = "x" * 300000
+    manifest["limits"] = {"max_output_bytes": 262144}
+    with pytest.raises(ValueError, match="library output byte limit exceeded by receipt") as caught:
+        build_library(manifest, project_root=project, store_root=store)
+    assert re.search(
+        r"current=\d+ writing=\d{6,} ceiling=\d+ max_output_bytes=262144", str(caught.value)
+    )
+    manifest["limits"] = {"max_output_bytes": 4096}
+    manifest.pop("description")
+    with pytest.raises(ValueError, match="cannot reserve failure evidence") as reserve:
+        build_library(manifest, project_root=project, store_root=store)
+    assert "max_output_bytes=4096 failure_reserve=4096" in str(reserve.value)
 
 
 def test_changed_source_adds_revision_and_retains_missing_source(tmp_path):
