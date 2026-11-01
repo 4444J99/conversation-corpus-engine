@@ -20,11 +20,44 @@ class CorpusStoreError(ValueError):
     """Raised when a corpus write does not satisfy the private-custody contract."""
 
 
+class CorpusStoreUnavailableError(CorpusStoreError):
+    """The store, or the archive in it, is not there to attach to (an unmounted volume, a typo).
+
+    Distinct from a custody refusal so the caller can say what is missing instead of telling the
+    operator to register a store that may already be registered.
+    """
+
+
 @dataclass(frozen=True)
 class CorpusWriteAuthorization:
     project_root: Path
     store_root: Path
     destination: Path
+
+
+@dataclass(frozen=True)
+class CorpusReadAuthorization:
+    """Custody for a command that only reads an archive; it can never authorize a write.
+
+    It carries the same three facts as a write authorization but is a different type on purpose
+    (not a subclass): every write path demands `CorpusWriteAuthorization`, and the runtime guards
+    in `require_inside` and `authorize_additional_corpus_path` refuse this one by type, so a
+    read-only attachment cannot be mistaken for permission to write.
+    """
+
+    project_root: Path
+    store_root: Path
+    destination: Path
+
+
+def require_write_authorization(authorization: object) -> CorpusWriteAuthorization:
+    """Return `authorization` if it is write custody; refuse anything else, a read one included."""
+    if not isinstance(authorization, CorpusWriteAuthorization):
+        raise CorpusStoreError(
+            "A write needs write custody, but this is a "
+            f"{type(authorization).__name__}, not a CorpusWriteAuthorization"
+        )
+    return authorization
 
 
 def _absolute_path(path: Path) -> Path:
@@ -112,7 +145,15 @@ def _validate_git_custody(root: Path) -> Path | None:
         raise CorpusStoreError(
             f"Corpus-store root contains nested Git metadata and is not private custody: {nested_git}"
         )
+    return _validate_git_privacy(root)
 
+
+def _validate_git_privacy(root: Path) -> Path | None:
+    """The Git half of custody, from a handful of git calls and no walk of the store.
+
+    A store outside every work tree is private. One inside a work tree must hold no tracked
+    content, must be ignored, and must show no Git-visible file. Returns the work tree or None.
+    """
     git_root = _git_root(root)
     if git_root is None:
         return None
@@ -171,9 +212,11 @@ def _resolve_existing_store_root(root: Path) -> Path:
     try:
         resolved_root = lexical_root.resolve(strict=True)
     except FileNotFoundError as exc:
-        raise CorpusStoreError(f"Corpus-store root does not exist: {lexical_root}") from exc
+        raise CorpusStoreUnavailableError(
+            f"Corpus-store root does not exist (its volume may be unmounted): {lexical_root}"
+        ) from exc
     if not resolved_root.is_dir():
-        raise CorpusStoreError(f"Corpus-store root is not a directory: {resolved_root}")
+        raise CorpusStoreUnavailableError(f"Corpus-store root is not a directory: {resolved_root}")
     return resolved_root
 
 
@@ -280,13 +323,12 @@ def _reject_destination_symlinks(store_root: Path, lexical_destination: Path) ->
             )
 
 
-def _validate_destination(
-    store_root: Path,
-    destination: Path,
-    *,
-    source_roots: Sequence[Path],
-    live_roots: Sequence[Path],
-) -> Path:
+def _place_destination(store_root: Path, destination: Path) -> Path:
+    """Where `destination` lands, refused unless it is a strict descendant of the store.
+
+    Looks only at the path itself: no component of it may be a symlink into the store, and it may
+    not be the store or sit outside it. Nothing beneath the destination is walked.
+    """
     lexical_destination = _absolute_path(destination)
     _reject_destination_symlinks(store_root, lexical_destination)
     resolved_destination = lexical_destination.resolve(strict=False)
@@ -295,6 +337,23 @@ def _validate_destination(
             "Corpus destination must be a strict descendant of the registered store: "
             f"{resolved_destination}"
         )
+    return resolved_destination
+
+
+def _require_destination_git_ignored(store_root: Path, resolved_destination: Path) -> None:
+    git_root = _git_root(store_root)
+    if git_root is not None and not _git_path_is_ignored(git_root, resolved_destination):
+        raise CorpusStoreError(f"Corpus destination is Git-visible: {resolved_destination}")
+
+
+def _validate_destination(
+    store_root: Path,
+    destination: Path,
+    *,
+    source_roots: Sequence[Path],
+    live_roots: Sequence[Path],
+) -> Path:
+    resolved_destination = _place_destination(store_root, destination)
 
     destination_symlink = _find_symlink(resolved_destination)
     if destination_symlink is not None:
@@ -315,10 +374,62 @@ def _validate_destination(
                 f"{resolved_other} <-> {resolved_destination}"
             )
 
-    git_root = _git_root(store_root)
-    if git_root is not None and not _git_path_is_ignored(git_root, resolved_destination):
-        raise CorpusStoreError(f"Corpus destination is Git-visible: {resolved_destination}")
+    _require_destination_git_ignored(store_root, resolved_destination)
     return resolved_destination
+
+
+def _attach_registered_store(
+    project_root: Path, corpus_store_root: Path | None
+) -> tuple[Path, Path]:
+    """The resolved project root and the registered store root the configuration names.
+
+    The cheap attachment properties both kinds of custody share: the configured root exists, is a
+    directory and is no symlink; the registration is active; and it names the configured root.
+    """
+    resolved_project_root = _absolute_path(project_root).resolve(strict=False)
+    configured_root = resolve_configured_corpus_store_root(corpus_store_root)
+    registration = load_corpus_store_registration(resolved_project_root)
+    registered_root = _resolve_existing_store_root(Path(registration["root"]))
+    if configured_root != registered_root:
+        raise CorpusStoreError(
+            "Configured corpus-store root does not match the active registration: "
+            f"{configured_root}"
+        )
+    return resolved_project_root, registered_root
+
+
+def authorize_corpus_read(
+    project_root: Path,
+    archive_root: Path,
+    corpus_store_root: Path | None = None,
+) -> CorpusReadAuthorization:
+    """Attach a read-only command to an archive in the registered store, without the tree walks.
+
+    Write custody proves the whole store holds no nested Git metadata and no symlink, which walks
+    every directory of it (tens of seconds on a large store). A command that writes nothing needs
+    only the cheap properties, and that is exactly what this keeps: the configured root resolves
+    and the registration is active and names it; the archive root is a strict descendant of the
+    store with no symlink on the way to it; the archive root exists and is a directory; and the
+    store is Git-private by the same handful of git calls write custody makes.
+
+    What it deliberately leaves out is `_find_nested_git_metadata` and `_find_symlink`, the two
+    walks. The result is a `CorpusReadAuthorization`, which no write path accepts.
+    """
+    resolved_project_root, registered_root = _attach_registered_store(
+        project_root, corpus_store_root
+    )
+    _validate_git_privacy(registered_root)
+    resolved_archive_root = _place_destination(registered_root, archive_root)
+    _require_destination_git_ignored(registered_root, resolved_archive_root)
+    if not resolved_archive_root.is_dir():
+        raise CorpusStoreUnavailableError(
+            f"Archive root does not exist or is not a directory: {resolved_archive_root}"
+        )
+    return CorpusReadAuthorization(
+        project_root=resolved_project_root,
+        store_root=registered_root,
+        destination=resolved_archive_root,
+    )
 
 
 def authorize_corpus_write(
@@ -329,15 +440,9 @@ def authorize_corpus_write(
     source_roots: Sequence[Path] = (),
     live_roots: Sequence[Path] = (),
 ) -> CorpusWriteAuthorization:
-    resolved_project_root = _absolute_path(project_root).resolve(strict=False)
-    configured_root = resolve_configured_corpus_store_root(corpus_store_root)
-    registration = load_corpus_store_registration(resolved_project_root)
-    registered_root = _resolve_existing_store_root(Path(registration["root"]))
-    if configured_root != registered_root:
-        raise CorpusStoreError(
-            "Configured corpus-store root does not match the active registration: "
-            f"{configured_root}"
-        )
+    resolved_project_root, registered_root = _attach_registered_store(
+        project_root, corpus_store_root
+    )
     validate_corpus_store_root(registered_root)
     resolved_destination = _validate_destination(
         registered_root,
@@ -356,6 +461,7 @@ def authorize_additional_corpus_path(
     authorization: CorpusWriteAuthorization,
     destination: Path,
 ) -> CorpusWriteAuthorization:
+    require_write_authorization(authorization)
     resolved_destination = _validate_destination(
         authorization.store_root,
         destination,

@@ -26,7 +26,7 @@ import shutil
 import sqlite3
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from . import archive_layout as layout
 from .archive_author import AUTHOR_BY_CONTAINER, AUTHORS, CONTAINER_BY_AUTHOR, HUMAN, MACHINE
@@ -415,6 +415,154 @@ def _open(paths: ArchivePaths, item: dict[str, Any]) -> sqlite3.Connection:
     return connection
 
 
+class _Candidate(NamedTuple):
+    """One turn that survived its shard's cut: enough to order it, find it again and show it."""
+
+    rank: float
+    uid: str
+    idx: int
+    rowid: int
+    item: dict[str, Any]
+
+
+# FTS5 may be asked for more rows than the cut keeps, because the mkind and kind filters can only
+# be applied after the rank: twice the cut leaves room for the filter to discard half of them.
+OVERSAMPLE = 2
+# Rows whose metadata one query fetches; far below SQLite's bound-variable limit.
+ID_CHUNK = 400
+# Shards a search keeps open between ranking and excerpts, well under any file-descriptor limit.
+HELD_SHARDS = 32
+HIDDEN_KINDS_SQL = "t.mkind NOT IN ('reasoning', 'tool')"
+
+
+class _Filters(NamedTuple):
+    """What a search keeps past the full-text match: some kinds of conversation, and whether
+    reasoning and tool turns are hidden."""
+
+    kinds: tuple[str, ...]
+    hide_reasoning: bool
+
+    def conditions(self) -> tuple[str, list[Any]]:
+        """` AND ...` SQL over `t` (turns) and `c` (conversations), and its arguments."""
+        terms: list[str] = []
+        if self.hide_reasoning:
+            terms.append(HIDDEN_KINDS_SQL)
+        if self.kinds:
+            terms.append(f"c.kind IN ({','.join('?' * len(self.kinds))})")
+        return "".join(f" AND {term}" for term in terms), list(self.kinds)
+
+
+def _joined_candidates(
+    connection: sqlite3.Connection, match: str, filters: _Filters, per_shard: int
+) -> list[tuple[float, str, int, int]]:
+    """The shard's best `per_shard` turns by the original joined query: the exact, slow path.
+
+    Joins the full-text match to the turns table before ranking, so it is correct whatever the
+    filters discard; the rank-first path falls back to it whenever its over-sample is not enough
+    to be sure of the same answer.
+    """
+    sql, args = filters.conditions()
+    rows = connection.execute(
+        "SELECT turn_fts.rowid AS rid, t.uid AS uid, t.ordinal AS idx, bm25(turn_fts) AS rank "
+        "FROM turn_fts JOIN turns t ON t.id = turn_fts.rowid JOIN conversations c ON c.uid = t.uid "
+        f"WHERE turn_fts MATCH ?{sql} ORDER BY rank LIMIT ?",
+        [match, *args, per_shard],
+    )
+    return [(row["rank"], row["uid"], row["idx"], row["rid"]) for row in rows]
+
+
+def _shard_candidates(
+    connection: sqlite3.Connection, match: str, filters: _Filters, per_shard: int
+) -> list[tuple[float, str, int, int]]:
+    """The shard's best `per_shard` turns, ranked on the full-text index alone.
+
+    A kind filter is first held against the shard's conversation rows, a table of one row per
+    conversation: a shard with no conversation of the kinds asked for has no turn that can pass,
+    and one whose every conversation is of those kinds has nothing left to filter on.
+
+    Stage one ranks a sample of `per_shard` rows (twice that when a filter remains) by BM25 with
+    no join, which is cheap because it never touches the turns table. Stage two looks the
+    sampled rows up by primary key and applies the mkind and kind filters in SQL, so they mean
+    exactly what they mean in the joined query. The first `per_shard` survivors are the joined
+    query's answer, and when fewer survive although stage one was cut off at the sample, better
+    rows may lie beyond it, so the joined query runs.
+    """
+    if filters.kinds:
+        matching, total = connection.execute(
+            f"SELECT COALESCE(SUM(kind IN ({','.join('?' * len(filters.kinds))})), 0), COUNT(*) "
+            "FROM conversations",
+            filters.kinds,
+        ).fetchone()
+        if matching == 0:
+            return []
+        if matching == total:
+            filters = filters._replace(kinds=())
+    sql, args = filters.conditions()
+    sample = per_shard * OVERSAMPLE if sql else per_shard
+    ranked = connection.execute(
+        "SELECT rowid AS rid, bm25(turn_fts) AS rank FROM turn_fts "
+        "WHERE turn_fts MATCH ? ORDER BY rank, rid LIMIT ?",
+        (match, sample),
+    ).fetchall()
+    if not ranked:
+        return []
+    metadata: dict[int, tuple[str, int]] = {}
+    ids = [row["rid"] for row in ranked]
+    for start in range(0, len(ids), ID_CHUNK):
+        chunk = ids[start : start + ID_CHUNK]
+        for row in connection.execute(
+            "SELECT t.id AS id, t.uid AS uid, t.ordinal AS idx FROM turns t "
+            "JOIN conversations c ON c.uid = t.uid "
+            f"WHERE t.id IN ({','.join('?' * len(chunk))}){sql}",
+            [*chunk, *args],
+        ):
+            metadata[row["id"]] = (row["uid"], row["idx"])
+    kept = [
+        (row["rank"], *metadata[row["rid"]], row["rid"]) for row in ranked if row["rid"] in metadata
+    ]
+    if len(kept) < per_shard and len(ranked) >= sample:
+        return _joined_candidates(connection, match, filters, per_shard)
+    return kept[:per_shard]
+
+
+def _winner_rows(
+    paths: ArchivePaths,
+    match: str,
+    winners: list[_Candidate],
+    held: dict[str, sqlite3.Connection],
+) -> list[dict[str, Any]]:
+    """The full row of each winner, in the winners' order: the one place excerpts are cut.
+
+    A shard still held open from the ranking is reused; one that was not is opened and closed here.
+    """
+    by_shard: dict[str, list[int]] = {}
+    for position, winner in enumerate(winners):
+        by_shard.setdefault(winner.item["path"], []).append(position)
+    rows: dict[int, dict[str, Any]] = {}
+    for path, positions in by_shard.items():
+        connection = held.get(path) or _open(paths, winners[positions[0]].item)
+        try:
+            for position in positions:
+                row = connection.execute(
+                    "SELECT c.uid, c.provider, c.kind, c.title, c.created, c.message_count, "
+                    "t.ordinal AS idx, t.author, t.role, t.channel, t.ts, "
+                    "snippet(turn_fts, 0, '[', ']', '…', 24) AS excerpt, bm25(turn_fts) AS rank "
+                    "FROM turn_fts JOIN turns t ON t.id = turn_fts.rowid "
+                    "JOIN conversations c ON c.uid = t.uid "
+                    "WHERE turn_fts MATCH ? AND turn_fts.rowid = ?",
+                    (match, winners[position].rowid),
+                ).fetchone()
+                if row is None:
+                    raise TurnStoreError(
+                        f"{winners[position].item['path']}: a ranked turn vanished from the shard"
+                    )
+                rows[position] = dict(row)
+        finally:
+            if path not in held:
+                connection.close()
+    return [rows[position] for position in range(len(winners))]
+
+
 def search_turns(
     paths: ArchivePaths,
     query: str,
@@ -426,7 +574,69 @@ def search_turns(
     limit: int = 20,
     include_reasoning: bool = False,
 ) -> list[dict[str, Any]]:
-    """Full-text search across the shards a question names; the best turn of each conversation."""
+    """Full-text search across the shards a question names; the best turn of each conversation.
+
+    Ranks first and joins after. Each shard ranks its matches on the full-text index alone and
+    keeps the best `max(limit * 8, 40)` that pass the filters; the shards' candidates are merged
+    by (rank, uid, ordinal), the first turn of each conversation wins, and only the `limit`
+    winners are read in full and given an excerpt. The answer is exactly that of
+    `search_turns_reference`, which joins every match to its turn before ranking and so takes
+    seconds on a common word where this takes a fraction of that.
+    """
+    match = fts_query(query)
+    if not match:
+        return []
+    per_shard = max(limit * 8, 40)
+    filters = _Filters(tuple(kinds or ()), not include_reasoning)
+    candidates: list[_Candidate] = []
+    held: dict[str, sqlite3.Connection] = {}  # shards that gave candidates, kept for the excerpts
+    try:
+        for _author, item in select_shards(
+            paths, authors=authors, providers=providers, months=months
+        ):
+            connection = _open(paths, item)
+            keep = False
+            try:
+                found = _shard_candidates(connection, match, filters, per_shard)
+                candidates.extend(_Candidate(*hit, item) for hit in found)
+                keep = bool(found) and len(held) < HELD_SHARDS
+            finally:
+                if keep:
+                    held[item["path"]] = connection
+                else:
+                    connection.close()
+        candidates.sort(key=lambda candidate: (candidate.rank, candidate.uid, candidate.idx))
+        seen: set[str] = set()
+        winners: list[_Candidate] = []
+        for candidate in candidates:
+            if candidate.uid in seen:
+                continue
+            seen.add(candidate.uid)
+            winners.append(candidate)
+            if len(winners) >= limit:
+                break
+        return _winner_rows(paths, match, winners, held)
+    finally:
+        for connection in held.values():
+            connection.close()
+
+
+def search_turns_reference(
+    paths: ArchivePaths,
+    query: str,
+    *,
+    authors: list[str] | None = None,
+    providers: list[str] | None = None,
+    kinds: list[str] | None = None,
+    months: list[str] | None = None,
+    limit: int = 20,
+    include_reasoning: bool = False,
+) -> list[dict[str, Any]]:
+    """The original search: every match joined to its turn before it is ranked.
+
+    Kept as the oracle `search_turns` is held to, by test and by a live differential; nothing in
+    the product calls it. It is the definition of the answer, so it is not to be optimised.
+    """
     match = fts_query(query)
     if not match:
         return []
