@@ -38,7 +38,7 @@ from .archive_model import (
     write_json_atomic,
 )
 from .archive_naming import NAMING_VERSION, day_of
-from .archive_shard import ShardWriter, month_key, shard_sort_key
+from .archive_shard import ShardWriter, month_key, plan_flat_folders, shard_sort_key
 from .corpus_store import CorpusStoreError, CorpusWriteAuthorization, authorize_corpus_write
 
 MANIFEST_SCHEMA = "archive-manifest.v2"
@@ -515,7 +515,7 @@ def _publish_shards(
         name = built.name
         for prefix in (f"shard-{provider}-", f"index-{provider}-"):
             if name.startswith(prefix):
-                name = name[len(prefix):].replace(".jsonl", "")
+                name = name[len(prefix) :].replace(".jsonl", "")
                 break
         if name not in subjects and not name.startswith("index-"):
             subjects.append(name)
@@ -525,7 +525,7 @@ def _publish_shards(
         name = built.name
         if not name.startswith(f"shard-{provider}-"):
             continue
-        subj = name[len(f"shard-{provider}-"):].replace(".jsonl", "")
+        subj = name[len(f"shard-{provider}-") :].replace(".jsonl", "")
         if subj not in subjects:
             subjects.append(subj)
     nshards = len(subjects)
@@ -533,18 +533,15 @@ def _publish_shards(
     if limit is None or (nshards * 2) <= limit:
         targets = [(built, directory / built.name) for built in built_files]
     else:
-        from .archive_shard import plan_flat_folders
-
         folder_plan = plan_flat_folders(subjects, limit // 2 if limit // 2 > 0 else 1)
         # plan_flat_folders returns subject -> relative folder (may be nested).
         targets = []
         for built in built_files:
             name = built.name
-            is_index = name.startswith(f"index-{provider}-")
             subj = name
             for prefix in (f"shard-{provider}-", f"index-{provider}-"):
                 if subj.startswith(prefix):
-                    subj = subj[len(prefix):].replace(".jsonl", "")
+                    subj = subj[len(prefix) :].replace(".jsonl", "")
                     break
             rel = folder_plan.get(subj, "")
             dest_dir = directory
