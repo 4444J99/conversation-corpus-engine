@@ -196,6 +196,7 @@ def test_a_full_build_writes_only_names_the_contract_accepts(full_build) -> None
         "provider-notebooklm",
         "provider-perplexity",
         "report-all-topics.json",
+        "search-all",
         "site-all",
         "vault-all",
     ]

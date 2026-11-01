@@ -33,7 +33,7 @@ from conversation_corpus_engine.provider_catalog import PROVIDER_CONFIG
 SPEC_KINDS = [
     *("archive", "conversation", "message", "thread", "family", "pair", "action", "question"),
     *("feed", "receipt", "corpus", "index", "pattern", "manifest", "report", "vault", "site"),
-    *("graph", "database", "check", "fixture", "provider", "month", "topic", "collection"),
+    *("graph", "search", "database", "check", "fixture", "provider", "month", "topic", "collection"),
     *("shard", "part", "day", "bucket", "container"),
     *("home", "coverage", "guide"),
 ]
@@ -72,6 +72,7 @@ GOLDEN: list[tuple[str, dict]] = [
     ("vault-all", {"kind": "vault", "scope": "all"}),
     ("site-all", {"kind": "site", "scope": "all"}),
     ("graph-all", {"kind": "graph", "scope": "all"}),
+    ("search-all", {"kind": "search", "scope": "all"}),
     ("manifest-all", {"kind": "manifest", "scope": "all"}),
     ("manifest-all-vault", {"kind": "manifest", "scope": "all", "subject": "vault"}),
     ("provider-chatgpt", {"kind": "provider", "scope": "chatgpt"}),

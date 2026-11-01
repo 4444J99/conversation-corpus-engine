@@ -208,6 +208,7 @@ KIND_TABLE: dict[str, KindRule] = {
     "vault": KindRule(scope_values=SCOPE_ONLY_ALL),
     "site": KindRule(scope_values=SCOPE_ONLY_ALL),
     "graph": KindRule(scope_values=SCOPE_ONLY_ALL),
+    "search": KindRule(scope_values=SCOPE_ONLY_ALL, note="unified generation-bound search index"),
     "database": KindRule(scope_values=SCOPE_ONLY_ALL, subject=REQUIRED),
     "check": KindRule(scope=OPTIONAL, subject=REQUIRED, note="a predicate script"),
     "fixture": KindRule(subject=OPTIONAL),

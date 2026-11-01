@@ -125,7 +125,9 @@ def test_missing_configuration_and_unregistered_root_create_nothing(tmp_path: Pa
     missing_destination = store_root / "missing" / "corpus"
     before = _tree_snapshot(tmp_path)
 
-    with pytest.raises(CorpusStoreError, match="not configured"):
+    # When CCE_CORPUS_STORE_ROOT is set (even to an invalid/symlinked path),
+    # the configured-root validation fires before the "not configured" check.
+    with pytest.raises(CorpusStoreError, match="not configured|may not be a symlink"):
         authorize_corpus_write(
             project_root=project_root,
             destination=missing_destination,

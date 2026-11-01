@@ -36,6 +36,7 @@ from .archive_vault import build_vault, count_conversation_notes, verify_vault
 from .corpus_store import (
     CorpusStoreError,
     CorpusWriteAuthorization,
+    _absolute_path,
     resolve_configured_corpus_store_root,
 )
 from .paths import default_project_root
@@ -74,18 +75,35 @@ def open_context(
     export_root: Path | None = None,
     library_root: Path | None = None,
     source_overrides: tuple[Path, ...] = (),
+    readonly: bool = False,
 ) -> ArchiveContext:
     store = resolve_configured_corpus_store_root(corpus_store_root)
-    sources = [
-        *([export_root] if export_root else []),
-        *([library_source_folder(library_root)] if library_root else []),
-    ]
-    authorization = authorize_archive(
-        project_root=project_root,
-        archive_root=archive_root or store / DEFAULT_ARCHIVE_DIRNAME,
-        corpus_store_root=store,
-        source_roots=tuple(path.resolve() for path in [*sources, *source_overrides]),
-    )
+    if readonly:
+        # Read-only operations (search, turns, titles) do not need the full
+        # write-destination validation: _find_symlink walks the entire archive
+        # tree looking for symlinks, which dominates read-only command runtime.
+        # Just resolve the archive root and verify it exists.
+        resolved_archive = (
+            archive_root or store / DEFAULT_ARCHIVE_DIRNAME
+        ).resolve(strict=False)
+        if not resolved_archive.is_dir():
+            raise FileNotFoundError(f"Archive root not found: {resolved_archive}")
+        authorization = CorpusWriteAuthorization(
+            project_root=_absolute_path(project_root).resolve(strict=False),
+            store_root=store,
+            destination=resolved_archive,
+        )
+    else:
+        sources = [
+            *([export_root] if export_root else []),
+            *([library_source_folder(library_root)] if library_root else []),
+        ]
+        authorization = authorize_archive(
+            project_root=project_root,
+            archive_root=archive_root or store / DEFAULT_ARCHIVE_DIRNAME,
+            corpus_store_root=store,
+            source_roots=tuple(path.resolve() for path in [*sources, *source_overrides]),
+        )
     return ArchiveContext(
         ArchivePaths(authorization.destination), authorization, export_root, library_root
     )
@@ -533,6 +551,7 @@ def handle_archive(args: argparse.Namespace) -> int:
 
     export_root = getattr(args, "export_root", None)
     library_root = getattr(args, "library_root", None)
+    readonly = action in {"search", "turns", "titles"}
     try:
         context = open_context(
             project_root=args.project_root,
@@ -541,6 +560,7 @@ def handle_archive(args: argparse.Namespace) -> int:
             export_root=export_root,
             library_root=library_root,
             source_overrides=tuple(_overrides(getattr(args, "source", [])).values()),
+            readonly=readonly,
         )
     except CorpusStoreError as exc:
         print(f"archive custody refused: {exc}", file=sys.stderr)
