@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 import sqlite3
 import urllib.error
 import urllib.request
@@ -15,7 +16,7 @@ from conversation_corpus_engine import archive_search, archive_turns
 from conversation_corpus_engine.archive_author import HUMAN, MACHINE
 from conversation_corpus_engine.archive_database import build_database
 from conversation_corpus_engine.archive_ingest import ingest, load_manifest
-from conversation_corpus_engine.archive_model import Message, write_json_atomic
+from conversation_corpus_engine.archive_model import Conversation, Message, write_json_atomic
 from conversation_corpus_engine.archive_naming import verify_names
 from conversation_corpus_engine.archive_serve import start_in_thread
 from conversation_corpus_engine.archive_site import build_site
@@ -388,3 +389,392 @@ def test_the_mcp_tool_filters_by_author_and_reports_an_old_store(built, tmp_path
         }
     )
     assert "author must be an array of strings" in json.dumps(bad)
+
+
+# --- rank-first search is the joined search, answer for answer ----------------------------------
+
+FILLER = ("alpha", "beta", "gamma", "delta", "marble", "lantern", "orchid", "falcon")
+RANKED_PROVIDERS = ("chatgpt", "claude", "gemini")
+RANKED_MONTHS = ("2025-01", "2025-02")
+
+
+def _sentence(rng: random.Random, size: int, *terms: str) -> str:
+    words = [rng.choice(FILLER) for _ in range(size)]
+    for term in terms:
+        words.insert(rng.randrange(len(words) + 1), term)
+    return " ".join(words)
+
+
+def _hidden_turn(text: str, kind: str, ts: str) -> Message:
+    """A reasoning or tool turn: machine text that a search hides unless it is asked for."""
+    channel, role = ("thinking", "assistant") if kind == "reasoning" else ("tool", "tool")
+    return Message(role=role, text=text, ts=ts, meta={"kind": kind}, channel=channel)
+
+
+def _ranked_corpus() -> list[Conversation]:
+    """Invented conversations that give a search every awkward shape to get right.
+
+    Ordinary provider-months repeat a few terms at varying frequency and length, so one
+    conversation matches many times at many ranks and carries reasoning and tool turns among
+    typed and replied ones, in two conversation kinds. One shard holds far more reasoning matches
+    than any small cut can see past, with the plain matches ranking behind them. One shard holds
+    sixty identical typed turns, so their ranks tie exactly across the per-shard cut.
+    """
+    rng = random.Random(97)
+    items: list[Conversation] = []
+    for provider in RANKED_PROVIDERS:
+        for month in RANKED_MONTHS:
+            for number in range(14):
+                texts = []
+                for turn in range(rng.randint(6, 14)):
+                    terms = rng.choice([(), ("kestrel",), ("kestrel", "orchid"), ("kestrel",) * 2])
+                    texts.append(
+                        (
+                            "user" if turn % 2 == 0 else "assistant",
+                            _sentence(rng, rng.randint(2, 40), *terms),
+                        )
+                    )
+                created = f"{month}-{number + 1:02d}T09:00:00Z"
+                conversation = conv(
+                    provider,
+                    f"{provider}-{month}-{number}",
+                    f"Talk {number}",
+                    texts,
+                    created=created,
+                    kind="note" if number % 4 == 0 else "chat",
+                )
+                for kind in ("reasoning", "tool", "reasoning"):
+                    if rng.random() < 0.7:
+                        conversation.messages.append(
+                            _hidden_turn(
+                                _sentence(rng, rng.randint(2, 12), "kestrel"), kind, created
+                            )
+                        )
+                items.append(conversation)
+    stamp = "2025-04-10T09:00:00Z"
+    for number in range(10):
+        heavy = conv(
+            "grok",
+            f"heavy-{number}",
+            f"Heavy {number}",
+            [("user", "begin"), ("assistant", _sentence(rng, 30, "zebra"))],
+            created=stamp,
+        )
+        heavy.messages.extend(
+            _hidden_turn("zebra zebra zebra", "reasoning", stamp) for _ in range(12)
+        )
+        items.append(heavy)
+    for number in range(6):
+        items.append(
+            conv(
+                "grok",
+                f"quiet-{number}",
+                f"Quiet {number}",
+                [("user", "begin"), ("assistant", _sentence(rng, 25, "zebra"))],
+                created=stamp,
+                kind="note",
+            )
+        )
+    for number in range(60):
+        items.append(
+            conv(
+                "perplexity",
+                f"tie-{number}",
+                f"Tie {number}",
+                [("user", "quartz marble"), ("assistant", "noted")],
+                created="2025-05-03T09:00:00Z",
+            )
+        )
+    return items
+
+
+@pytest.fixture
+def ranked_store(archive_env):
+    write_sharded_store(archive_env.paths, _ranked_corpus())
+    _write_minimal_manifest(archive_env)
+    build_turn_store(archive_env.paths, archive_env.auth)
+    return archive_env.paths
+
+
+def _scalar(paths, author: str, provider: str, month: str, sql: str) -> int:
+    """One number from the one shard that `author` has for `provider` in `month`."""
+    ((_, item),) = select_shards(paths, authors=[author], providers=[provider], months=[month])
+    connection = sqlite3.connect(f"file:{paths.turns / item['path']}?mode=ro", uri=True)
+    try:
+        return int(connection.execute(sql).fetchone()[0])
+    finally:
+        connection.close()
+
+
+def test_the_differential_fixture_has_the_shapes_it_claims(ranked_store) -> None:
+    per_shard = 40  # max(limit * 8, 40) for every limit up to 5
+    count = "SELECT COUNT(*) FROM turn_fts WHERE turn_fts MATCH '\"{}\"'"
+    assert _scalar(ranked_store, MACHINE, "grok", "202504", count.format("zebra")) > 2 * per_shard
+    tied = _scalar(ranked_store, HUMAN, "perplexity", "202505", count.format("quartz"))
+    assert tied == 60 > per_shard
+    hits = archive_turns.search_turns_reference(ranked_store, "kestrel", limit=50)
+    assert len(hits) >= 20 and len({hit["provider"] for hit in hits}) == 3
+    most = (
+        "SELECT MAX(n) FROM (SELECT COUNT(*) AS n FROM turns t JOIN turn_fts "
+        "ON turn_fts.rowid = t.id WHERE turn_fts MATCH '\"kestrel\"' GROUP BY t.uid)"
+    )
+    assert _scalar(ranked_store, MACHINE, "claude", "202501", most) >= 3  # many hits, one winner
+
+
+DIFFERENTIAL_QUERIES = (
+    "kestrel",
+    "kestrel orchid",
+    '"kestrel orchid"',
+    "marble lantern",
+    "quartz",
+    "zebra",
+    "unseenterm",
+)
+DIFFERENTIAL_FILTERS: tuple[dict, ...] = (
+    {},
+    {"authors": ["human"]},
+    {"authors": ["machine"]},
+    {"providers": ["claude"]},
+    {"providers": ["chatgpt", "gemini"], "authors": ["machine"]},
+    {"kinds": ["note"]},
+    {"kinds": ["chat", "note"]},
+    {"months": ["202502"]},
+    {"months": ["202501", "202504"]},
+    {"providers": ["claude"], "authors": ["human"], "months": ["202502"], "kinds": ["chat"]},
+)
+
+
+@pytest.mark.parametrize("limit", [0, 1, 5, 20, 50])
+def test_rank_first_search_returns_exactly_what_the_joined_search_returns(
+    ranked_store, limit: int
+) -> None:
+    compared = answered = 0
+    for query in DIFFERENTIAL_QUERIES:
+        for filters in DIFFERENTIAL_FILTERS:
+            for include_reasoning in (False, True):
+                want = archive_turns.search_turns_reference(
+                    ranked_store, query, limit=limit, include_reasoning=include_reasoning, **filters
+                )
+                got = archive_turns.search_turns(
+                    ranked_store, query, limit=limit, include_reasoning=include_reasoning, **filters
+                )
+                assert got == want, (query, filters, include_reasoning, limit)
+                compared += 1
+                answered += bool(want)
+    assert compared == len(DIFFERENTIAL_QUERIES) * len(DIFFERENTIAL_FILTERS) * 2
+    assert answered >= compared // 3  # most of the comparisons are of real answers
+
+
+def _watch_fallback(monkeypatch) -> list[int]:
+    calls: list[int] = []
+    real = archive_turns._joined_candidates
+
+    def watched(connection, match, filters, per_shard):
+        calls.append(per_shard)
+        return real(connection, match, filters, per_shard)
+
+    monkeypatch.setattr(archive_turns, "_joined_candidates", watched)
+    return calls
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"providers": ["grok"]},
+        {"providers": ["grok"], "authors": ["machine"]},
+        {"providers": ["grok"], "kinds": ["note"], "include_reasoning": True},
+    ],
+)
+def test_an_insufficient_oversample_falls_back_to_the_exact_query(
+    ranked_store, monkeypatch, arguments: dict
+) -> None:
+    calls = _watch_fallback(monkeypatch)
+    for limit in (1, 5):
+        want = archive_turns.search_turns_reference(ranked_store, "zebra", limit=limit, **arguments)
+        calls.clear()
+        got = archive_turns.search_turns(ranked_store, "zebra", limit=limit, **arguments)
+        assert want and got == want
+        assert calls, "the reasoning rows should have filled the oversample"
+
+
+def test_the_fallback_is_for_a_cut_that_is_too_narrow_to_be_sure(ranked_store, monkeypatch) -> None:
+    calls = _watch_fallback(monkeypatch)
+    for limit in (1, 5):  # nothing to discard: the first rows ranked are the answer, however few
+        archive_turns.search_turns(ranked_store, "kestrel", limit=limit, include_reasoning=True)
+    for limit in (20, 50):  # a wide cut sees every match of these small shards, filtered or not
+        archive_turns.search_turns(ranked_store, "kestrel", providers=["chatgpt"], limit=limit)
+        archive_turns.search_turns(ranked_store, "kestrel", kinds=["chat"], limit=limit)
+    assert calls == []
+
+
+def _trace_sql(monkeypatch) -> list[str]:
+    """Every SQL statement the search sends to any shard."""
+    statements: list[str] = []
+    real = archive_turns._open
+
+    def traced(paths, item):
+        connection = real(paths, item)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(archive_turns, "_open", traced)
+    return statements
+
+
+def test_a_shard_with_no_conversation_of_the_kind_is_never_ranked(
+    ranked_store, monkeypatch
+) -> None:
+    statements = _trace_sql(monkeypatch)
+    for query in ("quartz", "quartz marble"):
+        want = archive_turns.search_turns_reference(
+            ranked_store, query, providers=["perplexity"], kinds=["note"], limit=5
+        )
+        statements.clear()
+        got = archive_turns.search_turns(
+            ranked_store, query, providers=["perplexity"], kinds=["note"], limit=5
+        )
+        assert got == want == []
+        assert statements and not [s for s in statements if "turn_fts" in s]
+
+
+def test_a_shard_whose_conversations_all_have_the_kind_has_no_kind_left_to_filter(
+    ranked_store, monkeypatch
+) -> None:
+    statements = _trace_sql(monkeypatch)
+    want = archive_turns.search_turns_reference(
+        ranked_store, "quartz", providers=["perplexity"], kinds=["chat"], limit=5
+    )
+    statements.clear()
+    got = archive_turns.search_turns(
+        ranked_store, "quartz", providers=["perplexity"], kinds=["chat"], limit=5
+    )
+    assert got == want and len(got) == 5
+    assert [s for s in statements if "t.id IN" in s]  # the turns were looked up
+    assert not [s for s in statements if "c.kind IN" in s]  # but no kind condition was left
+
+
+def test_a_shard_that_mixes_kinds_keeps_the_kind_condition(ranked_store, monkeypatch) -> None:
+    statements = _trace_sql(monkeypatch)
+    want = archive_turns.search_turns_reference(
+        ranked_store, "kestrel", providers=["claude"], kinds=["note"], limit=5
+    )
+    statements.clear()
+    got = archive_turns.search_turns(
+        ranked_store, "kestrel", providers=["claude"], kinds=["note"], limit=5
+    )
+    assert got == want and got
+    assert {hit["kind"] for hit in got} == {"note"}
+    assert [s for s in statements if "c.kind IN" in s]
+
+
+class _Tracked(sqlite3.Connection):
+    """A connection that remembers having been closed."""
+
+    closed = False
+
+    def close(self) -> None:
+        self.closed = True
+        super().close()
+
+
+def _track_connections(monkeypatch) -> list[_Tracked]:
+    opened: list[_Tracked] = []
+
+    def tracking_open(paths, item):
+        connection = sqlite3.connect(
+            f"file:{paths.turns / item['path']}?mode=ro", uri=True, factory=_Tracked
+        )
+        connection.row_factory = sqlite3.Row
+        opened.append(connection)
+        return connection
+
+    monkeypatch.setattr(archive_turns, "_open", tracking_open)
+    return opened
+
+
+@pytest.mark.parametrize("held", [0, 2, 32])
+def test_holding_shards_open_for_the_excerpts_changes_no_answer(
+    ranked_store, monkeypatch, held: int
+) -> None:
+    monkeypatch.setattr(archive_turns, "HELD_SHARDS", held)
+    for limit in (5, 20):
+        want = archive_turns.search_turns_reference(
+            ranked_store, "kestrel", providers=["chatgpt"], limit=limit
+        )
+        opened = _track_connections(monkeypatch)
+        got = archive_turns.search_turns(
+            ranked_store, "kestrel", providers=["chatgpt"], limit=limit
+        )
+        assert got == want and got
+        assert all(connection.closed for connection in opened)
+        shards = len(archive_turns.select_shards(ranked_store, providers=["chatgpt"]))
+        if held == 0:
+            assert len(opened) > shards  # a shard that gave a winner is opened again for it
+        if held == 32:
+            assert len(opened) == shards  # each shard is opened once
+
+
+def test_every_shard_is_closed_when_a_search_fails_part_way(ranked_store, monkeypatch) -> None:
+    real = archive_turns._shard_candidates
+    calls: list[int] = []
+
+    def failing(connection, match, filters, per_shard):
+        calls.append(1)
+        if len(calls) == 4:
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(connection, match, filters, per_shard)
+
+    opened = _track_connections(monkeypatch)
+    monkeypatch.setattr(archive_turns, "_shard_candidates", failing)
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+        archive_turns.search_turns(ranked_store, "kestrel", limit=5)
+    assert len(opened) == 4 and all(connection.closed for connection in opened)
+
+
+@pytest.mark.parametrize("limit", [1, 5, 20, 50])
+def test_exact_ties_across_the_shard_cut_pick_the_same_turns(ranked_store, limit: int) -> None:
+    for query in ("quartz", "quartz marble"):
+        want = archive_turns.search_turns_reference(
+            ranked_store, query, providers=["perplexity"], limit=limit
+        )
+        got = archive_turns.search_turns(ranked_store, query, providers=["perplexity"], limit=limit)
+        assert len(want) == min(limit, 60)
+        assert len({hit["rank"] for hit in want}) == 1  # every hit ties
+        assert got == want
+
+
+def test_a_turn_with_no_conversation_row_is_dropped_by_both_searches(ranked_store) -> None:
+    ((_, item),) = select_shards(
+        ranked_store, authors=[HUMAN], providers=["perplexity"], months=["202505"]
+    )
+    path = ranked_store.turns / item["path"]
+    connection = sqlite3.connect(path)
+    try:
+        first = connection.execute("SELECT uid FROM turns ORDER BY id LIMIT 3").fetchall()
+        for (uid,) in first:  # orphan the best-placed turns, so the cut has to look further
+            connection.execute("DELETE FROM conversations WHERE uid = ?", (uid,))
+        connection.commit()
+    finally:
+        connection.close()
+    for limit in (1, 5, 50):
+        want = archive_turns.search_turns_reference(
+            ranked_store, "quartz", providers=["perplexity"], limit=limit, include_reasoning=True
+        )
+        got = archive_turns.search_turns(
+            ranked_store, "quartz", providers=["perplexity"], limit=limit, include_reasoning=True
+        )
+        assert got == want and not {hit["uid"] for hit in got} & {uid for (uid,) in first}
+
+
+def test_a_ranked_turn_that_vanishes_is_an_error_not_a_short_answer(
+    ranked_store, monkeypatch
+) -> None:
+    real = archive_turns._shard_candidates
+
+    def ghost(connection, match, filters, per_shard):
+        rows = real(connection, match, filters, per_shard)
+        return [(rank, uid, idx, rowid + 10_000_000) for rank, uid, idx, rowid in rows]
+
+    monkeypatch.setattr(archive_turns, "_shard_candidates", ghost)
+    with pytest.raises(archive_turns.TurnStoreError, match="vanished"):
+        archive_turns.search_turns(ranked_store, "kestrel", providers=["claude"], limit=3)
