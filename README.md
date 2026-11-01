@@ -112,7 +112,9 @@ database and a graph, all inside the private corpus store. See
 The unified private knowledge library extends this with versioned records from web archives,
 native coding sessions, and selected authored documents. It provides bounded CLI/MCP search,
 revision history, graph/index contracts, Obsidian-compatible Markdown, and a verified Notion
-import ZIP. See [docs/knowledge-library.md](docs/knowledge-library.md).
+import ZIP. Library builds now emit a stable progress event at the start of every phase
+(including previously silent fingerprint, verify, and artifact stages) with elapsed_seconds,
+and byte-limit failures include measured numbers for sizing retries. See [docs/knowledge-library.md](docs/knowledge-library.md).
 
 Example:
 
@@ -208,4 +210,4 @@ Runtime state is written to `state/`, `federation/`, and `reports/`. Those direc
 
 ## Status
 
-This repo now serves as the canonical Organ I home of the conversation corpus system. The adjacent Meta consumer path is also live: `schema-definitions` canonizes the outward contracts, `organvm-engine` discovers and validates emitted surface bundles, and `organvm-mcp-server` exposes them to agent sessions. Operational hardening is underway: CI gates all pushes, ChatGPT is a first-class provider alongside Claude/Gemini/Grok/Perplexity/Copilot, and sanitized test fixtures document the expected export formats. Archive provider readers (including Copilot SingleFile research pages) are complete and CI-green on main. The unified private knowledge library (PR #86) adds versioned records, bounded retrieval, and portable exports over the existing archive and selected documents; see docs/knowledge-library.md. The next frontier is downstream dashboard consumption and additional provider adapters.
+This repo now serves as the canonical Organ I home of the conversation corpus system. The adjacent Meta consumer path is also live: `schema-definitions` canonizes the outward contracts, `organvm-engine` discovers and validates emitted surface bundles, and `organvm-mcp-server` exposes them to agent sessions. Operational hardening is underway: CI gates all pushes, ChatGPT is a first-class provider alongside Claude/Gemini/Grok/Perplexity/Copilot, and sanitized test fixtures document the expected export formats. Archive provider readers (including Copilot SingleFile research pages) are complete and CI-green on main. The unified private knowledge library (PR #86) adds versioned records, bounded retrieval, and portable exports over the existing archive and selected documents; see docs/knowledge-library.md. Library builds emit per-phase progress events with elapsed times and numbered byte-limit diagnostics. The next frontier is downstream dashboard consumption and additional provider adapters.
