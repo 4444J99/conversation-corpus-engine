@@ -16,6 +16,7 @@ import zlib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import wraps
+from itertools import groupby
 from pathlib import Path
 from typing import Any
 
@@ -554,27 +555,43 @@ class Library:
             if values:
                 clauses.append(f"r.{column} IN ({','.join('?' for _ in values)})")
                 params.extend(values)
-        source = "FROM record_fts JOIN records r ON r.uid=record_fts.uid WHERE " + " AND ".join(
+        source = "FROM record_fts JOIN records r ON r.rowid=record_fts.rowid WHERE " + " AND ".join(
             clauses
         )
         total = self.connection.execute("SELECT COUNT(*) " + source, params).fetchone()[0]
-        results = self.connection.execute(
+        # FTS5 can stream its native rank order, but adding uid to SQL's ORDER BY
+        # forces SQLite to sort every match. Sort only equal-score groups in Python
+        # to preserve the existing deterministic uid tie-break across page edges.
+        ranked = self.connection.execute(
             "SELECT r.uid,r.title,r.provider,r.kind,r.wing,r.lane,r.current_version AS version,"
-            "r.body_status,r.message_count,r.source_ref,snippet(record_fts,-1,'[',']','...',28) AS excerpt "
+            "r.body_status,r.message_count,r.source_ref,record_fts.rowid AS fts_rowid,rank AS score "
             + source
-            + " ORDER BY bm25(record_fts,0,5,1),r.uid LIMIT ? OFFSET ?",
-            [*params, limit, offset],
+            + " AND rank MATCH 'bm25(0,5,1)' ORDER BY rank",
+            params,
         )
         hits = []
-        for row in results:
-            hit = dict(row)
+        position = 0
+        for _, group in groupby(ranked, key=lambda row: row["score"]):
+            tied = sorted(group, key=lambda row: row["uid"])
+            for row in tied:
+                if position >= offset and len(hits) < limit:
+                    hits.append(dict(row))
+                position += 1
+            if len(hits) == limit:
+                break
+        for hit in hits:
+            excerpt = self.connection.execute(
+                "SELECT snippet(record_fts,-1,'[',']','...',28) FROM record_fts "
+                "WHERE record_fts MATCH ? AND rowid=?",
+                (match, hit.pop("fts_rowid")),
+            ).fetchone()[0]
+            hit.pop("score")
             hit["title"] = hit["title"][:512]
             hit["source_ref"] = hit["source_ref"][:2048]
             for key in ("kind", "lane"):
                 hit[key] = hit[key][:128]
-            hit["excerpt"] = hit["excerpt"][:360]
+            hit["excerpt"] = excerpt[:360]
             hit["path"] = f"vault/records/{hit['uid']}.md"
-            hits.append(hit)
         return {
             **empty,
             "total": total,
@@ -659,6 +676,11 @@ class Library:
             "SELECT uid FROM records EXCEPT SELECT uid FROM record_fts"
         ).fetchone():
             problems.append("record absent from search")
+        if self.connection.execute(
+            "SELECT 1 FROM record_fts f LEFT JOIN records r ON r.rowid=f.rowid "
+            "WHERE r.uid IS NULL OR r.uid != f.uid LIMIT 1"
+        ).fetchone():
+            problems.append("search row identity mismatch")
         if full:
             for row in self.connection.execute("SELECT digest,payload,raw_bytes FROM objects"):
                 if check_callback:

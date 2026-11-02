@@ -70,6 +70,39 @@ def test_record_pagination_is_not_starved_by_long_conversation(tmp_path):
         assert max(len(hit["excerpt"]) for hit in first["hits"]) <= 360
 
 
+def test_ranked_search_matches_reference_order_and_excerpts_across_pages(tmp_path):
+    with Library.create(tmp_path / "library.sqlite") as library:
+        for identity in ("z", "b", "q", "a", "m", "c"):
+            item = record(identity, "lattice evidence")
+            item.title = "Same title"
+            library.put(item)
+        library.put(record("strong", "lattice evidence " * 4))
+        reference = library.connection.execute(
+            "SELECT r.uid,snippet(record_fts,-1,'[',']','...',28) AS excerpt "
+            "FROM record_fts JOIN records r ON r.uid=record_fts.uid "
+            "WHERE record_fts MATCH ? AND r.provider=? "
+            "ORDER BY bm25(record_fts,0,5,1),r.uid",
+            ('"lattice" "evidence"', "chatgpt"),
+        ).fetchall()
+        hits = []
+        for offset in (0, 2, 4, 6):
+            page = library.search("lattice evidence", providers=["chatgpt"], limit=2, offset=offset)
+            assert page["total"] == len(reference)
+            hits.extend((row["uid"], row["excerpt"]) for row in page["hits"])
+        assert hits == [(row["uid"], row["excerpt"][:360]) for row in reference]
+
+
+def test_verify_detects_search_rowid_identity_mismatch(tmp_path):
+    with Library.create(tmp_path / "library.sqlite") as library:
+        library.put(record("a"))
+        library.put(record("b"))
+        library.connection.execute(
+            "UPDATE record_fts SET uid=CASE uid WHEN 'chatgpt-a' THEN 'chatgpt-b' "
+            "ELSE 'chatgpt-a' END"
+        )
+        assert "search row identity mismatch" in library.verify(full=False)
+
+
 def test_candidate_inherits_history_and_does_not_prune_missing_sources(tmp_path):
     original = tmp_path / "original.sqlite"
     with Library.create(original) as library:
