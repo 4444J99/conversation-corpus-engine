@@ -43,7 +43,7 @@ from .archive_author import HUMAN_CHANNELS
 from .archive_model import Conversation, SourceTracker
 from .archive_provenance import BASIS_KEY, reclassify_typed_turns
 
-READER = "archive_read_library@1"
+READER = "archive_read_library@2"
 POINTER = "current.json"
 DATABASE = "library.sqlite"
 WRITTEN = "written"
@@ -194,6 +194,13 @@ def expected(root: Path, family: Family) -> dict[str, int]:
     }
 
 
+def family_uids(root: Path, family: Family) -> set[str]:
+    """Source identities available to a bridge, without loading the conversation bodies."""
+    database, _ = locate(root)
+    with _open(database) as library:
+        return {row["uid"] for row in _rows(library, family)}
+
+
 def describe(root: Path, family: Family) -> dict[str, list[str]]:
     """The manifest's account of what a family read and what it left alone."""
     database, pointer = locate(root)
@@ -255,8 +262,19 @@ def iter_family(root: Path, tracker: SourceTracker, family: Family) -> Iterator[
     read (`bridge_*`), and the basis of every coding-CLI user turn (`basis:<author>:<basis>`).
     """
     database, pointer = locate(root)
+    database_input = tracker.provenance(database, origin="library_generation")
+    generation: dict[str, Any] = {
+        "generation": database.parent.name,
+        "database_sha256": database_input["source_sha256"],
+        "database_bytes": database_input["source_size_bytes"],
+    }
     if pointer is not None:
-        tracker.provenance(pointer)
+        tracker.provenance(pointer, origin="library_generation")
+        current = json.loads(pointer.read_text(encoding="utf-8"))
+        for key in ("generation", "record_fingerprint", "evidence_fingerprint", "report_sha256"):
+            if key in current:
+                generation[key] = current[key]
+    tracker.metadata["library_generation"] = generation
     counts = expected(root, family)
     tracker.note("library_records", counts["records"])
     tracker.note("library_messages", counts["messages"])
@@ -266,6 +284,11 @@ def iter_family(root: Path, tracker: SourceTracker, family: Family) -> Iterator[
         for row in _rows(library, family):
             payload = library.record(row["uid"])
             conversation = _convert(row, payload, family)
+            conversation.provenance.update(
+                source_origin="library_generation",
+                library_database_sha256=database_input["source_sha256"],
+                library_generation=generation["generation"],
+            )
             del payload
             if family.cli:
                 for key, amount in reclassify_typed_turns(conversation).items():

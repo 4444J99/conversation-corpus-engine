@@ -19,7 +19,12 @@ from conversation_corpus_engine.archive_ingest import (
     load_manifest,
     resolve_sources,
 )
-from conversation_corpus_engine.archive_model import Conversation, Message, SourceTracker
+from conversation_corpus_engine.archive_model import (
+    Conversation,
+    Message,
+    SourceTracker,
+    sha256_file,
+)
 from conversation_corpus_engine.corpus_store import register_corpus_store
 from conversation_corpus_engine.library_store import Library
 
@@ -321,7 +326,7 @@ def test_the_manifest_binds_the_generation_and_holds_the_ingest_to_its_counts(
     info = manifest["providers"]["codex"]
     read = "\n".join(info["channels"]["read"])
     assert GENERATION in read and "r" * 64 in read and "p" * 64 in read
-    assert set(info["source_files"]) == {"current.json"}
+    assert set(info["source_files"]) == {"current.json", f"{GENERATION}/library.sqlite"}
     assert info["reader_counters"]["library_records"] == info["reader_counters"]["bridge_records"]
     broken = {**info, "conversations": info["conversations"] - 1}
     problems = reconcile_source("codex", broken)
@@ -353,6 +358,93 @@ def test_merge_keeps_the_providers_a_call_does_not_read(archive_env, library_roo
     assert load_manifest(archive_env.paths) == merged
     replaced = _ingest(archive_env, library_root, ["applenotes"])
     assert set(replaced["providers"]) == {"applenotes"}
+
+
+def _store_bytes(paths) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(paths.root)): path.read_bytes()
+        for path in paths.root.rglob("*")
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("provider", ["chatgpt", "codex"])
+def test_merge_refuses_omitted_library_before_changing_any_provider(
+    archive_env, library_root: Path, provider: str
+) -> None:
+    _ingest(archive_env, library_root, [provider])
+    before = _store_bytes(archive_env.paths)
+    with pytest.raises(ValueError, match="library.*allow-input-loss"):
+        ingest(
+            export_root=archive_env.export,
+            paths=archive_env.paths,
+            authorization=archive_env.auth,
+            providers=["claude", provider],
+            merge=True,
+        )
+    assert _store_bytes(archive_env.paths) == before
+
+
+def test_merge_input_loss_requires_an_explicit_override(archive_env, library_root: Path) -> None:
+    _ingest(archive_env, library_root, ["chatgpt"])
+    manifest = ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["chatgpt"],
+        merge=True,
+        allow_input_loss=True,
+    )
+    assert manifest["build_options"]["allow_input_loss"] is True
+    assert manifest["providers"]["chatgpt"]["kinds"].get("page", 0) == 0
+
+
+def test_library_input_binds_database_and_generation(archive_env, library_root: Path) -> None:
+    info = _ingest(archive_env, library_root, ["chatgpt"])["providers"]["chatgpt"]
+    database = library_root / GENERATION / "library.sqlite"
+    library_inputs = [item for item in info["inputs"] if item["origin"] == "library_generation"]
+    assert {item["source_file"] for item in library_inputs} == {"current.json", "library.sqlite"}
+    bound_database = next(
+        item for item in library_inputs if item["source_file"] == "library.sqlite"
+    )
+    assert bound_database["sha256"] == sha256_file(database)
+    assert bound_database["size_bytes"] == database.stat().st_size
+    assert info["library_generation"]["generation"] == GENERATION
+    assert info["library_generation"]["record_fingerprint"] == "r" * 64
+    assert info["library_uids"] == ["chatgpt-page-1"]
+    assert info["build_options"]["library_root"] == str(library_root.resolve())
+    record = next(c for c in iter_store(archive_env.paths, ["chatgpt"]) if c.kind == "page")
+    assert record.provenance["source_origin"] == "library_generation"
+    assert record.provenance["library_database_sha256"] == sha256_file(database)
+
+
+def test_merge_refuses_a_generation_that_drops_previous_bridged_ids(
+    archive_env, library_root: Path, tmp_path: Path
+) -> None:
+    _ingest(archive_env, library_root, ["chatgpt"])
+    other = tmp_path / "other-generation"
+    with Library.create(other / "library.sqlite") as library:
+        library.put(_conversation("chatgpt", "replacement-page", [], kind="page"))
+    before = _store_bytes(archive_env.paths)
+    with pytest.raises(ValueError, match="library.*allow-input-loss"):
+        _ingest(archive_env, other, ["chatgpt"], merge=True)
+    assert _store_bytes(archive_env.paths) == before
+
+
+def test_merge_guard_also_recognizes_pre_receipt_manifests(archive_env, library_root: Path) -> None:
+    manifest = _ingest(archive_env, library_root, ["chatgpt"])
+    manifest["providers"]["chatgpt"].pop("library_uids")
+    archive_env.paths.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    before = _store_bytes(archive_env.paths)
+    with pytest.raises(ValueError, match="library.*allow-input-loss"):
+        ingest(
+            export_root=archive_env.export,
+            paths=archive_env.paths,
+            authorization=archive_env.auth,
+            providers=["chatgpt"],
+            merge=True,
+        )
+    assert _store_bytes(archive_env.paths) == before
 
 
 def test_merge_keeps_the_reader_version_a_provider_was_read_with(

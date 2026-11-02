@@ -423,10 +423,23 @@ def sha256_file(path: Path, cache: dict[Path, str] | None = None) -> str:
 class SourceTracker:
     """Per-export provenance: relative source path plus a lazily cached sha256."""
 
-    def __init__(self, root: Path, reader: str) -> None:
+    def __init__(
+        self,
+        root: Path,
+        reader: str,
+        *,
+        origin: str = "unspecified",
+        path_origins: dict[Path, str] | None = None,
+        hash_cache: dict[Path, str] | None = None,
+    ) -> None:
         self.root = root.resolve()
         self.reader = reader
+        self.origin = origin
+        self.path_origins = {path.resolve(): value for path, value in (path_origins or {}).items()}
         self._hashes: dict[Path, str] = {}
+        self._hash_cache = hash_cache if hash_cache is not None else {}
+        self._inputs: dict[Path, dict[str, Any]] = {}
+        self.metadata: dict[str, Any] = {}
         self.files_read: list[str] = []
         self.counters: Counter[str] = Counter()
 
@@ -442,13 +455,32 @@ class SourceTracker:
     def hashes(self) -> dict[str, str]:
         return {self.relative(path): digest for path, digest in sorted(self._hashes.items())}
 
-    def provenance(self, path: Path, *, member: str = "") -> dict[str, Any]:
+    def inputs(self) -> list[dict[str, Any]]:
+        """Files actually read, including container bytes and the caller-declared origin."""
+        return sorted(self._inputs.values(), key=lambda item: (item["source_file"], item["sha256"]))
+
+    def provenance(
+        self, path: Path, *, member: str = "", origin: str | None = None
+    ) -> dict[str, Any]:
+        resolved = path.resolve()
         rel = self.relative(path)
         if rel not in self.files_read:
             self.files_read.append(rel)
+        if resolved not in self._inputs:
+            digest = sha256_file(path, self._hash_cache)
+            self._hashes[resolved] = digest
+            self._inputs[resolved] = {
+                "source_file": rel,
+                "sha256": digest,
+                "size_bytes": resolved.stat().st_size,
+                "origin": origin or self.path_origins.get(resolved, self.origin),
+            }
+        source = self._inputs[resolved]
         info: dict[str, Any] = {
             "source_file": rel,
-            "source_sha256": sha256_file(path, self._hashes),
+            "source_sha256": source["sha256"],
+            "source_size_bytes": source["size_bytes"],
+            "source_origin": source["origin"],
             "reader": self.reader,
         }
         if member:

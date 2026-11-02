@@ -9,11 +9,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .attributed_knowledge import ZETTEL_SCHEMA, export_zettels, zettel_atoms
 from .corpus_store import CorpusStoreError
 from .library_analysis import AnalysisLimits, export_analysis
 from .library_build import build_library, current_generation, publish_library, verify_candidate
 from .library_store import Library
 from .paths import default_project_root
+from .persona_extract import extract_persona_lexicon
 
 STORE_ENV = "CCE_LIBRARY_STORE_ROOT"
 
@@ -129,6 +131,27 @@ def add_library_parser(subparsers: Any) -> None:
     publish = sub.add_parser("publish", help="Verify and atomically publish an existing candidate")
     common(publish)
     publish.add_argument("generation", type=Path)
+    zettels = sub.add_parser(
+        "zettels", help="Validate and export reviewed semantic ideas with exact source spans"
+    )
+    common(zettels)
+    zettels.add_argument(
+        "--input", type=Path, required=True, help="Private reviewed-Zettels JSON envelope"
+    )
+    zettels.add_argument(
+        "--format",
+        choices=("json", "atoms-jsonl"),
+        default="json",
+        help="Reviewed envelope or explicit sealed-archive knowledge atoms",
+    )
+    profile = sub.add_parser(
+        "profile", help="Strict owner profile from explicit canonical message annotations"
+    )
+    common(profile)
+    profile.add_argument("--persona", required=True, help="Exact owner author_id")
+    profile.add_argument(
+        "--annotations", type=Path, required=True, help="Private JSON list of source annotations"
+    )
     for name in ("status", "verify"):
         common(sub.add_parser(name))
     search = sub.add_parser("search", help="Paged full-text retrieval with exact match count")
@@ -207,7 +230,21 @@ def handle_library(args: argparse.Namespace) -> int:
         else:
             generation, library = open_library(store)
             with library:
-                if args.action == "analyze":
+                if args.action == "zettels":
+                    envelope = json.loads(args.input.read_text(encoding="utf-8"))
+                    if not isinstance(envelope, dict) or envelope.get("schema") != ZETTEL_SCHEMA:
+                        raise ValueError("unsupported reviewed Zettel envelope schema")
+                    exporter = zettel_atoms if args.format == "atoms-jsonl" else export_zettels
+                    result = exporter(library, envelope.get("zettels"))
+                elif args.action == "profile":
+                    annotations = json.loads(args.annotations.read_text(encoding="utf-8"))
+                    result = extract_persona_lexicon(
+                        args.project_root,
+                        args.persona,
+                        library=library,
+                        annotations=annotations,
+                    )
+                elif args.action == "analyze":
                     result = export_analysis(
                         library,
                         args.output,
@@ -272,7 +309,11 @@ def handle_library(args: argparse.Namespace) -> int:
                         return 1
                 else:
                     result = {"generation": str(generation), **library.status()}
-        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        if args.action == "zettels" and args.format == "atoms-jsonl":
+            for atom in result:
+                print(json.dumps(atom, ensure_ascii=False, sort_keys=True))
+        else:
+            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     except (ValueError, OSError, KeyError, CorpusStoreError) as error:
         print(f"library: {error}", file=sys.stderr)

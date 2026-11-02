@@ -496,6 +496,8 @@ def test_the_standard_page_maps_every_conversation_field(tmp_path: Path) -> None
     assert conversation.provenance == {
         "source_file": COPILOT_PAGE_NAME,
         "source_sha256": hashlib.sha256(page.read_bytes()).hexdigest(),
+        "source_origin": "unspecified",
+        "source_size_bytes": page.stat().st_size,
         "reader": archive_read_copilot.READER,
     }
 

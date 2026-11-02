@@ -278,6 +278,8 @@ def iter_conversations(
     """Yield every conversation; `extra_files` (live deltas) are read first so they win."""
     names = _asset_names(root)
     for source in [*(Path(p) for p in extra_files), *shard_files(root)]:
+        # Empty captures are still inputs: their digest must explain a zero-record read.
+        tracker.provenance(source)
         payload = json.loads(source.read_text(encoding="utf-8"))
         records = payload if isinstance(payload, list) else payload.get("conversations", [])
         for raw in records:

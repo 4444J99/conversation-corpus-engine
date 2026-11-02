@@ -20,6 +20,7 @@ from .archive_ingest import (
     DEFAULT_ARCHIVE_DIRNAME,
     PROVIDER_SPECS,
     ArchivePaths,
+    MergeInputLoss,
     authorize_archive,
     failed_providers,
     has_bounded_layout,
@@ -282,6 +283,7 @@ def run_stages(
     options: dict[str, Any] | None = None,
     limits: Limits | None = None,
     merge: bool = False,
+    allow_input_loss: bool = False,
 ) -> dict[str, Any]:
     paths, authorization = context.paths, context.write_authorization()
     limits = limits or Limits()
@@ -312,6 +314,7 @@ def run_stages(
                 options=options,
                 library_root=context.library_root,
                 merge=merge,
+                allow_input_loss=allow_input_loss,
             )
             result[stage] = {
                 "totals": manifest["totals"],
@@ -384,6 +387,11 @@ def add_archive_parser(subparsers: Any) -> None:
             action="store_true",
             help="keep the manifest entries of providers this call does not read, so a store "
             "is built one provider at a time",
+        )
+        parser.add_argument(
+            "--allow-input-loss",
+            action="store_true",
+            help="explicitly allow --merge to omit a previous library or live-capture input",
         )
 
     ingest_parser = sub.add_parser("ingest", help="Read raw exports into the normalized store")
@@ -594,15 +602,20 @@ def handle_archive(args: argparse.Namespace) -> int:
         }
         stages = ("ingest",) if action == "ingest" else STAGES
         limits = limits_from_args(args)
-        result = run_stages(
-            context,
-            stages,
-            providers=providers,
-            overrides=_overrides(args.source),
-            options=options,
-            limits=limits,
-            merge=args.merge,
-        )
+        try:
+            result = run_stages(
+                context,
+                stages,
+                providers=providers,
+                overrides=_overrides(args.source),
+                options=options,
+                limits=limits,
+                merge=args.merge,
+                allow_input_loss=args.allow_input_loss,
+            )
+        except MergeInputLoss as exc:
+            print(f"archive merge refused: {exc}", file=sys.stderr)
+            return 2
         problems = verify_archive(paths, limits) if action == "build" else []
         failed = [n for n, i in result["ingest"]["providers"].items() if i["status"] == "failed"]
         payload = {"stages": result, "problems": problems, "ok": not problems and not failed}

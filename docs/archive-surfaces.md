@@ -20,6 +20,11 @@ archive_layout.py mints every file, folder and note name (and every wikilink) wi
 
 ## Privacy model
 
+An opt-in [encrypted publication layer](encrypted-publication.md) can package explicitly selected
+private files as ciphertext in a separate dedicated Git worktree. It does not change any of the
+plaintext write rules below. Its keys, selections, manifests after decryption and restored files
+remain private; ordinary `archive` commands never write plaintext into that publication tree.
+
 - Raw exports are read, never written, moved or deduplicated. Output may not overlap a source root.
 - Every write goes through `authorize_corpus_write`: the destination must be a strict descendant of
   a registered, non-symlinked, non-Git corpus store (see `cce corpus-store register`).
@@ -212,10 +217,38 @@ cce archive ingest --export-root "$EXPORTS" --library-root "$OLD_STORE" --provid
 
 `--merge` keeps the manifest entries of providers a call does not read, so a store this size is
 built one provider at a time and a failed one is read again alone; without it the manifest lists
-exactly the providers of the call. A conversation larger than a shard (one Antigravity session is
+exactly the providers of the call. Before any selected provider is written, a merge checks its
+previous library and live-capture inputs. A library generation that lacks previously bridged
+source IDs refuses the merge. Live captures are checked by their normalized conversation IDs:
+omitting a delta file or refreshing a fixed filename with only newer records cannot remove
+earlier records, even when two input files share a basename. A complete account export may
+replace a delta if it contains all of those identities. Intentional removal requires
+`--allow-input-loss`, which is recorded in the
+manifest. Older manifests without the source-ID list use their existing library record count
+as the compatibility check; they cannot prove identity preservation within an equal-size
+replacement generation. Providers not selected keep their original input and build receipts.
+Captured identities remain protected across later merges after an account export absorbs them.
+A failed provider rebuild retains the previous shards and their input receipt, alongside a
+separate failed-attempt receipt; failure does not erase the protection for the next retry.
+Older live captures without recorded IDs cannot provide the same identity-level assurance;
+retain their original complete inputs for the first build that writes these receipts.
+
+The manifest records effective build options and the files actually read, with their SHA-256,
+byte size and declared origin (`account_export`, `live_capture`, or `library_generation`). The
+library database and its pointer are both hashed, and the generation's record/evidence/report
+fingerprints are carried with them. A hash cache reads a shared library database only once per
+ingest. Live captures are listed separately from account-export shards in the channel report.
+Origins describe the ingestion route; they are not a claim about who authored the text. An
+outer export ZIP that was unpacked before ingestion is not an input unless a reader opens it;
+preserve its original checksum in the capture receipt. Private source paths in build receipts
+belong in the private store, not in the code repository.
+
+A conversation larger than a shard (one Antigravity session is
 about 170 MiB) is never cut: its shard is that one row, the manifest marks it `oversize_row`, and
 the census lists the file under `violations.exempt` with the reason instead of ignoring the
 ceiling — a data file past the ceiling that the manifest does not name is still a violation.
+This exemption preserves the canonical record; it does not exempt an encrypted publication
+from its own unit, chunk, manifest or total-capacity limits.
 
 ### The normalized layer (version 2)
 
