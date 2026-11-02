@@ -34,6 +34,13 @@ cce library analyze lattice --output /private/store/derived/analysis/lattice --p
 cce library verify --store-root /private/store
 ```
 
+Read reports the observed attachment count for the selected message sequence and
+bounded metadata for the current message. A truncation flag identifies shortened
+lists or fields. Counts cover normalized messages, so a partial or metadata-only
+source may omit attachments. `typed_chars` marks the number of characters typed
+before any appended attachment text when that boundary was recorded. Neither
+metadata nor counts establish that attachment bytes were retained.
+
 `CCE_LIBRARY_STORE_ROOT` supplies the store when a command omits it; the existing `CCE_CORPUS_STORE_ROOT` is a fallback. Search returns an exact total, bounded excerpts, stable record identities, vault paths and the next offset. Read retrieves one message span and reports main/alternate sequence counts; use `--sequence alternate` (MCP `sequence: "alternate"`) to page retained conversation branches. History and digest selection also expose retained snapshots that were not selected as the current body. `cce-mcp --library-store-root /private/store` adds three read-only tools: `cce_library_search`, `cce_library_read`, and `cce_library_history`. Clients cannot choose arbitrary filesystem paths through these tools.
 
 ## Source manifest

@@ -67,6 +67,10 @@ def read_record(
     if not isinstance(alternates, list) or any(not isinstance(item, dict) for item in alternates):
         raise ValueError("alternate message sequence is malformed")
     messages = payload["messages"] if sequence == "main" else alternates
+    for item in messages:
+        attachments = item.get("attachments", [])
+        if not isinstance(attachments, list) or any(not isinstance(a, dict) for a in attachments):
+            raise ValueError("attachment metadata is malformed")
     result = {
         "uid": uid,
         "title": payload["title"][:512],
@@ -77,6 +81,8 @@ def read_record(
         "main_message_count": len(payload["messages"]),
         "alternate_message_count": len(alternates),
         "body_status": payload["extra"].get("body_status", "full" if messages else "metadata_only"),
+        "attachment_count_observed": sum(len(item.get("attachments", [])) for item in messages),
+        "attachment_notice": "Counts describe observed normalized messages; sources may omit attachments.",
         "provenance": {
             key[:128]: value
             if len(json.dumps(value, ensure_ascii=False)) <= 2048
@@ -101,6 +107,7 @@ def read_record(
         raise ValueError("message index is outside the record")
     item = messages[message]
     text = str(item.get("text", ""))
+    attachments = item.get("attachments", [])
     if offset > len(text):
         raise ValueError("text offset is outside the message")
     end = min(len(text), offset + limit)
@@ -110,6 +117,22 @@ def read_record(
         channel=item.get("channel", "")[:128],
         message_id=item.get("id", "")[:512],
         total_characters=len(text),
+        typed_chars=item.get("typed_chars"),
+        attachment_count_in_message=len(attachments),
+        attachments=[
+            {
+                "name": str(a.get("name", ""))[:512],
+                "kind": str(a.get("kind", "file"))[:128],
+                "size": a.get("size") if isinstance(a.get("size"), int) and not isinstance(a.get("size"), bool) else None,
+                "ref": str(a.get("ref", ""))[:1024],
+            }
+            for a in attachments[:20]
+        ],
+        attachments_truncated=len(attachments) > 20 or any(
+            len(str(a.get(key, ""))) > limit
+            for a in attachments[:20]
+            for key, limit in (("name", 512), ("kind", 128), ("ref", 1024))
+        ),
     )
     if end < len(text):
         result["next_offset"] = end

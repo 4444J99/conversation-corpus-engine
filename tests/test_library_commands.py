@@ -3,7 +3,7 @@ import json
 import pytest
 
 from conversation_corpus_engine import library_commands, library_mcp
-from conversation_corpus_engine.archive_model import Conversation, Message
+from conversation_corpus_engine.archive_model import Attachment, Conversation, Message
 from conversation_corpus_engine.cli import build_parser
 from conversation_corpus_engine.corpus_store import register_corpus_store
 from conversation_corpus_engine.library_commands import handle_library, read_record
@@ -45,6 +45,46 @@ def test_parser_and_bounded_read(tmp_path):
         assert read_record(library, item.uid, message=1)["text"] == "second"
         with pytest.raises(ValueError):
             read_record(library, item.uid, limit=1000000)
+
+
+def test_read_exposes_observed_attachments_and_typed_boundary(tmp_path):
+    with Library.create(tmp_path / "library.sqlite") as library:
+        item = Conversation(
+            provider="chatgpt", source_id="attachments", title="Evidence",
+            messages=[
+                Message(role="user", text="typed attachment text", typed_chars=5,
+                        attachments=[Attachment(name="one.pdf", size=42, ref="file-one")]),
+                Message(role="user", text="second", attachments=[Attachment(name="two.png")]),
+            ],
+        )
+        library.put(item)
+        first = read_record(library, item.uid, limit=4)
+        assert first["attachment_count_observed"] == 2
+        assert "observed" in first["attachment_notice"]
+        assert first["typed_chars"] == 5
+        assert first["attachments"] == [{"name": "one.pdf", "kind": "file", "size": 42, "ref": "file-one"}]
+        assert first["attachment_count_in_message"] == 1
+        second = read_record(library, item.uid, message=1)
+        assert second["attachments"][0]["name"] == "two.png"
+
+
+def test_partial_read_labels_observed_attachment_count_and_bounds_metadata(tmp_path):
+    with Library.create(tmp_path / "library.sqlite") as library:
+        item = Conversation(
+            provider="claude", source_id="partial", title="Partial",
+            messages=[Message(role="user", text="x", attachments=[
+                Attachment(name="a" * 600) for _ in range(21)
+            ])],
+            extra={"body_status": "partial"},
+        )
+        library.put(item)
+        result = read_record(library, item.uid)
+        assert result["body_status"] == "partial"
+        assert result["attachment_count_observed"] == 21
+        assert result["attachment_count_in_message"] == 21
+        assert len(result["attachments"]) == 20
+        assert len(result["attachments"][0]["name"]) == 512
+        assert result["attachments_truncated"] is True
 
 
 def test_mcp_only_exposes_library_when_configured_and_rejects_paths(tmp_path):
