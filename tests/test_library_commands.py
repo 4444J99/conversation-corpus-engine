@@ -65,6 +65,22 @@ def test_missing_library_cli_is_nonzero(tmp_path, capsys):
     assert "no library generation" in capsys.readouterr().err
 
 
+def test_unavailable_store_is_explained_without_creating_it(tmp_path, capsys):
+    store = tmp_path / "missing-volume" / "archive"
+    args = build_parser().parse_args(["library", "status", "--store-root", str(store)])
+    assert handle_library(args) == 2
+    error = capsys.readouterr().err
+    assert "store unavailable" in error and str(store) in error
+    assert "drive" in error
+    assert not store.parent.exists()
+
+    server = CceMcpServer(default_project_root=tmp_path, library_store_root=store)
+    result = server.call_tool(SEARCH_TOOL, {"query": "lattice"})
+    assert result["isError"] is True
+    assert "store unavailable" in result["content"][0]["text"]
+    assert not store.parent.exists()
+
+
 def test_searchable_alternate_branch_is_readable_in_bounded_spans(tmp_path):
     with Library.create(tmp_path / "library.sqlite") as library:
         item = Conversation(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,14 @@ def configured_store(explicit: Path | None = None) -> Path:
 
 
 def open_library(store_root: Path) -> tuple[Path, Library]:
+    try:
+        mode = store_root.stat().st_mode
+    except (FileNotFoundError, NotADirectoryError) as error:
+        raise ValueError(
+            f"library store unavailable: {store_root}; check the path and mount the drive if needed"
+        ) from error
+    if not stat.S_ISDIR(mode):
+        raise ValueError(f"library store is not a directory: {store_root}")
     generation = current_generation(store_root)
     if generation is None:
         raise ValueError("no library generation has been published")
