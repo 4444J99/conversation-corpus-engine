@@ -364,9 +364,7 @@ class _FenceTracker:
         elif before is None and self.fence_prefix is None:
             # Plain fences carry no prefix; list fences carry the item
             # prefix that makes their content-indented closer close.
-            self.fence_prefix = (
-                "-" + " " * (self.list_indent - 1) if self.list_indent else ""
-            )
+            self.fence_prefix = "-" + " " * (self.list_indent - 1) if self.list_indent else ""
         return result
 
     def _advance_inner(self, line):
@@ -600,7 +598,8 @@ def ranges(data, body_limit, *, relative=None, maximum=None):
                 + len(after or "")
             )
             if (
-                end - offset
+                end
+                - offset
                 + wrapper
                 + navigation_growth(raw, relative, state, starts_line, list_indent)
                 <= maximum

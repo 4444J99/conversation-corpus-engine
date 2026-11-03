@@ -541,7 +541,11 @@ def test_round4_split_list_fence_rewrites_following_link(packer, tmp_path):
     # prefix, so the closing line closes it and the link is rewritten.
     large = b"# Record\n\n## Message 1\n\n" + b"body\n" * 1400
     large += b"\n## Message 2\n\nLast message.\n"
-    note = b"-   ```python\n" + b"    code\n" * 300 + b"    ```\n\n[Second](../records/a.md#message-2)\n"
+    note = (
+        b"-   ```python\n"
+        + b"    code\n" * 300
+        + b"    ```\n\n[Second](../records/a.md#message-2)\n"
+    )
     _, output, _ = build(
         packer,
         tmp_path,
