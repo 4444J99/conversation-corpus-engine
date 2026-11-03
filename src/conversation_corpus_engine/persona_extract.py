@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any
 
 from .answering import STOP_WORDS, load_json, shorten, tokenize
+from .attributed_knowledge import collect_owner_segments
+from .attribution import ASSURANCE, attributed_spans, owner_profile_eligible
+from .library_store import Library
 from .sharded_collection import collection_exists, iter_corpus_collection
 
 # Persona identifiers that denote the assistant/model side of a transcript.
@@ -286,6 +289,41 @@ def _collect_segments(source: Path, persona_id: str) -> tuple[list[str], list[st
     return persona_parts, other_parts
 
 
+def _attributed_turns(obj: Any) -> list[dict[str, Any]]:
+    """Keep exact message text and attribution together; never infer from its role."""
+    if isinstance(obj, list):
+        return [turn for item in obj for turn in _attributed_turns(item)]
+    if not isinstance(obj, dict):
+        return [{"text": obj}] if isinstance(obj, str) else []
+    for key in ("messages", "turns", "conversation", "dialog", "dialogue"):
+        if isinstance(obj.get(key), list):
+            return _attributed_turns(obj[key])
+    if isinstance(obj.get("mapping"), dict):
+        return [
+            turn
+            for node in obj["mapping"].values()
+            if isinstance(node, dict)
+            for turn in _attributed_turns(node.get("message"))
+        ]
+    text = _turn_text(obj.get("content") if "content" in obj else obj)
+    # Empty text can still carry stale or malformed supplied attribution.
+    meta = obj.get("meta") if isinstance(obj.get("meta"), dict) else {}
+    return [{"text": text, "attribution": obj.get("attribution", meta.get("attribution"))}]
+
+
+def _collect_strict_segments(source: Path, owner_id: str) -> tuple[list[str], list[str]]:
+    owner, other = [], []
+    for path in _iter_transcript_files(source):
+        objects = _load_jsonl(path) if path.suffix == ".jsonl" else [load_json(path, default=None)]
+        for obj in objects:
+            for turn in _attributed_turns(obj):
+                for span in attributed_spans(turn["text"], turn.get("attribution")):
+                    (owner if owner_profile_eligible(span, owner_id) else other).append(
+                        span["text"]
+                    )
+    return owner, other
+
+
 def _frequency_lexicon(
     persona_text: str, other_text: str, *, limit: int = 25
 ) -> tuple[list[dict[str, Any]], int]:
@@ -348,7 +386,7 @@ def _shadow_terms(persona_text: str, *, limit: int = 15) -> list[dict[str, Any]]
 
 
 def _divine_yearning(
-    persona_id: str, vocabulary: list[dict[str, Any]]
+    persona_id: str, vocabulary: list[dict[str, Any]], *, allow_curated: bool = True
 ) -> tuple[str | None, str | None, str]:
     """Pass C — Yearning Diviner.
 
@@ -356,7 +394,7 @@ def _divine_yearning(
     by signature overlap and synthesises a yearning from the dominant vocabulary. Stdlib-only
     stand-in for an LLM-assisted pass (``method`` records which path produced the result).
     """
-    curated = CURATED_YEARNINGS.get(persona_id.strip().lower())
+    curated = CURATED_YEARNINGS.get(persona_id.strip().lower()) if allow_curated else None
     if curated:
         return curated["ideal_yearning"], curated["archetypal_pattern"], "curated"
 
@@ -377,7 +415,14 @@ def _divine_yearning(
 
 
 def extract_persona_lexicon(
-    project_root: Path, persona_id: str, source_corpus: Path | None = None, dry_run: bool = False
+    project_root: Path,
+    persona_id: str,
+    source_corpus: Path | None = None,
+    dry_run: bool = False,
+    *,
+    mode: str = "strict",
+    library: Library | None = None,
+    annotations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Extract vocabulary, friction terms, and yearning for a persona from transcripts.
 
@@ -386,9 +431,20 @@ def extract_persona_lexicon(
       B. Shadow Catcher     — forbidden terms via moment-of-friction detection
       C. Yearning Diviner   — curated or derived ideal yearning + archetype
 
-    With no ``source_corpus`` the function returns the curated scaffold (backward compatible).
+    Strict mode accepts only explicit evidenced owner spans; provider roles are not
+    authorship evidence. ``mode="legacy-role"`` explicitly opts into historical heuristics.
+    A canonical Library plus message annotations can replace transcript input.
+    With no source the function returns the labelled curated scaffold.
     """
+    if mode not in {"strict", "legacy-role"}:
+        raise ValueError("mode must be strict or legacy-role")
+    if library is not None and (source_corpus is not None or mode != "strict"):
+        raise ValueError("canonical library profiles require strict mode and no transcript source")
+    if library is None and annotations is not None:
+        raise ValueError("canonical annotations require a library")
     result: dict[str, Any] = {
+        "attribution_mode": mode,
+        "assurance": ASSURANCE if mode == "strict" else "role_heuristic_not_authorship",
         "persona_id": persona_id,
         "source_corpus": str(source_corpus) if source_corpus is not None else None,
         "dry_run": dry_run,
@@ -401,22 +457,28 @@ def extract_persona_lexicon(
         "status": "VACUUM (SCAFFOLDED)",
     }
 
-    # Curated yearning applies even without a source so known personas stay populated.
-    yearning, archetype, method = _divine_yearning(persona_id, [])
+    # No-source scaffolds and explicit compatibility mode retain their curated values.
+    allow_curated = mode == "legacy-role" or (source_corpus is None and library is None)
+    yearning, archetype, method = _divine_yearning(persona_id, [], allow_curated=allow_curated)
     if method == "curated":
         result["ideal_yearning"] = yearning
         result["archetypal_pattern"] = archetype
         result["yearning_method"] = "curated"
 
-    if source_corpus is None:
+    if library is not None:
+        persona_parts, other_parts = collect_owner_segments(
+            library, [] if annotations is None else annotations, persona_id
+        )
+        result["source_corpus"] = str(library.path)
+    elif source_corpus is None:
         return result
-
-    source = Path(source_corpus)
-    if not source.exists():
-        result["status"] = "VACUUM (SOURCE NOT FOUND)"
-        return result
-
-    persona_parts, other_parts = _collect_segments(source, persona_id)
+    else:
+        source = Path(source_corpus)
+        if not source.exists():
+            result["status"] = "VACUUM (SOURCE NOT FOUND)"
+            return result
+        collector = _collect_strict_segments if mode == "strict" else _collect_segments
+        persona_parts, other_parts = collector(source, persona_id)
     persona_text = "\n".join(persona_parts)
     other_text = "\n".join(other_parts)
     result["stats"]["turns_scanned"] = len(persona_parts) + len(other_parts)
@@ -427,7 +489,9 @@ def extract_persona_lexicon(
 
     vocabulary, persona_token_count = _frequency_lexicon(persona_text, other_text)
     forbidden = _shadow_terms(persona_text)
-    yearning, archetype, method = _divine_yearning(persona_id, vocabulary)
+    yearning, archetype, method = _divine_yearning(
+        persona_id, vocabulary, allow_curated=allow_curated
+    )
 
     result["vocabulary"] = vocabulary
     result["forbidden_terms"] = forbidden
@@ -448,6 +512,8 @@ def render_persona_extract_markdown(payload: dict[str, Any]) -> str:
         f"# Persona Extract — {payload['persona_id']}",
         "",
         f"- **Status:** {payload['status']}",
+        f"- **Attribution mode:** {payload.get('attribution_mode', 'unspecified')}",
+        f"- **Assurance:** {payload.get('assurance', 'unspecified')}",
         f"- **Archetype:** {payload.get('archetypal_pattern') or '—'}",
         f"- **Yearning method:** {payload.get('yearning_method') or '—'}",
         f"- **Ideal yearning:** {payload.get('ideal_yearning') or '—'}",

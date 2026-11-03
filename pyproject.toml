@@ -29,6 +29,7 @@ Issues = "https://github.com/4444J99/conversation-corpus-engine/issues"
 dev = ["pytest>=9.0.3", "ruff>=0.15.8,<0.16", "mypy>=1.10.0", "markdown-it-py==4.2.0"]
 mcp = []
 obsidian = ["markdown-it-py==4.2.0"]
+sealed = ["cryptography>=46,<51"]
 
 [project.scripts]
 cce = "conversation_corpus_engine.cli:main"

@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 
 from .archive_commands import add_archive_parser, handle_archive
+from .archive_sealed_commands import add_sealed_parser
+from .archive_sealed_commands import run as run_sealed
 from .chatgpt_local_session import (
     discover_chatgpt_projects,
     fetch_chatgpt_project,
@@ -155,6 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
     corpus_extract.add_argument("--persona", required=True, help="Persona ID (e.g. rob, claude)")
     corpus_extract.add_argument("--source-corpus", type=Path, help="Path to session transcripts")
     corpus_extract.add_argument("--project-root", type=Path, default=default_project_root())
+    corpus_extract.add_argument(
+        "--mode",
+        choices=("strict", "legacy-role"),
+        default="strict",
+        help="Strict explicit owner assertions (default), or labelled legacy role heuristics",
+    )
     corpus_extract.add_argument("--dry-run", action="store_true")
     corpus_extract.add_argument("--write", action="store_true")
     corpus_extract.add_argument("--json", action="store_true")
@@ -729,6 +737,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_archive_parser(subparsers)
     add_library_parser(subparsers)
+    add_sealed_parser(subparsers)
 
     return parser
 
@@ -736,6 +745,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.group == "sealed":
+        raise SystemExit(run_sealed(args))
 
     if args.group == "archive":
         raise SystemExit(handle_archive(args))
@@ -761,6 +773,7 @@ def main() -> None:
             args.persona,
             source_corpus=args.source_corpus,
             dry_run=args.dry_run,
+            mode=args.mode,
         )
         if args.write and not args.dry_run:
             artifacts = write_persona_extract_artifacts(args.project_root, payload)
@@ -769,6 +782,7 @@ def main() -> None:
             print(json.dumps(payload, indent=2))
         else:
             print(f"persona: {payload['persona_id']}  status: {payload['status']}")
+            print(f"  attribution: {payload['attribution_mode']} ({payload['assurance']})")
             print(f"  archetype: {payload.get('archetypal_pattern') or '-'}")
             print(f"  yearning: {payload.get('ideal_yearning') or '-'}")
             print(f"  lexicon terms: {len(payload.get('vocabulary') or [])}")

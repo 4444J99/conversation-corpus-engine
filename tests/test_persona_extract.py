@@ -33,7 +33,7 @@ class PersonaExtractTests(unittest.TestCase):
             payload = extract_persona_lexicon(Path(tmp), "rob", source_corpus=Path(tmp) / "nope")
         self.assertEqual(payload["status"], "VACUUM (SOURCE NOT FOUND)")
 
-    def test_extracts_human_persona_lexicon(self) -> None:
+    def test_legacy_extracts_human_persona_lexicon(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "transcripts"
             source.mkdir()
@@ -46,7 +46,9 @@ class PersonaExtractTests(unittest.TestCase):
                     {"role": "user", "text": "The cathedral needs a foundation first."},
                 ],
             )
-            payload = extract_persona_lexicon(Path(tmp), "rob", source_corpus=source)
+            payload = extract_persona_lexicon(
+                Path(tmp), "rob", source_corpus=source, mode="legacy-role"
+            )
 
         self.assertEqual(payload["status"], "EXTRACTED")
         terms = {entry["term"]: entry for entry in payload["vocabulary"]}
@@ -59,7 +61,7 @@ class PersonaExtractTests(unittest.TestCase):
         self.assertGreater(payload["stats"]["persona_tokens"], 0)
         self.assertEqual(payload["yearning_method"], "derived")
 
-    def test_assistant_persona_attribution(self) -> None:
+    def test_legacy_assistant_persona_attribution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "transcripts"
             source.mkdir()
@@ -71,7 +73,9 @@ class PersonaExtractTests(unittest.TestCase):
                     {"role": "assistant", "text": "I cannot proceed with that migration request."},
                 ],
             )
-            payload = extract_persona_lexicon(Path(tmp), "claude", source_corpus=source)
+            payload = extract_persona_lexicon(
+                Path(tmp), "claude", source_corpus=source, mode="legacy-role"
+            )
 
         terms = {entry["term"] for entry in payload["vocabulary"]}
         self.assertIn("migration", terms)
@@ -82,7 +86,7 @@ class PersonaExtractTests(unittest.TestCase):
         self.assertIn("proceed", forbidden)
         self.assertIn("migration", forbidden)
 
-    def test_jsonl_and_mapping_shapes(self) -> None:
+    def test_legacy_jsonl_and_mapping_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "transcripts"
             source.mkdir()
@@ -104,13 +108,15 @@ class PersonaExtractTests(unittest.TestCase):
                 "message": {"author": {"role": "assistant"}, "content": {"parts": ["ok"]}}
             }
             (source / "b.json").write_text(json.dumps(mapping), encoding="utf-8")
-            payload = extract_persona_lexicon(Path(tmp), "rob", source_corpus=source)
+            payload = extract_persona_lexicon(
+                Path(tmp), "rob", source_corpus=source, mode="legacy-role"
+            )
 
         terms = {entry["term"]: entry["count"] for entry in payload["vocabulary"]}
         self.assertEqual(terms.get("lattice"), 2)
         self.assertEqual(terms.get("recursion"), 2)
 
-    def test_corpus_pairs_index_source(self) -> None:
+    def test_legacy_corpus_pairs_index_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "corpus-root"
             corpus = source / "corpus"
@@ -122,7 +128,9 @@ class PersonaExtractTests(unittest.TestCase):
                 }
             ]
             (corpus / "pairs-index.json").write_text(json.dumps(pairs), encoding="utf-8")
-            payload = extract_persona_lexicon(Path(tmp), "rob", source_corpus=source)
+            payload = extract_persona_lexicon(
+                Path(tmp), "rob", source_corpus=source, mode="legacy-role"
+            )
 
         terms = {entry["term"] for entry in payload["vocabulary"]}
         self.assertIn("harmonics", terms)
@@ -133,7 +141,9 @@ class PersonaExtractTests(unittest.TestCase):
             source = Path(tmp) / "transcripts"
             source.mkdir()
             _write_transcript(source, "s.json", [{"role": "user", "text": "alpha beta gamma"}])
-            payload = extract_persona_lexicon(Path(tmp), "rob", source_corpus=source, dry_run=True)
+            payload = extract_persona_lexicon(
+                Path(tmp), "rob", source_corpus=source, dry_run=True, mode="legacy-role"
+            )
         self.assertEqual(payload["status"], "PREVIEW")
         self.assertTrue(payload["dry_run"])
 
