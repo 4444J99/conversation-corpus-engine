@@ -499,3 +499,84 @@ def test_verifier_rejects_package_ending_in_open_fence(packer, tmp_path):
     home.write_bytes(home.read_bytes() + b"```\n")
     with pytest.raises(ValueError, match="fence"):
         packer.verify_package(output)
+
+
+def test_round4_raw_html_blocks_end_at_closing_tag_not_blank_line(packer):
+    # PR #115 round-4 review corrections: type-1 raw HTML blocks end
+    # only at their matching closing tag. A blank line inside <pre>
+    # used to end the block, so a fence after it falsely opened one.
+    assert packer.fence_state("<pre>\n\n```\n</pre>\n") is None
+    assert packer.fence_state("<pre>\n\n```\n</pre>\n\n```\ncode\n") is not None
+    for tag in ("script", "style", "textarea"):
+        assert packer.fence_state(f"<{tag}>\n```\n</{tag}>\n") is None
+        assert packer.fence_state(f"<{tag}>x</{tag}>\n```\ncode\n") is not None
+
+
+def test_round4_literal_block_ends_at_list_item_boundary(packer, tmp_path):
+    # PR #115 round-4 review corrections: a literal block opened inside
+    # a list item must not swallow the top-level content that follows
+    # the item. A link after the item is rewritten, not left literal.
+    large = b"# Record\n\n## Message 1\n\n" + b"body\n" * 1400
+    large += b"\n## Message 2\n\nLast message.\n"
+    _, output, _ = build(
+        packer,
+        tmp_path,
+        {
+            "records/a.md": large,
+            "blocks/b.md": (
+                b"- item\n    <!--\n    comment\n\n[Second](../records/a.md#message-2)\n"
+            ),
+        },
+    )
+    backlink = output.joinpath("blocks/b.md").read_text()
+    assert "a.__part" in backlink and "#message-2" in backlink
+    assert packer.verify_package(output)["status"] == "verified"
+
+
+def test_round4_split_list_fence_rewrites_following_link(packer, tmp_path):
+    # PR #115 round-4 review corrections: a list-contained fence that
+    # crosses a part boundary used to strand the link after it, because
+    # the next segment lost the list content indent and never closed
+    # the fence. The part header now reopens the fence with its list
+    # prefix, so the closing line closes it and the link is rewritten.
+    large = b"# Record\n\n## Message 1\n\n" + b"body\n" * 1400
+    large += b"\n## Message 2\n\nLast message.\n"
+    note = b"-   ```python\n" + b"    code\n" * 300 + b"    ```\n\n[Second](../records/a.md#message-2)\n"
+    _, output, _ = build(
+        packer,
+        tmp_path,
+        {"records/a.md": large, "blocks/b.md": note},
+    )
+    parts = sorted(output.glob("blocks/b.__part*.md"))
+    assert len(parts) == 2
+    assert "a.__part" in parts[1].read_text() and "#message-2" in parts[1].read_text()
+    assert packer.verify_package(output)["status"] == "verified"
+    assert b"".join(packer.reconstruct(output, "blocks/b.md")) == note
+
+
+def test_round4_agent_entry_unicode_links_budget_percent_encoding(packer, tmp_path):
+    # PR #115 round-4 review corrections: navigation growth skipped
+    # links without a fragment, so an agent entry whose unicode links
+    # expand under percent-encoding was never split and aborted with
+    # "rewritten Markdown exceeds note byte limit" instead.
+    filename = "文" * 70 + ".md"
+    generation = tmp_path / "generation"
+    source = generation / "vault"
+    source.mkdir(parents=True)
+    source.joinpath("Home.md").write_text("# Home\n")
+    source.joinpath(filename).write_text("# F\n")
+    agent = generation / "agent-entry.md"
+    agent.write_text("".join(f"[Home](vault/{filename})\n" for _ in range(8)))
+    assert len(agent.read_bytes()) == 1824
+    output = tmp_path / "derived"
+    packer.package(
+        source,
+        output,
+        agent_entry=agent,
+        source_generation="test-generation",
+        max_note_bytes=4096,
+        max_output_bytes=10_000_000,
+        max_seconds=30,
+    )
+    assert packer.verify_package(output)["status"] == "verified"
+    assert b"".join(packer.reconstruct(output, "agent-entry.md")) == agent.read_bytes()
