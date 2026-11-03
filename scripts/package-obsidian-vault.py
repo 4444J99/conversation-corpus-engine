@@ -587,6 +587,39 @@ def fence_state(text, state=None, starts_line=True, list_indent=None):
     return marker
 
 
+def _segment_fence_opener(
+    raw, *, state, starts_line, list_indent, fence_prefix, fence_content_indent, carried
+):
+    """Container prefix of the fence open at a segment's end.
+
+    ``ranges`` carries this prefix with the fence marker so a later
+    part's header can reopen the same fence in its original nested
+    containers (``- > 10000. ``` ``), not just its outer list prefix:
+    the bare ``> - ``` `` opener sits at a shallow content indent,
+    so neither the column-11 footer nor the source's own closing
+    lines close it, and the rendered part ends inside an open fence.
+    The prefix is the opener line up to its marker column (see
+    ``_fence_column``); a fence that closes and another that opens
+    later in the same segment replaces it, and a segment that ends
+    outside any fence clears it (the caller passes that case through
+    as ``None`` by only calling this while a fence is open).
+    """
+    tracker = _FenceTracker(
+        state,
+        list_indent=list_indent if state is not None else None,
+        fence_prefix=fence_prefix if state is not None else None,
+        fence_content_indent=fence_content_indent if state is not None else None,
+    )
+    opener = carried if state is not None else None
+    for number, line in enumerate(raw.splitlines(keepends=True)):
+        if not (number or starts_line):
+            continue
+        before, after, _ = tracker.advance(line)
+        if before is None and after is not None:
+            opener = line[: _fence_column(line)]
+    return opener
+
+
 def require_closed_fences(data: bytes, target: str) -> None:
     """Fail closed when rendered Markdown ends inside an open fence.
 
@@ -790,6 +823,7 @@ def ranges(data, body_limit, *, relative=None, maximum=None, source=None, agent_
     list_indent = None
     fence_prefix = None
     fence_content_indent = None
+    fence_opener = None
     starts_line = True
     result = []
     while offset < len(data):
@@ -849,9 +883,22 @@ def ranges(data, body_limit, *, relative=None, maximum=None, source=None, agent_
                     fence_content_indent if state is not None else None
                 ),
                 "fence_content_indent_after": (after_content if after is not None else None),
+                "fence_opener_before": fence_opener if state is not None else None,
                 "starts_line": starts_line,
             }
         )
+        if after is None:
+            fence_opener = None
+        else:
+            fence_opener = _segment_fence_opener(
+                raw,
+                state=state,
+                starts_line=starts_line,
+                list_indent=list_indent,
+                fence_prefix=fence_prefix,
+                fence_content_indent=fence_content_indent,
+                carried=fence_opener,
+            )
         starts_line = data[end - 1 : end] in {b"\n", b"\r"}
         state = after
         list_indent = after_indent
@@ -869,6 +916,7 @@ def ranges(data, body_limit, *, relative=None, maximum=None, source=None, agent_
             "fence_prefix_after": None,
             "fence_content_indent_before": None,
             "fence_content_indent_after": None,
+            "fence_opener_before": None,
             "starts_line": True,
         }
     ]
@@ -1013,18 +1061,32 @@ def render_part(body, relative, number, count, segment):
     filename = quote(Path(relative).name, safe="._-~")
     header = f"# Part {number} of {count}\n\n[Source note index]({filename})\n\n".encode()
     if segment["before"]:
-        # Reopen a carried fence with its list prefix (if any), inserted
-        # after any quote prefix the marker already carries, so a
-        # content-indented closing line closes it in this part too.
+        # Reopen a carried fence. When the fence's original opener
+        # prefix is known and carries explicit containers (a list
+        # marker or blockquote, e.g. "- > 10000. "), reuse it whole:
+        # the bare list prefix alone rebuilds only the outer item
+        # ("> - ```"), whose shallow content indent leaves the
+        # column-11 footer and the source's own closing lines unable
+        # to close it, so the part ends inside an open fence. A
+        # spaces-only prefix (a bare continuation-line fence) keeps
+        # the existing list-prefix behaviour, which recreates its
+        # list context instead.
         opener = segment["before"]
-        prefix = segment.get("fence_prefix_before") or ""
-        if prefix:
-            quote_prefix = ""
-            rest = opener
-            while rest.startswith("> "):
-                quote_prefix += "> "
-                rest = rest[2:]
-            opener = quote_prefix + prefix + rest
+        carried_prefix = segment.get("fence_opener_before") or ""
+        if carried_prefix and (">" in carried_prefix or _LIST_MARKER.match(carried_prefix)):
+            marker = opener
+            while marker.startswith("> "):
+                marker = marker[2:]
+            opener = carried_prefix + marker
+        else:
+            prefix = segment.get("fence_prefix_before") or ""
+            if prefix:
+                quote_prefix = ""
+                rest = opener
+                while rest.startswith("> "):
+                    quote_prefix += "> "
+                    rest = rest[2:]
+                opener = quote_prefix + prefix + rest
         header += (opener + "\n").encode()
     elif segment.get("inline_before"):
         header += ("Inline code continued: " + segment["inline_before"] + " ").encode()

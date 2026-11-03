@@ -698,6 +698,42 @@ def test_round6_review_corrections(packer, tmp_path):
     assert b"".join(packer.reconstruct(output6, "agent-entry.md")) == entry.read_bytes()
 
 
+def test_round7_review_corrections(packer, tmp_path):
+    # PR #115 round-7 review correction (bot round on a25f9b8e).
+    # 4456828117: a fence inside alternating list and blockquote
+    # containers ("- > 10000. ```") spans split parts, but the part
+    # header rebuilt only the outer list prefix ("> - ```"), whose
+    # shallow content indent leaves the column-11 footer and the
+    # source's own closing lines unable to close it, so each later
+    # part ended inside an open fence and packaging failed closed.
+    # ranges now carries the fence's original opener prefix, and
+    # render_part reopens with it whole, so every part parses as
+    # exactly one closed fence block and the note packages,
+    # verifies, and reconstructs exactly.
+    raw = b"- > 10000. ```python\n" + b"  >        code\n" * 300 + b"  >        ```\n"
+    segments = packer.ranges(raw, 2048, relative="blocks/b.md", maximum=4096)
+    assert len(segments) == 3
+    for number, segment in enumerate(segments, 1):
+        rendered, _ = packer.render_part(
+            raw[segment["start"] : segment["end"]],
+            "blocks/b.md",
+            number,
+            len(segments),
+            segment,
+        )
+        assert packer.fence_state(rendered.decode()) is None
+        fences = [
+            token
+            for token in MarkdownIt("commonmark", {"html": True}).parse(rendered.decode())
+            if token.type == "fence"
+        ]
+        assert len(fences) == 1
+    assert segments[1]["fence_opener_before"] == "- > 10000. "
+    _, output, _ = build(packer, tmp_path, {"blocks/b.md": raw})
+    assert packer.verify_package(output)["status"] == "verified"
+    assert b"".join(packer.reconstruct(output, "blocks/b.md")) == raw
+
+
 def test_round4_agent_entry_unicode_links_budget_percent_encoding(packer, tmp_path):
     # PR #115 round-4 review corrections: navigation growth skipped
     # links without a fragment, so an agent entry whose unicode links
