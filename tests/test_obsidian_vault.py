@@ -433,6 +433,12 @@ def test_container_fences_are_tracked(packer):
     # fence content: the item (and its fence) end there, the trailing
     # fence opens a new block, and the note ends inside it.
     assert packer.fence_state("- ```\ncode\n```\n") is not None
+    # Round-6 review corrections (4455440484): the same holds for a
+    # fence line itself: a column-zero fence after a list fence ends
+    # the item and opens a new fence, while a sibling item with a
+    # different fence marker opens and closes its own fence.
+    assert packer.fence_state("- ```\n```\n") is not None
+    assert packer.fence_state("- ```\n  code\n- ~~~\n  code\n  ~~~\n") is None
     assert packer.fence_state("<pre>\n</pre>\n```python\ncode\n") is not None
     assert packer.fence_state("<pre>```</pre>\n") is None
 
@@ -611,6 +617,85 @@ def test_round5_review_corrections(packer, tmp_path):
     segment = {"before": "```", "after": "```", "fence_prefix_before": ""}
     rendered, _ = packer.render_part(b"code\n", "b.md", 1, 2, segment)
     assert rendered.decode().splitlines()[-1] == "```"
+
+
+def test_round6_review_corrections(packer, tmp_path):
+    # PR #115 round-6 review corrections (bot round on bd0dcf14).
+    # 4455440450: a fence opened in a list item inside a blockquote
+    # ("- > 10. ```") closes at the nested item's content indent: a
+    # closer six spaces after ">" sits at column 8, the nested
+    # content indent, not four spaces past the outer item's indent.
+    assert packer.fence_state("- > 10. ```python\n>       code\n>       ```\n") is None
+    # 4455440469: a blockquote starting outside the list item ends
+    # the item (and its fence); a quoted continuation indented into
+    # the item does not.
+    assert packer.fence_state("- ```\n> outside\n") is None
+    assert packer.fence_state("- ```\n  > inside\n") is not None
+    # 4455353064: a split part whose segment opens a list fence
+    # inside itself must close it with a footer at the fence's own
+    # column (4 for "-   ```"), not column zero: the pinned parser
+    # reads the part as exactly one fence block, and the note
+    # packages, verifies, and reconstructs exactly.
+    raw = b"-   ```python\n" + b"    code\n" * 300 + b"    ```\n"
+    segments = packer.ranges(raw, 2048, relative="blocks/b.md", maximum=4096)
+    assert len(segments) >= 2
+    rendered, _ = packer.render_part(
+        raw[segments[0]["start"] : segments[0]["end"]],
+        "blocks/b.md",
+        1,
+        len(segments),
+        segments[0],
+    )
+    assert rendered.decode().splitlines()[-1] == "    ```"
+    fences = [
+        token
+        for token in MarkdownIt("commonmark", {"html": True}).parse(rendered.decode())
+        if token.type == "fence"
+    ]
+    assert len(fences) == 1
+    _, output, _ = build(packer, tmp_path, {"blocks/b.md": raw})
+    assert packer.verify_package(output)["status"] == "verified"
+    assert b"".join(packer.reconstruct(output, "blocks/b.md")) == raw
+    # 4455440504 / 4455440510: navigation growth with vault context
+    # budgets an agent entry's rebase prefix (each "[a](b)" link in
+    # an entry inside "agents/" gains 7 bytes) and charges an
+    # escaping link only when it actually lands on the agent entry.
+    vault = tmp_path / "vault6"
+    agent = vault / "agents" / "entry.md"
+    assert (
+        packer.navigation_growth(
+            "[a](b)\n" * 330, "agent-entry.md", source=vault, agent_entry=agent
+        )
+        == 330 * 7
+    )
+    assert (
+        packer.navigation_growth("[a](../other.md)\n", "a.md", source=vault, agent_entry=agent) == 0
+    )
+    assert (
+        packer.navigation_growth("[e](entry.md)\n", "agents/x.md", source=vault, agent_entry=agent)
+        == 9
+    )
+    # Without vault context the old bounds are unchanged.
+    assert packer.navigation_growth("[a](../other.md)\n", "a.md") == 3
+    # 4455440504 end to end: the 330-link single-line entry (1980
+    # bytes of links) used to abort with "rewritten Markdown exceeds
+    # note byte limit" because its growth budgeted zero; with the
+    # rebase budgeted it splits and verifies instead.
+    (tmp_path / "vault6src" / "agents").mkdir(parents=True)
+    entry = tmp_path / "vault6src" / "agents" / "entry.md"
+    entry.write_bytes(b"# Entry\n\n" + b"[a](b)" * 330 + b"\n")
+    output6 = tmp_path / "derived6"
+    packer.package(
+        tmp_path / "vault6src",
+        output6,
+        agent_entry=entry,
+        source_generation="test-generation",
+        max_note_bytes=4096,
+        max_output_bytes=10_000_000,
+        max_seconds=30,
+    )
+    assert packer.verify_package(output6)["status"] == "verified"
+    assert b"".join(packer.reconstruct(output6, "agent-entry.md")) == entry.read_bytes()
 
 
 def test_round4_agent_entry_unicode_links_budget_percent_encoding(packer, tmp_path):
