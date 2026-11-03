@@ -342,6 +342,9 @@ def test_plain_leaves_already_escaped_entities_alone() -> None:
     assert _plain("&#35; and #") == "&#35; and &#35;"
     assert _plain("A &amp; B") == "A &amp; B"
     assert _plain("100&#37; sure") == "100&#37; sure"
+    # Hex entities pass through with either case of x (PR #115 review).
+    assert _plain("&#x41; hex") == "&#x41; hex"
+    assert _plain("&#X41; hex") == "&#X41; hex"
 
 
 def test_plain_is_idempotent() -> None:

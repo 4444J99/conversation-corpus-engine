@@ -405,6 +405,30 @@ def test_open_fence_note_fails_closed_but_split_wrapper_closes(packer, tmp_path)
     assert b"".join(packer.reconstruct(output, "note.md")) == raw
 
 
+def test_container_fences_are_tracked(packer):
+    # PR #115 review corrections: a fence opened on a list item's own line
+    # used to be missed, so its closing fence was misread as an opener
+    # (a closed note failed, an unclosed one passed).
+    assert packer.fence_state("- ```python\n  print(1)\n  ```\n") is None
+    assert packer.fence_state("- ```python\n  print(1)\n") is not None
+    # A fence on a list continuation line is measured from the item's
+    # content indent, so 4 spaces inside a "- " item is a fence, while
+    # 6 spaces (indented code past the content) is not.
+    assert packer.fence_state("- item\n\n    ```\n    code\n") is not None
+    assert packer.fence_state("- item\n\n    ```\n    code\n    ```\n") is None
+    assert packer.fence_state("- item\n\n      ```\n      code\n") is None
+    # Fence markers inside a raw <pre> block are HTML content, not fences.
+    assert packer.fence_state("<pre>\n```\n</pre>\n") is None
+    assert packer.fence_state("<pre>\n```\n</pre>\n\n```\ncode\n") is not None
+
+
+def test_list_item_fence_note_packages(packer, tmp_path):
+    _, output, _ = build(
+        packer, tmp_path, {"note.md": b"# Note\n\n- ```python\n  print(1)\n  ```\n"}
+    )
+    assert packer.verify_package(output)["status"] == "verified"
+
+
 def test_verifier_rejects_package_ending_in_open_fence(packer, tmp_path):
     _, output, _ = build(packer, tmp_path, {"Home.md": b"# Home\n"})
     home = output / "Home.md"

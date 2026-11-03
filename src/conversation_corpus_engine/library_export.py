@@ -55,8 +55,8 @@ def _uid(value: str) -> str:
     return value
 
 
-_ESCAPED_ENTITY = re.compile(r"&(?:amp|lt|gt|quot|#[0-9]+|#x[0-9a-fA-F]+);")
-_ESCAPED_ENTITY_SPLIT = re.compile(r"(&(?:amp|lt|gt|quot|#[0-9]+|#x[0-9a-fA-F]+);)")
+_ESCAPED_ENTITY = re.compile(r"&(?:amp|lt|gt|quot|#[0-9]+|#[xX][0-9a-fA-F]+);")
+_ESCAPED_ENTITY_SPLIT = re.compile(r"(&(?:amp|lt|gt|quot|#[0-9]+|#[xX][0-9a-fA-F]+);)")
 _PLAIN_SPECIAL = re.compile(r"[\[\]`\\*_#|!]")
 
 
@@ -68,7 +68,8 @@ def _plain(value: Any) -> str:
     replaced ``[`` with ``&#91;`` and then re-escaped the ``#`` inside that
     just-created entity, emitting ``&&#35;91;`` for every bracket, backtick,
     backslash, star, or underscore in a title. Second, already-escaped
-    entities (``&#35;``, ``&amp;``) pass through unchanged, so re-exporting
+    entities (``&#35;``, ``&amp;``, hex entities in either case,
+    ``&#x41;`` or ``&#X41;``) pass through unchanged, so re-exporting
     an escaped title cannot double-escape it. Text without entities or
     specials renders exactly as before.
     """

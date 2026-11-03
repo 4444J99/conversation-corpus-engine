@@ -218,8 +218,40 @@ def unquote_line(line):
         depth += 1
 
 
+_LIST_MARKER = re.compile(r"^ {0,3}(?:[-*+]|\d{1,9}[.)]) ")
+_PRE_OPEN = re.compile(r"^ {0,3}<pre(?:[\s>]|$)", re.IGNORECASE)
+
+
+def _strip_list_markers(line):
+    """Strip leading list markers; return (rest, content indent or None).
+
+    The content indent is the offset where the list item's content starts,
+    so a fence on a continuation line can be measured relative to it.
+    """
+    indent = 0
+    while True:
+        match = _LIST_MARKER.match(line)
+        if not match:
+            return line, (indent or None)
+        indent += match.end()
+        line = line[match.end() :]
+
+
+def _leading_indent(line):
+    spaces = len(line) - len(line.lstrip(" "))
+    if line[spaces : spaces + 1] == "\t":
+        return spaces + 4
+    return spaces
+
+
 def advance_fence(line, state):
     probe, depth = unquote_line(line)
+    if state is None:
+        # A fence may open on a list item's own line ("- ```python"). List
+        # markers are stripped only when opening: once inside a fence, a
+        # marker-prefixed line is fence content, not a closing fence, and
+        # the close must be a plain (possibly quoted) fence line.
+        probe, _ = _strip_list_markers(probe)
     previous, previous_depth = unquote_line(state or "")
     if state and depth < previous_depth:
         state = None
@@ -242,13 +274,57 @@ def advance_fence(line, state):
 
 
 def fence_state(text, state=None, starts_line=True):
+    """Track fence state, including list-item and raw-HTML containers.
+
+    Plain ``advance_fence`` misses fences that live inside containers: a
+    fence opened on a list item's line ("- ```python") was missed, so its
+    closing fence was misread as an opener, and a fence on a list
+    continuation line (indented to the item's content) was missed entirely.
+    Fence markers inside a raw ``<pre>`` HTML block are likewise not fences
+    (a type-6 HTML block runs to the next blank line). This tracker is an
+    approximation, not a full CommonMark parser: it follows one list
+    content indent at a time and only recognizes ``<pre>`` blocks, which
+    covers the containers the packager's rendered notes actually contain.
+    """
+    list_indent = None
+    in_pre = False
     for number, line in enumerate(text.splitlines(keepends=True)):
-        if number or starts_line:
-            state = advance_fence(line, state)
+        if not (number or starts_line):
+            continue
+        if in_pre:
+            if not line.strip():
+                in_pre = False
+            continue
+        probe, _ = unquote_line(line)
+        stripped, content_indent = _strip_list_markers(probe)
+        if state is None:
+            if _PRE_OPEN.match(stripped):
+                in_pre = True
+                continue
+            if content_indent is not None:
+                list_indent = content_indent
+            elif list_indent is not None and line.strip() and _leading_indent(probe) < list_indent:
+                list_indent = None
+        if content_indent is None and list_indent is not None and line.strip():
+            indent = _leading_indent(probe)
+            if indent < list_indent:
+                state = advance_fence(line, state)
+            else:
+                # Re-express the line relative to the list item's content
+                # indent, so a fence opened or closed on a continuation
+                # line is tracked and indented code (4+ past content)
+                # still is not.
+                effective = " " * (indent - list_indent) + probe.lstrip(" \t")
+                if state is None and _PRE_OPEN.match(effective):
+                    in_pre = True
+                    continue
+                state = advance_fence(effective, state)
+            continue
+        state = advance_fence(line, state)
     return state
 
 
-def require_closed_fences(data, target):
+def require_closed_fences(data: bytes, target: str) -> None:
     """Fail closed when rendered Markdown ends inside an open fence.
 
     Split parts are exempt by construction: their wrappers close any fence the
@@ -601,6 +677,10 @@ def verify_package(output, *, budget=None, expected=None):
             continue
         if budget:
             budget.check()
+        require(
+            path.stat().st_size <= manifest["max_note_bytes"],
+            "rendered Markdown exceeds note byte limit",
+        )
         require_closed_fences(path.read_bytes(), str(path.relative_to(output)))
     total = hashlib.sha256()
     count = 0
@@ -646,7 +726,7 @@ def package(
     output,
     *,
     agent_entry=None,
-    source_generation,
+    source_generation: str,
     max_note_bytes=256 * 1024,
     max_output_bytes=12 * 1024**3,
     max_seconds=1800,
