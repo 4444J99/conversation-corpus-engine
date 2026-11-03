@@ -246,15 +246,18 @@ def _leading_indent(line):
 
 def advance_fence(line, state):
     probe, depth = unquote_line(line)
+    previous, previous_depth = unquote_line(state or "")
+    if state and depth < previous_depth:
+        # Leaving a blockquote also leaves its fence: a fence line that
+        # follows (possibly a list item's fence opener) must be read fresh
+        # rather than missed because the old quoted state was still set.
+        state = None
     if state is None:
         # A fence may open on a list item's own line ("- ```python"). List
         # markers are stripped only when opening: once inside a fence, a
         # marker-prefixed line is fence content, not a closing fence, and
         # the close must be a plain (possibly quoted) fence line.
         probe, _ = _strip_list_markers(probe)
-    previous, previous_depth = unquote_line(state or "")
-    if state and depth < previous_depth:
-        state = None
     match = FENCE.match(probe)
     if not match:
         return state
@@ -292,14 +295,20 @@ def fence_state(text, state=None, starts_line=True):
         if not (number or starts_line):
             continue
         if in_pre:
-            if not line.strip():
+            # A raw <pre> block ends at its closing tag or at a blank line
+            # (CommonMark HTML block type 6 ends at a blank line, so a
+            # fence after a blank line inside <pre> is a real fence).
+            if not line.strip() or "</pre>" in line.lower():
                 in_pre = False
             continue
-        probe, _ = unquote_line(line)
+        probe, quote_depth = unquote_line(line)
         stripped, content_indent = _strip_list_markers(probe)
         if state is None:
             if _PRE_OPEN.match(stripped):
-                in_pre = True
+                # A <pre> element closed on its own opening line is not
+                # an open block.
+                if "</pre>" not in stripped.lower():
+                    in_pre = True
                 continue
             if content_indent is not None:
                 list_indent = content_indent
@@ -313,12 +322,18 @@ def fence_state(text, state=None, starts_line=True):
                 # Re-express the line relative to the list item's content
                 # indent, so a fence opened or closed on a continuation
                 # line is tracked and indented code (4+ past content)
-                # still is not.
-                effective = " " * (indent - list_indent) + probe.lstrip(" \t")
-                if state is None and _PRE_OPEN.match(effective):
-                    in_pre = True
+                # still is not. The quote prefix is kept: dropping it
+                # would make a quoted fence's content lines reset the
+                # state and its closing fence reopen one. Only a line
+                # that actually looks like a fence may move the state;
+                # other continuation lines inside a fence are content.
+                adjusted = " " * (indent - list_indent) + probe.lstrip(" \t")
+                if state is None and _PRE_OPEN.match(adjusted):
+                    if "</pre>" not in adjusted.lower():
+                        in_pre = True
                     continue
-                state = advance_fence(effective, state)
+                if FENCE.match(adjusted):
+                    state = advance_fence("> " * quote_depth + adjusted, state)
             continue
         state = advance_fence(line, state)
     return state

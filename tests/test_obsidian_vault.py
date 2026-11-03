@@ -420,6 +420,15 @@ def test_container_fences_are_tracked(packer):
     # Fence markers inside a raw <pre> block are HTML content, not fences.
     assert packer.fence_state("<pre>\n```\n</pre>\n") is None
     assert packer.fence_state("<pre>\n```\n</pre>\n\n```\ncode\n") is not None
+    # Round-2 review corrections: a quoted list fence keeps its quote
+    # depth through content and closing lines, and a <pre> block closed
+    # on its opening line (or by its closing tag) does not swallow the
+    # fences that follow it.
+    assert packer.fence_state("> - ```python\n>   print(1)\n>   ```\n") is None
+    assert packer.fence_state("> - item\n>\n>     ```\n>     code\n>     ```\n") is None
+    assert packer.fence_state("> ```\n> code\n> ```\n- ```\ncode\n```\n") is None
+    assert packer.fence_state("<pre>\n</pre>\n```python\ncode\n") is not None
+    assert packer.fence_state("<pre>```</pre>\n") is None
 
 
 def test_list_item_fence_note_packages(packer, tmp_path):
