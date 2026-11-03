@@ -438,6 +438,61 @@ def test_list_item_fence_note_packages(packer, tmp_path):
     assert packer.verify_package(output)["status"] == "verified"
 
 
+def test_comment_and_container_fences_share_one_tracker(packer, tmp_path):
+    # PR #115 round-3 review corrections: validation and rewriting shared
+    # only a plain fence tracker, so they disagreed. A fence-looking line
+    # inside an HTML comment is comment text, not a fence, and a real fence
+    # after the comment still opens one.
+    assert packer.fence_state("<!--\n```python\nexample\n-->\n") is None
+    assert packer.fence_state("<!-- note -->\n```\ncode\n") is not None
+    assert packer.fence_state("<!--\n```\n-->\n```python\ncode\n") is not None
+    assert packer.fence_state("- <!--\n  ```\n  -->\n") is None
+    # A commented fence must not fail packaging.
+    (tmp_path / "comment").mkdir()
+    _, output, _ = build(
+        packer,
+        tmp_path / "comment",
+        {
+            "Home.md": b"# Home\n\n<!--\n```python\nexample\n-->\n\n[Other](other.md)\n",
+            "other.md": b"# Other\n",
+        },
+    )
+    assert packer.verify_package(output)["status"] == "verified"
+    # A link after a list-contained fence is rewritten by the same tracker
+    # that validates it: the 4-space-indented closing delimiter closes the
+    # fence for rewriting too, instead of stranding the link as code.
+    large = b"# Record\n\n## Message 1\n\n" + b"body\n" * 1400
+    large += b"\n## Message 2\n\nLast message.\n"
+    (tmp_path / "listfence").mkdir()
+    _, output, _ = build(
+        packer,
+        tmp_path / "listfence",
+        {
+            "records/a.md": large,
+            "blocks/b.md": (
+                b"-   ```python\n    code\n    ```\n\n[Second](../records/a.md#message-2)\n"
+            ),
+        },
+    )
+    backlink = output.joinpath("blocks/b.md").read_text()
+    assert "a.__part" in backlink and "#message-2" in backlink
+    target = backlink.split("](", 1)[1].split(")", 1)[0].split("#", 1)[0]
+    assert "## Message 2" in (output / "blocks" / target).read_text()
+    # A link after a <pre> block is rewritten too: rewrite used to treat
+    # the fence-looking line inside <pre> as an opener and skip the rest.
+    (tmp_path / "pre").mkdir()
+    _, output, _ = build(
+        packer,
+        tmp_path / "pre",
+        {
+            "records/a.md": large,
+            "blocks/c.md": (b"<pre>\n```\n</pre>\n\n[Second](../records/a.md#message-2)\n"),
+        },
+    )
+    backlink = output.joinpath("blocks/c.md").read_text()
+    assert "a.__part" in backlink and "#message-2" in backlink
+
+
 def test_verifier_rejects_package_ending_in_open_fence(packer, tmp_path):
     _, output, _ = build(packer, tmp_path, {"Home.md": b"# Home\n"})
     home = output / "Home.md"

@@ -220,6 +220,7 @@ def unquote_line(line):
 
 _LIST_MARKER = re.compile(r"^ {0,3}(?:[-*+]|\d{1,9}[.)]) ")
 _PRE_OPEN = re.compile(r"^ {0,3}<pre(?:[\s>]|$)", re.IGNORECASE)
+_COMMENT_OPEN = re.compile(r"^ {0,3}<!--")
 
 
 def _strip_list_markers(line):
@@ -276,48 +277,84 @@ def advance_fence(line, state):
     return state
 
 
-def fence_state(text, state=None, starts_line=True):
-    """Track fence state, including list-item and raw-HTML containers.
+class _FenceTracker:
+    """Shared container-aware fence tracking for validation and rewriting.
 
     Plain ``advance_fence`` misses fences that live inside containers: a
     fence opened on a list item's line ("- ```python") was missed, so its
     closing fence was misread as an opener, and a fence on a list
     continuation line (indented to the item's content) was missed entirely.
     Fence markers inside a raw ``<pre>`` HTML block are likewise not fences
-    (a type-6 HTML block runs to the next blank line). This tracker is an
-    approximation, not a full CommonMark parser: it follows one list
-    content indent at a time and only recognizes ``<pre>`` blocks, which
-    covers the containers the packager's rendered notes actually contain.
+    (a type-6 HTML block runs to the next blank line), and markers inside
+    an HTML comment (``<!--`` to ``-->``) are comment text, not fences.
+    Validation (``fence_state``) already used this logic while link
+    rewriting, anchor collection, and navigation growth used plain
+    ``advance_fence``, so the two disagreed: a valid note with a commented
+    fence failed packaging, and links after a list-contained fence were
+    silently left unrewritten. All four now share this tracker, so a line
+    is literal for every consumer or for none of them.
+
+    This tracker is an approximation, not a full CommonMark parser: it
+    follows one list content indent at a time, only recognizes ``<pre>``
+    blocks and whole-line comments, and a segment that starts inside a
+    ``<pre>`` block or comment (its ``before`` state carries only the
+    fence marker) is tracked as plain text until the next container
+    boundary, exactly as before.
     """
-    list_indent = None
-    in_pre = False
-    for number, line in enumerate(text.splitlines(keepends=True)):
-        if not (number or starts_line):
-            continue
-        if in_pre:
+
+    def __init__(self, state=None):
+        self.state = state
+        self.list_indent = None
+        self.in_pre = False
+        self.in_comment = False
+
+    def advance(self, line):
+        """Advance one line; return (before, after, literal).
+
+        ``literal`` means the line is inside a ``<pre>`` block or an HTML
+        comment, so no link or heading on it may be rewritten or collected.
+        Fence lines themselves are not flagged literal: callers already
+        skip them because ``before`` or ``after`` is not None.
+        """
+        before = self.state
+        if self.in_pre:
             # A raw <pre> block ends at its closing tag or at a blank line
             # (CommonMark HTML block type 6 ends at a blank line, so a
             # fence after a blank line inside <pre> is a real fence).
             if not line.strip() or "</pre>" in line.lower():
-                in_pre = False
-            continue
+                self.in_pre = False
+            return before, self.state, True
+        if self.in_comment:
+            if "-->" in line:
+                self.in_comment = False
+            return before, self.state, True
         probe, quote_depth = unquote_line(line)
         stripped, content_indent = _strip_list_markers(probe)
-        if state is None:
+        if self.state is None:
+            if _COMMENT_OPEN.match(stripped):
+                # A comment closed on its opening line is not an open block;
+                # either way the line itself is comment text, not a fence.
+                if "-->" not in stripped:
+                    self.in_comment = True
+                return before, self.state, True
             if _PRE_OPEN.match(stripped):
                 # A <pre> element closed on its own opening line is not
                 # an open block.
                 if "</pre>" not in stripped.lower():
-                    in_pre = True
-                continue
+                    self.in_pre = True
+                return before, self.state, True
             if content_indent is not None:
-                list_indent = content_indent
-            elif list_indent is not None and line.strip() and _leading_indent(probe) < list_indent:
-                list_indent = None
-        if content_indent is None and list_indent is not None and line.strip():
+                self.list_indent = content_indent
+            elif (
+                self.list_indent is not None
+                and line.strip()
+                and _leading_indent(probe) < self.list_indent
+            ):
+                self.list_indent = None
+        if content_indent is None and self.list_indent is not None and line.strip():
             indent = _leading_indent(probe)
-            if indent < list_indent:
-                state = advance_fence(line, state)
+            if indent < self.list_indent:
+                self.state = advance_fence(line, self.state)
             else:
                 # Re-express the line relative to the list item's content
                 # indent, so a fence opened or closed on a continuation
@@ -327,16 +364,30 @@ def fence_state(text, state=None, starts_line=True):
                 # state and its closing fence reopen one. Only a line
                 # that actually looks like a fence may move the state;
                 # other continuation lines inside a fence are content.
-                adjusted = " " * (indent - list_indent) + probe.lstrip(" \t")
-                if state is None and _PRE_OPEN.match(adjusted):
+                adjusted = " " * (indent - self.list_indent) + probe.lstrip(" \t")
+                if self.state is None and _COMMENT_OPEN.match(adjusted):
+                    if "-->" not in adjusted:
+                        self.in_comment = True
+                    return before, self.state, True
+                if self.state is None and _PRE_OPEN.match(adjusted):
                     if "</pre>" not in adjusted.lower():
-                        in_pre = True
-                    continue
+                        self.in_pre = True
+                    return before, self.state, True
                 if FENCE.match(adjusted):
-                    state = advance_fence("> " * quote_depth + adjusted, state)
+                    self.state = advance_fence("> " * quote_depth + adjusted, self.state)
+            return before, self.state, False
+        self.state = advance_fence(line, self.state)
+        return before, self.state, False
+
+
+def fence_state(text, state=None, starts_line=True):
+    """Track fence state, including list-item and raw-HTML containers."""
+    tracker = _FenceTracker(state)
+    for number, line in enumerate(text.splitlines(keepends=True)):
+        if not (number or starts_line):
             continue
-        state = advance_fence(line, state)
-    return state
+        tracker.advance(line)
+    return tracker.state
 
 
 def require_closed_fences(data: bytes, target: str) -> None:
@@ -374,12 +425,15 @@ def part_path(relative, number, kind="part"):
 def navigation_growth(text, relative, state=None, starts_line=True):
     """Upper bound for same-directory part names, including fragment-only links."""
     growth = 0
+    tracker = _FenceTracker(state)
     for number, line in enumerate(text.splitlines(keepends=True)):
         before = state
+        literal = False
         if number or starts_line:
-            state = advance_fence(line, state)
+            before, state, literal = tracker.advance(line)
         if (
-            before is not None
+            literal
+            or before is not None
             or state is not None
             or unquote_line(line)[0].startswith(("    ", "\t"))
         ):
@@ -463,13 +517,15 @@ def heading_anchor(title):
 def populate_anchors(connection, relative, data, segments):
     for number, segment in enumerate(segments, 1):
         state = segment["before"]
+        tracker = _FenceTracker(state)
         text = data[segment["start"] : segment["end"]].decode()
         for line_number, line in enumerate(text.splitlines(keepends=True)):
             eligible = line_number > 0 or segment["starts_line"]
             before = state
+            literal = False
             if eligible:
-                state = advance_fence(line, state)
-            if eligible and before is None and state is None:
+                before, state, literal = tracker.advance(line)
+            if eligible and before is None and state is None and not literal:
                 match = HEADING.match(line.rstrip("\r\n"))
                 if match:
                     connection.execute(
@@ -521,13 +577,16 @@ def rewrite(raw, relative, segment, plans, connection, *, source, agent_entry):
     edits = []
     written = 0
     state = segment["before"]
+    tracker = _FenceTracker(state)
     for number, line in enumerate(text.splitlines(keepends=True)):
         eligible = number > 0 or segment["starts_line"]
         before = state
+        literal = False
         if eligible:
-            state = advance_fence(line, state)
+            before, state, literal = tracker.advance(line)
         if (
             not eligible
+            or literal
             or before is not None
             or state is not None
             or unquote_line(line)[0].startswith(("    ", "\t"))
