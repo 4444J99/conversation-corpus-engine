@@ -487,6 +487,33 @@ class _FenceTracker:
                 if f"</{tag}>" not in stripped.lower():
                     self._enter_literal(tag, quote_depth, content_indent)
                 return before, self.state, True
+            # A literal block may also open inside alternating
+            # containers ("- > <pre>"): stripping only the outer list
+            # marker leaves the blockquote prefix in front of the tag,
+            # so the single-layer check above misses it and its literal
+            # backticks are then misread as a fence. Strip all
+            # containers, as fence openers already do, and enter the
+            # literal in the stripped form's quote context. The
+            # list-indent exit is disabled for this shape: its
+            # continuation lines ("  > ...") measure their
+            # quote-stripped indent below the item's content indent
+            # while still being inside the blockquote, so keeping the
+            # item's indent would exit the literal on the first
+            # continuation line; the quote-depth change still ends it.
+            containers, container_depth = _strip_containers(probe, quote_depth)
+            if containers != stripped:
+                if _COMMENT_OPEN.match(containers):
+                    if "-->" not in containers:
+                        self._enter_literal("comment", container_depth, None)
+                        self.literal_list_indent = None
+                    return before, self.state, True
+                raw2 = _RAW_OPEN.match(containers)
+                if raw2:
+                    tag = raw2.group(1).lower()
+                    if f"</{tag}>" not in containers.lower():
+                        self._enter_literal(tag, container_depth, None)
+                        self.literal_list_indent = None
+                    return before, self.state, True
             if content_indent is not None:
                 self.list_indent = content_indent
             elif (
@@ -677,7 +704,11 @@ def navigation_growth(
     Without ``source``/``agent_entry`` context the old conservative
     bounds are kept (agent-entry notes budget encoding only, escaping
     links budget the relocation), so direct callers without that
-    context see no change. Charging every fragmentless link's
+    context see no change. Fragment-bearing links in the agent-entry
+    note budget the same rebase on top of their fixed part-name
+    allowance when vault context is known: without it an entry under
+    a long directory is estimated far below its rewritten size.
+    Charging every fragmentless link's
     encoding growth used to split notes that fit unsplit, and under
     a tight output budget that split could abort packaging; charging
     every escaping link's relocation used to do the same for links
@@ -803,7 +834,7 @@ def navigation_growth(
                                 - len(parsed.path.encode()),
                             )
                 continue
-            growth += (
+            bound = (
                 len(quote(Path(part_path(relative, 1)).name, safe="._-~"))
                 if not parsed.path
                 else 32
@@ -813,6 +844,32 @@ def navigation_growth(
                     - len(parsed.path.encode()),
                 )
             )
+            if (
+                parsed.path
+                and relative == "agent-entry.md"
+                and source is not None
+                and agent_entry is not None
+            ):
+                # Mirror the fragmentless branch: the entry's own links
+                # were written relative to its original parent, so a
+                # fragment-bearing link is rebased by that parent
+                # before any part retargeting. The fixed 32-byte
+                # allowance covers only the part-name suffix, not the
+                # rebased prefix, so without this an entry under a long
+                # directory is estimated far below its rewritten size
+                # and packaging aborts instead of splitting it.
+                decoded = unquote(parsed.path)
+                if decoded:
+                    candidate = Path(
+                        posixpath.normpath(posixpath.join(str(Path(agent_entry).parent), decoded))
+                    )
+                    if candidate.is_relative_to(Path(source)):
+                        rebased = candidate.relative_to(Path(source)).as_posix()
+                        bound += max(
+                            0,
+                            len(quote(rebased, safe="/._-~").encode()) - len(parsed.path.encode()),
+                        )
+            growth += bound
     return growth
 
 

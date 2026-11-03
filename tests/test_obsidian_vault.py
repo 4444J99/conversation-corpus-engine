@@ -734,6 +734,59 @@ def test_round7_review_corrections(packer, tmp_path):
     assert b"".join(packer.reconstruct(output, "blocks/b.md")) == raw
 
 
+def test_round8_review_corrections(packer, tmp_path):
+    # PR #115 round-8 review corrections (bot round on 80909fa5).
+    # 4458223689: a raw HTML block inside a list item's blockquote
+    # ("- > <pre>") was missed because stripping only the outer list
+    # marker left the blockquote prefix in front of the tag, so its
+    # literal backticks opened a fence and packaging failed closed.
+    # The tracker now strips alternating containers before detecting
+    # literal HTML, so the block parses closed, packages, verifies,
+    # and reconstructs exactly.
+    raw = b"- > <pre>\n  > ```python\n  > example\n  > </pre>\n"
+    assert packer.fence_state(raw.decode()) is None
+    _, output, _ = build(packer, tmp_path, {"note.md": raw})
+    assert packer.verify_package(output)["status"] == "verified"
+    assert b"".join(packer.reconstruct(output, "note.md")) == raw
+    # 4458223679: navigation_growth budgeted fragment-bearing links
+    # in the agent-entry note with only the fixed 32-byte part-name
+    # allowance, ignoring the rebase prefix, so an entry under a
+    # 200-character directory was estimated at 1470 bytes but
+    # rewritten to 6540 and packaging aborted instead of splitting.
+    # The bound now includes the rebased prefix, covers the actual
+    # rewritten growth, and ranges splits the entry under a 4096
+    # byte limit instead of accepting it whole.
+    directory = "d" * 200
+    generation = tmp_path / "generation"
+    source = generation / "vault"
+    (source / directory).mkdir(parents=True)
+    agent = source / directory / "entry.md"
+    lines = "[a](b#message-1)\n" * 30
+    agent.write_text(lines)
+    assert len(lines.encode()) == 510
+    growth = packer.navigation_growth(lines, "agent-entry.md", source=source, agent_entry=agent)
+    rewritten = packer.rewritten_target(
+        "b#message-1",
+        "agent-entry.md",
+        {},
+        None,
+        source=source,
+        agent_entry=agent,
+    )
+    actual = (len(rewritten.encode()) - len(b"b#message-1")) * 30
+    assert actual == 6030
+    assert growth >= actual
+    segments = packer.ranges(
+        lines.encode(),
+        4096,
+        relative="agent-entry.md",
+        maximum=4096,
+        source=source,
+        agent_entry=agent,
+    )
+    assert len(segments) >= 2
+
+
 def test_round4_agent_entry_unicode_links_budget_percent_encoding(packer, tmp_path):
     # PR #115 round-4 review corrections: navigation growth skipped
     # links without a fragment, so an agent entry whose unicode links
