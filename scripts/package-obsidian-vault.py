@@ -248,6 +248,23 @@ def fence_state(text, state=None, starts_line=True):
     return state
 
 
+def require_closed_fences(data, target):
+    """Fail closed when rendered Markdown ends inside an open fence.
+
+    Split parts are exempt by construction: their wrappers close any fence the
+    segment carries over. Anything else that ends open is a source defect the
+    package must not ship, so it fails here instead of being repaired silently.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(f"rendered Markdown is not valid UTF-8: {target}") from None
+    require(
+        fence_state(text) is None,
+        f"rendered Markdown ends inside an open fence: {target}",
+    )
+
+
 def part_path(relative, number, kind="part"):
     path = Path(relative)
     stem = path.stem
@@ -380,6 +397,16 @@ def rewritten_target(target, relative, plans, connection, *, source, agent_entry
     current_parent = posixpath.dirname(relative)
     resolved = posixpath.normpath(posixpath.join(current_parent, decoded)) if decoded else relative
     changed = False
+    if agent_entry is not None and relative == "agent-entry.md" and decoded:
+        # The relocated entry's own links were written relative to the
+        # generation directory (the entry's original parent), not the vault
+        # root: "vault/Home.md" names Home.md, its sibling in the package.
+        # Rebase only targets that land inside the source vault; anything
+        # else falls through to the normal rules below.
+        candidate = Path(posixpath.normpath(posixpath.join(str(agent_entry.parent), decoded)))
+        if candidate.is_relative_to(source):
+            resolved = candidate.relative_to(source).as_posix()
+            changed = True
     if agent_entry and (source / resolved).resolve() == agent_entry:
         resolved = "agent-entry.md"
         changed = True
@@ -567,6 +594,14 @@ def verify_package(output, *, budget=None, expected=None):
         hash_file(output / META / "navigation.sqlite", budget) == manifest["navigation_sha256"],
         "navigation database digest mismatch",
     )
+    for path in output.rglob("*"):
+        if not path.is_file() or path.suffix.lower() != ".md":
+            continue
+        if path.relative_to(output).parts[0] == ".obsidian":
+            continue
+        if budget:
+            budget.check()
+        require_closed_fences(path.read_bytes(), str(path.relative_to(output)))
     total = hashlib.sha256()
     count = 0
     with ledger_path.open() as stream:
@@ -611,6 +646,7 @@ def package(
     output,
     *,
     agent_entry=None,
+    source_generation,
     max_note_bytes=256 * 1024,
     max_output_bytes=12 * 1024**3,
     max_seconds=1800,
@@ -642,6 +678,11 @@ def package(
         and max_source_bytes > 0,
         "invalid packaging limits",
     )
+    require(
+        isinstance(source_generation, str) and source_generation.strip(),
+        "source generation identity is required; pass --source-generation",
+    )
+    source_generation = source_generation.strip()
     require(output.parent.is_dir(), "output parent must exist")
     budget = Budget(output, max_output_bytes, max_seconds)
     budget.check(8192)
@@ -761,6 +802,7 @@ def package(
                                 len(rendered) <= max_note_bytes,
                                 "rewritten Markdown exceeds note byte limit; reduce raw segment size",
                             )
+                            require_closed_fences(rendered, target)
                         entry = write(output / target, rendered, budget)
                         entry.update(
                             {
@@ -785,6 +827,7 @@ def package(
                                 target == relative or not (source / target).exists(),
                                 "generated index collides with source path",
                             )
+                            require_closed_fences(data, target)
                             row["indexes"].append(write(output / target, data, budget))
                             output_files += 1
                             rendered_bytes += len(data)
@@ -814,6 +857,7 @@ def package(
             result = {
                 "schema": SCHEMA,
                 "status": "verified",
+                "source_generation": source_generation,
                 "source_files": source_count,
                 "source_bytes": source_bytes,
                 "source_tree_sha256": source_digest.hexdigest(),
@@ -849,6 +893,13 @@ def main():
     parser.add_argument("source", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--agent-entry", type=Path)
+    parser.add_argument(
+        "--source-generation",
+        required=True,
+        help="identity of the library generation the source vault came from; "
+        "recorded in META/manifest.json so a package never needs its "
+        "generation derived from content hashes after the fact",
+    )
     parser.add_argument("--max-note-bytes", type=int, default=256 * 1024)
     parser.add_argument("--max-output-bytes", type=int, default=12 * 1024**3)
     parser.add_argument("--max-source-bytes", type=int, default=128 * 1024**2)

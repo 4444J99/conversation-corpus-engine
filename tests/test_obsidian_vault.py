@@ -28,6 +28,7 @@ def build(packer, tmp_path, files, **kwargs):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
     output = tmp_path / "derived"
+    kwargs.setdefault("source_generation", "test-generation")
     result = packer.package(
         source,
         output,
@@ -112,12 +113,12 @@ def test_refuses_existing_or_nested_output_and_symlink(packer, tmp_path):
     existing = tmp_path / "existing"
     existing.mkdir()
     with pytest.raises(ValueError, match="exist"):
-        packer.package(source, existing)
+        packer.package(source, existing, source_generation="test-generation")
     with pytest.raises(ValueError, match="inside|overlap"):
-        packer.package(source, source / "nested")
+        packer.package(source, source / "nested", source_generation="test-generation")
     source.joinpath("link.md").symlink_to(source / "Home.md")
     with pytest.raises(ValueError, match="symlink"):
-        packer.package(source, tmp_path / "new")
+        packer.package(source, tmp_path / "new", source_generation="test-generation")
 
 
 def test_invalid_utf8_and_output_budget_do_not_claim_success(packer, tmp_path):
@@ -125,10 +126,12 @@ def test_invalid_utf8_and_output_budget_do_not_claim_success(packer, tmp_path):
     source.mkdir()
     source.joinpath("bad.md").write_bytes(b"\xff")
     with pytest.raises(UnicodeError):
-        packer.package(source, tmp_path / "invalid")
+        packer.package(source, tmp_path / "invalid", source_generation="test-generation")
     source.joinpath("bad.md").write_bytes(b"x" * 10000)
     with pytest.raises(ValueError, match="budget"):
-        packer.package(source, tmp_path / "tiny", max_output_bytes=1024)
+        packer.package(
+            source, tmp_path / "tiny", max_output_bytes=1024, source_generation="test-generation"
+        )
     assert not (tmp_path / "tiny/.cce-package/manifest.json").exists()
 
 
@@ -167,7 +170,7 @@ def test_failed_tiny_budget_never_writes_more_than_the_cap(packer, tmp_path):
     source.joinpath("Home.md").write_text("# Home\n")
     output = tmp_path / "tiny"
     with pytest.raises(ValueError, match="budget"):
-        packer.package(source, output, max_output_bytes=1)
+        packer.package(source, output, max_output_bytes=1, source_generation="test-generation")
     assert sum(path.stat().st_size for path in output.rglob("*") if path.is_file()) <= 1
 
 
@@ -188,7 +191,9 @@ def test_configurable_source_cap_rejects_before_reading(packer, tmp_path):
     source.mkdir()
     source.joinpath("large.md").write_bytes(b"a" * 100)
     with pytest.raises(ValueError, match="source.*byte"):
-        packer.package(source, tmp_path / "bounded", max_source_bytes=50)
+        packer.package(
+            source, tmp_path / "bounded", max_source_bytes=50, source_generation="test-generation"
+        )
 
 
 def test_quoted_fences_and_indented_code_remain_literal(packer, tmp_path):
@@ -214,7 +219,13 @@ def test_navigation_growth_obeys_the_output_cap_before_sqlite_writes(packer, tmp
     )
     output = tmp_path / "bounded"
     with pytest.raises((ValueError, sqlite3.DatabaseError)):
-        packer.package(source, output, max_note_bytes=4096, max_output_bytes=16384)
+        packer.package(
+            source,
+            output,
+            max_note_bytes=4096,
+            max_output_bytes=16384,
+            source_generation="test-generation",
+        )
     actual = sum(path.stat().st_size for path in output.rglob("*") if path.is_file())
     assert actual <= 16384
     assert not output.joinpath(".cce-package/manifest.json").exists()
@@ -238,7 +249,7 @@ def test_refuses_output_anywhere_inside_canonical_generation(packer, tmp_path):
     source.mkdir(parents=True)
     source.joinpath("Home.md").write_text("# Home\n")
     with pytest.raises(ValueError, match="canonical generation"):
-        packer.package(source, generation / "derived")
+        packer.package(source, generation / "derived", source_generation="test-generation")
 
 
 def test_refuses_output_inside_a_different_canonical_generation(packer, tmp_path):
@@ -249,7 +260,7 @@ def test_refuses_output_inside_a_different_canonical_generation(packer, tmp_path
     other = generations / "generation-other"
     other.mkdir()
     with pytest.raises(ValueError, match="canonical generation"):
-        packer.package(source, other / "derived")
+        packer.package(source, other / "derived", source_generation="test-generation")
 
 
 @pytest.mark.parametrize("ticks", ["`", "``", "```"])
@@ -336,3 +347,67 @@ def test_inline_suffix_after_newline_does_not_start_a_fence(packer, tmp_path):
             for child in token.children or []
         )
     assert b"".join(packer.reconstruct(output, "record.md")) == raw
+
+
+def test_manifest_names_source_generation(packer, tmp_path):
+    _, output, result = build(
+        packer, tmp_path, {"Home.md": b"# Home\n"}, source_generation="20261027"
+    )
+    assert result["source_generation"] == "20261027"
+    receipt = json.loads(output.joinpath(".cce-package/manifest.json").read_text())
+    assert receipt["source_generation"] == "20261027"
+    assert packer.verify_package(output)["status"] == "verified"
+
+
+def test_missing_source_generation_is_refused(packer, tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    source.joinpath("Home.md").write_text("# Home\n")
+    with pytest.raises(TypeError):
+        packer.package(source, tmp_path / "derived")
+
+
+def test_agent_entry_outbound_links_rebase_into_vault(packer, tmp_path):
+    generation = tmp_path / "generation"
+    source = generation / "vault"
+    source.mkdir(parents=True)
+    source.joinpath("Home.md").write_text("# Home\n")
+    big = b"# Big\n\n## Message 2\n\n" + b"body\n" * 1500
+    source.joinpath("big.md").write_bytes(big)
+    agent = generation / "agent-entry.md"
+    agent.write_text("[Home](vault/Home.md)\n[Big](vault/big.md#message-2)\n[Outside](other.md)\n")
+    output = tmp_path / "derived"
+    packer.package(
+        source,
+        output,
+        agent_entry=agent,
+        source_generation="test-generation",
+        max_note_bytes=4096,
+        max_output_bytes=10_000_000,
+        max_seconds=30,
+    )
+    entry = output.joinpath("agent-entry.md").read_text()
+    assert "[Home](Home.md)" in entry
+    assert "big.__part" in entry and "#message-2" in entry
+    assert "[Outside](other.md)" in entry
+    assert b"".join(packer.reconstruct(output, "agent-entry.md")) == agent.read_bytes()
+
+
+def test_open_fence_note_fails_closed_but_split_wrapper_closes(packer, tmp_path):
+    with pytest.raises(ValueError, match="fence"):
+        build(packer, tmp_path, {"note.md": b"# Note\n\n```\ncode\n"})
+    split_base = tmp_path / "split"
+    split_base.mkdir()
+    raw = b"# Note\n\n" + b"body\n" * 1500 + b"```python\n" + b"code\n" * 300
+    _, output, _ = build(packer, split_base, {"note.md": raw})
+    for path in output.glob("note.__part*.md"):
+        assert packer.fence_state(path.read_text()) is None
+    assert b"".join(packer.reconstruct(output, "note.md")) == raw
+
+
+def test_verifier_rejects_package_ending_in_open_fence(packer, tmp_path):
+    _, output, _ = build(packer, tmp_path, {"Home.md": b"# Home\n"})
+    home = output / "Home.md"
+    home.write_bytes(home.read_bytes() + b"```\n")
+    with pytest.raises(ValueError, match="fence"):
+        packer.verify_package(output)

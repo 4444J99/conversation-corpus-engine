@@ -55,12 +55,32 @@ def _uid(value: str) -> str:
     return value
 
 
+_ESCAPED_ENTITY = re.compile(r"&(?:amp|lt|gt|quot|#[0-9]+|#x[0-9a-fA-F]+);")
+_ESCAPED_ENTITY_SPLIT = re.compile(r"(&(?:amp|lt|gt|quot|#[0-9]+|#x[0-9a-fA-F]+);)")
+_PLAIN_SPECIAL = re.compile(r"[\[\]`\\*_#|!]")
+
+
 def _plain(value: Any) -> str:
-    """One inert line for source-supplied titles and metadata, not Markdown."""
-    text = html.escape(" ".join(str(value).split()), quote=False)
-    for character in "[]`\\*_#|!":
-        text = text.replace(character, f"&#{ord(character)};")
-    return text
+    """One inert line for source-supplied titles and metadata, not Markdown.
+
+    Two idempotence properties, both load-bearing. First, the special
+    characters are replaced in a single pass: the old sequential loop
+    replaced ``[`` with ``&#91;`` and then re-escaped the ``#`` inside that
+    just-created entity, emitting ``&&#35;91;`` for every bracket, backtick,
+    backslash, star, or underscore in a title. Second, already-escaped
+    entities (``&#35;``, ``&amp;``) pass through unchanged, so re-exporting
+    an escaped title cannot double-escape it. Text without entities or
+    specials renders exactly as before.
+    """
+    text = " ".join(str(value).split())
+    rendered = []
+    for segment in _ESCAPED_ENTITY_SPLIT.split(text):
+        if _ESCAPED_ENTITY.fullmatch(segment):
+            rendered.append(segment)
+            continue
+        escaped = html.escape(segment, quote=False)
+        rendered.append(_PLAIN_SPECIAL.sub(lambda match: f"&#{ord(match.group(0))};", escaped))
+    return "".join(rendered)
 
 
 def _facet_path(facet: str, value: str) -> str:
