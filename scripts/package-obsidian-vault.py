@@ -248,6 +248,26 @@ def _leading_indent(line):
     return spaces
 
 
+def _strip_containers(probe, depth):
+    """Strip alternating list markers and blockquote prefixes.
+
+    A fence may open inside nested containers in either order ("- > ```"
+    or "> - ```"): stripping only the outer layer leaves the inner
+    prefix in front of the fence marker, so the opener was missed and
+    its closing line was misread as a new opener.
+    """
+    while True:
+        stripped, _ = _strip_list_markers(probe)
+        if stripped != probe:
+            probe = stripped
+            continue
+        unquoted, extra = unquote_line(probe)
+        if extra:
+            probe, depth = unquoted, depth + extra
+            continue
+        return probe, depth
+
+
 def advance_fence(line, state):
     probe, depth = unquote_line(line)
     previous, previous_depth = unquote_line(state or "")
@@ -261,7 +281,7 @@ def advance_fence(line, state):
         # markers are stripped only when opening: once inside a fence, a
         # marker-prefixed line is fence content, not a closing fence, and
         # the close must be a plain (possibly quoted) fence line.
-        probe, _ = _strip_list_markers(probe)
+        probe, depth = _strip_containers(probe, depth)
     match = FENCE.match(probe)
     if not match:
         return state
@@ -397,6 +417,29 @@ class _FenceTracker:
                 return before, self.state, True
             # Fell through: this line left the container, so process it
             # normally below (it may open a fence or a new literal block).
+        if self.state is not None and self.list_indent is not None and line.strip():
+            # A fence inside a list item ends when a non-fence line
+            # leaves that item: an unindented paragraph after a blank
+            # line, or a sibling-or-outer list marker. The line is then
+            # processed normally below, in its new context. Fence lines
+            # are exempt: a column-zero closer still closes the fence
+            # (existing behaviour), and a marker-prefixed fence line
+            # stays fence content, so the sibling-fence case remains
+            # deferred rather than misread. Lines in a deeper quote
+            # than the fence are likewise left alone: quote-depth
+            # decreases already clear the fence, and increases are
+            # content under the existing approximation. The indent is
+            # measured in both coordinate systems the tracker already
+            # uses (raw line and quote-stripped probe), because a
+            # quoted continuation line's probe indent alone would
+            # falsely report it as leaving the item.
+            fence_depth = unquote_line(self.state)[1]
+            if quote_depth == fence_depth and not FENCE.match(probe) and not FENCE.match(stripped):
+                if content_indent is not None:
+                    if _leading_indent(probe) < self.list_indent:
+                        self.state = None
+                elif max(_leading_indent(line), _leading_indent(probe)) < self.list_indent:
+                    self.state = None
         if self.state is None:
             if _COMMENT_OPEN.match(stripped):
                 # A comment closed on its opening line is not an open block;
@@ -514,11 +557,18 @@ def part_path(relative, number, kind="part"):
 def navigation_growth(text, relative, state=None, starts_line=True, list_indent=None):
     """Upper bound for same-directory part names, including fragment-only links.
 
-    Links without a fragment are not retargeted to a part, but an
-    agent-entry link is rebased and percent-encoded when rewritten, so
-    its growth is budgeted too: the quoted form of its path minus the
-    original path length. Rebasing only shortens the vault-relative
-    path, so the encoding growth of the original path bounds it.
+    Links without a fragment are not retargeted to a part, and most
+    are not rewritten at all, so they budget nothing. The two
+    fragmentless rewrites are budgeted exactly where they can occur:
+    an agent-entry note's own links are rebased and percent-encoded
+    when rewritten, so the quoted form of the path minus the original
+    path length bounds them (rebasing only shortens the vault-relative
+    path); and a link in any other note that escapes the vault (the
+    only shape that can name the agent entry itself) budgets the
+    relocated "agent-entry.md" target minus the original path.
+    Charging every fragmentless link's encoding growth used to split
+    notes that fit unsplit, and under a tight output budget that split
+    could abort packaging.
     """
     growth = 0
     tracker = _FenceTracker(state, list_indent=list_indent if state is not None else None)
@@ -542,14 +592,36 @@ def navigation_growth(text, relative, state=None, starts_line=True, list_indent=
             if parsed.scheme or parsed.netloc:
                 continue
             if not parsed.fragment:
-                # Agent-entry rebasing percent-encodes the path even
-                # without a fragment; budget that expansion, nothing more.
                 if parsed.path:
-                    growth += max(
-                        0,
-                        len(quote(unquote(parsed.path), safe="/._-~").encode())
-                        - len(parsed.path.encode()),
-                    )
+                    if relative is None or relative == "agent-entry.md":
+                        # Agent-entry rebasing percent-encodes the path
+                        # even without a fragment; budget that expansion,
+                        # nothing more. (relative None keeps the old
+                        # conservative bound: the note is unknown.)
+                        growth += max(
+                            0,
+                            len(quote(unquote(parsed.path), safe="/._-~").encode())
+                            - len(parsed.path.encode()),
+                        )
+                    else:
+                        # Any other note rewrites a fragmentless link
+                        # only when it names the agent entry, which
+                        # requires escaping the vault; anything else is
+                        # left unchanged, so it budgets nothing.
+                        decoded = unquote(parsed.path)
+                        parent = posixpath.dirname(relative)
+                        resolved = (
+                            posixpath.normpath(posixpath.join(parent, decoded))
+                            if decoded
+                            else relative
+                        )
+                        if resolved == ".." or resolved.startswith("../"):
+                            local = posixpath.relpath("agent-entry.md", parent or ".")
+                            growth += max(
+                                0,
+                                len(quote(local, safe="/._-~").encode())
+                                - len(parsed.path.encode()),
+                            )
                 continue
             growth += (
                 len(quote(Path(part_path(relative, 1)).name, safe="._-~"))
@@ -785,7 +857,22 @@ def render_part(body, relative, number, count, segment):
     footer = b""
     if segment["after"]:
         separator = "" if body.endswith((b"\n", b"\r")) else "\n"
-        footer = (separator + segment["after"] + "\n").encode()
+        closer = segment["after"]
+        prefix = segment.get("fence_prefix_before") or ""
+        if prefix:
+            # A list fence's closing footer must sit at the item's
+            # content indent, not column zero: CommonMark ends the list
+            # item at an unindented closer, so the part would end inside
+            # a newly opened fence instead of closing the carried one.
+            # The prefix length is the content indent; the quote prefix,
+            # if any, is kept ahead of it, mirroring the header opener.
+            quote_prefix = ""
+            rest = closer
+            while rest.startswith("> "):
+                quote_prefix += "> "
+                rest = rest[2:]
+            closer = quote_prefix + " " * len(prefix) + rest
+        footer = (separator + closer + "\n").encode()
     elif segment.get("inline_after"):
         footer = inline_suffix(
             segment["inline_after"].encode(), at_line_start=body.endswith((b"\n", b"\r"))

@@ -426,7 +426,13 @@ def test_container_fences_are_tracked(packer):
     # fences that follow it.
     assert packer.fence_state("> - ```python\n>   print(1)\n>   ```\n") is None
     assert packer.fence_state("> - item\n>\n>     ```\n>     code\n>     ```\n") is None
-    assert packer.fence_state("> ```\n> code\n> ```\n- ```\ncode\n```\n") is None
+    assert packer.fence_state("> ```\n> code\n> ```\n") is None
+    # Round-5 review correction: a fence inside a list item ends when a
+    # later line leaves the item, exactly as the pinned CommonMark
+    # parser reads it. A column-zero content line is therefore not
+    # fence content: the item (and its fence) end there, the trailing
+    # fence opens a new block, and the note ends inside it.
+    assert packer.fence_state("- ```\ncode\n```\n") is not None
     assert packer.fence_state("<pre>\n</pre>\n```python\ncode\n") is not None
     assert packer.fence_state("<pre>```</pre>\n") is None
 
@@ -556,6 +562,55 @@ def test_round4_split_list_fence_rewrites_following_link(packer, tmp_path):
     assert "a.__part" in parts[1].read_text() and "#message-2" in parts[1].read_text()
     assert packer.verify_package(output)["status"] == "verified"
     assert b"".join(packer.reconstruct(output, "blocks/b.md")) == note
+
+
+def test_round5_review_corrections(packer, tmp_path):
+    # PR #115 round-5 review corrections (bot round on 71ac0fc1).
+    # 4454058551: a fence opened by a list item's blockquoted line
+    # ("- > ```") was missed, so its closer was misread as an opener.
+    assert packer.fence_state("- > ```python\n  > code\n  > ```\n") is None
+    # 4454058563: a list-contained fence ends when a later non-fence
+    # line leaves the item (blank line plus unindented paragraph, or a
+    # sibling item); this also closes the deferred 4452002015 case.
+    assert packer.fence_state("- ```python\n  code\n\nOutside\n") is None
+    assert packer.fence_state("- ```python\n  code\n- next\n") is None
+    assert packer.fence_state("- ```python\n  code\n") is not None
+    # Both notes package and verify: neither fails closed any more.
+    (tmp_path / "quoted").mkdir()
+    _, output, _ = build(
+        packer,
+        tmp_path / "quoted",
+        {"note.md": b"# Note\n\n- > ```python\n  > code\n  > ```\n"},
+    )
+    assert packer.verify_package(output)["status"] == "verified"
+    (tmp_path / "exited").mkdir()
+    _, output, _ = build(
+        packer,
+        tmp_path / "exited",
+        {"note.md": b"# Note\n\n- ```python\n  code\n\nOutside\n"},
+    )
+    assert packer.verify_package(output)["status"] == "verified"
+    # 4454102219: fragmentless links in an ordinary note are never
+    # rewritten, so they budget no encoding growth; the agent entry's
+    # own links keep the existing rebase bound.
+    assert packer.navigation_growth("[A](other.md)\n[B](vault/café.md)\n", "notes/a.md") == 0
+    assert packer.navigation_growth("[Home](vault/café.md)\n", "agent-entry.md") == 4
+    # 4454102229: a split list fence's closing footer sits at the
+    # item's content indent, so the rendered part parses as one fence
+    # block instead of ending inside a newly opened one.
+    segment = {"before": "```", "after": "```", "fence_prefix_before": "-   "}
+    rendered, _ = packer.render_part(b"    code\n", "blocks/b.md", 1, 2, segment)
+    assert "    ```" in rendered.decode().splitlines()
+    fences = [
+        token
+        for token in MarkdownIt("commonmark", {"html": True}).parse(rendered.decode())
+        if token.type == "fence"
+    ]
+    assert len(fences) == 1
+    # A plain fence keeps its column-zero closer.
+    segment = {"before": "```", "after": "```", "fence_prefix_before": ""}
+    rendered, _ = packer.render_part(b"code\n", "b.md", 1, 2, segment)
+    assert rendered.decode().splitlines()[-1] == "```"
 
 
 def test_round4_agent_entry_unicode_links_budget_percent_encoding(packer, tmp_path):
