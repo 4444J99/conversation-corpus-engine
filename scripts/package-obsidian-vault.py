@@ -231,6 +231,13 @@ def _strip_list_markers(line):
 
     The content indent is the offset where the list item's content starts,
     so a fence on a continuation line can be measured relative to it.
+    A tab immediately after a marker's space expands to the next tab
+    stop (CommonMark): "- \\t```" has content indent 4, not 2, and
+    leaving the tab in front of the fence marker hid the opener from
+    the fence regex, so the closing delimiter was misread as a new
+    opener and packaging failed closed. The tab is replaced by the
+    spaces it expands to, so every consumer of the stripped rest
+    (fence, comment, and raw-HTML matching) sees the marker.
     """
     indent = 0
     while True:
@@ -239,6 +246,28 @@ def _strip_list_markers(line):
             return line, (indent or None)
         indent += match.end()
         line = line[match.end() :]
+        # Expand tabs in the separator's leading whitespace to tab
+        # stops, and measure the content indent from the expanded
+        # columns. The loop above already strips one space after the
+        # marker, so a "- \t" separator leaves the tab in front of
+        # the content; expanding only when a tab is present keeps
+        # the spaces-only behaviour (and its list_indent) unchanged.
+        run = 0
+        while run < len(line) and line[run] in " \t":
+            run += 1
+        if "\t" in line[:run]:
+            column = indent
+            expanded = []
+            for char in line[:run]:
+                if char == " ":
+                    expanded.append(" ")
+                    column += 1
+                else:
+                    spaces = 4 - (column % 4)
+                    expanded.append(" " * spaces)
+                    column += spaces
+            indent = column
+            line = "".join(expanded) + line[run:]
 
 
 def _leading_indent(line):
@@ -256,10 +285,15 @@ def _fence_column(line):
     remaining line's own indent. For a fence opened inside nested
     containers ("- > 10. ```") this is the item's content indent (8),
     not the outer item's indent (2), so a closer measured from the
-    nested item's indent is recognized as a close.
+    nested item's indent is recognized as a close. Tabs expand to
+    tab stops first: counting a tab as one column would put a
+    "- \\t```" fence at column 3 instead of its content indent 4,
+    and a split footer built at that column would fall outside the
+    item and open a new fence instead of closing the carried one.
     """
-    stripped, _ = _strip_containers(line, 0)
-    return (len(line) - len(stripped)) + (len(stripped) - len(stripped.lstrip(" ")))
+    expanded = line.expandtabs(4)
+    stripped, _ = _strip_containers(expanded, 0)
+    return (len(expanded) - len(stripped)) + (len(stripped) - len(stripped.lstrip(" ")))
 
 
 def _strip_containers(probe, depth):
@@ -643,7 +677,12 @@ def _segment_fence_opener(
             continue
         before, after, _ = tracker.advance(line)
         if before is None and after is not None:
-            opener = line[: _fence_column(line)]
+            # Slice the tab-expanded line: _fence_column counts
+            # columns, and a raw tab would shift the slice into the
+            # marker itself. The expanded prefix ("-   " for a
+            # "- \t" opener) parses identically and reconstructs
+            # the same list context in the later part's header.
+            opener = line.expandtabs(4)[: _fence_column(line)]
     return opener
 
 

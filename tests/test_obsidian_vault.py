@@ -813,3 +813,37 @@ def test_round4_agent_entry_unicode_links_budget_percent_encoding(packer, tmp_pa
     )
     assert packer.verify_package(output)["status"] == "verified"
     assert b"".join(packer.reconstruct(output, "agent-entry.md")) == agent.read_bytes()
+
+
+def test_round9_review_corrections(packer, tmp_path):
+    # PR #115 round-9 review corrections (bot round on 593858b2).
+    # 4459507294: a tab after a list marker's space ("- \t```python")
+    # was left in front of the fence marker, so the opener was missed,
+    # the closing delimiter was misread as a new opener, and packaging
+    # failed closed. Marker stripping now expands separator tabs to
+    # tab stops (content indent 4), so the note parses closed,
+    # packages, verifies, and reconstructs exactly; the pinned
+    # CommonMark parser agrees it holds exactly one fence.
+    raw = b"- \t```python\n    print(1)\n    ```\n"
+    assert packer.fence_state(raw.decode()) is None
+    fences = [
+        token for token in MarkdownIt("commonmark").parse(raw.decode()) if token.type == "fence"
+    ]
+    assert len(fences) == 1
+    # An ordered marker with the same tab separator, and a tab-opened
+    # fence long enough to split: the split footer must sit at the
+    # content indent (4), not at the tab-counted column (3), or it
+    # falls outside the item and opens a new fence in the part
+    # instead of closing the carried one.
+    ordered = b"1. \t```python\n    print(1)\n    ```\n"
+    assert packer.fence_state(ordered.decode()) is None
+    long = b"- \t```python\n" + b"    x = 1\n" * 500 + b"    ```\n"
+    assert packer.fence_state(long.decode()) is None
+    _, output, _ = build(packer, tmp_path, {"note.md": raw, "ordered.md": ordered, "long.md": long})
+    assert packer.verify_package(output)["status"] == "verified"
+    for relative, original in (
+        ("note.md", raw),
+        ("ordered.md", ordered),
+        ("long.md", long),
+    ):
+        assert b"".join(packer.reconstruct(output, relative)) == original
