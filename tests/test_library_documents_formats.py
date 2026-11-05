@@ -6,11 +6,13 @@ injected, and no test hydrates, reads or enumerates any real cloud folder.
 
 from __future__ import annotations
 
+import importlib.util
 import io
 import json
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -21,6 +23,9 @@ from conversation_corpus_engine.corpus_store import register_corpus_store
 from conversation_corpus_engine.library_build import build_library, publish_library
 from conversation_corpus_engine.library_documents import iter_documents
 from conversation_corpus_engine.library_store import Library
+
+GIB = 1024**3
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "icloud_hydrate.py"
 
 
 def source(root: Path, **options: object) -> dict:
@@ -363,6 +368,167 @@ def test_enumeration_lists_dataless_files_for_hydration_planning(
         "package": False,
     }
     assert by_path["y.rtf"]["state"] == "local"
+
+
+# --- (5) hydration planning script --------------------------------------------------------
+
+
+def load_script() -> Any:
+    spec = importlib.util.spec_from_file_location("icloud_hydrate_under_test", SCRIPT)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def fake_enumerator(entries: list[tuple[str, int, str]]):
+    def enumerate_root(root: Path) -> list[dict]:
+        return [
+            {
+                "path": path,
+                "extension": Path(path).suffix.lower(),
+                "size_bytes": size,
+                "state": state,
+                "package": False,
+            }
+            for path, size, state in entries
+        ]
+
+    return enumerate_root
+
+
+def exploding_hydrator(path: Path) -> None:
+    pytest.fail(f"plan mode must never hydrate: {path}")
+
+
+def run_plan(
+    module: Any,
+    capsys: pytest.CaptureFixture[str],
+    entries: list[tuple[str, int, str]],
+    free_bytes: int,
+    *extra: str,
+) -> tuple[int, dict]:
+    code = module.main(
+        ["--root", "/synthetic/container", "--plan", "--json", *extra],
+        enumerator=fake_enumerator(entries),
+        disk_usage=lambda _path: SimpleNamespace(free=free_bytes),
+        hydrator=exploding_hydrator,
+    )
+    return code, json.loads(capsys.readouterr().out)
+
+
+def test_plan_batches_dataless_files_to_at_most_five_gib(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = load_script()
+    entries = [
+        ("a.pdf", 3 * GIB, "dataless"),
+        ("b.pdf", 2 * GIB, "dataless"),
+        ("c.pdf", 2 * GIB, "dataless"),
+        ("d.pdf", 4 * GIB, "dataless"),
+        ("e.md", 1, "dataless"),
+        ("local.md", 9 * GIB, "local"),
+    ]
+    code, plan = run_plan(module, capsys, entries, free_bytes=100 * GIB)
+    assert code == 0
+    assert plan["mode"] == "plan"
+    assert plan["batch_limit_bytes"] == 5 * GIB
+    batches = plan["batches"]
+    assert all(b["bytes"] <= 5 * GIB for b in batches)
+    planned = sorted(f["path"] for b in batches for f in b["files"])
+    assert planned == ["a.pdf", "b.pdf", "c.pdf", "d.pdf", "e.md"]
+    assert "local.md" not in planned
+    assert all(b["required_free_bytes"] == 2 * b["bytes"] for b in batches)
+    assert all(b["sufficient_free_space"] for b in batches)
+    assert plan["totals"] == {
+        "dataless_files": 5,
+        "dataless_bytes": 11 * GIB + 1,
+        "batches": len(batches),
+        "oversize_files": 0,
+    }
+
+
+def test_plan_reports_files_larger_than_a_batch_instead_of_splitting_them(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = load_script()
+    entries = [("huge.pdf", 6 * GIB, "dataless"), ("small.md", 10, "dataless")]
+    _code, plan = run_plan(module, capsys, entries, free_bytes=100 * GIB)
+    assert [f["path"] for f in plan["oversize"]] == ["huge.pdf"]
+    assert [f["path"] for b in plan["batches"] for f in b["files"]] == ["small.md"]
+    assert plan["totals"]["oversize_files"] == 1
+
+
+def test_plan_flags_a_batch_when_free_space_is_below_twice_its_size(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = load_script()
+    entries = [("a.pdf", 4 * GIB, "dataless")]
+    _code, plan = run_plan(module, capsys, entries, free_bytes=7 * GIB)
+    batch = plan["batches"][0]
+    assert batch["required_free_bytes"] == 8 * GIB
+    assert batch["sufficient_free_space"] is False
+    assert plan["free_bytes"] == 7 * GIB
+    _code, enough = run_plan(module, capsys, entries, free_bytes=8 * GIB)
+    assert enough["batches"][0]["sufficient_free_space"] is True
+
+
+def test_plan_is_the_default_and_batch_size_cannot_exceed_five_gib(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = load_script()
+    entries = [("a.pdf", 2 * GIB, "dataless"), ("b.pdf", 2 * GIB, "dataless")]
+    code = module.main(
+        ["--root", "/synthetic/container", "--json", "--batch-gib", "20"],
+        enumerator=fake_enumerator(entries),
+        disk_usage=lambda _path: SimpleNamespace(free=100 * GIB),
+        hydrator=exploding_hydrator,
+    )
+    plan = json.loads(capsys.readouterr().out)
+    assert code == 0 and plan["mode"] == "plan"
+    assert plan["batch_limit_bytes"] == 5 * GIB
+    assert [b["bytes"] for b in plan["batches"]] == [4 * GIB]
+    code = module.main(
+        ["--root", "/synthetic/container", "--json", "--batch-gib", "1"],
+        enumerator=fake_enumerator(entries),
+        disk_usage=lambda _path: SimpleNamespace(free=100 * GIB),
+        hydrator=exploding_hydrator,
+    )
+    assert json.loads(capsys.readouterr().out)["batch_limit_bytes"] == GIB
+
+
+def test_text_plan_lists_batches_without_hydrating(capsys: pytest.CaptureFixture[str]) -> None:
+    module = load_script()
+    code = module.main(
+        ["--root", "/synthetic/container", "--plan"],
+        enumerator=fake_enumerator([("a.pdf", GIB, "dataless")]),
+        disk_usage=lambda _path: SimpleNamespace(free=10 * GIB),
+        hydrator=exploding_hydrator,
+    )
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "batch 1" in output and "a.pdf" in output and "WOULD" in output.upper()
+
+
+def test_execute_is_refused_without_the_explicit_confirmation_flag(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = load_script()
+    code = module.main(
+        ["--root", "/synthetic/container", "--execute"],
+        enumerator=fake_enumerator([("a.pdf", GIB, "dataless")]),
+        disk_usage=lambda _path: SimpleNamespace(free=10 * GIB),
+        hydrator=exploding_hydrator,
+    )
+    assert code == 2
+    assert "--confirm-hydrate" in capsys.readouterr().err
+
+
+def test_a_root_is_required_so_no_folder_is_implicitly_selected() -> None:
+    module = load_script()
+    with pytest.raises(SystemExit) as error:
+        module.main(["--plan"])
+    assert error.value.code == 2
 
 
 def test_cli_library_status_reports_the_reason_histogram_end_to_end(
