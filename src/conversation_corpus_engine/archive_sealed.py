@@ -903,10 +903,29 @@ def storage_status(repo: Path, identity: Identity, trust_path: Path) -> dict[str
 
 
 def _git_bytes(repo: Path) -> int:
-    git = subprocess.run(
-        ["git", "-C", str(repo), "count-objects", "-v"], check=False, capture_output=True, text=True
-    )
-    if git.returncode == 0:
-        counts = dict(line.split(": ", 1) for line in git.stdout.splitlines())
-        return (int(counts["size"]) + int(counts["size-pack"])) * 1024
-    return 0
+    """Git object-store bytes. 0 only when `repo` is absent or provably not a Git work tree.
+
+    Any other failure to measure raises: a silent 0 would let the capacity plan report
+    `fits: true` for an arbitrarily large history.
+    """
+    if not repo.exists():
+        return 0
+    try:
+        in_work_tree = _git_root(repo) is not None
+    except CorpusStoreError as exc:
+        raise SealedError("git-size-unmeasurable") from exc
+    if not in_work_tree:
+        return 0
+    try:
+        git = subprocess.run(
+            ["git", "-C", str(repo), "count-objects", "-v"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if git.returncode == 0:
+            counts = dict(line.split(": ", 1) for line in git.stdout.splitlines())
+            return (int(counts["size"]) + int(counts["size-pack"])) * 1024
+    except (OSError, ValueError, KeyError) as exc:
+        raise SealedError("git-size-unmeasurable") from exc
+    raise SealedError("git-size-unmeasurable")
