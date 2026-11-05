@@ -247,7 +247,13 @@ The manifest records effective build options and the files actually read, with t
 byte size and declared origin (`account_export`, `live_capture`, or `library_generation`). The
 library database and its pointer are both hashed, and the generation's record/evidence/report
 fingerprints are carried with them. A hash cache reads a shared library database only once per
-ingest. Live captures are listed separately from account-export shards in the channel report.
+ingest. Each input is keyed by its path relative to the provider's source root. A file outside
+the root (a delta, a library database) is keyed by its basename; when two inputs would share a
+key they are qualified as `external/<first 12 hex of the content SHA-256>/<name>`, so
+`source_files` and `inputs` never collapse them and no key holds an absolute host path. The
+`source_file` on each conversation row keeps the plain name and is paired with its
+`source_sha256`. Live captures are listed separately from account-export shards in the channel
+report.
 Origins describe the ingestion route; they are not a claim about who authored the text. An
 outer export ZIP that was unpacked before ingestion is not an input unless a reader opens it;
 preserve its original checksum in the capture receipt. Private source paths in build receipts

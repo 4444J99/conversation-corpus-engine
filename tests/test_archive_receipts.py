@@ -3,12 +3,13 @@ inputs the manifest names. Every fixture is synthetic."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from pathlib import Path
 
 import pytest
-from archive_support import copilot_small_page
+from archive_support import copilot_small_page, gpt_conversation
 
 from conversation_corpus_engine.archive_ingest import ingest, iter_store, load_index
 from conversation_corpus_engine.cli import main
@@ -203,3 +204,33 @@ def test_a_rebuild_ignores_an_unreadable_previous_manifest(archive_env) -> None:
     archive_env.paths.manifest.write_text("{not json", encoding="utf-8")
     manifest = ingest(**_kwargs(archive_env, providers=["grok"]))
     assert manifest["providers"]["grok"]["status"] == "ok"
+
+
+# --- A5: inputs that share a basename keep separate manifest entries -----------------------------
+
+
+def test_inputs_that_share_a_basename_keep_separate_source_files(
+    archive_env, tmp_path: Path
+) -> None:
+    first, second = tmp_path / "capture-a" / "live.json", tmp_path / "capture-b" / "live.json"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_text(json.dumps([gpt_conversation("delta-a", "A", [("user", "first capture")])]))
+    second.write_text(json.dumps([gpt_conversation("delta-b", "B", [("user", "second capture")])]))
+    info = ingest(
+        **_kwargs(
+            archive_env, providers=["chatgpt"], options={"chatgpt_extra_files": [first, second]}
+        )
+    )["providers"]["chatgpt"]
+    digests = {hashlib.sha256(path.read_bytes()).hexdigest() for path in (first, second)}
+    assert len(digests) == 2
+    assert digests <= set(info["source_files"].values())
+    assert digests == {item["sha256"] for item in info["inputs"] if "live" in item["source_file"]}
+    live_keys = [key for key in info["source_files"] if key.endswith("live.json")]
+    assert len(live_keys) == 2 and len(set(live_keys)) == 2
+    live_inputs = [item["source_file"] for item in info["inputs"] if "live" in item["source_file"]]
+    assert len(set(live_inputs)) == 2
+    # No key leaks a host path, and a file nobody collides with keeps its plain name.
+    for key in [*info["source_files"], *(item["source_file"] for item in info["inputs"])]:
+        assert not key.startswith("/") and str(tmp_path) not in key
+    assert info["source_files"]["conversations-000.json"]
