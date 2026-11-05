@@ -324,12 +324,14 @@ def _zettel_plan(
         export_zettels(library, envelope.get("zettels"))["zettels"], key=lambda z: z["id"]
     )
     hashes: dict[str, str] = {}
+    seen_hashes: set[str] = set()
     for item in items:
         if len(item["id"]) > _ZETTEL_ID_LIMIT:
             raise ValueError(f"Zettel id too long for a page ({_ZETTEL_ID_LIMIT} characters max)")
         digest = _zettel_hash(item["id"])
-        if digest in hashes.values():
+        if digest in seen_hashes:
             raise ValueError("Zettel page hash collision")
+        seen_hashes.add(digest)
         hashes[item["id"]] = digest
         for entry in item["sources"]:
             if _uid(entry["source"]["uid"]) not in by_uid:
@@ -397,8 +399,9 @@ def _inert_lines(text: str) -> str:
     )
 
 
-def _span_label(span: dict[str, Any]) -> str:
-    who = span["author"] + (f":{span['author_id']}" if span.get("author_id") else "")
+def _span_label(span: dict[str, Any], limit: int = 80) -> str:
+    author_id = str(span["author_id"])[:limit] if span.get("author_id") else ""
+    who = span["author"] + (f":{author_id}" if author_id else "")
     return f"{who} {span['start']}-{span['end']} {span['assertion_status']}"
 
 
@@ -444,12 +447,14 @@ def _render_zettel(item: dict[str, Any], plan: dict[str, Any], scale: int) -> st
     front = ["---", f"id: {_frontmatter_value(identity)}", 'type: "zettel"']
     front += [f"title: {_frontmatter_value(title)}", f"summary: {_frontmatter_value(summary)}"]
     front += [
-        f"created: {_frontmatter_value(item.get('created', '') or '')}",
-        f"updated: {_frontmatter_value(item.get('updated', '') or '')}",
+        f"created: {_frontmatter_value(_clip(str(item.get('created') or ''), cap(64))[0])}",
+        f"updated: {_frontmatter_value(_clip(str(item.get('updated') or ''), cap(64))[0])}",
         f"author: {_frontmatter_value(author)}",
         "authorship:",
     ]
-    front += [f"  - {_frontmatter_value(f'{part} {_span_label(s)}')}" for part, s in shown_spans]
+    front += [
+        f"  - {_frontmatter_value(f'{part} {_span_label(s, cap(80))}')}" for part, s in shown_spans
+    ]
     # Omissions are stated in the visible sections below, never as pseudo entries here.
     front += ['status: "reviewed"', "sources:"]
     front += [f"  - {_frontmatter_value(tuple_of(entry))}" for entry in sources]
@@ -469,7 +474,7 @@ def _render_zettel(item: dict[str, Any], plan: dict[str, Any], scale: int) -> st
     out.append("\n## Authorship\n\n")
     out.append(f"- Assurance: {ASSURANCE}\n")
     for part, span in shown_spans:
-        out.append(f"- {part.title()}: {_inert(_span_label(span))}\n")
+        out.append(f"- {part.title()}: {_inert(_span_label(span, cap(80)))}\n")
     if len(spans) > len(shown_spans):
         out.append(f"- Authorship spans truncated: {len(spans) - len(shown_spans)} not shown\n")
     review = item["review"]
@@ -506,10 +511,10 @@ def _render_zettel(item: dict[str, Any], plan: dict[str, Any], scale: int) -> st
                 f"- Record: [{label}](../records/{ref['uid']}.md) - revision {_inert(ref['version'])} is a historical revision; the current note shows a later one\n"
             )
         out.append(
-            f"- Role: {_inert(entry['role'])}; channel: {_inert(entry['channel']) or 'Not recorded'}; message time: {_inert(entry['message_timestamp']) or 'Not recorded'}\n"
+            f"- Role: {_inert(entry['role'], cap(80))}; channel: {_inert(entry['channel'], cap(80)) or 'Not recorded'}; message time: {_inert(entry['message_timestamp'], cap(80)) or 'Not recorded'}\n"
         )
         for span in entry["attributed_spans"][: cap(6)]:
-            out.append(f"- Quoted text attribution: {_inert(_span_label(span))}\n")
+            out.append(f"- Quoted text attribution: {_inert(_span_label(span, cap(80)))}\n")
         quote, cut = _clip(entry["text"], max(1, _QUOTE_LIMIT // scale))
         out.append(
             "\n"
@@ -1001,7 +1006,10 @@ def _verify_zettel_pages(
         )
     if declared is not None:
         hubs = sorted(path for path in existing if _ZETTEL_HUB.fullmatch(path))
-        wanted = {f"vault/hubs/zettels-{n}.md" for n in range(1, max(1, -(-declared // 100)) + 1)}
+        wanted = {
+            f"vault/hubs/zettels-{n}.md"
+            for n in range(1, max(1, -(-declared // ZETTEL_HUB_SIZE)) + 1)
+        }
         if set(hubs) != wanted:
             problems.append("Zettel hub pages differ from the declared pagination")
         entries = 0

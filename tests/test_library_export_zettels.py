@@ -479,6 +479,37 @@ def test_adversarial_zettel_never_exceeds_the_page_limit(tmp_path: Path) -> None
         assert verify_export(destination, expected_zettels=1) == []
 
 
+def test_every_caller_supplied_field_is_bounded_so_the_export_completes(tmp_path: Path) -> None:
+    with populate(tmp_path, records=1) as library:
+        huge = "[x" * 4000
+        library.put(
+            Conversation(
+                provider="chatgpt",
+                source_id="wide",
+                title="Wide",
+                messages=[
+                    Message(role="r" * 4000, text="plain source text", id=f"w{i}", ts=huge)
+                    for i in range(40)
+                ],
+            )
+        )
+        refs = [reference(library, "chatgpt-wide", message=i, end=10) for i in range(40)]
+        item = zettel(library, 1, refs, created=huge, updated=huge)
+        for entry in item["sources"]:
+            entry["attribution"]["spans"] = [
+                {**entry["attribution"]["spans"][0], "author_id": huge} for _ in range(1)
+            ]
+        body = item["body"]
+        item["attribution"]["spans"] = [
+            {**item["attribution"]["spans"][0], "author_id": huge, "evidence": [huge]}
+        ]
+        assert len(body) < 100
+        destination = tmp_path / "export"
+        export_library(library, destination, zettels=envelope([item]))
+        assert page(destination, item["id"]).stat().st_size <= PAGE_LIMIT
+        assert verify_export(destination, expected_zettels=1) == []
+
+
 def test_quotes_are_cut_at_four_hundred_characters_with_a_marker(tmp_path: Path) -> None:
     with populate(tmp_path, records=1) as library:
         long_text = "word " * 400

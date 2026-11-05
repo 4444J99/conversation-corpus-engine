@@ -202,8 +202,10 @@ manifest has no `zettels` key.
 
 - **One page per Zettel** at `vault/zettels/<h>.md`, where `<h>` is the first 16 hex digits of
   the SHA-256 of the caller's id (ids are not safe file names; the id stays visible and is
-  bound to the file name by `verify-export`). A page never exceeds 16 KiB: long bodies,
-  titles, span lists and source lists are cut with a visible "truncated" statement, and a
+  bound to the file name by `verify-export`). A page never exceeds 16 KiB: every caller
+  field (body, title, ids shown in spans, timestamps, roles, channels, reviewer and
+  evidence, relationship targets) and every list is clipped, with a visible "truncated"
+  statement where content is omitted, and a
   quotation shows at most 400 source characters ("Quotation truncated", with the exact
   offsets). The reviewed envelope remains the complete record.
 - **Frontmatter keys** (in this order): `id`, `type: "zettel"`, `title`, `summary`, `created`,
