@@ -1,0 +1,49 @@
+# seed.yaml — Automation Contract for organvm-i-theoria/my-knowledge-base
+# Schema: seed/v1.0
+# Generated: 2026-02-17 (SENSORIA Sprint)
+
+schema_version: "1.0"
+organ: I
+organ_name: Theory
+repo: my-knowledge-base
+org: organvm-i-theoria
+
+metadata:
+  implementation_status: ACTIVE
+  tier: standard
+  promotion_status: CANDIDATE
+  last_validated: "2026-02-11"
+  generated: "2026-02-17"
+  sprint: "SENSORIA"
+  language: typescript
+
+agents:
+  - name: ci
+    trigger: on_push
+    workflow: .github/workflows/ci-typescript.yml
+    description: "Continuous integration pipeline"
+
+implements:
+  - concept: AMMOI
+    zettel_source: "post-flood/archive_original/.zettel-index.yaml#AMMOI"
+    aspect: "End-to-end epistemological pipeline — export, atomize, search, intelligence"
+  - concept: SVSE
+    zettel_source: "post-flood/archive_original/.zettel-index.yaml#SVSE"
+    aspect: "Identity-stable knowledge objects with mutable expression and versioned relationships"
+  - concept: structural_interrogation
+    zettel_source: "post-flood/archive_original/.zettel-index.yaml#structural_interrogation"
+    aspect: "7-dimension diagnostic applied to knowledge intake — Existence through Teleology"
+
+produces:
+  - type: theory
+    description: "Epistemological frameworks, recursive engines, ontological systems"
+
+consumes: []
+
+subscriptions:
+  - event: governance.updated
+    source: ORGAN-IV
+    action: Check compliance with updated governance rules
+  - event: health-audit.completed
+    source: ORGAN-IV
+    action: Review audit findings for this repo

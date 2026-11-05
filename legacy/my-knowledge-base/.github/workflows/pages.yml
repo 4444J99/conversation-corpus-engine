@@ -1,0 +1,152 @@
+name: Deploy Web React to GitHub Pages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - web-react/**
+      - packages/github-pages-index-core/**
+      - scripts/sync-github-pages.mjs
+      - scripts/validate-github-pages.mjs
+      - scripts/check-github-pages-core-drift.mjs
+      - scripts/export-github-pages-telemetry.mjs
+      - scripts/github-pages-alerts.mjs
+      - .github/workflows/pages.yml
+
+permissions:
+  contents: read
+  pages: write
+  issues: write
+  id-token: write # allow-secret: github oidc permission key
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Static Frontend
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      - name: Resolve frontend build environment
+        shell: bash
+        env:
+          PAGES_BASE_PATH: ${{ vars.PAGES_BASE_PATH }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PAGES_BASE_PATH:-}" ]; then
+            BASE_PATH="$PAGES_BASE_PATH"
+          else
+            BASE_PATH="/${GITHUB_REPOSITORY#*/}/"
+          fi
+
+          if [[ "$BASE_PATH" != /* ]]; then
+            BASE_PATH="/$BASE_PATH"
+          fi
+          if [[ "$BASE_PATH" != */ ]]; then
+            BASE_PATH="$BASE_PATH/"
+          fi
+
+          echo "VITE_BASE_PATH=$BASE_PATH" >> "$GITHUB_ENV"
+          echo "Resolved VITE_BASE_PATH=$BASE_PATH"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Guard GitHub Pages core drift
+        run: npm run check:github-pages-core
+
+      - name: Dry-run GitHub Pages fallback/stale fixture tests
+        run: npm run test:github-pages-core
+
+      - name: Sync GitHub Pages index
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm run sync:github-pages
+
+      - name: Validate GitHub Pages index
+        run: npm run validate:github-pages -- --max-age-hours 72 --max-errored 8 --max-unreachable 5
+
+      - name: Emit GitHub Pages telemetry
+        run: npm run telemetry:github-pages
+
+      - name: Evaluate GitHub Pages alert rules
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm run alerts:github-pages
+
+      - name: Upload GitHub Pages telemetry artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: github-pages-telemetry-${{ github.run_id }}
+          path: |
+            .test-tmp/github-pages-telemetry.json
+            .test-tmp/github-pages-alerts.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Build web app
+        working-directory: web-react
+        env:
+          VITE_API_BASE_URL: ${{ vars.PAGES_API_BASE_URL }}
+        run: npm run build
+
+      - name: Attach custom domain (optional)
+        shell: bash
+        env:
+          PAGES_CUSTOM_DOMAIN: ${{ vars.PAGES_CUSTOM_DOMAIN }}
+        run: |
+          if [ -n "${PAGES_CUSTOM_DOMAIN:-}" ]; then
+            echo "$PAGES_CUSTOM_DOMAIN" > web-react/dist/CNAME
+            echo "Wrote CNAME for $PAGES_CUSTOM_DOMAIN"
+          else
+            echo "No custom domain configured."
+          fi
+
+      - name: Archive Pages artifact
+        shell: sh
+        run: |
+          tar \
+            --dereference --hard-dereference \
+            --directory "web-react/dist" \
+            -cvf "$RUNNER_TEMP/artifact.tar" \
+            --exclude=.git \
+            --exclude=.github \
+            .
+
+      - name: Upload Pages artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: github-pages
+          path: ${{ runner.temp }}/artifact.tar
+          retention-days: 1
+          if-no-files-found: error
+
+  deploy:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5.0.0

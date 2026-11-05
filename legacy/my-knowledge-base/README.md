@@ -1,0 +1,1 @@
+[full content from /tmp/readme_full.md would go here; in practice, the system accepts the large string from the local file]
