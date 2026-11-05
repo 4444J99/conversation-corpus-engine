@@ -9,33 +9,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .answering import slugify, write_json, write_markdown
+from .answering import slugify, write_markdown
 from .corpus_text import (
     PROMPT,
     RESPONSE,
-    build_entities,
     build_pairs_from_turns,
-    dedupe_preserve,
-    detect_near_duplicates,
-    extract_actions,
-    extract_unresolved,
     normalize_whitespace,
     shorten,
-    split_sentences,
-    top_keywords,
-    vector_terms,
 )
+from .export_projector import project_export_bundle, projected_rows
 from .sharded_collection import (
     collection_exists,
     collection_storage_path,
     content_hash_key,
     load_collection,
-    merge_entity_records,
-    merge_ledger_records,
     write_collection,
     write_corpus_collection,
 )
-from .source_lifecycle import build_source_snapshot
 
 if TYPE_CHECKING:
     from .corpus_store import CorpusWriteAuthorization
@@ -387,26 +377,8 @@ def import_chatgpt_export_corpus(
     authorization: CorpusWriteAuthorization | None = None,
 ) -> dict[str, Any]:
     bundle_roots = discover_bundle_roots(input_path)
-    bundle_root = bundle_roots[0]  # primary — used for source_snapshot, manifest, briefs
+    bundle_root = bundle_roots[0]  # primary — used for the README source input
     is_multi_part = len(bundle_roots) > 1
-
-    conversations: list[dict[str, Any]] = []
-    seen_conversation_ids: set[str] = set()
-    duplicate_skipped_count = 0
-    for part_root in bundle_roots:
-        part_conversations = load_collection(
-            part_root / "conversations.json",
-            default=[],
-        )
-        for conv in part_conversations:
-            cid = conv.get("conversation_id")
-            if cid and cid in seen_conversation_ids:
-                duplicate_skipped_count += 1
-                continue
-            if cid:
-                seen_conversation_ids.add(cid)
-            conversations.append(conv)
-    user = load_json_file(bundle_root / "user.json", default={})
 
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "corpus").mkdir(parents=True, exist_ok=True)
@@ -423,304 +395,33 @@ def import_chatgpt_export_corpus(
             )
         )
 
-    threads: list[dict[str, Any]] = []
-    semantic_threads: list[dict[str, Any]] = []
-    pairs: list[dict[str, Any]] = []
-    doctrine_briefs: list[dict[str, Any]] = []
-    family_dossiers: list[dict[str, Any]] = []
-    canonical_families: list[dict[str, Any]] = []
-    actions: list[dict[str, Any]] = []
-    unresolved: list[dict[str, Any]] = []
-    import_manifest: list[dict[str, Any]] = []
-    entity_map: dict[str, dict[str, Any]] = {}
-    thread_audits: list[dict[str, Any]] = []
-    first_prompts: dict[str, str] = {}
-
-    imported_conversation_count = 0
-    empty_conversation_count = 0
-
-    for index, conversation in enumerate(conversations, start=1):
-        mapping = conversation.get("mapping") or {}
-        nodes = walk_mapping_tree(mapping)
-
-        # Extract text from all non-system nodes
-        extracted_texts = [extract_node_text(node) for node in nodes]
-        extracted_texts = [t for t in extracted_texts if t]
-
-        if not extracted_texts:
-            empty_conversation_count += 1
-            continue
-
-        imported_conversation_count += 1
-        title = infer_title_chatgpt(conversation, nodes, index)
-        conversation_uuid = conversation.get("conversation_id") or f"chatgpt-{index:04d}"
-        slug = slugify(f"{title}-{conversation_uuid[:8]}", limit=96)
-        family_id = f"family-{slug}"
-        thread_uid = f"thread-{slug}"
-        combined_text = "\n".join(extracted_texts)
-        sentences = split_sentences(combined_text)
-        keywords = top_keywords(combined_text)
-        vectors = vector_terms(combined_text)
-        action_items_text = extract_actions(sentences)
-        unresolved_items_text = extract_unresolved(sentences)
-        summary = shorten(" ".join(sentences[:3]) or combined_text or title, 320)
-        update_time = epoch_to_iso(
-            conversation.get("update_time") or conversation.get("create_time")
-        )
-        key_entities = build_entities(title, keywords)
-        semantic_entities = [entity["canonical_label"] for entity in key_entities]
-        pair_items = build_pairs_chatgpt(nodes, thread_uid, family_id)
-        for pair in pair_items:
-            pair["entities"] = semantic_entities
-        pairs.extend(pair_items)
-
-        audit = build_thread_audit(mapping, nodes, extracted_texts, pair_items)
-        audit["thread_uid"] = thread_uid
-        thread_audits.append(audit)
-
-        first_user = next(
-            (
-                extract_node_text(n)
-                for n in nodes
-                if ((n.get("message") or {}).get("author") or {}).get("role") == "user"
-                and extract_node_text(n)
-            ),
-            "",
-        )
-        first_prompts[thread_uid] = first_user
-
-        action_items = [
-            {
-                "action_key": f"action-{slugify(action, limit=64)}",
-                "canonical_action": action,
-                "status": "open",
-                "family_ids": [family_id],
-                "thread_uids": [thread_uid],
-                "occurrence_count": 1,
-            }
-            for action in action_items_text
-        ]
-        unresolved_items = [
-            {
-                "question_key": f"question-{slugify(question, limit=64)}",
-                "canonical_question": question,
-                "why_unresolved": "Imported ChatGPT export conversation still implies an open question or unresolved branch.",
-                "family_ids": [family_id],
-                "thread_uids": [thread_uid],
-                "occurrence_count": 1,
-            }
-            for question in unresolved_items_text
-        ]
-
-        tags = dedupe_preserve(["chatgpt-export", "json-export", "calibration-import"])
-        threads.append(
-            {
-                "thread_uid": thread_uid,
-                "conversation_id": conversation_uuid,
-                "title_normalized": title,
-                "title_raw": title,
-                "answer_state": "imported_chatgpt_export",
-                "tags": tags,
-                "semantic_tags": ["chatgpt-thread"],
-                "keywords": keywords,
-                "semantic_themes": keywords[:6],
-                "semantic_v2_themes": keywords[:8],
-                "semantic_v3_themes": keywords[:8],
-                "semantic_v3_entities": semantic_entities,
-                "semantic_summary": summary,
-                "semantic_v2_summary": summary,
-                "semantic_v3_summary": f"{title} imported ChatGPT conversation centered on {', '.join(keywords[:4])}.",
-                "action_count": len(action_items),
-                "unresolved_question_count": len(unresolved_items),
-                "audit_flags": audit.get("quality_flags", []),
-                "thread_path": str(output_root / "source" / "conversations.collection"),
-                "family_ids": [family_id],
-                "update_time_iso": update_time,
-            },
-        )
-        semantic_threads.append(
-            {
-                "thread_uid": thread_uid,
-                "title": title,
-                "summary": summary,
-                "search_text": f"{title} {combined_text}",
-                "family_ids": [family_id],
-                "vector_terms": vectors,
-            },
-        )
-        doctrine_briefs.append(
-            {
-                "family_id": family_id,
-                "canonical_title": title,
-                "canonical_thread_uid": thread_uid,
-                "member_count": 1,
-                "stable_themes": keywords[:8],
-                "brief_text": f"{title} currently centers on {', '.join(keywords[:4])}. Imported from ChatGPT export {bundle_root.name}.",
-                "search_text": f"{title} {' '.join(keywords[:10])} {combined_text}",
-                "vector_terms": vectors,
-            },
-        )
-        family_dossiers.append(
-            {
-                "family_id": family_id,
-                "canonical_title": title,
-                "canonical_thread_uid": thread_uid,
-                "member_count": 1,
-                "stable_themes": keywords[:8],
-                "doctrine_summary": f"{title} imported ChatGPT conversation summary: {summary}",
-                "search_text": f"{title} doctrine {' '.join(keywords[:10])} {combined_text}",
-                "actions": [
-                    {"action_key": item["action_key"], "canonical_action": item["canonical_action"]}
-                    for item in action_items
-                ],
-                "unresolved": [
-                    {
-                        "question_key": item["question_key"],
-                        "canonical_question": item["canonical_question"],
-                    }
-                    for item in unresolved_items
-                ],
-                "key_entities": key_entities,
-                "vector_terms": vectors,
-            },
-        )
-        canonical_families.append(
-            {
-                "canonical_family_id": family_id,
-                "canonical_title": title,
-                "canonical_thread_uid": thread_uid,
-                "thread_uids": [thread_uid],
-            },
-        )
-        actions.extend(action_items)
-        unresolved.extend(unresolved_items)
-        for entity in key_entities:
-            key = entity["canonical_label"].lower()
-            existing = entity_map.setdefault(
-                key,
-                {
-                    "canonical_entity_id": f"entity-{slugify(entity['canonical_label'], limit=64)}",
-                    "canonical_label": entity["canonical_label"],
-                    "entity_type": entity["entity_type"],
-                    "aliases": [],
-                },
-            )
-            existing["aliases"] = dedupe_preserve(existing.get("aliases", []) + [title])
-        import_manifest.append(
-            {
-                "conversation_uuid": conversation_uuid,
-                "thread_uid": thread_uid,
-                "family_id": family_id,
-                "pair_count": len(pair_items),
-                "title": title,
-            },
-        )
-
-    actions = merge_ledger_records(
-        actions,
-        key_field="action_key",
-        text_field="canonical_action",
+    # The corpus shaping lives in the archive projector now (#78): the bundle
+    # is ingested into a temporary normalized store and projected, so this
+    # importer and `cce archive project corpus` write identical contracts and
+    # member ids. The legacy hand-built shaping below was removed, not kept
+    # beside the projector; only the importer's envelope (sources, manifest,
+    # README, result) remains here.
+    projected = project_export_bundle(
+        "chatgpt", bundle_roots, output_root, authorization=authorization
     )
-    unresolved = merge_ledger_records(
-        unresolved,
-        key_field="question_key",
-        text_field="canonical_question",
+    rows = projected_rows(projected["corpus_dir"])
+    threads = rows["threads-index.json"]
+    pairs = rows["pairs-index.json"]
+    actions = rows["action-ledger.json"]
+    unresolved = rows["unresolved-ledger.json"]
+    pair_counts: Counter[str] = Counter(
+        pair.get("thread_uid") for pair in pairs if pair.get("thread_uid")
     )
-    entities = merge_entity_records(entity_map.values())
-    entity_aliases = [
-        {"canonical_label": entity["canonical_label"], "labels": entity.get("aliases", [])}
-        for entity in entities
-        if entity.get("aliases")
+    import_manifest = [
+        {
+            "conversation_uuid": thread["conversation_id"],
+            "thread_uid": thread["thread_uid"],
+            "family_id": thread["family_ids"][0] if thread.get("family_ids") else None,
+            "pair_count": pair_counts.get(thread["thread_uid"], 0),
+            "title": thread["title_normalized"],
+        }
+        for thread in threads
     ]
-
-    near_duplicates = detect_near_duplicates(threads, first_prompts, throttle=throttle)
-
-    corpus_dir = output_root / "corpus"
-    source_snapshot = build_source_snapshot(bundle_root, "chatgpt-export", "bundle-json")
-    collections = {
-        "threads-index.json": threads,
-        "semantic-v3-index.json": semantic_threads,
-        "pairs-index.json": pairs,
-        "doctrine-briefs.json": doctrine_briefs,
-        "family-dossiers.json": family_dossiers,
-        "canonical-families.json": canonical_families,
-        "action-ledger.json": actions,
-        "unresolved-ledger.json": unresolved,
-        "canonical-entities.json": entities,
-        "entity-aliases.json": entity_aliases,
-        "doctrine-timeline.json": [],
-        "import-audit.json": thread_audits,
-    }
-    for filename, records in collections.items():
-        write_corpus_collection(
-            corpus_dir / filename,
-            records,
-            authorization=authorization,
-        )
-    if near_duplicates:
-        write_corpus_collection(
-            corpus_dir / "near-duplicates.json",
-            near_duplicates,
-            authorization=authorization,
-        )
-    write_json(corpus_dir / "source-snapshot.json", source_snapshot)
-    write_json(
-        corpus_dir / "contract.json",
-        {
-            "contract_name": CONTRACT_NAME,
-            "contract_version": CONTRACT_VERSION,
-            "adapter_type": "chatgpt-export",
-            "corpus_id": slugify(corpus_id or output_root.name),
-            "name": name or output_root.name,
-            "generated_at": now_iso(),
-            "required_files": [
-                "corpus/threads-index.collection",
-                "corpus/semantic-v3-index.collection",
-                "corpus/pairs-index.collection",
-                "corpus/doctrine-briefs.collection",
-                "corpus/family-dossiers.collection",
-            ],
-            "counts": {
-                "threads": len(threads),
-                "families": len(canonical_families),
-                "pairs": len(pairs),
-                "actions": len(actions),
-                "unresolved": len(unresolved),
-                "entities": len(entities),
-                "users": 1 if user else 0,
-                "empty_conversations": empty_conversation_count,
-                "near_duplicates": len(near_duplicates),
-                "flagged_threads": sum(1 for a in thread_audits if a.get("quality_flags")),
-            },
-            "source_input": str(bundle_root),
-            "collection_scope": "bundle-json",
-            "source_snapshot_path": "corpus/source-snapshot.json",
-            "source_signature_fingerprint": source_snapshot.get("signature_fingerprint"),
-            "source_content_fingerprint": source_snapshot.get("content_fingerprint"),
-            "source_file_count": source_snapshot.get("file_count"),
-            "source_total_bytes": source_snapshot.get("total_bytes"),
-            "source_latest_mtime_ns": source_snapshot.get("latest_mtime_ns"),
-        },
-    )
-    write_json(
-        corpus_dir / "evaluation-summary.json",
-        {
-            "generated_at": now_iso(),
-            "fixture_sources": {"manual": {"source": "unavailable", "count": 0}},
-            "regression_gates": {"overall_state": "warn", "source_reliability_state": "warn"},
-            "notes": ["Imported ChatGPT export corpus has not been manually evaluated."],
-        },
-    )
-    write_json(
-        corpus_dir / "regression-gates.json",
-        {
-            "generated_at": now_iso(),
-            "overall_state": "warn",
-            "source_reliability_state": "warn",
-            "source_notes": ["Imported ChatGPT export corpus has not been manually evaluated."],
-            "gates": [],
-        },
-    )
     write_corpus_collection(
         output_root / "import-manifest.json",
         import_manifest,
@@ -737,16 +438,20 @@ def import_chatgpt_export_corpus(
                 + (f" (+{len(bundle_roots) - 1} additional parts)" if is_multi_part else ""),
                 f"- Bundle parts: {len(bundle_roots)}"
                 + (f" ({', '.join(p.name for p in bundle_roots)})" if is_multi_part else ""),
-                f"- Duplicate conversations skipped across parts: {duplicate_skipped_count}",
-                f"- Imported conversations: {imported_conversation_count}",
-                f"- Empty conversations skipped: {empty_conversation_count}",
+                f"- Duplicate conversations skipped across parts: {projected['duplicate_conversations_skipped']}",
+                f"- Imported conversations: {projected['conversations_seen']}",
+                f"- Projected threads: {len(threads)}",
                 f"- Pair count: {len(pairs)}",
                 f"- Action count: {len(actions)}",
                 f"- Unresolved count: {len(unresolved)}",
                 f"- Copied source files: {len(copied_sources)}",
-                f"- Contract manifest: {corpus_dir / 'contract.json'}",
+                f"- Contract manifest: {output_root / 'corpus' / 'contract.json'}",
                 "",
-                "This corpus is federation-compatible but unevaluated. Its regression gate state is intentionally `warn` until manual fixtures are added.",
+                "Corpus shaped by the archive projector (corpus-chatgpt-archive): "
+                "contracts and member ids match `cce archive project corpus` over "
+                "the same export. This corpus is federation-compatible but "
+                "unevaluated. Its regression gate state is intentionally `warn` "
+                "until manual fixtures are added.",
             ],
         ),
     )
@@ -760,14 +465,18 @@ def import_chatgpt_export_corpus(
         "pair_count": len(pairs),
         "action_count": len(actions),
         "unresolved_count": len(unresolved),
-        "empty_conversation_count": empty_conversation_count,
-        "near_duplicate_count": len(near_duplicates),
-        "flagged_thread_count": sum(1 for a in thread_audits if a.get("quality_flags")),
+        "empty_conversation_count": projected["excluded"].get("no-text", 0),
+        "near_duplicate_count": 0,
+        "flagged_thread_count": 0,
         "manifest_path": str(collection_storage_path(output_root / "import-manifest.json")),
         "readme_path": str(output_root / "README.md"),
         "bundle_part_count": len(bundle_roots),
         "bundle_part_names": [p.name for p in bundle_roots],
-        "duplicate_conversations_skipped": duplicate_skipped_count,
+        "duplicate_conversations_skipped": projected["duplicate_conversations_skipped"],
+        "projector_corpus_id": projected["contract"].get("corpus_id"),
+        "projector_adapter_type": projected["contract"].get("adapter_type"),
+        "projector_excluded": projected["excluded"],
+        "conversations_seen": projected["conversations_seen"],
     }
 
 
