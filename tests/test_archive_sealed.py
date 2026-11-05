@@ -435,12 +435,24 @@ def test_history_audit_rejects_annotated_tag_payload(vault):
     publish(vault)
 
     def git(*args):
+        # Hermetic: a host-level tag.gpgsign/commit.gpgsign must not decide this test.
         return subprocess.run(
-            ["git", "-C", str(repo), *args],
+            [
+                "git",
+                "-c",
+                "tag.gpgsign=false",
+                "-c",
+                "commit.gpgsign=false",
+                "-C",
+                str(repo),
+                *args,
+            ],
             check=True,
             capture_output=True,
             env={
                 **os.environ,
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_AUTHOR_NAME": "Synthetic",
                 "GIT_AUTHOR_EMAIL": "test@example.invalid",
                 "GIT_COMMITTER_NAME": "Synthetic",
