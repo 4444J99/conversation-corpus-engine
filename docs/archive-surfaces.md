@@ -219,17 +219,27 @@ cce archive ingest --export-root "$EXPORTS" --library-root "$OLD_STORE" --provid
 built one provider at a time and a failed one is read again alone; without it the manifest lists
 exactly the providers of the call. Before any selected provider is written, a merge checks its
 previous library and live-capture inputs. A library generation that lacks previously bridged
-source IDs refuses the merge. Live captures are checked by their normalized conversation IDs:
-omitting a delta file or refreshing a fixed filename with only newer records cannot remove
-earlier records, even when two input files share a basename. A complete account export may
-replace a delta if it contains all of those identities. Intentional removal requires
+source IDs refuses the merge. Live captures are checked by their normalized conversation IDs
+for every live-capture provider (the ChatGPT delta files, `copilot`, `copilotreports` and
+`localmemory`): omitting a capture file or refreshing a fixed filename with only newer records
+cannot remove earlier records, even when two input files share a basename. A complete account
+export may replace a ChatGPT delta if it contains all of those identities. A merge also refuses
+a selected provider whose source is absent (a missing or wrong folder) when the store already
+holds conversations for it, since the provider's receipt would become `absent` and its shards
+would be orphaned. Intentional removal requires
 `--allow-input-loss`, which is recorded in the
 manifest. Older manifests without the source-ID list use their existing library record count
 as the compatibility check; they cannot prove identity preservation within an equal-size
 replacement generation. Providers not selected keep their original input and build receipts.
 Captured identities remain protected across later merges after an account export absorbs them.
-A failed provider rebuild retains the previous shards and their input receipt, alongside a
-separate failed-attempt receipt; failure does not erase the protection for the next retry.
+A failed provider rebuild, with or without `--merge`, retains the previous shards and their
+input receipt, alongside a separate failed-attempt receipt (a provider that had no shards before
+has nothing to retain, and an unreadable previous manifest retains nothing); failure does not erase the protection for the next retry. The
+manifest totals keep counting those retained conversations, so the vault, site, search store,
+graph and turn store keep serving them too (the surfaces and the totals never disagree), and
+`cce archive verify` fails with `provider X failed: … (serving the N conversation(s) retained
+from the previous build)` until the provider is read again. The ingest summary marks such a
+provider `"retained": true`. The feed and corpus projections still skip any failed provider.
 Older live captures without recorded IDs cannot provide the same identity-level assurance;
 retain their original complete inputs for the first build that writes these receipts.
 
@@ -237,11 +247,30 @@ The manifest records effective build options and the files actually read, with t
 byte size and declared origin (`account_export`, `live_capture`, or `library_generation`). The
 library database and its pointer are both hashed, and the generation's record/evidence/report
 fingerprints are carried with them. A hash cache reads a shared library database only once per
-ingest. Live captures are listed separately from account-export shards in the channel report.
+ingest. Each input is keyed by its path relative to the provider's source root. A file outside
+the root (a delta, a library database) is keyed by its basename; when two inputs would share a
+key they are qualified as `external/<first 12 hex of the content SHA-256>/<name>`, so
+`source_files` and `inputs` never collapse them and no key holds an absolute host path. The
+`source_file` on each conversation row keeps the plain name and is paired with its
+`source_sha256`. Live captures are listed separately from account-export shards in the channel
+report: for ChatGPT, `channels.read` counts the export's shard files on one line and the delta
+files kept outside the export folder on the next, and together they equal the ChatGPT entries
+of `source_files` (a delta sits in `source_files` too, so a build with 29 shards and one delta
+lists 30 files and reports "29 conversation shard file(s)" plus "1 extra live capture
+file(s)"). This holds for a plain account export plus deltas; a library-bridged build also
+lists the library database and pointer in `source_files`, and its library line counts records,
+not files. A delta placed inside the export folder under a shard name (`conversations-NNN.json`)
+is counted on both lines and read twice (the second read folds as a duplicate); keep deltas
+outside the export folder.
 Origins describe the ingestion route; they are not a claim about who authored the text. An
-outer export ZIP that was unpacked before ingestion is not an input unless a reader opens it;
-preserve its original checksum in the capture receipt. Private source paths in build receipts
-belong in the private store, not in the code repository.
+outer export ZIP that was unpacked before ingestion is not read by any reader, so it is recorded
+only when named: `--export-zip PROVIDER=PATH` (repeatable) hashes the ZIP and records its
+SHA-256, byte size and the origin `export_archive` in that provider's `inputs` (not in
+`source_files`, which lists what a reader opened) and its path in the build options. The
+provider must be part of the build and the file must exist, or the command exits 2. Naming a ZIP
+changes the source fingerprint, as any recorded input does. A ZIP that is not named is not
+recorded; preserve its original checksum in the capture receipt. Private source paths in build
+receipts belong in the private store, not in the code repository.
 
 A conversation larger than a shard (one Antigravity session is
 about 170 MiB) is never cut: its shard is that one row, the manifest marks it `oversize_row`, and

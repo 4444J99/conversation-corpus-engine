@@ -22,10 +22,12 @@ from .archive_ingest import (
     ArchivePaths,
     MergeInputLoss,
     authorize_archive,
+    check_export_zips,
     failed_providers,
     has_bounded_layout,
     ingest,
     load_manifest,
+    retained_after_failure,
 )
 from .archive_limits import Limits, census_problems, take_census
 from .archive_naming import names_payload, render_names_text, verify_names
@@ -193,7 +195,7 @@ def verify_layout(paths: ArchivePaths, manifest: dict[str, Any]) -> list[str]:
     """Check the bounded layout's own promises: shards, author counts, notes, pages and limits."""
     problems: list[str] = []
     for name, info in manifest["providers"].items():
-        if info.get("status") != "ok":
+        if info.get("status") != "ok" and not retained_after_failure(info):
             continue
         problems += [
             f"{name}: {item}" for item in reconcile(info.get("authors", {}), info["messages"])
@@ -228,10 +230,16 @@ def verify_archive(paths: ArchivePaths, limits: Limits | None = None) -> list[st
         manifest = load_manifest(paths)
     except FileNotFoundError as exc:
         return [str(exc)]
-    problems = [
-        f"provider {name} failed: {manifest['providers'][name].get('error', '')}"
-        for name in failed_providers(manifest)
-    ]
+    problems = []
+    for name in failed_providers(manifest):
+        info = manifest["providers"][name]
+        kept = (
+            f" (serving the {info.get('conversations', 0)} conversation(s) retained from the "
+            "previous build)"
+            if retained_after_failure(info)
+            else ""
+        )
+        problems.append(f"provider {name} failed: {info.get('error', '')}{kept}")
     total = manifest["totals"]["conversations"]
     enrichment = paths.enrichment
     if not enrichment.is_file():
@@ -319,7 +327,12 @@ def run_stages(
             result[stage] = {
                 "totals": manifest["totals"],
                 "providers": {
-                    name: {k: info.get(k) for k in ("status", "conversations", "messages", "error")}
+                    name: {
+                        **{
+                            k: info.get(k) for k in ("status", "conversations", "messages", "error")
+                        },
+                        **({"retained": True} if retained_after_failure(info) else {}),
+                    }
                     for name, info in manifest["providers"].items()
                 },
             }
@@ -374,6 +387,14 @@ def add_archive_parser(subparsers: Any) -> None:
             type=Path,
             default=[],
             help="extra ChatGPT conversation JSON (live delta); wins over export shards",
+        )
+        parser.add_argument(
+            "--export-zip",
+            action="append",
+            default=[],
+            metavar="PROVIDER=PATH",
+            help="the outer export ZIP a provider's folder was unpacked from: its SHA-256 and "
+            "size are recorded in the manifest (the ZIP itself is not read)",
         )
         parser.add_argument("--include-attachment-text", action="store_true")
         parser.add_argument(
@@ -509,6 +530,18 @@ def _overrides(raw: list[str]) -> dict[str, Path]:
     return out
 
 
+def _export_zips(raw: list[str]) -> dict[str, list[Path]]:
+    out: dict[str, list[Path]] = {}
+    for item in raw:
+        name, sep, value = item.partition("=")
+        if not sep or name not in PROVIDER_SPECS or not value:
+            raise ValueError(
+                f"--export-zip must be PROVIDER=PATH with a known provider, got: {item}"
+            )
+        out.setdefault(name, []).append(Path(value))
+    return out
+
+
 def _handle_project(args: argparse.Namespace) -> int:
     if args.target not in {"feed", "corpus"}:
         raise ValueError(f"unsupported projection: {args.target}")
@@ -596,9 +629,16 @@ def handle_archive(args: argparse.Namespace) -> int:
 
     if action in {"ingest", "build"}:
         providers = args.provider or None
+        try:
+            export_zips = _export_zips(args.export_zip)
+            check_export_zips(export_zips, providers or list(PROVIDER_SPECS))
+        except ValueError as exc:
+            print(f"archive refused: {exc}", file=sys.stderr)
+            return 2
         options = {
             "chatgpt_extra_files": args.chatgpt_extra,
             "include_attachment_text": args.include_attachment_text,
+            "export_zips": export_zips,
         }
         stages = ("ingest",) if action == "ingest" else STAGES
         limits = limits_from_args(args)
