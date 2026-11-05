@@ -206,6 +206,13 @@ Serialize writers; lock directories fail closed and are not automatically stolen
 write may leave unreferenced ciphertext or a lock; investigate it under custody before manually
 clearing anything. The CLI does not delete or garbage-collect objects or history.
 
+Every ciphertext object, `HEAD.cce` and checkpoint is written to a `.cce-*` temp file in its own
+directory, fsynced, then atomically linked (new object, never replacing an existing one) or renamed
+(HEAD, checkpoint) into place; the temp file is removed on any failure. A failed write such as a
+full disk therefore leaves no truncated object under its final name, and a retry works. A hard
+crash (kill, power loss) can still leave a `.cce-*` temp file; the tree check refuses it as
+`non-ciphertext-tree` until it is removed under custody, because a stray file is never trusted.
+
 `audit-history` examines every reachable commit/ref, requires the fixed content-free commit
 message above, validates historical signed manifests, and checks historical/current object bytes
 against authenticated ciphertext digests. Run it as an owner identity that can decrypt historical
@@ -280,7 +287,10 @@ conservative next Git snapshot estimate (existing Git object-store bytes, pendin
 new HEAD bytes, plus 1 MiB and 4 KiB per retained/pending object and HEAD for loose-object
 allocation and rewritten tree/commit metadata). `publish` rechecks it before installing ciphertext.
 A no-op still checks current
-storage against the budget. `status` reports current tree and Git storage independently. Pending
+storage against the budget. The Git object-store size is read from `git count-objects`; if the
+repository is a Git work tree and that measurement fails, is unparseable or cannot run, `plan`,
+`publish` and `status` fail with `git-size-unmeasurable` instead of assuming zero (only a missing
+or non-Git destination counts as zero). `status` reports current tree and Git storage independently. Pending
 publication ciphertext remains bounded by the budget; planning retains lengths rather than
 pending ciphertext. Run `status` again after the required Git commit and compare its tree plus Git
 object-store bytes to the approved budget before pushing. Host accounting, unusually large
