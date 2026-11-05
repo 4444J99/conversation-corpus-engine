@@ -322,7 +322,12 @@ class ArchivePaths:
         if isinstance(manifest, dict):
             info = manifest.get("providers", {}).get(provider)
             if isinstance(info, dict) and "status" in info:
-                return info.get("status") == "ok"
+                if info.get("status") == "ok":
+                    return True
+                # A failed rebuild keeps the previous shards and their receipt, and the totals
+                # still count them: every reader of the store must see them, and `verify` flags
+                # the provider as failed.
+                return retained_after_failure(info) and bool(self.conversation_files(provider))
         return bool(self.conversation_files(provider))
 
     def feed(self, provider: str) -> Path:
@@ -596,6 +601,14 @@ def receipt_holds_shards(info: dict[str, Any]) -> bool:
     """True when a provider's receipt describes conversation shards that exist in the store."""
     return info.get("status") in {"ok", "failed"} and (
         bool(info.get("conversations")) or bool(info.get("layout", {}).get("shards"))
+    )
+
+
+def retained_after_failure(info: dict[str, Any]) -> bool:
+    """True for a failed provider whose previous shards and receipt were kept (`failed_attempt`
+    holds the new, failed receipt)."""
+    return (
+        info.get("status") == "failed" and "failed_attempt" in info and receipt_holds_shards(info)
     )
 
 

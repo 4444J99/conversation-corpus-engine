@@ -3,12 +3,26 @@ inputs the manifest names. Every fixture is synthetic."""
 
 from __future__ import annotations
 
+import json
+import sys
 from pathlib import Path
 
 import pytest
 from archive_support import copilot_small_page
 
-from conversation_corpus_engine.archive_ingest import ingest
+from conversation_corpus_engine.archive_ingest import ingest, iter_store, load_index
+from conversation_corpus_engine.cli import main
+
+
+def _cce(monkeypatch, capsys, *argv: str) -> tuple[int, str, str]:
+    monkeypatch.setattr(sys, "argv", ["cce", *argv])
+    code = 0
+    try:
+        main()
+    except SystemExit as exit_:
+        code = int(exit_.code or 0)
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
 
 
 def _snapshot(root: Path) -> dict[str, bytes]:
@@ -98,3 +112,59 @@ def test_merge_protects_the_live_captures_of_every_live_capture_provider(
     assert _snapshot(archive_env.paths.root) == before
     manifest = ingest(**kwargs, merge=True, allow_input_loss=True)
     assert manifest["providers"][provider]["conversations"] == 1
+
+
+# --- A3: shards kept after a failed rebuild stay visible and flagged -----------------------------
+
+
+def _corrupt_grok(env) -> None:
+    (next((env.export / "grok").rglob("prod-grok-backend.json"))).write_text("{", encoding="utf-8")
+
+
+def test_shards_retained_after_a_failed_merge_stay_counted_and_flagged(archive_env) -> None:
+    first = ingest(**_kwargs(archive_env, providers=["grok"]))
+    grok_total = first["providers"]["grok"]["conversations"]
+    assert grok_total > 0
+    _corrupt_grok(archive_env)
+    manifest = ingest(**_kwargs(archive_env, providers=["grok"], merge=True))
+    assert manifest["providers"]["grok"]["status"] == "failed"
+    assert manifest["totals"]["conversations"] == grok_total
+    # The totals count the retained shards, so every reader of the store must see them too.
+    assert "grok" in archive_env.paths.providers_present()
+    assert sum(1 for _ in iter_store(archive_env.paths)) == grok_total
+    assert len(load_index(archive_env.paths)) == grok_total
+
+
+def test_a_failed_merge_build_flags_the_retained_provider_and_keeps_surfaces_consistent(
+    archive_env, monkeypatch, capsys
+) -> None:
+    common = [
+        "--project-root",
+        str(archive_env.project),
+        "--corpus-store-root",
+        str(archive_env.store),
+    ]
+    export = str(archive_env.export)
+    code, _, _ = _cce(monkeypatch, capsys, "archive", "build", "--export-root", export, *common)
+    assert code == 0
+    _corrupt_grok(archive_env)
+    code, out, _ = _cce(
+        monkeypatch,
+        capsys,
+        "archive",
+        "build",
+        "--export-root",
+        export,
+        "--provider",
+        "grok",
+        "--merge",
+        *common,
+    )
+    payload = json.loads(out)
+    assert code == 1 and payload["ok"] is False
+    assert payload["problems"], "the failed provider is reported"
+    assert all("provider grok failed" in problem for problem in payload["problems"]), payload[
+        "problems"
+    ]
+    assert "retained from the previous build" in payload["problems"][0]
+    assert payload["stages"]["ingest"]["providers"]["grok"]["retained"] is True

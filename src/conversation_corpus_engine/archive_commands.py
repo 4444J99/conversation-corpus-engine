@@ -26,6 +26,7 @@ from .archive_ingest import (
     has_bounded_layout,
     ingest,
     load_manifest,
+    retained_after_failure,
 )
 from .archive_limits import Limits, census_problems, take_census
 from .archive_naming import names_payload, render_names_text, verify_names
@@ -193,7 +194,7 @@ def verify_layout(paths: ArchivePaths, manifest: dict[str, Any]) -> list[str]:
     """Check the bounded layout's own promises: shards, author counts, notes, pages and limits."""
     problems: list[str] = []
     for name, info in manifest["providers"].items():
-        if info.get("status") != "ok":
+        if info.get("status") != "ok" and not retained_after_failure(info):
             continue
         problems += [
             f"{name}: {item}" for item in reconcile(info.get("authors", {}), info["messages"])
@@ -228,10 +229,16 @@ def verify_archive(paths: ArchivePaths, limits: Limits | None = None) -> list[st
         manifest = load_manifest(paths)
     except FileNotFoundError as exc:
         return [str(exc)]
-    problems = [
-        f"provider {name} failed: {manifest['providers'][name].get('error', '')}"
-        for name in failed_providers(manifest)
-    ]
+    problems = []
+    for name in failed_providers(manifest):
+        info = manifest["providers"][name]
+        kept = (
+            f" (serving the {info.get('conversations', 0)} conversation(s) retained from the "
+            "previous build)"
+            if retained_after_failure(info)
+            else ""
+        )
+        problems.append(f"provider {name} failed: {info.get('error', '')}{kept}")
     total = manifest["totals"]["conversations"]
     enrichment = paths.enrichment
     if not enrichment.is_file():
@@ -319,7 +326,12 @@ def run_stages(
             result[stage] = {
                 "totals": manifest["totals"],
                 "providers": {
-                    name: {k: info.get(k) for k in ("status", "conversations", "messages", "error")}
+                    name: {
+                        **{
+                            k: info.get(k) for k in ("status", "conversations", "messages", "error")
+                        },
+                        **({"retained": True} if retained_after_failure(info) else {}),
+                    }
                     for name, info in manifest["providers"].items()
                 },
             }

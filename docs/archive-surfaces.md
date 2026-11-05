@@ -233,7 +233,12 @@ as the compatibility check; they cannot prove identity preservation within an eq
 replacement generation. Providers not selected keep their original input and build receipts.
 Captured identities remain protected across later merges after an account export absorbs them.
 A failed provider rebuild retains the previous shards and their input receipt, alongside a
-separate failed-attempt receipt; failure does not erase the protection for the next retry.
+separate failed-attempt receipt; failure does not erase the protection for the next retry. The
+manifest totals keep counting those retained conversations, so the vault, site, search store,
+graph and turn store keep serving them too (the surfaces and the totals never disagree), and
+`cce archive verify` fails with `provider X failed: … (serving the N conversation(s) retained
+from the previous build)` until the provider is read again. The ingest summary marks such a
+provider `"retained": true`. The feed and corpus projections still skip any failed provider.
 Older live captures without recorded IDs cannot provide the same identity-level assurance;
 retain their original complete inputs for the first build that writes these receipts.
 
