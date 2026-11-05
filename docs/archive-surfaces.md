@@ -253,7 +253,10 @@ key they are qualified as `external/<first 12 hex of the content SHA-256>/<name>
 `source_files` and `inputs` never collapse them and no key holds an absolute host path. The
 `source_file` on each conversation row keeps the plain name and is paired with its
 `source_sha256`. Live captures are listed separately from account-export shards in the channel
-report.
+report: for ChatGPT, `channels.read` counts the export's shard files on one line and the delta
+files on the next, and together they equal the ChatGPT entries of `source_files` (a delta sits
+in `source_files` too, so a build with 29 shards and one delta lists 30 files and reports
+"29 conversation shard file(s)" plus "1 extra live capture file(s)").
 Origins describe the ingestion route; they are not a claim about who authored the text. An
 outer export ZIP that was unpacked before ingestion is not read by any reader, so it is recorded
 only when named: `--export-zip PROVIDER=PATH` (repeatable) hashes the ZIP and records its

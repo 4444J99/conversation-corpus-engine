@@ -326,3 +326,116 @@ def test_command_line_export_zip_refuses_a_bad_request(
     )
     assert code == 2 and "--export-zip" in err
     assert not archive_env.paths.manifest.exists()
+
+
+# --- A7: the --allow-input-loss flag and the recorded build options ------------------------------
+
+
+def _delta(tmp_path: Path) -> Path:
+    delta = tmp_path / "live-delta.json"
+    delta.write_text(json.dumps([gpt_conversation("live-1", "Live", [("user", "new")])]))
+    return delta
+
+
+def _ingest_argv(env, *extra: str) -> list[str]:
+    return [
+        "archive",
+        "ingest",
+        "--project-root",
+        str(env.project),
+        "--corpus-store-root",
+        str(env.store),
+        "--export-root",
+        str(env.export),
+        "--provider",
+        "chatgpt",
+        *extra,
+    ]
+
+
+def test_command_line_merge_without_a_live_delta_exits_2_unless_loss_is_allowed(
+    archive_env, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    delta = _delta(tmp_path)
+    code, _, err = _cce(
+        monkeypatch, capsys, *_ingest_argv(archive_env, "--chatgpt-extra", str(delta))
+    )
+    assert code == 0, err
+    before = _snapshot(archive_env.paths.root)
+    code, out, err = _cce(monkeypatch, capsys, *_ingest_argv(archive_env, "--merge"))
+    assert code == 2 and out == ""
+    assert "archive merge refused" in err and "--allow-input-loss" in err
+    assert _snapshot(archive_env.paths.root) == before
+    code, out, err = _cce(
+        monkeypatch, capsys, *_ingest_argv(archive_env, "--merge", "--allow-input-loss")
+    )
+    assert code == 0, err
+    assert json.loads(out)["stages"]["ingest"]["providers"]["chatgpt"]["status"] == "ok"
+    options = json.loads(archive_env.paths.manifest.read_text(encoding="utf-8"))["build_options"]
+    assert options["merge"] is True and options["allow_input_loss"] is True
+
+
+def test_the_manifest_records_the_effective_build_options(archive_env, tmp_path: Path) -> None:
+    delta = _delta(tmp_path)
+    folder = tmp_path / "grok-elsewhere"
+    folder.mkdir()
+    manifest = ingest(
+        **_kwargs(
+            archive_env,
+            providers=["chatgpt", "grok"],
+            overrides={"grok": folder},
+            options={
+                "chatgpt_extra_files": [delta],
+                "include_attachment_text": True,
+                "shard_bytes": 4000,
+            },
+            folder_entries=12,
+            merge=True,
+            allow_input_loss=True,
+        )
+    )
+    assert manifest["build_options"] == {
+        "export_root": str(archive_env.export.resolve()),
+        "providers": ["chatgpt", "grok"],
+        "source_overrides": {"grok": str(folder.resolve())},
+        "library_root": None,
+        "export_zips": {},
+        "merge": True,
+        "allow_input_loss": True,
+    }
+    chatgpt = manifest["providers"]["chatgpt"]["build_options"]
+    assert chatgpt["chatgpt_extra_files"] == [str(delta.resolve())]
+    assert chatgpt["include_attachment_text"] is True
+    assert (chatgpt["shard_bytes"], chatgpt["folder_entries"]) == (4000, 12)
+    assert chatgpt["source_root"] == str((archive_env.export / "chatgpt").resolve())
+    grok = manifest["providers"]["grok"]
+    assert grok["status"] == "absent"
+    assert grok["build_options"]["source_root"] == str(folder.resolve())
+    assert grok["build_options"]["chatgpt_extra_files"] == []
+
+
+# --- A8: channels.read against source_files when a live delta is supplied ------------------------
+
+
+def test_channels_read_and_source_files_account_for_the_same_files(
+    archive_env, tmp_path: Path
+) -> None:
+    shard = archive_env.export / "chatgpt" / "conversations-001.json"
+    shard.write_text(json.dumps([gpt_conversation("second-shard", "S", [("user", "more")])]))
+    empty = archive_env.export / "chatgpt" / "conversations-002.json"
+    empty.write_text("[]")
+    delta = _delta(tmp_path)
+    info = ingest(
+        **_kwargs(archive_env, providers=["chatgpt"], options={"chatgpt_extra_files": [delta]})
+    )["providers"]["chatgpt"]
+    shards, extras = info["channels"]["read"]
+    assert shards == "3 conversation shard file(s)"
+    assert extras.startswith("1 extra live capture file(s)")
+    # Every shard (an empty one included) and the delta are inputs: 3 + 1 entries, none lost.
+    assert sorted(info["source_files"]) == [
+        "conversations-000.json",
+        "conversations-001.json",
+        "conversations-002.json",
+        "live-delta.json",
+    ]
+    assert len(info["inputs"]) == len(info["source_files"]) == 3 + 1
