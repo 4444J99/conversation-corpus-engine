@@ -17,7 +17,10 @@ from conversation_corpus_engine.attributed_knowledge import (
 from conversation_corpus_engine.attribution import attributed_spans
 from conversation_corpus_engine.cli import build_parser
 from conversation_corpus_engine.library_store import Library
-from conversation_corpus_engine.persona_extract import extract_persona_lexicon
+from conversation_corpus_engine.persona_extract import (
+    extract_persona_lexicon,
+    render_persona_extract_markdown,
+)
 
 
 def digest(text):
@@ -581,3 +584,73 @@ def test_valid_empty_annotation_contributes_no_profile_words(tmp_path, location)
     result = extract_persona_lexicon(tmp_path, "rob", source)
     assert result["status"] == "EXTRACTED"
     assert {entry["term"]: entry["count"] for entry in result["vocabulary"]} == {"cathedral": 1}
+
+
+def test_strict_without_source_never_substitutes_curated_assistant_text(tmp_path):
+    result = extract_persona_lexicon(tmp_path, "claude")
+    assert result["attribution_mode"] == "strict"
+    assert result["vocabulary"] == []
+    assert result["ideal_yearning"] is None
+    assert result["archetypal_pattern"] is None
+    assert result["yearning_method"] is None
+    assert result["curated_fallback"] is False
+    assert result["owner_evidence"] == "none"
+    assert result["status"] == "VACUUM (NO OWNER-EVIDENCED SPANS)"
+    assert "no owner-evidenced spans" in result["empty_reason"]
+
+
+def test_curated_fallback_requires_explicit_opt_in_and_is_labelled(tmp_path):
+    result = extract_persona_lexicon(tmp_path, "claude", allow_curated=True)
+    assert result["attribution_mode"] == "strict"
+    assert result["curated_fallback"] is True
+    assert result["yearning_method"] == "curated"
+    assert "real participant" in result["ideal_yearning"]
+    assert result["owner_evidence"] == "none"
+    assert result["assurance"] == "curated_scaffold_not_owner_evidence"
+    assert result["status"] == "VACUUM (SCAFFOLDED)"
+    assert result["vocabulary"] == []
+    markdown = render_persona_extract_markdown(result)
+    assert "Curated fallback:** yes" in markdown
+
+
+def test_strict_with_source_and_no_owner_spans_stays_empty_unless_opted_in(tmp_path):
+    source = tmp_path / "assistant.json"
+    source.write_text(json.dumps([{"role": "assistant", "text": "machine prose"}]))
+    plain = extract_persona_lexicon(tmp_path, "claude", source)
+    assert plain["ideal_yearning"] is None and plain["curated_fallback"] is False
+    opted = extract_persona_lexicon(tmp_path, "claude", source, allow_curated=True)
+    assert opted["curated_fallback"] is True and opted["yearning_method"] == "curated"
+    assert opted["vocabulary"] == []
+
+
+def test_curated_opt_in_never_overrides_owner_evidenced_profile(tmp_path):
+    text = "cathedral foundation"
+    source = tmp_path / "owner.json"
+    source.write_text(
+        json.dumps(
+            [
+                {
+                    "text": text,
+                    "attribution": annotation(text, [span(0, len(text), author_id="claude")]),
+                }
+            ]
+        )
+    )
+    result = extract_persona_lexicon(tmp_path, "claude", source, allow_curated=True)
+    assert {v["term"] for v in result["vocabulary"]} == {"cathedral", "foundation"}
+    assert result["curated_fallback"] is False
+    assert result["yearning_method"] == "derived"
+    assert result["owner_evidence"] == "spans"
+
+
+def test_legacy_role_keeps_curated_output_without_opt_in(tmp_path):
+    result = extract_persona_lexicon(tmp_path, "claude", mode="legacy-role")
+    assert result["yearning_method"] == "curated"
+    assert "curated_fallback" not in result
+
+
+def test_persona_extract_cli_exposes_explicit_curated_opt_in():
+    parser = build_parser()
+    base = ["corpus", "persona-extract", "--persona", "claude"]
+    assert parser.parse_args(base).allow_curated is False
+    assert parser.parse_args([*base, "--allow-curated"]).allow_curated is True

@@ -15,6 +15,8 @@ from .sharded_collection import collection_exists, iter_corpus_collection
 
 # Persona identifiers that denote the assistant/model side of a transcript.
 # Everything else (rob, user, human, operator, ...) is treated as a human persona.
+CURATED_ASSURANCE = "curated_scaffold_not_owner_evidence"
+
 ASSISTANT_PERSONAS = {
     "assistant",
     "ai",
@@ -423,6 +425,7 @@ def extract_persona_lexicon(
     mode: str = "strict",
     library: Library | None = None,
     annotations: list[dict[str, Any]] | None = None,
+    allow_curated: bool = False,
 ) -> dict[str, Any]:
     """Extract vocabulary, friction terms, and yearning for a persona from transcripts.
 
@@ -434,7 +437,11 @@ def extract_persona_lexicon(
     Strict mode accepts only explicit evidenced owner spans; provider roles are not
     authorship evidence. ``mode="legacy-role"`` explicitly opts into historical heuristics.
     A canonical Library plus message annotations can replace transcript input.
-    With no source the function returns the labelled curated scaffold.
+    Strict mode never substitutes curated assistant-generated text: without owner-evidenced
+    spans the profile is empty and says so (``owner_evidence: "none"``). Only the explicit
+    ``allow_curated=True`` opt-in restores the curated scaffold, labelled
+    ``curated_fallback: true``; owner-evidenced vocabulary always replaces it. Legacy-role
+    mode keeps its historical curated behaviour regardless of this option.
     """
     if mode not in {"strict", "legacy-role"}:
         raise ValueError("mode must be strict or legacy-role")
@@ -456,14 +463,27 @@ def extract_persona_lexicon(
         "stats": {"turns_scanned": 0, "persona_tokens": 0, "other_tokens": 0},
         "status": "VACUUM (SCAFFOLDED)",
     }
+    strict = mode == "strict"
+    if strict:
+        result["owner_evidence"] = "none"
+        result["curated_fallback"] = False
+        if not allow_curated and source_corpus is None and library is None:
+            result["status"] = "VACUUM (NO OWNER-EVIDENCED SPANS)"
+            result["empty_reason"] = (
+                "no source input was supplied, so there are no owner-evidenced spans; "
+                "strict profiles never substitute curated assistant text"
+            )
 
-    # No-source scaffolds and explicit compatibility mode retain their curated values.
-    allow_curated = mode == "legacy-role" or (source_corpus is None and library is None)
-    yearning, archetype, method = _divine_yearning(persona_id, [], allow_curated=allow_curated)
+    # Legacy mode keeps its curated values; strict mode only with the explicit opt-in.
+    use_curated = allow_curated if strict else True
+    yearning, archetype, method = _divine_yearning(persona_id, [], allow_curated=use_curated)
     if method == "curated":
         result["ideal_yearning"] = yearning
         result["archetypal_pattern"] = archetype
         result["yearning_method"] = "curated"
+        if strict:
+            result["curated_fallback"] = True
+            result["assurance"] = CURATED_ASSURANCE
 
     if library is not None:
         persona_parts, other_parts = collect_owner_segments(
@@ -489,9 +509,12 @@ def extract_persona_lexicon(
 
     vocabulary, persona_token_count = _frequency_lexicon(persona_text, other_text)
     forbidden = _shadow_terms(persona_text)
-    yearning, archetype, method = _divine_yearning(
-        persona_id, vocabulary, allow_curated=allow_curated
-    )
+    # Strict: owner-evidenced vocabulary replaces any curated fallback entirely.
+    yearning, archetype, method = _divine_yearning(persona_id, vocabulary, allow_curated=not strict)
+    if strict:
+        result["owner_evidence"] = "spans"
+        result["curated_fallback"] = False
+        result["assurance"] = ASSURANCE
 
     result["vocabulary"] = vocabulary
     result["forbidden_terms"] = forbidden
@@ -516,6 +539,19 @@ def render_persona_extract_markdown(payload: dict[str, Any]) -> str:
         f"- **Assurance:** {payload.get('assurance', 'unspecified')}",
         f"- **Archetype:** {payload.get('archetypal_pattern') or '—'}",
         f"- **Yearning method:** {payload.get('yearning_method') or '—'}",
+        *(
+            [
+                f"- **Owner evidence:** {payload['owner_evidence']}",
+                "- **Curated fallback:** "
+                + (
+                    "yes (explicit opt-in; not owner evidence)"
+                    if payload.get("curated_fallback")
+                    else "no"
+                ),
+            ]
+            if "owner_evidence" in payload
+            else []
+        ),
         f"- **Ideal yearning:** {payload.get('ideal_yearning') or '—'}",
         "",
         "## Lexicon",

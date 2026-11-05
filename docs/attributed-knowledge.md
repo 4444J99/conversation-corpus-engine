@@ -60,9 +60,16 @@ supported. Annotation offsets apply to the extractor's message string: content
 parts are joined with one space, as in the existing transcript adapter. Prefer
 canonical Library messages when exact provider normalization matters.
 Unannotated imported text and old pair summaries cannot enter a strict profile.
-Strict profiles with source input do not substitute curated assistant yearnings
-when owner evidence is absent. The no-source scaffold remains explicitly marked
-as a scaffold.
+Strict profiles never substitute curated assistant-generated yearnings when owner
+evidence is absent, with or without source input. With no owner-evidenced spans the
+strict profile is empty and says so: `owner_evidence` is `"none"`, `curated_fallback`
+is `false`, and a call with no source at all reports the status
+`VACUUM (NO OWNER-EVIDENCED SPANS)` with an `empty_reason`. Curated text is reachable
+only through the explicit opt-in `--allow-curated` (Python keyword `allow_curated=True`,
+strict mode only). Its output is labelled: `curated_fallback: true`, `yearning_method:
+"curated"`, assurance `curated_scaffold_not_owner_evidence`, and the Markdown and CLI
+text name it. The curated text is assistant-generated, never owner evidence, and
+owner-evidenced vocabulary always replaces it (`owner_evidence: "spans"`).
 
 To request historical role heuristics explicitly, add `--mode legacy-role`.
 JSON, Markdown, and human-readable CLI output label this mode. Its assurance is

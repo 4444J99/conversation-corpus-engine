@@ -163,6 +163,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="strict",
         help="Strict explicit owner assertions (default), or labelled legacy role heuristics",
     )
+    corpus_extract.add_argument(
+        "--allow-curated",
+        action="store_true",
+        help=(
+            "Strict mode only: explicitly permit the curated assistant-generated scaffold when "
+            "no owner-evidenced spans exist; output is labelled curated_fallback"
+        ),
+    )
     corpus_extract.add_argument("--dry-run", action="store_true")
     corpus_extract.add_argument("--write", action="store_true")
     corpus_extract.add_argument("--json", action="store_true")
@@ -774,6 +782,7 @@ def main() -> None:
             source_corpus=args.source_corpus,
             dry_run=args.dry_run,
             mode=args.mode,
+            allow_curated=args.allow_curated,
         )
         if args.write and not args.dry_run:
             artifacts = write_persona_extract_artifacts(args.project_root, payload)
@@ -783,6 +792,10 @@ def main() -> None:
         else:
             print(f"persona: {payload['persona_id']}  status: {payload['status']}")
             print(f"  attribution: {payload['attribution_mode']} ({payload['assurance']})")
+            if payload.get("curated_fallback"):
+                print("  curated fallback: yes (explicit opt-in; not owner evidence)")
+            elif payload.get("owner_evidence") == "none":
+                print("  owner evidence: none (empty strict profile)")
             print(f"  archetype: {payload.get('archetypal_pattern') or '-'}")
             print(f"  yearning: {payload.get('ideal_yearning') or '-'}")
             print(f"  lexicon terms: {len(payload.get('vocabulary') or [])}")
