@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import posixpath
+import re
 from collections import Counter
 from collections.abc import Callable
 from itertools import combinations
@@ -36,6 +37,7 @@ from .archive_site_assets import (
 from .archive_split import fit_blocks, pack, utf8_size
 from .archive_text import render_markdown_html
 from .archive_topics import load_enrichment
+from .archive_wiki import TOC_MIN_HEADINGS
 from .corpus_store import CorpusWriteAuthorization
 
 SNIPPET_CHARS = 160
@@ -48,7 +50,15 @@ NAV_RESERVE = 1024
 # a few per line), so text this far under the cap cannot reach it; such a conversation is one page
 # and is not rendered twice to find that out.
 HTML_GROWTH = 6
-SINGLE_PAGE_MARGIN = 8192
+# A page lists its headings as a table of contents from TOC_MIN_HEADINGS of them; it lists at most
+# TOC_MAX_ENTRIES of them, each label cut to TOC_LABEL_CHARS (the body keeps every heading whole).
+# TOC_RESERVE is the room both page budgets keep for it, so a page that gains one still fits.
+TOC_MAX_ENTRIES = 40
+TOC_LABEL_CHARS = 60
+TOC_RESERVE = 8192
+SINGLE_PAGE_MARGIN = 8192 + TOC_RESERVE
+HEADING_RE = re.compile(r'<h[3-6] id="([^"]+)">(.*?)</h[3-6]>')
+TAG_RE = re.compile(r"<[^>]+>")
 # A deliberately long relative path and a deep prefix, used to measure the largest a page's own
 # links can be before the real folder plan exists.
 WORST_PREFIX = "../" * 8
@@ -70,8 +80,14 @@ def _stamp(ts: str) -> str:
     return ts[:16].replace("T", " ") if ts else "undated"
 
 
-def message_html_blocks(message: Message, max_block: int) -> list[str]:
-    """One message as `<article>` blocks that each fit `max_block` bytes; nothing is dropped."""
+def message_html_blocks(message: Message, max_block: int, number: int = 0) -> list[str]:
+    """One message as `<article>` blocks that each fit `max_block` bytes; nothing is dropped.
+
+    `number` is the message's 1-based place in its conversation. When given, the first block
+    carries the id `message-<number>` (the same fragment the library records use) and a later
+    piece of a split message `message-<number>-piece-<k>`, so every message is a link target and
+    no id repeats.
+    """
     kind = str(message.meta.get("kind") or "text")
     label = ROLE_LABELS.get(message.role, message.role.title())
     if kind not in {"text", "code"}:
@@ -86,17 +102,24 @@ def message_html_blocks(message: Message, max_block: int) -> list[str]:
         )
 
     def render(piece: str, index: int, total: int) -> str:
-        body = f'<div class="body">{render_markdown_html(piece)}</div>'
+        anchor = ""
+        if number:
+            anchor = f"message-{number}" if index == 0 else f"message-{number}-piece-{index + 1}"
+        body = f'<div class="body">{render_markdown_html(piece, anchor)}</div>'
         if index == 0:
             body += attachments
         tag = f"{label} · piece {index + 1}/{total}" if total > 1 else label
         head = f"{_esc(tag)} · {_esc(_stamp(message.ts))}"
+        ident = f' id="{anchor}"' if anchor else ""
         if kind in COLLAPSED_KINDS:
             return (
-                f'<article class="msg {_esc(message.role)}"><details><summary>{head}</summary>'
-                f"{body}</details></article>"
+                f'<article class="msg {_esc(message.role)}"{ident}><details>'
+                f"<summary>{head}</summary>{body}</details></article>"
             )
-        return f'<article class="msg {_esc(message.role)}"><header>{head}</header>{body}</article>'
+        return (
+            f'<article class="msg {_esc(message.role)}"{ident}><header>{head}</header>{body}'
+            "</article>"
+        )
 
     return fit_blocks(message.text, render, max_block)
 
@@ -133,6 +156,7 @@ def _shell(
     related_html: str,
     body: str,
     nav: str,
+    toc: str = "",
 ) -> str:
     """One page: the document around a group of message blocks."""
     title = conversation.title or "Untitled"
@@ -156,7 +180,7 @@ def _shell(
         f"<p>{topic_links}</p>"
         '<p class="banner">Conversation text is a record of speech acts, not of verified events.'
         "</p>"
-        f"{related_html}\n{nav}\n{body}\n{nav}\n"
+        f"{related_html}\n{toc}{nav}\n{body}\n{nav}\n"
         f'<p class="muted">Source: {_esc(provenance.get("source_file", ""))} · sha256 '
         f"{_esc(str(provenance.get('source_sha256', ''))[:16])}…</p>"
         "</div></body></html>\n"
@@ -175,6 +199,36 @@ def _related_html(
         if row["uid"] in titles
     )
     return f'<section class="related"><h2>Related</h2><ul>{items}</ul></section>'
+
+
+def page_headings(body: str) -> list[tuple[str, str]]:
+    """The (anchor, plain label) of every heading a page body carries, in reading order."""
+    found = []
+    for anchor, inner in HEADING_RE.findall(body):
+        label = " ".join(html.unescape(TAG_RE.sub("", inner)).split())
+        if len(label) > TOC_LABEL_CHARS:
+            label = label[: TOC_LABEL_CHARS - 1].rstrip() + "…"
+        found.append((anchor, label or "Untitled"))
+    return found
+
+
+def _toc_html(headings: list[tuple[str, str]], shown: int) -> str:
+    """A table of contents for a page's headings; empty below `TOC_MIN_HEADINGS` headings.
+
+    Only the list is cut (to `shown` entries); the headings themselves stay whole in the body.
+    """
+    if len(headings) < TOC_MIN_HEADINGS or shown < 1:
+        return ""
+    items = "".join(
+        f'<li><a href="#{_esc(anchor)}">{_esc(label)}</a></li>'
+        for anchor, label in headings[:shown]
+    )
+    more = len(headings) - min(shown, len(headings))
+    if more:
+        items += f'<li class="muted">… and {more} more heading(s) on this page</li>'
+    return (
+        f'<nav class="toc" aria-label="Contents"><strong>Contents</strong><ol>{items}</ol></nav>\n'
+    )
 
 
 def _nav_html(total: int, index: int, start: str, previous: str, following: str) -> str:
@@ -235,8 +289,9 @@ def page_groups(
         body="",
         nav=worst_nav,
     )
-    first_budget = note_bytes - utf8_size(first) - NAV_RESERVE
-    budget = note_bytes - utf8_size(later) - NAV_RESERVE
+    reserve = NAV_RESERVE + min(TOC_RESERVE, note_bytes // 8)
+    first_budget = note_bytes - utf8_size(first) - reserve
+    budget = note_bytes - utf8_size(later) - reserve
     if budget < 1024:
         # Too small to split into linked pages, so it can only hold a conversation that fits one
         # page: measured without the split reserve (a lone page carries no navigation).
@@ -256,8 +311,8 @@ def page_groups(
             single = pack(
                 [
                     block
-                    for message in conversation.messages
-                    for block in message_html_blocks(message, room)
+                    for number, message in enumerate(conversation.messages, 1)
+                    for block in message_html_blocks(message, room, number)
                 ],
                 room,
                 room,
@@ -266,7 +321,9 @@ def page_groups(
                 return single
         raise ValueError(f"note_bytes {note_bytes} leaves no room for content beside the page")
     blocks = [
-        block for message in conversation.messages for block in message_html_blocks(message, budget)
+        block
+        for number, message in enumerate(conversation.messages, 1)
+        for block in message_html_blocks(message, budget, number)
     ]
     return pack(blocks, first_budget, budget)
 
@@ -324,19 +381,31 @@ def render_pages(
         source = paths[index]
         previous = _relative(paths[index - 1], source) if index > 0 else ""
         following = _relative(paths[index + 1], source) if index + 1 < total else ""
-        page = _shell(
-            conversation,
-            part=index + 1,
-            parts=total,
-            home_href=_relative(layout.SITE_HOME_FILENAME, source),
-            style_href=_relative(layout.SITE_STYLE_FILENAME, source),
-            topics=topics,
-            related_html=(
-                _related_html(related, titles, _href_from(source, page_of)) if index == 0 else ""
-            ),
-            body="\n".join(group),
-            nav=_nav_html(total, index, _relative(paths[0], source), previous, following),
-        )
+        body = "\n".join(group)
+        headings = page_headings(body)
+        shown = min(len(headings), TOC_MAX_ENTRIES)
+        while True:
+            page = _shell(
+                conversation,
+                part=index + 1,
+                parts=total,
+                home_href=_relative(layout.SITE_HOME_FILENAME, source),
+                style_href=_relative(layout.SITE_STYLE_FILENAME, source),
+                topics=topics,
+                related_html=(
+                    _related_html(related, titles, _href_from(source, page_of))
+                    if index == 0
+                    else ""
+                ),
+                body=body,
+                nav=_nav_html(total, index, _relative(paths[0], source), previous, following),
+                toc=_toc_html(headings, shown),
+            )
+            # The table of contents is navigation, not record: when a page would pass the cap it
+            # is shortened (then dropped) before the page is refused.
+            if utf8_size(page) <= note_bytes or shown < 1:
+                break
+            shown //= 2
         if utf8_size(page) > note_bytes:
             raise ValueError(
                 f"{conversation.uid}: page {index + 1} is {utf8_size(page)} bytes, cap is "

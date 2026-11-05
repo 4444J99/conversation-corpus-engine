@@ -102,6 +102,9 @@ details { margin: 6px 0; } summary { cursor: pointer; }
 .page .related li { margin: 2px 0; }
 .page h1 { font-size: 1.4rem; margin: 18px 0 6px; }
 .attach { color: var(--muted); font-size: .85rem; margin: 6px 0 0; }
+.page nav.toc { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 8px 14px; margin: 14px 0; font-size: .92rem; }
+.page nav.toc ol { margin: 4px 0 0; padding-left: 1.4em; }
 .banner { color: var(--muted); font-size: .85rem; border-left: 3px solid var(--line); padding-left: 10px; }
 canvas#map { width: 100%; height: 70vh; background: var(--card); border: 1px solid var(--line);
   border-radius: 10px; }

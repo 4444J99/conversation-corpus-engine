@@ -34,6 +34,7 @@ from .archive_site import build_site, count_conversation_pages
 from .archive_topics import build_analysis
 from .archive_turns import list_turns
 from .archive_vault import build_vault, count_conversation_notes, verify_vault
+from .archive_wiki import verify_site_wiki
 from .corpus_store import (
     CorpusReadAuthorization,
     CorpusStoreError,
@@ -222,8 +223,14 @@ def verify_layout(paths: ArchivePaths, manifest: dict[str, Any]) -> list[str]:
     return problems
 
 
-def verify_archive(paths: ArchivePaths, limits: Limits | None = None) -> list[str]:
-    """Cross-check every surface against the ingest manifest; empty list means consistent."""
+def verify_archive(
+    paths: ArchivePaths, limits: Limits | None = None, *, report: dict[str, Any] | None = None
+) -> list[str]:
+    """Cross-check every surface against the ingest manifest; empty list means consistent.
+
+    A caller that passes a `report` dict gets the wiki block (what the site checked, with counts)
+    under its `wiki` key.
+    """
     try:
         manifest = load_manifest(paths)
     except FileNotFoundError as exc:
@@ -257,6 +264,10 @@ def verify_archive(paths: ArchivePaths, limits: Limits | None = None) -> list[st
     pages = count_conversation_pages(paths)
     if pages != total:
         problems.append(f"site has {pages} conversation page(s), manifest has {total}")
+    wiki = verify_site_wiki(paths)
+    problems += wiki["problems"]
+    if report is not None:
+        report["wiki"] = wiki
     if has_bounded_layout(manifest):
         problems += verify_layout(paths, manifest)
         problems += census_problems(
@@ -616,9 +627,15 @@ def handle_archive(args: argparse.Namespace) -> int:
         except MergeInputLoss as exc:
             print(f"archive merge refused: {exc}", file=sys.stderr)
             return 2
-        problems = verify_archive(paths, limits) if action == "build" else []
+        verified: dict[str, Any] = {}
+        problems = verify_archive(paths, limits, report=verified) if action == "build" else []
         failed = [n for n, i in result["ingest"]["providers"].items() if i["status"] == "failed"]
-        payload = {"stages": result, "problems": problems, "ok": not problems and not failed}
+        payload = {
+            "stages": result,
+            "problems": problems,
+            "ok": not problems and not failed,
+            **({"wiki": verified["wiki"]} if "wiki" in verified else {}),
+        }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0 if payload["ok"] else 1
 
@@ -628,8 +645,9 @@ def handle_archive(args: argparse.Namespace) -> int:
         return 0
 
     if action == "verify":
-        problems = verify_archive(paths, limits_from_args(args))
-        print(json.dumps({"ok": not problems, "problems": problems}, indent=2))
+        verified = {}
+        problems = verify_archive(paths, limits_from_args(args), report=verified)
+        print(json.dumps({"ok": not problems, "problems": problems, **verified}, indent=2))
         return 0 if not problems else 1
 
     if action == "turns":

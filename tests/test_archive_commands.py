@@ -55,7 +55,10 @@ def test_build_runs_every_stage_and_verifies(cli_env) -> None:
 def test_verify_search_and_titles_commands(cli_env, monkeypatch, capsys) -> None:
     _, common, _, _, _ = cli_env
     code, out, _ = _cce(monkeypatch, capsys, "archive", "verify", *common)
-    assert code == 0 and json.loads(out) == {"ok": True, "problems": []}
+    verified = json.loads(out)
+    wiki = verified.pop("wiki")  # the site's wiki checks, reported beside the verdict
+    assert code == 0 and verified == {"ok": True, "problems": []}
+    assert wiki["problems"] == [] and wiki["dangling_links"] == 0 and wiki["pages"] > 0
     code, out, _ = _cce(monkeypatch, capsys, "archive", "search", "kubernetes", "--json", *common)
     hits = json.loads(out)
     assert code == 0 and {"chatgpt", "claude"} <= {h["provider"] for h in hits}
