@@ -88,7 +88,11 @@ The input is a JSON list, each entry containing `source` and `attribution`.
 `source` uses the exact canonical reference described below, without `start` and
 `end`; span boundaries belong to its whole-message annotation. The chosen set of
 messages is explicit, and duplicate references are rejected to prevent inflated
-frequencies. The Python equivalent is
+frequencies. A message left unchanged across several accepted revisions of one source
+may be annotated in each revision; each distinct span is counted once, keyed by source
+`uid`, `sequence`, `message_id`, and the SHA-256 of the span text (plus its occurrence
+ordinal among identical spans of that message and its owner eligibility, so a phrase
+that really repeats inside one message still counts each time). The Python equivalent is
 `extract_persona_lexicon(project_root, owner_id, library=library,
 annotations=entries)`. All canonical source resolution uses existing
 `Library.history` and `Library.record` APIs; there is no second identity database.

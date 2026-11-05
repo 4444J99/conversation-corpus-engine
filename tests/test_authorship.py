@@ -654,3 +654,73 @@ def test_persona_extract_cli_exposes_explicit_curated_opt_in():
     base = ["corpus", "persona-extract", "--persona", "claude"]
     assert parser.parse_args(base).allow_curated is False
     assert parser.parse_args([*base, "--allow-curated"]).allow_curated is True
+
+
+def _revised_entries(library, item, ref, text="😀 café source", owner_spans=None):
+    """Annotate the same unchanged message in two accepted revisions of one source."""
+    owner_spans = owner_spans or [span(7, 13)]
+    first = {k: v for k, v in ref.items() if k not in {"start", "end"}}
+    item.messages.append(Message(role="user", text="unrelated addition", id="m2"))
+    revision = library.put(item)
+    assert revision["version"] != ref["version"]
+    second = {**first, "version": revision["version"], "revision_digest": revision["digest"]}
+    return [
+        {"source": first, "attribution": annotation(text, owner_spans)},
+        {"source": second, "attribution": annotation(text, owner_spans)},
+    ]
+
+
+def test_same_owner_span_in_two_revisions_of_one_message_counts_once(canonical, tmp_path):
+    library, item, ref = canonical
+    entries = _revised_entries(library, item, ref)
+    owner, _ = collect_owner_segments(library, entries, "rob")
+    assert owner == ["source"]
+    result = extract_persona_lexicon(tmp_path, "rob", library=library, annotations=entries)
+    assert {v["term"]: v["count"] for v in result["vocabulary"]} == {"source": 1}
+
+
+def test_changed_message_text_in_a_later_revision_is_a_distinct_span(canonical):
+    library, item, ref = canonical
+    item.messages[0].text = "😀 café source revised"
+    revision = library.put(item)
+    first = {k: v for k, v in ref.items() if k not in {"start", "end"}}
+    second = {
+        **first,
+        "version": revision["version"],
+        "revision_digest": revision["digest"],
+        "text_digest": digest("😀 café source revised"),
+    }
+    entries = [
+        {"source": first, "attribution": annotation("😀 café source", [span(7, 13)])},
+        {
+            "source": second,
+            "attribution": annotation("😀 café source revised", [span(7, 13), span(14, 21)]),
+        },
+    ]
+    owner, _ = collect_owner_segments(library, entries, "rob")
+    assert owner == ["source", "revised"]
+
+
+def test_identical_owner_spans_within_one_message_are_still_counted_separately(canonical):
+    library, item, ref = canonical
+    text = "echo echo"
+    item.messages[0].text = text
+    revision = library.put(item)
+    source = {
+        **{k: v for k, v in ref.items() if k not in {"start", "end"}},
+        "version": revision["version"],
+        "revision_digest": revision["digest"],
+        "text_digest": digest(text),
+    }
+    entries = [{"source": source, "attribution": annotation(text, [span(0, 4), span(5, 9)])}]
+    owner, _ = collect_owner_segments(library, entries, "rob")
+    assert owner == ["echo", "echo"]
+
+
+def test_later_revision_asserting_a_previously_unattributed_span_still_counts_once(canonical):
+    library, item, ref = canonical
+    entries = _revised_entries(library, item, ref)
+    entries[0]["attribution"] = None
+    owner, other = collect_owner_segments(library, entries, "rob")
+    assert owner == ["source"]
+    assert other == ["😀 café source", "😀 café "]
