@@ -1,0 +1,532 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  NODE_VERSION: "24"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================
+  # Run Tests Before Release
+  # ============================================
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      - name: Prepare database
+        run: npm run prepare-db
+
+      - name: Run tests
+        run: npm run test:ci
+
+  # ============================================
+  # Dedicated Search Parity Smoke
+  # ============================================
+  parity-smoke:
+    name: Search Parity Smoke
+    runs-on: ubuntu-latest
+    needs: [test]
+    env:
+      NODE_ENV: test
+      KB_EMBEDDINGS_PROVIDER: mock
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Prepare database
+        run: npm run prepare-db
+
+      - name: Run parity smoke suite
+        run: npm run test:parity
+
+  # ============================================
+  # Universe Contracts & Ingest Safety
+  # ============================================
+  universe-contracts:
+    name: Universe Contracts
+    runs-on: ubuntu-latest
+    needs: [test]
+    env:
+      NODE_ENV: test
+      KB_EMBEDDINGS_PROVIDER: mock
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Prepare database
+        run: npm run prepare-db
+
+      - name: Run universe suites
+        run: npm run test:universe
+
+      - name: Run native parity suite
+        run: npm run test:native
+
+  # ============================================
+  # Strict Semantic/Hybrid Readiness Gate
+  # ============================================
+  readiness-strict:
+    name: Strict Semantic Readiness
+    runs-on: ubuntu-latest
+    needs: [test]
+    env:
+      NODE_ENV: test
+      KB_EMBEDDINGS_PROVIDER: mock
+      KB_SEARCH_SEMANTIC_POLICY: strict
+      KB_SEARCH_HYBRID_POLICY: strict
+      CHROMA_URL: http://127.0.0.1:8000
+    services:
+      chroma:
+        image: ghcr.io/chroma-core/chroma:latest
+        ports:
+          - 8000:8000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Prepare database
+        run: npm run prepare-db
+
+      - name: Wait for Chroma service
+        shell: bash
+        run: |
+          for _ in {1..30}; do
+            if curl -fsS "http://127.0.0.1:8000/api/v2/heartbeat" > /dev/null || \
+               curl -fsS "http://127.0.0.1:8000/api/v1/heartbeat" > /dev/null; then
+              echo "Chroma is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Chroma did not become ready in time."
+          exit 1
+
+      - name: Reindex vectors for strict readiness probe
+        run: npm run generate-embeddings -- --mode reindex --limit 200 --yes
+
+      - name: Run strict readiness gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run readiness:semantic:strict | tee strict-readiness.log
+
+      - name: Upload strict readiness evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: strict-readiness-log-${{ github.ref_name }}
+          path: strict-readiness.log
+          if-no-files-found: error
+          retention-days: 30
+
+  # ============================================
+  # Runtime Probe Promotion Gate (Staging/Prod)
+  # ============================================
+  runtime-probe-gates:
+    name: Runtime Probe Gates
+    runs-on: ubuntu-latest
+    needs: [parity-smoke, readiness-strict, universe-contracts]
+    outputs:
+      staging_probe: ${{ steps.runtime_probe_paths.outputs.staging_probe }}
+      prod_probe: ${{ steps.runtime_probe_paths.outputs.prod_probe }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Preflight runtime probe configuration
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          OP_STAGING_BASE_URL_REF: ${{ vars.OP_STAGING_BASE_URL_REF }}
+          OP_PROD_BASE_URL_REF: ${{ vars.OP_PROD_BASE_URL_REF }}
+          REINDEX_EVIDENCE_REF: ${{ vars.REINDEX_EVIDENCE_REF }}
+        run: npm run probe:preflight:strict
+
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@1a3160d5e9de1ae0803eaa08a88746f5ae3daa50 # v4.1.0
+
+      - name: Resolve runtime probe configuration from 1Password
+        shell: bash
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+          OP_STAGING_BASE_URL_REF: ${{ vars.OP_STAGING_BASE_URL_REF }}
+          OP_PROD_BASE_URL_REF: ${{ vars.OP_PROD_BASE_URL_REF }}
+          OP_STAGING_AUTH_HEADER_REF: ${{ vars.OP_STAGING_AUTH_HEADER_REF }}
+          OP_PROD_AUTH_HEADER_REF: ${{ vars.OP_PROD_AUTH_HEADER_REF }}
+        run: |
+          set -euo pipefail
+          : "${OP_SERVICE_ACCOUNT_TOKEN:?Missing OP_SERVICE_ACCOUNT_TOKEN GitHub secret}"
+          : "${OP_STAGING_BASE_URL_REF:?Missing OP_STAGING_BASE_URL_REF GitHub variable}"
+          : "${OP_PROD_BASE_URL_REF:?Missing OP_PROD_BASE_URL_REF GitHub variable}"
+
+          STAGING_BASE_URL="$(op read "$OP_STAGING_BASE_URL_REF")"
+          PROD_BASE_URL="$(op read "$OP_PROD_BASE_URL_REF")"
+
+          echo "STAGING_BASE_URL=$STAGING_BASE_URL" >> "$GITHUB_ENV"
+          echo "PROD_BASE_URL=$PROD_BASE_URL" >> "$GITHUB_ENV"
+
+          if [ -n "${OP_STAGING_AUTH_HEADER_REF:-}" ]; then
+            echo "STAGING_AUTH_HEADER=$(op read "$OP_STAGING_AUTH_HEADER_REF")" >> "$GITHUB_ENV"
+          fi
+
+          if [ -n "${OP_PROD_AUTH_HEADER_REF:-}" ]; then
+            echo "PROD_AUTH_HEADER=$(op read "$OP_PROD_AUTH_HEADER_REF")" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run staging and production runtime probes
+        id: runtime_probe_paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/evidence/runtime-probes
+          TS="$(date +%Y%m%d-%H%M%S)"
+          STAGING_PROBE_OUT="docs/evidence/runtime-probes/staging-${TS}.json"
+          PROD_PROBE_OUT="docs/evidence/runtime-probes/prod-${TS}.json"
+          echo "staging_probe=$STAGING_PROBE_OUT" >> "$GITHUB_OUTPUT"
+          echo "prod_probe=$PROD_PROBE_OUT" >> "$GITHUB_OUTPUT"
+
+          npm run probe:staging -- --out "$STAGING_PROBE_OUT"
+          npm run probe:prod -- --out "$PROD_PROBE_OUT"
+
+      - name: Upload runtime probe evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runtime-probe-gates-${{ github.ref_name }}
+          path: docs/evidence/runtime-probes/*.json
+          if-no-files-found: error
+          retention-days: 30
+
+  # ============================================
+  # Build & Push Release Docker Image
+  # ============================================
+  docker-release:
+    name: Docker Release
+    runs-on: ubuntu-latest
+    needs: [test, parity-smoke, readiness-strict, universe-contracts, runtime-probe-gates]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      image_ref: ${{ steps.image_ref.outputs.value }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Releasing version: $VERSION"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+
+      - name: Resolve canonical image reference
+        id: image_ref
+        shell: bash
+        run: |
+          IMAGE_REF='${{ fromJSON(steps.meta.outputs.json).tags[0] }}'
+          if [ -z "$IMAGE_REF" ] || [ "$IMAGE_REF" = "null" ]; then
+            echo "Failed to resolve canonical image reference from docker metadata output."
+            exit 1
+          fi
+          echo "value=$IMAGE_REF" >> "$GITHUB_OUTPUT"
+          echo "Canonical image ref: $IMAGE_REF"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: ${{ steps.image_ref.outputs.value }}
+          format: "table"
+          exit-code: "1"
+          severity: "CRITICAL"
+
+  # ============================================
+  # Release Evidence Packet + Closure Gate
+  # ============================================
+  release-evidence:
+    name: Release Evidence
+    runs-on: ubuntu-latest
+    needs: [docker-release, runtime-probe-gates]
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Download runtime probe artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: runtime-probe-gates-${{ github.ref_name }}
+          path: docs/evidence/runtime-probes
+
+      - name: Resolve reindex evidence reference
+        shell: bash
+        env:
+          REINDEX_EVIDENCE_REF: ${{ vars.REINDEX_EVIDENCE_REF }}
+        run: |
+          set -euo pipefail
+          : "${REINDEX_EVIDENCE_REF:?Missing REINDEX_EVIDENCE_REF GitHub variable}"
+          echo "REINDEX_EVIDENCE_REF=$REINDEX_EVIDENCE_REF" >> "$GITHUB_ENV"
+
+      - name: Verify and normalize reindex evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/evidence/reindex-runs
+          NORMALIZED="docs/evidence/reindex-runs/release-${{ github.ref_name }}.json"
+          npm run reindex:evidence:verify -- \
+            --ref "${REINDEX_EVIDENCE_REF}" \
+            --out "$NORMALIZED" \
+            --min-chats 1 \
+            --min-turns 1 \
+            --require-unbounded true
+          echo "REINDEX_EVIDENCE_REF=$NORMALIZED" >> "$GITHUB_ENV"
+
+      - name: Verify alert coverage evidence (strict)
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run alerts:verify:strict
+
+      - name: Generate release evidence JSON and update release index
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run release:evidence:generate -- \
+            --tag "${{ github.ref_name }}" \
+            --commit "${{ github.sha }}" \
+            --release-run-id "${{ github.run_id }}" \
+            --release-run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --image-ref "${{ needs.docker-release.outputs.image_ref }}" \
+            --staging-probe "${{ needs.runtime-probe-gates.outputs.staging_probe }}" \
+            --prod-probe "${{ needs.runtime-probe-gates.outputs.prod_probe }}" \
+            --alert-artifact "docs/evidence/alert-verification/latest.json" \
+            --reindex-evidence "${REINDEX_EVIDENCE_REF}"
+
+      - name: Verify closure evidence linkage
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run closure:evidence:strict -- --tag "${{ github.ref_name }}"
+
+      - name: Assemble release evidence bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="release-evidence-bundle"
+          mkdir -p "$BUNDLE_DIR"
+
+          cp "docs/evidence/release-evidence/${{ github.ref_name }}.json" "$BUNDLE_DIR/release-evidence.json"
+          cp "docs/RELEASE_INDEX.md" "$BUNDLE_DIR/RELEASE_INDEX.md"
+          cp "docs/evidence/alert-verification/latest.json" "$BUNDLE_DIR/alert-verification.json"
+          cp docs/evidence/runtime-probes/*.json "$BUNDLE_DIR/"
+
+          cp "$REINDEX_EVIDENCE_REF" "$BUNDLE_DIR/reindex-evidence.json"
+
+      - name: Upload release evidence artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-evidence-${{ github.ref_name }}
+          path: |
+            docs/evidence/release-evidence/${{ github.ref_name }}.json
+            docs/RELEASE_INDEX.md
+            release-evidence-bundle/**
+          if-no-files-found: error
+          retention-days: 30
+
+  # ============================================
+  # Create GitHub Release
+  # ============================================
+  github-release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: [docker-release, release-evidence]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Get the previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+          if [ -z "$PREV_TAG" ]; then
+            echo "First release - no previous tag found"
+            CHANGELOG="## Initial Release\n\nFirst release of the knowledge-base system."
+          else
+            echo "Generating changelog from $PREV_TAG to ${{ github.ref_name }}"
+
+            # Generate changelog from commits
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" $PREV_TAG..HEAD | head -50)
+
+            # Categorize commits
+            FEATURES=$(echo "$CHANGELOG" | grep -E "^- (feat|add|new)" || true)
+            FIXES=$(echo "$CHANGELOG" | grep -E "^- (fix|bug)" || true)
+            DOCS=$(echo "$CHANGELOG" | grep -E "^- (doc|docs)" || true)
+            CHORE=$(echo "$CHANGELOG" | grep -E "^- (chore|refactor|style|test|ci)" || true)
+            OTHER=$(echo "$CHANGELOG" | grep -vE "^- (feat|add|new|fix|bug|doc|docs|chore|refactor|style|test|ci)" || true)
+          fi
+
+          # Build release notes
+          {
+            echo "RELEASE_NOTES<<EOF"
+            echo "## What's Changed"
+            echo ""
+
+            if [ -n "$FEATURES" ]; then
+              echo "### Features"
+              echo "$FEATURES"
+              echo ""
+            fi
+
+            if [ -n "$FIXES" ]; then
+              echo "### Bug Fixes"
+              echo "$FIXES"
+              echo ""
+            fi
+
+            if [ -n "$DOCS" ]; then
+              echo "### Documentation"
+              echo "$DOCS"
+              echo ""
+            fi
+
+            if [ -n "$CHORE" ]; then
+              echo "### Maintenance"
+              echo "$CHORE"
+              echo ""
+            fi
+
+            if [ -n "$OTHER" ]; then
+              echo "### Other Changes"
+              echo "$OTHER"
+              echo ""
+            fi
+
+            echo "---"
+            echo ""
+            echo "## Docker Image"
+            echo ""
+            echo "\`\`\`bash"
+            echo "docker pull ${{ needs.docker-release.outputs.image_ref }}"
+            echo "\`\`\`"
+            echo ""
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/$PREV_TAG...${{ github.ref_name }}"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          name: Release ${{ github.ref_name }}
+          body: ${{ steps.changelog.outputs.RELEASE_NOTES }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
