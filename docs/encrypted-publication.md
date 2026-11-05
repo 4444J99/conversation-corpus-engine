@@ -23,7 +23,14 @@ JSON exists only after explicit unlocking in process memory. Publication remains
 its format, algorithms and recipient semantics are unchanged. Credential files are mode 0600 on
 POSIX and outside Git. Supply exact passphrase bytes from a mode-0600 private file with
 `--passphrase-file`, or a protected producer through `--passphrase-stdin`. The CLI has no secret
-argument and does not print keys or passphrases. Keep the passphrase separate from its credential;
+argument and does not print keys or passphrases. Creating a **new** identity requires a passphrase
+of at least 12 bytes (12 ASCII characters; the exact file bytes count, so a trailing newline counts)
+and fails with `passphrase-too-short` before anything is written. Unlocking an existing
+identity never enforces a minimum, so credentials made earlier keep working. Credential, trust
+and recipient files are created mode 0600; reading a credential or a `--passphrase-file` whose mode
+grants any group or other access fails with `credential-permissions`. Directories created on the way
+to a new credential file are mode 0700; existing directories are left as they are.
+Keep the passphrase separate from its credential;
 this software cannot protect a key when an attacker can read both or inspect an unlocked process.
 A strong passphrase and protected recovery custody remain operator responsibilities.
 
@@ -38,6 +45,23 @@ outside Git too. The publisher's signed HEAD is the enrollment authorization; a 
 does not enroll itself. The owner must verify each device key's fingerprint through an
 independent trusted channel before selecting it. Every snapshot grants each listed device access
 to all selected content. Use a separate vault/trust root for a smaller disclosure scope.
+
+Print a recipient's fingerprint with the read-only `fingerprint` command. It needs no unlock,
+writes nothing and accepts only a public recipient record (exactly `app_id`, `instance_id` and a
+lowercase 64-hex `encryption_public`); a credential file, a malformed record or any extra field is
+refused with `invalid-recipient` and nothing from the file is echoed:
+
+```bash
+cce sealed fingerprint --recipient "$PRIVATE/device.recipient.json"
+# {"algorithm": "sha256", "fingerprint": "<64 hex characters>"}
+```
+
+The fingerprint is SHA-256 over `cce-sealed.v1:recipient-fingerprint:` followed by the canonical
+JSON of the recipient record, so it covers the public key **and** its app/instance labels: a
+changed label or key yields a different value. The device owner runs this on the device and reads
+the value to the publisher over an independent channel; the publisher runs it on the recipient
+file they are about to enroll and compares the two before running `publish`. The labels
+themselves are not printed.
 
 ## Reproducible workflow
 
@@ -182,6 +206,13 @@ Serialize writers; lock directories fail closed and are not automatically stolen
 write may leave unreferenced ciphertext or a lock; investigate it under custody before manually
 clearing anything. The CLI does not delete or garbage-collect objects or history.
 
+Every ciphertext object, `HEAD.cce` and checkpoint is written to a `.cce-*` temp file in its own
+directory, fsynced, then atomically linked (new object, never replacing an existing one) or renamed
+(HEAD, checkpoint) into place; the temp file is removed on any failure. A failed write such as a
+full disk therefore leaves no truncated object under its final name, and a retry works. A hard
+crash (kill, power loss) can still leave a `.cce-*` temp file; the tree check refuses it as
+`non-ciphertext-tree` until it is removed under custody, because a stray file is never trusted.
+
 `audit-history` examines every reachable commit/ref, requires the fixed content-free commit
 message above, validates historical signed manifests, and checks historical/current object bytes
 against authenticated ciphertext digests. Run it as an owner identity that can decrypt historical
@@ -189,6 +220,13 @@ epochs; a newly enrolled device may lack old-epoch access. It rejects unknown pa
 plaintext even if deleted from the current worktree. It does not inspect Git reflogs, unreachable
 objects, provider caches, hidden server refs, branch-name privacy, or other copies. Begin with a
 fresh dedicated repository; this is an audit, **not sanitization** of a formerly plaintext repo.
+The audit is bounded: it inspects at most 10,000 commits, gives each Git subprocess 30 seconds,
+and stops with `history-audit-limit` once the Git output it has read (and the hash metadata it
+retains, one entry per 4 KiB of cap) exceeds an aggregate cap. The cap defaults to 512 MiB and
+is set with `audit-history --budget BYTES`; `publish` and `plan` take the same cap for their
+pre-publication history audit as `--audit-budget BYTES`. It is independent of the storage
+`--budget`, so a small storage forecast budget does not abort history auditing. Raise the cap
+for a long history rather than disabling it; a negative value is refused (`invalid-budget`).
 Only `main`/`master` branches, matching remote-tracking refs and lightweight `snapshot-N` tags
 are accepted. Annotated tags, notes, replace refs and arbitrary ref names are refused; annotated
 tag messages can otherwise carry plaintext outside the commit-tree audit.
@@ -249,7 +287,10 @@ conservative next Git snapshot estimate (existing Git object-store bytes, pendin
 new HEAD bytes, plus 1 MiB and 4 KiB per retained/pending object and HEAD for loose-object
 allocation and rewritten tree/commit metadata). `publish` rechecks it before installing ciphertext.
 A no-op still checks current
-storage against the budget. `status` reports current tree and Git storage independently. Pending
+storage against the budget. The Git object-store size is read from `git count-objects`; if the
+repository is a Git work tree and that measurement fails, is unparseable or cannot run, `plan`,
+`publish` and `status` fail with `git-size-unmeasurable` instead of assuming zero (only a missing
+or non-Git destination counts as zero). `status` reports current tree and Git storage independently. Pending
 publication ciphertext remains bounded by the budget; planning retains lengths rather than
 pending ciphertext. Run `status` again after the required Git commit and compare its tree plus Git
 object-store bytes to the approved budget before pushing. Host accounting, unusually large

@@ -103,6 +103,30 @@ class Identity:
         }
 
 
+RECIPIENT_FIELDS = {"app_id", "instance_id", "encryption_public"}
+
+
+def recipient_fingerprint(recipient: Any) -> str:
+    """Stable SHA-256 fingerprint of a public recipient record (key and labels together).
+
+    Accepts only the exact public record `identity.recipient()` emits, so a private credential
+    file can never be fingerprinted, echoed or mistaken for a recipient.
+    """
+    try:
+        if (
+            not isinstance(recipient, dict)
+            or set(recipient) != RECIPIENT_FIELDS
+            or not all(isinstance(value, str) for value in recipient.values())
+        ):
+            raise ValueError
+        key = bytes.fromhex(recipient["encryption_public"])
+        if len(key) != 32 or key.hex() != recipient["encryption_public"]:
+            raise ValueError
+    except ValueError as exc:
+        raise SealedError("invalid-recipient") from exc
+    return digest(FORMAT.encode() + b":recipient-fingerprint:" + canonical(recipient))
+
+
 def wrap(secret: bytes, recipient: dict[str, str], context: str) -> str:
     ephemeral = X25519PrivateKey.generate()
     public = X25519PublicKey.from_public_bytes(bytes.fromhex(recipient["encryption_public"]))
