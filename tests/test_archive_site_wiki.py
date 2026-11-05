@@ -887,3 +887,44 @@ def test_verify_reports_the_lineage_in_its_wiki_block(built) -> None:
     assert report["problems"] == []
     assert report["generations"] == 2
     assert report["recent_changes"] == 3
+
+
+def test_a_merge_on_a_store_that_predates_the_lineage_baselines_every_provider(built) -> None:
+    """Stores are built one provider at a time with `--merge`; a provider that is carried over
+    with no recorded digests must still be part of the baseline, not 'added' by the next merge."""
+    built.paths.lineage.unlink()
+    built.paths.digests.unlink()
+    ingest(
+        export_root=built.export,
+        paths=built.paths,
+        authorization=built.auth,
+        providers=["chatgpt"],
+        merge=True,
+    )
+    (first,) = lineage_of(built.paths)
+    everything = sorted(row["uid"] for row in load_index(built.paths))
+    assert {uid.partition("-")[0] for uid in everything} > {"chatgpt"}, "claude is carried over"
+    assert first["added"] == everything and first["conversations"] == len(everything)
+    ingest(
+        export_root=built.export,
+        paths=built.paths,
+        authorization=built.auth,
+        providers=["claude"],
+        merge=True,
+    )
+    assert lineage_of(built.paths) == [first], "nothing changed, so the next merge adds nothing"
+    manifest = json.loads(built.paths.manifest.read_text("utf-8"))
+    digests = importlib.import_module("conversation_corpus_engine.archive_lineage").load_digests(
+        built.paths
+    )
+    assert sum(len(rows) for rows in digests.values()) == manifest["totals"]["conversations"]
+
+
+def test_verify_fails_when_the_latest_generation_miscounts_the_manifest(built) -> None:
+    saved = built.paths.lineage.read_text("utf-8")
+    count = lineage_of(built.paths)[0]["conversations"]
+    built.paths.lineage.write_text(
+        saved.replace(f'"conversations": {count}', '"conversations": 999'), encoding="utf-8"
+    )
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    assert any("lineage" in item and "999" in item for item in problems)

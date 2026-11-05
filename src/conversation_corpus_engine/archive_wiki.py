@@ -395,9 +395,16 @@ def _lineage_problems(
             problems.append(f"generation lineage is broken at generation {index}")
             break
     try:
-        fingerprint = load_manifest(paths)["source_fingerprint"]
+        manifest = load_manifest(paths)
+        fingerprint = manifest["source_fingerprint"]
+        conversations = manifest["totals"]["conversations"]
     except (FileNotFoundError, ValueError, KeyError):
-        fingerprint = ""
+        fingerprint, conversations = "", None
+    if ledger and conversations is not None and ledger[-1]["conversations"] != conversations:
+        problems.append(
+            f"generation lineage holds {ledger[-1]['conversations']} conversation(s) in its "
+            f"latest generation, the manifest has {conversations}"
+        )
     if ledger and fingerprint and ledger[-1]["fingerprint"] != fingerprint:
         problems.append(
             f"generation lineage is behind the manifest: its last generation is for "

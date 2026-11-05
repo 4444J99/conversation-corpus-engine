@@ -466,7 +466,9 @@ moves an existing conversation page URL.
   before, in `index-all-lineage.jsonl`, with the digests of the latest generation in
   `index-all-digests.jsonl`. A generation is named by its fingerprint and the data's own latest
   day, never a clock, and re-ingesting unchanged sources adds nothing. The first generation lists
-  everything as added. `report-all-changes.html` lists exactly what the latest generation
+  everything as added; with `--merge`, a provider carried over from a store that predates the
+  lineage is digested from the shards it already holds, so it is part of that first generation
+  and not "added" by the next merge. `report-all-changes.html` lists exactly what the latest generation
   added, changed and removed (continued on linked pages past the cap) above a table of the last
   20 generations, and each conversation page ends with a *History* section: its newest 8
   revisions, linking to their row on that page while the generation is still in the table.

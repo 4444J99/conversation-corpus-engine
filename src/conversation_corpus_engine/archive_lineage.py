@@ -17,7 +17,7 @@ Recent changes and per-page history on the site are read from the ledger, not by
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
 
 from .archive_model import iter_jsonl, write_jsonl_atomic
@@ -52,13 +52,17 @@ def record_generation(
     *,
     read: Iterable[str],
     day: str = "",
+    digest_store: Callable[[str], dict[str, str]] | None = None,
 ) -> dict[str, Any] | None:
     """Record the generation `manifest` is, against the one before; return its ledger row.
 
     `digests` are the digests of the providers this ingest read (provider -> uid -> digest).
     A provider listed in the manifest that this ingest did not read successfully keeps its
     previous digests (a merge carries it over, a failed read leaves its previous shards in
-    place); a provider the manifest does not list, or lists as absent, holds nothing.
+    place); a provider the manifest does not list, or lists as absent, holds nothing. A carried
+    provider that has no digests yet (a store that predates the lineage, merged one provider at
+    a time) is digested from the shards it already holds, through `digest_store(provider)`, so
+    its conversations are part of this generation's baseline and not "added" by the next one.
     Nothing is written when the sources are unchanged (same fingerprint, no uid differs).
     """
     previous = load_digests(paths)
@@ -67,8 +71,11 @@ def record_generation(
     for name, info in manifest["providers"].items():
         if name in read_now and info.get("status") == "ok":
             current[name] = dict(digests.get(name, {}))
-        elif info.get("status") != "absent" and name in previous:
-            current[name] = previous[name]
+        elif info.get("status") != "absent":
+            if name in previous:
+                current[name] = previous[name]
+            elif digest_store is not None:
+                current[name] = digest_store(name)
     before = {uid: digest for rows in previous.values() for uid, digest in rows.items()}
     after = {uid: digest for rows in current.values() for uid, digest in rows.items()}
     added = sorted(after.keys() - before.keys())

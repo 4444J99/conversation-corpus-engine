@@ -938,7 +938,15 @@ def ingest(
     except ValueError:  # no provider reports any activity: the generation has no day
         day = ""
     record_generation(
-        paths, manifest, options.get("lineage_digests", {}), read=sources.keys(), day=day
+        paths,
+        manifest,
+        options.get("lineage_digests", {}),
+        read=sources.keys(),
+        day=day,
+        digest_store=lambda name: {
+            conversation.uid: content_digest(conversation)
+            for conversation in iter_store(paths, [name])
+        },
     )
     return manifest
 
