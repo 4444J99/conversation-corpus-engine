@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -221,10 +222,79 @@ def test_impossible_threshold_exits_one_and_names_the_failed_check(bench, synthe
 
 
 def test_cold_threshold_is_strict_less_than(bench, synthetic, capsys):
+    """A real cold call is always slower than a zero limit; the exact boundary is pinned by
+    test_cold_threshold_boundary_is_strict and test_check_relation_at_the_limit."""
     code, out = run(bench, capsys, *fast(synthetic["database"]), "--max-cold-first-call-s", "0")
     report = json.loads(out.out)
     assert code == 1
     assert [c["name"] for c in report["checks"] if not c["ok"]] == ["cold_first_call_s"]
+
+
+COLD_LIMIT = 0.5  # exactly representable, so "equal to the limit" is exact in binary floating point
+
+
+def test_check_relation_at_the_limit(bench):
+    limit = COLD_LIMIT
+    below, above = math.nextafter(limit, 0.0), math.nextafter(limit, 1.0)
+    assert below < limit < above
+    # "<" is strict: only a value below the limit passes, the limit itself fails.
+    assert [bench.check("c", v, limit, "<")["ok"] for v in (below, limit, above)] == [
+        True,
+        False,
+        False,
+    ]
+    # "<=" and ">=" include the limit, so equality is what tells them apart from "<".
+    assert [bench.check("c", v, limit, "<=")["ok"] for v in (below, limit, above)] == [
+        True,
+        True,
+        False,
+    ]
+    assert [bench.check("c", v, limit, ">=")["ok"] for v in (below, limit, above)] == [
+        False,
+        True,
+        True,
+    ]
+    # A missing measurement never passes, whatever the relation.
+    assert [bench.check("c", None, limit, r)["ok"] for r in ("<", "<=", ">=")] == [False] * 3
+    entry = bench.check("c", limit, limit, "<")
+    assert (entry["name"], entry["value"], entry["limit"], entry["relation"]) == (
+        "c",
+        limit,
+        limit,
+        "<",
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "measured", "passes"),
+    [
+        ("just-below", math.nextafter(COLD_LIMIT, 0.0), True),
+        ("equal", COLD_LIMIT, False),
+        ("just-above", math.nextafter(COLD_LIMIT, 1.0), False),
+    ],
+)
+def test_cold_threshold_boundary_is_strict(
+    bench, synthetic, capsys, monkeypatch, label, measured, passes
+):
+    """The benchmark applies the cold gate as measured < limit: the injected measured value is
+    compared, never a real timing, so a value equal to the limit must fail (it would pass if the
+    gate were measured <= limit)."""
+    real = bench.cold_inprocess
+
+    def with_measured_time(target, query, args):
+        return {**real(target, query, args), "wall_s": measured}
+
+    monkeypatch.setattr(bench, "cold_inprocess", with_measured_time)
+    arguments = fast(synthetic["database"], QUERIES, "--max-cold-first-call-s", str(COLD_LIMIT))
+    code, out = run(bench, capsys, *arguments)
+    report = json.loads(out.out)
+    cold = next(item for item in report["checks"] if item["name"] == "cold_first_call_s")
+    assert (cold["limit"], cold["relation"]) == (COLD_LIMIT, "<"), label
+    assert cold["ok"] is passes, label
+    if not passes:
+        assert code == 1 and report["pass"] is False, label
+        failed = [item["name"] for item in report["checks"] if not item["ok"]]
+        assert "cold_first_call_s" in failed, label
 
 
 def test_calls_to_unit_counts_search_then_reads(bench, synthetic, capsys, tmp_path):
