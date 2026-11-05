@@ -25,6 +25,10 @@ from .archive_naming import InvalidName, conversation_uid, parse_name
 from .archive_vault import incoming_links, part_owners
 
 MESSAGE_ID_RE = re.compile(r"message-(\d+)")
+# `#t=<term>` is state the home page's script reads, not an anchor of any page. The site's topic
+# chips emit it as `<home page>#t=` plus `quote(term)`, so the value holds only what `quote`
+# leaves alone or percent-encodes; any other fragment, one with an `=` included, is an anchor.
+SEARCH_FRAGMENT_RE = re.compile(r"t=(?:[A-Za-z0-9_.~/-]|%[0-9A-Fa-f]{2})*")
 # A page lists at most this many conversations under "What links here" (and says how many more).
 BACKLINK_LIMIT = 25
 BACKLINK_LABEL_CHARS = 80
@@ -90,6 +94,15 @@ def backlinks_by_uid(incoming: dict[str, set[str]], titles: dict[str, str]) -> d
         found[target] = Backlinks(hubs=hubs, conversations=tuple(uids))
     return found
 
+
+# What the wiki block says of a store that predates the lineage (neither of its two files exists):
+# verify passes it, because nothing is wrong, and says what records the first generation.
+LINEAGE_ABSENT_NOTE = (
+    "no generation lineage is recorded: this store was ingested before the lineage existed, so "
+    "verify passes it with no recent-changes rows and no page history; `cce archive build` "
+    "records its first generation (an ingest or merge does too, then `cce archive site` "
+    "shows it)"
+)
 
 # The most problems of one kind a report lists; the counts above them say how many there were.
 PROBLEM_LIMIT = 20
@@ -209,9 +222,15 @@ def _check_links(
     wanted: dict[Path, set[str]],
     problems: list[str],
 ) -> tuple[int, int]:
-    """Resolve every relative link of one page; a fragment must exist on the page it names."""
+    """Resolve every relative link of one page; a fragment must exist on the page it names.
+
+    The one exception is the home page's search fragment (`SEARCH_FRAGMENT_RE`) on a link to the
+    home page itself: it is read by that page's script, so it is not looked up as an anchor.
+    """
     checked = dangling = 0
     relative = path.relative_to(root).as_posix()
+    resolved_root = root.resolve()
+    home = resolved_root / layout.SITE_HOME_FILENAME
     for href in facts.hrefs:
         parts = urlsplit(href)
         if parts.scheme or parts.netloc:
@@ -221,24 +240,18 @@ def _check_links(
             dangling += 1
             problems.append(f"dangling link in {relative}: {href!r} points at nothing")
             continue
-        if "=" in parts.fragment:
-            # `#t=<term>` is state the home page's script reads, not an anchor of any page.
-            if parts.path:
-                target = (path.parent / unquote(parts.path)).resolve()
-                if root.resolve() not in target.parents or not target.is_file():
-                    dangling += 1
-                    problems.append(f"dangling link in {relative}: {href} (no such page)")
-            continue
         if not parts.path:
             if parts.fragment not in facts.ids:
                 dangling += 1
                 problems.append(f"dangling link in {relative}: {href} (no such anchor)")
             continue
         target = (path.parent / unquote(parts.path)).resolve()
-        if root.resolve() not in target.parents or not target.is_file():
+        if resolved_root not in target.parents or not target.is_file():
             dangling += 1
             problems.append(f"dangling link in {relative}: {href} (no such page)")
-        elif parts.fragment:
+        elif parts.fragment and not (
+            target == home and SEARCH_FRAGMENT_RE.fullmatch(parts.fragment)
+        ):
             wanted.setdefault(target, set()).add(parts.fragment)
     return checked, dangling
 
@@ -258,6 +271,7 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
         "backlink_pages": 0,
         "history_pages": 0,
         "generations": 0,
+        "lineage": {"status": "unchecked", "note": ""},
         "recent_changes": 0,
         "links_listed": 0,
         "links_checked": 0,
@@ -380,15 +394,31 @@ def _lineage_problems(
 ) -> list[str]:
     """Hold the recent-changes page and each page's history to the lineage of generations.
 
-    The lineage must exist, chain from generation to generation and end at the manifest it
-    belongs to; the recent-changes page must list exactly what the latest generation added,
-    changed and removed; and every page's history must be the lineage's own account of it.
+    The lineage must chain from generation to generation and end at the manifest it belongs to;
+    the recent-changes page must list exactly what the latest generation added, changed and
+    removed; and every page's history must be the lineage's own account of it.
+
+    A store ingested before the lineage existed has neither lineage file (an ingest writes the
+    ledger and the digests together). That is not a fault: it passes with a note in the wiki
+    block, and the same checks then hold its site to an empty history. A ledger with no digests
+    beside it, or a ledger file that holds no generation, is a broken lineage and fails.
     """
     ledger = load_lineage(paths)
     report["generations"] = len(ledger)
     problems = []
-    if not paths.lineage.is_file():
-        problems.append("generation lineage missing: run `cce archive ingest`")
+    if ledger:
+        report["lineage"] = {"status": "recorded", "note": ""}
+    elif paths.lineage.exists():
+        report["lineage"]["status"] = "empty"
+        problems.append("generation lineage holds no generation: run `cce archive ingest`")
+    elif paths.digests.exists():
+        report["lineage"]["status"] = "partial"
+        problems.append(
+            "generation lineage missing: its digest file is present but the ledger is not; "
+            "run `cce archive ingest`"
+        )
+    else:
+        report["lineage"] = {"status": "absent", "note": LINEAGE_ABSENT_NOTE}
     for index, record in enumerate(ledger, 1):
         parent = ledger[index - 2]["fingerprint"] if index > 1 else ""
         if record.get("generation") != index or record.get("parent") != parent:
@@ -440,6 +470,11 @@ def _lineage_problems(
             window = {f"g{record['generation']}" for record in ledger[-RECENT_GENERATIONS:]}
             if window_ids != window:
                 problems.append("recent changes generation table differs from the lineage")
+        elif listed or window_ids:
+            problems.append(
+                f"recent changes lists {len(listed)} row(s) and {len(window_ids)} generation(s), "
+                "the lineage has none"
+            )
     revisions = history_by_uid(ledger)
     for uid, facts in sorted(history_seen.items()):
         want_entries = revisions.get(uid, [])

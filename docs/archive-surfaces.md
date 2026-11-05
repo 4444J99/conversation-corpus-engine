@@ -476,15 +476,28 @@ moves an existing conversation page URL.
 
 `cce archive verify` (and the verify that closes `build`) reports a `wiki` block (pages,
 messages and messages anchored, pages with a table of contents, backlink and history pages,
-turns by author, topic pages against topic hubs, generations, recent-changes rows, links
-checked, dangling links) and fails when: a link, a fragment included, points at nothing; a
-message has no anchor or an id repeats; a page with three headings has no contents list; a
-page's *What links here* differs from the vault graph; a topic page is missing, has no hub, or
-lists other conversations than its hub; a message has no single author class or the labelled
-turns differ from the manifest's author counts; the lineage is missing, does not chain, or does
-not end at the manifest; the recent-changes page differs from the latest generation; or a
-page's history differs from the ledger. A store ingested before the lineage existed fails the
-lineage check until it is ingested again (its first generation then lists everything as added).
+turns by author, topic pages against topic hubs, generations, the `lineage` status and its note,
+recent-changes rows, links checked, dangling links) and fails when: a link, a fragment
+included, points at nothing (the home page's `#t=<term>` search fragment on a link to the home
+page is the one fragment that is not looked up as an anchor; any other fragment, one with an
+`=` included, must name an anchor of the page it points at); a message has no anchor or an id
+repeats; a page with three headings has no contents list; a page's *What links here* differs
+from the vault graph; a topic page is missing, has no hub, or lists other conversations than
+its hub; a message has no single author class or the labelled turns differ from the manifest's
+author counts; the lineage is broken (a ledger that holds no generation, digests with no
+ledger, a ledger that does not chain or does not end at the manifest); the recent-changes page
+differs from the latest generation; or a page's history differs from the ledger.
+
+`verify` only reads. A store ingested before the lineage existed has neither lineage file, and
+that is not a failure: it passes with `lineage` status `absent` and a note in the wiki block,
+zero generations, an empty recent-changes page and no page history. It stays that way until
+`cce archive build` records its first generation (an ingest or merge does too, and
+`cce archive site` then shows it); that first generation lists everything as added, and the
+status becomes `recorded`. The pass depends on the site agreeing with the lineage: a site that
+lists changes or history while no ledger backs them still fails, as does any lineage that
+exists and is inconsistent. (A site built before the wiki features also lacks anchors, backlinks
+and history sections, and fails those checks until `cce archive site` rebuilds it; that is the
+site being stale, not the lineage.)
 
 ## Data-grounding rules the surfaces follow
 

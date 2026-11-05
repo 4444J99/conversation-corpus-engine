@@ -791,7 +791,7 @@ def changes_plan(
     by_uid = {row["uid"]: row for row in rows}
     items: list[dict[str, Any]] = []
     if not ledger:
-        intro = "No generation lineage is recorded for this archive; run `cce archive ingest`."
+        intro = "No generation lineage is recorded for this archive; run `cce archive build`."
         lead = ""
     else:
         latest = ledger[-1]

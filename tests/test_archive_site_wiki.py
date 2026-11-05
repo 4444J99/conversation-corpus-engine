@@ -3,8 +3,10 @@ and recent changes. Every string here is invented."""
 
 from __future__ import annotations
 
+import html
 import importlib
 import json
+import posixpath
 import re
 from html.parser import HTMLParser
 from pathlib import Path
@@ -928,3 +930,119 @@ def test_verify_fails_when_the_latest_generation_miscounts_the_manifest(built) -
     )
     problems = wiki().verify_site_wiki(built.paths)["problems"]
     assert any("lineage" in item and "999" in item for item in problems)
+
+
+# --- a store that predates the lineage: absent passes with a note, a broken one still fails ----
+
+
+def drop_lineage(env: Any) -> None:
+    """Make a built store one that was ingested before the lineage existed: no ledger and no
+    digests, and a site built without them (every page's history empty)."""
+    env.paths.lineage.unlink()
+    env.paths.digests.unlink()
+    build_site(env.paths, env.auth)
+
+
+def test_verify_passes_with_a_note_on_a_store_that_has_no_lineage_at_all(built) -> None:
+    drop_lineage(built)
+    report = wiki().verify_site_wiki(built.paths)
+    assert report["problems"] == []
+    assert report["lineage"]["status"] == "absent"
+    assert "cce archive build" in report["lineage"]["note"]
+    assert report["generations"] == 0 and report["recent_changes"] == 0
+    assert not built.paths.lineage.exists() and not built.paths.digests.exists(), (
+        "verify only reads"
+    )
+
+
+def test_the_next_build_baselines_a_store_that_predates_the_lineage(built) -> None:
+    drop_lineage(built)
+    assert wiki().verify_site_wiki(built.paths)["lineage"]["status"] == "absent"
+    rebuild(built)
+    report = wiki().verify_site_wiki(built.paths)
+    assert report["problems"] == []
+    assert report["lineage"] == {"status": "recorded", "note": ""}
+    assert report["generations"] == 1
+    assert report["recent_changes"] == len(load_index(built.paths))
+
+
+def test_verify_reports_a_recorded_lineage_without_a_note(built) -> None:
+    report = wiki().verify_site_wiki(built.paths)
+    assert report["problems"] == []
+    assert report["lineage"] == {"status": "recorded", "note": ""}
+
+
+def test_verify_fails_when_the_lineage_is_absent_but_the_site_claims_history(built) -> None:
+    built.paths.lineage.unlink()
+    built.paths.digests.unlink()
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    assert any("recent changes" in item for item in problems), "rows with no lineage behind them"
+    assert any("chatgpt-aaaa1111" in item and "history" in item for item in problems)
+
+
+def test_verify_fails_on_a_digest_file_without_a_ledger(built) -> None:
+    built.paths.lineage.unlink()
+    report = wiki().verify_site_wiki(built.paths)
+    assert report["lineage"]["status"] == "partial"
+    assert any("lineage" in item and "missing" in item for item in report["problems"])
+
+
+def test_verify_fails_on_a_lineage_file_that_holds_no_generation(built) -> None:
+    built.paths.lineage.write_text("", encoding="utf-8")
+    report = wiki().verify_site_wiki(built.paths)
+    assert report["lineage"]["status"] == "empty"
+    assert any("lineage" in item and "no generation" in item for item in report["problems"])
+
+
+# --- the home page's search fragment is the one fragment that is not an anchor -----------------
+
+
+def inject(page: Path, markup: str) -> None:
+    page.write_text(
+        page.read_text("utf-8").replace("</body>", markup + "</body>"), encoding="utf-8"
+    )
+
+
+def href_to(target: Path, page: Path) -> str:
+    return posixpath.relpath(target.as_posix(), start=page.parent.as_posix())
+
+
+def test_verify_accepts_the_search_fragment_the_site_emits(built) -> None:
+    page = built.paths.site_page("chatgpt", "chatgpt-aaaa1111")
+    before = wiki().verify_site_wiki(built.paths)
+    assert before["problems"] == []
+    terms = ["lantern", "two words", "naïve café", "a/b", "c++ & d=e", "100% (really)"]
+    emitted = wiki("archive_site")._topic_chips(terms, href_to(built.paths.site_home, page), None)
+    assert all("#t=" in href for _, href in emitted)
+    inject(page, "".join(f'<a href="{href}">{html.escape(term)}</a>' for term, href in emitted))
+    after = wiki().verify_site_wiki(built.paths)
+    assert after["problems"] == []
+    assert after["links_checked"] == before["links_checked"] + len(terms)
+
+
+def test_verify_fails_on_a_fragment_that_only_looks_like_the_search_state(built) -> None:
+    page = built.paths.site_page("chatgpt", "chatgpt-aaaa1111")
+    original = page.read_text("utf-8")
+    home = href_to(built.paths.site_home, page)
+    changes = href_to(built.paths.site / "report-all-changes.html", page)
+    hrefs = [
+        "#x=y",
+        "#t=foo",  # the home page reads it, this page does not
+        f"{home}#x=y",
+        f"{home}#T=foo",
+        f"{home}#tt=foo",
+        f"{home}#t=a=b",
+        f"{home}#t=a&x=y",
+        f"{home}#t=a b",
+        f"{home}#t=%zz",
+        f"{changes}#t=foo",  # only the home page reads it
+    ]
+    for href in hrefs:
+        page.write_text(original, encoding="utf-8")
+        inject(page, f'<a href="{href}">x</a>')
+        report = wiki().verify_site_wiki(built.paths)
+        fragment = href.partition("#")[2]
+        assert any(
+            f"#{fragment}" in item and "no such anchor" in item for item in report["problems"]
+        ), href
+        assert report["dangling_links"] >= 1, href
