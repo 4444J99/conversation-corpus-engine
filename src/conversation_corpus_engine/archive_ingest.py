@@ -578,6 +578,35 @@ class MergeInputLoss(ValueError):
     """A merge would omit inputs which contributed to the existing provider."""
 
 
+# What a reader or its source can raise while a provider is read; the ingest isolates the
+# provider on any of these, and the merge check treats them as "cannot be checked".
+READ_ERRORS = (
+    OSError,
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+    IndexError,
+    sqlite3.Error,
+    zlib.error,
+)
+
+
+def receipt_holds_shards(info: dict[str, Any]) -> bool:
+    """True when a provider's receipt describes conversation shards that exist in the store."""
+    return info.get("status") in {"ok", "failed"} and (
+        bool(info.get("conversations")) or bool(info.get("layout", {}).get("shards"))
+    )
+
+
+def _would_be_absent(spec: ProviderSpec, root: Path, options: dict[str, Any]) -> bool:
+    """True when this call has nothing to read for the provider: no source of its own, no extra
+    live-capture file and no supplement (the library pages a ChatGPT build can take)."""
+    own = root.exists() and spec.module.detect(root)
+    extra_files = options.get("chatgpt_extra_files", []) if spec.name == "chatgpt" else []
+    return not (own or extra_files or (spec.supplement is not None and spec.supplement(options)))
+
+
 def _check_merge_inputs(
     previous: dict[str, Any], sources: dict[str, Path], options: dict[str, Any]
 ) -> None:
@@ -602,42 +631,70 @@ def _check_merge_inputs(
                     f"{name}: library inputs would be lost; provide the complete --library-root "
                     "(or library --source), or explicitly acknowledge removal with --allow-input-loss"
                 )
-        if name == "chatgpt":
-            required_uids = set(old.get("live_capture_uids", []))
-            if required_uids:
-                available_uids: set[str] = set()
-                tracker = SourceTracker(
-                    root, archive_read_chatgpt.READER, hash_cache=options.get("source_hash_cache")
-                )
-                try:
-                    for conversation in _chatgpt(root, tracker, options):
-                        finalize_conversation(conversation)
-                        available_uids.add(conversation.uid)
-                        if required_uids <= available_uids:
-                            break
-                except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
-                    raise MergeInputLoss(
-                        "chatgpt: live capture inputs cannot be checked; supply complete readable inputs "
-                        "or explicitly acknowledge removal with --allow-input-loss"
-                    ) from exc
-                if required_uids - available_uids:
-                    raise MergeInputLoss(
-                        "chatgpt: live capture records would be lost; supply the previous records "
-                        "in --chatgpt-extra or the account export, or acknowledge removal with --allow-input-loss"
-                    )
-                continue
-            old_files = old.get("build_options", {}).get("chatgpt_extra_files", [])
-            required = {Path(path).resolve() for path in old_files}
-            current = {
-                Path(path).resolve()
-                for path in options.get("chatgpt_extra_files", [])
-                if Path(path).is_file()
-            }
-            if required - current:
+        _check_live_capture_inputs(name, root, old, options)
+    # The specific refusals above come first; this one covers a source that is simply not there.
+    for name, root in sources.items():
+        if receipt_holds_shards(previous.get(name, {})) and _would_be_absent(
+            PROVIDER_SPECS[name], root, options
+        ):
+            raise MergeInputLoss(
+                f"{name}: the source is absent, so its previous conversations would be orphaned; "
+                "supply the source, or explicitly acknowledge removal with --allow-input-loss"
+            )
+
+
+def _check_live_capture_inputs(
+    name: str, root: Path, old: dict[str, Any], options: dict[str, Any]
+) -> None:
+    """Refuse a merge that would drop a captured identity the provider already holds.
+
+    Every provider whose inputs are live captures (the ChatGPT delta files, the Copilot pages
+    and reports, the local-session memory) records the normalized ids it read; the new inputs
+    must still carry each of them, in a capture or, for ChatGPT, in an account export.
+    """
+    spec = PROVIDER_SPECS[name]
+    required_uids = set(old.get("live_capture_uids", []))
+    if required_uids:
+        available_uids: set[str] = set()
+        if not _would_be_absent(spec, root, options):
+            tracker = SourceTracker(
+                root, spec.module.READER, hash_cache=options.get("source_hash_cache")
+            )
+            try:
+                for conversation in spec.open_reader(root, tracker, options):
+                    finalize_conversation(conversation)
+                    available_uids.add(conversation.uid)
+                    if required_uids <= available_uids:
+                        break
+            except READ_ERRORS as exc:
                 raise MergeInputLoss(
-                    "chatgpt: live capture inputs would be lost; repeat --chatgpt-extra, "
-                    "or explicitly acknowledge removal with --allow-input-loss"
-                )
+                    f"{name}: live capture inputs cannot be checked; supply complete readable "
+                    "inputs or explicitly acknowledge removal with --allow-input-loss"
+                ) from exc
+        if required_uids - available_uids:
+            where = (
+                "in --chatgpt-extra or the account export"
+                if name == "chatgpt"
+                else "in the capture source"
+            )
+            raise MergeInputLoss(
+                f"{name}: live capture records would be lost; supply the previous records "
+                f"{where}, or acknowledge removal with --allow-input-loss"
+            )
+        return
+    if name == "chatgpt":
+        old_files = old.get("build_options", {}).get("chatgpt_extra_files", [])
+        required = {Path(path).resolve() for path in old_files}
+        current = {
+            Path(path).resolve()
+            for path in options.get("chatgpt_extra_files", [])
+            if Path(path).is_file()
+        }
+        if required - current:
+            raise MergeInputLoss(
+                "chatgpt: live capture inputs would be lost; repeat --chatgpt-extra, "
+                "or explicitly acknowledge removal with --allow-input-loss"
+            )
 
 
 def _provider_build_options(
@@ -661,14 +718,9 @@ def _provider_build_options(
 def _ingest_provider(
     spec: ProviderSpec, root: Path, paths: ArchivePaths, options: dict[str, Any]
 ) -> dict[str, Any]:
-    own = root.exists() and spec.module.detect(root)
     extra_files = options.get("chatgpt_extra_files", []) if spec.name == "chatgpt" else []
     build_options = _provider_build_options(spec, root, options)
-    if (
-        not own
-        and not extra_files
-        and not (spec.supplement is not None and spec.supplement(options))
-    ):
+    if _would_be_absent(spec, root, options):
         return {
             "status": "absent",
             "source_root": str(root),
@@ -751,16 +803,7 @@ def _ingest_provider(
             if conversation.last_activity:
                 activity.append(conversation.last_activity)
         shards = writer.close()
-    except (
-        OSError,
-        ValueError,
-        KeyError,
-        TypeError,
-        AttributeError,
-        IndexError,
-        sqlite3.Error,
-        zlib.error,
-    ) as exc:
+    except READ_ERRORS as exc:
         error = f"{type(exc).__name__}: {exc}"
     if error:
         writer.close()

@@ -219,10 +219,14 @@ cce archive ingest --export-root "$EXPORTS" --library-root "$OLD_STORE" --provid
 built one provider at a time and a failed one is read again alone; without it the manifest lists
 exactly the providers of the call. Before any selected provider is written, a merge checks its
 previous library and live-capture inputs. A library generation that lacks previously bridged
-source IDs refuses the merge. Live captures are checked by their normalized conversation IDs:
-omitting a delta file or refreshing a fixed filename with only newer records cannot remove
-earlier records, even when two input files share a basename. A complete account export may
-replace a delta if it contains all of those identities. Intentional removal requires
+source IDs refuses the merge. Live captures are checked by their normalized conversation IDs
+for every live-capture provider (the ChatGPT delta files, `copilot`, `copilotreports` and
+`localmemory`): omitting a capture file or refreshing a fixed filename with only newer records
+cannot remove earlier records, even when two input files share a basename. A complete account
+export may replace a ChatGPT delta if it contains all of those identities. A merge also refuses
+a selected provider whose source is absent (a missing or wrong folder) when the store already
+holds conversations for it, since the provider's receipt would become `absent` and its shards
+would be orphaned. Intentional removal requires
 `--allow-input-loss`, which is recorded in the
 manifest. Older manifests without the source-ID list use their existing library record count
 as the compatibility check; they cannot prove identity preservation within an equal-size
