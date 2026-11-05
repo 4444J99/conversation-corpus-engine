@@ -25,6 +25,9 @@ from .library_blocks import split_blocks
 
 LIBRARY_SCHEMA = "cce.knowledge-library.v1"
 MAX_PAGE = 200
+# Document records state their reason in ``body_reason`` only; other providers may instead
+# record coverage findings, so findings never explain a document.
+DOCUMENT_PROVIDER = "documents"
 
 
 def _bounded_sql(method: Any) -> Any:
@@ -111,6 +114,18 @@ def _body_digest(payload: dict[str, Any]) -> str:
             for message in payload["messages"]
         ]
         + [{"alternate_messages": payload.get("extra", {}).get("alternate_messages", [])}]
+    )
+
+
+def _has_finding(findings: Any) -> bool:
+    """True when a record's coverage findings hold at least one non-empty entry.
+
+    Native readers attach a finding for every non-full body (partial reads and metadata-only
+    identities alike), so one usable entry is the recorded reason. A value that is not a list,
+    or a list with no non-empty string, records no reason.
+    """
+    return isinstance(findings, list) and any(
+        isinstance(entry, str) and entry for entry in findings
     )
 
 
@@ -618,24 +633,37 @@ class Library:
                 self.connection.execute(f"SELECT {column},COUNT(*) FROM records GROUP BY {column}")
             )
         # The reason lives in the stored revision payload; it is not a records column, so
-        # existing stores need no migration. Only non-full records are decoded.
+        # existing stores need no migration. Only non-full records are decoded. Documents
+        # record a ``body_reason``; native estate records keep their reasons in ``findings``.
+        # A non-full record is explained by either, so the count is decided per record and
+        # reported per provider rather than inferred from one provider's convention.
         reasons: dict[str, dict[str, int]] = {}
-        unexplained = 0
+        blank = {"non_full": 0, "explained": 0, "unexplained": 0}
+        by_provider: dict[str, dict[str, int]] = {
+            provider: dict(blank) for provider in counts["by_provider"]
+        }
         for row in self.connection.execute(
-            "SELECT r.body_status AS body_status, o.payload AS payload FROM records r "
-            "JOIN objects o ON o.digest=r.current_digest WHERE r.body_status!='full'"
+            "SELECT r.provider AS provider, r.body_status AS body_status, o.payload AS payload "
+            "FROM records r JOIN objects o ON o.digest=r.current_digest "
+            "WHERE r.body_status!='full'"
         ):
             if check_callback:
                 check_callback()
             extra = json.loads(zlib.decompress(row["payload"])).get("extra") or {}
+            split = by_provider.setdefault(row["provider"], dict(blank))
+            split["non_full"] += 1
             reason = extra.get("body_reason")
             if isinstance(reason, str) and reason:
                 by_reason = reasons.setdefault(row["body_status"], {})
                 by_reason[reason] = by_reason.get(reason, 0) + 1
+                split["explained"] += 1
+            elif row["provider"] != DOCUMENT_PROVIDER and _has_finding(extra.get("findings")):
+                split["explained"] += 1
             else:
-                unexplained += 1
+                split["unexplained"] += 1
         counts["body_reasons"] = reasons
-        counts["unexplained_non_full"] = unexplained
+        counts["non_full_by_provider"] = by_provider
+        counts["unexplained_non_full"] = sum(item["unexplained"] for item in by_provider.values())
         counts["raw_revision_bytes"] = self.connection.execute(
             "SELECT COALESCE(SUM(raw_bytes),0) FROM objects"
         ).fetchone()[0]
