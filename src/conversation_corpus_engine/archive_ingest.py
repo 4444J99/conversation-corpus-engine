@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import itertools
 import json
@@ -921,10 +922,17 @@ def ingest(
         }
         if not allow_input_loss:
             _check_merge_inputs(report, sources, options)
+    # Without --merge the manifest lists only this call's providers, but a provider that fails
+    # still has its previous shards on disk: its previous receipt is the one to keep. An
+    # unreadable previous manifest keeps nothing; it never blocks a rebuild.
+    prior: dict[str, Any] = {}
+    if not merge and paths.manifest.is_file():
+        with contextlib.suppress(ValueError, OSError, KeyError, TypeError):
+            prior = load_manifest(paths)["providers"]
     for name, root in sources.items():
-        previous = report.get(name)
+        previous = report.get(name) if merge else prior.get(name)
         result = _ingest_provider(PROVIDER_SPECS[name], root, paths, options)
-        if previous and result["status"] == "failed":
+        if previous and result["status"] == "failed" and (merge or receipt_holds_shards(previous)):
             # _ingest_provider leaves the previous shards in place on failure. Keep their
             # original input/identity receipt too, so a later retry cannot bypass protection.
             result = {

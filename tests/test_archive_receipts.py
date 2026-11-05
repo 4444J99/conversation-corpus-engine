@@ -168,3 +168,38 @@ def test_a_failed_merge_build_flags_the_retained_provider_and_keeps_surfaces_con
     ]
     assert "retained from the previous build" in payload["problems"][0]
     assert payload["stages"]["ingest"]["providers"]["grok"]["retained"] is True
+
+
+# --- A4: a failed rebuild without --merge keeps the previous receipt -----------------------------
+
+
+def test_failed_rebuild_without_merge_keeps_the_previous_receipt(archive_env) -> None:
+    original = ingest(**_kwargs(archive_env, providers=["grok"]))["providers"]["grok"]
+    _corrupt_grok(archive_env)
+    manifest = ingest(**_kwargs(archive_env, providers=["grok"]))
+    failed = manifest["providers"]["grok"]
+    assert failed["status"] == "failed"
+    assert failed["layout"] == original["layout"]
+    assert failed["conversations"] == original["conversations"]
+    assert failed["source_files"] == original["source_files"]
+    assert failed["failed_attempt"]["status"] == "failed"
+    assert failed["failed_attempt"]["error"] == failed["error"]
+    assert manifest["totals"]["conversations"] == original["conversations"]
+    assert sum(1 for _ in iter_store(archive_env.paths)) == original["conversations"]
+
+
+def test_failed_rebuild_keeps_the_receipt_of_a_provider_that_was_never_ok_plain(
+    archive_env,
+) -> None:
+    # No previous receipt to keep: the failed result stands alone and nothing is invented.
+    _corrupt_grok(archive_env)
+    failed = ingest(**_kwargs(archive_env, providers=["grok"]))["providers"]["grok"]
+    assert failed["status"] == "failed" and "failed_attempt" not in failed
+    assert "layout" not in failed
+
+
+def test_a_rebuild_ignores_an_unreadable_previous_manifest(archive_env) -> None:
+    ingest(**_kwargs(archive_env, providers=["grok"]))
+    archive_env.paths.manifest.write_text("{not json", encoding="utf-8")
+    manifest = ingest(**_kwargs(archive_env, providers=["grok"]))
+    assert manifest["providers"]["grok"]["status"] == "ok"

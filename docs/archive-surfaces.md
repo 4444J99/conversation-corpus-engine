@@ -232,8 +232,9 @@ manifest. Older manifests without the source-ID list use their existing library 
 as the compatibility check; they cannot prove identity preservation within an equal-size
 replacement generation. Providers not selected keep their original input and build receipts.
 Captured identities remain protected across later merges after an account export absorbs them.
-A failed provider rebuild retains the previous shards and their input receipt, alongside a
-separate failed-attempt receipt; failure does not erase the protection for the next retry. The
+A failed provider rebuild, with or without `--merge`, retains the previous shards and their
+input receipt, alongside a separate failed-attempt receipt (a provider that had no shards before
+has nothing to retain, and an unreadable previous manifest retains nothing); failure does not erase the protection for the next retry. The
 manifest totals keep counting those retained conversations, so the vault, site, search store,
 graph and turn store keep serving them too (the surfaces and the totals never disagree), and
 `cce archive verify` fails with `provider X failed: … (serving the N conversation(s) retained
