@@ -22,10 +22,12 @@ from .archive_ingest import (
     ArchivePaths,
     MergeInputLoss,
     authorize_archive,
+    check_export_zips,
     failed_providers,
     has_bounded_layout,
     ingest,
     load_manifest,
+    retained_after_failure,
 )
 from .archive_limits import Limits, census_problems, take_census
 from .archive_naming import names_payload, render_names_text, verify_names
@@ -34,6 +36,7 @@ from .archive_site import build_site, count_conversation_pages
 from .archive_topics import build_analysis
 from .archive_turns import list_turns
 from .archive_vault import build_vault, count_conversation_notes, verify_vault
+from .archive_wiki import verify_site_wiki
 from .corpus_store import (
     CorpusReadAuthorization,
     CorpusStoreError,
@@ -193,7 +196,7 @@ def verify_layout(paths: ArchivePaths, manifest: dict[str, Any]) -> list[str]:
     """Check the bounded layout's own promises: shards, author counts, notes, pages and limits."""
     problems: list[str] = []
     for name, info in manifest["providers"].items():
-        if info.get("status") != "ok":
+        if info.get("status") != "ok" and not retained_after_failure(info):
             continue
         problems += [
             f"{name}: {item}" for item in reconcile(info.get("authors", {}), info["messages"])
@@ -222,16 +225,28 @@ def verify_layout(paths: ArchivePaths, manifest: dict[str, Any]) -> list[str]:
     return problems
 
 
-def verify_archive(paths: ArchivePaths, limits: Limits | None = None) -> list[str]:
-    """Cross-check every surface against the ingest manifest; empty list means consistent."""
+def verify_archive(
+    paths: ArchivePaths, limits: Limits | None = None, *, report: dict[str, Any] | None = None
+) -> list[str]:
+    """Cross-check every surface against the ingest manifest; empty list means consistent.
+
+    A caller that passes a `report` dict gets the wiki block (what the site checked, with counts)
+    under its `wiki` key.
+    """
     try:
         manifest = load_manifest(paths)
     except FileNotFoundError as exc:
         return [str(exc)]
-    problems = [
-        f"provider {name} failed: {manifest['providers'][name].get('error', '')}"
-        for name in failed_providers(manifest)
-    ]
+    problems = []
+    for name in failed_providers(manifest):
+        info = manifest["providers"][name]
+        kept = (
+            f" (serving the {info.get('conversations', 0)} conversation(s) retained from the "
+            "previous build)"
+            if retained_after_failure(info)
+            else ""
+        )
+        problems.append(f"provider {name} failed: {info.get('error', '')}{kept}")
     total = manifest["totals"]["conversations"]
     enrichment = paths.enrichment
     if not enrichment.is_file():
@@ -257,6 +272,10 @@ def verify_archive(paths: ArchivePaths, limits: Limits | None = None) -> list[st
     pages = count_conversation_pages(paths)
     if pages != total:
         problems.append(f"site has {pages} conversation page(s), manifest has {total}")
+    wiki = verify_site_wiki(paths)
+    problems += wiki["problems"]
+    if report is not None:
+        report["wiki"] = wiki
     if has_bounded_layout(manifest):
         problems += verify_layout(paths, manifest)
         problems += census_problems(
@@ -319,7 +338,12 @@ def run_stages(
             result[stage] = {
                 "totals": manifest["totals"],
                 "providers": {
-                    name: {k: info.get(k) for k in ("status", "conversations", "messages", "error")}
+                    name: {
+                        **{
+                            k: info.get(k) for k in ("status", "conversations", "messages", "error")
+                        },
+                        **({"retained": True} if retained_after_failure(info) else {}),
+                    }
                     for name, info in manifest["providers"].items()
                 },
             }
@@ -374,6 +398,14 @@ def add_archive_parser(subparsers: Any) -> None:
             type=Path,
             default=[],
             help="extra ChatGPT conversation JSON (live delta); wins over export shards",
+        )
+        parser.add_argument(
+            "--export-zip",
+            action="append",
+            default=[],
+            metavar="PROVIDER=PATH",
+            help="the outer export ZIP a provider's folder was unpacked from: its SHA-256 and "
+            "size are recorded in the manifest (the ZIP itself is not read)",
         )
         parser.add_argument("--include-attachment-text", action="store_true")
         parser.add_argument(
@@ -509,6 +541,18 @@ def _overrides(raw: list[str]) -> dict[str, Path]:
     return out
 
 
+def _export_zips(raw: list[str]) -> dict[str, list[Path]]:
+    out: dict[str, list[Path]] = {}
+    for item in raw:
+        name, sep, value = item.partition("=")
+        if not sep or name not in PROVIDER_SPECS or not value:
+            raise ValueError(
+                f"--export-zip must be PROVIDER=PATH with a known provider, got: {item}"
+            )
+        out.setdefault(name, []).append(Path(value))
+    return out
+
+
 def _handle_project(args: argparse.Namespace) -> int:
     if args.target not in {"feed", "corpus"}:
         raise ValueError(f"unsupported projection: {args.target}")
@@ -596,9 +640,16 @@ def handle_archive(args: argparse.Namespace) -> int:
 
     if action in {"ingest", "build"}:
         providers = args.provider or None
+        try:
+            export_zips = _export_zips(args.export_zip)
+            check_export_zips(export_zips, providers or list(PROVIDER_SPECS))
+        except ValueError as exc:
+            print(f"archive refused: {exc}", file=sys.stderr)
+            return 2
         options = {
             "chatgpt_extra_files": args.chatgpt_extra,
             "include_attachment_text": args.include_attachment_text,
+            "export_zips": export_zips,
         }
         stages = ("ingest",) if action == "ingest" else STAGES
         limits = limits_from_args(args)
@@ -616,9 +667,15 @@ def handle_archive(args: argparse.Namespace) -> int:
         except MergeInputLoss as exc:
             print(f"archive merge refused: {exc}", file=sys.stderr)
             return 2
-        problems = verify_archive(paths, limits) if action == "build" else []
+        verified: dict[str, Any] = {}
+        problems = verify_archive(paths, limits, report=verified) if action == "build" else []
         failed = [n for n, i in result["ingest"]["providers"].items() if i["status"] == "failed"]
-        payload = {"stages": result, "problems": problems, "ok": not problems and not failed}
+        payload = {
+            "stages": result,
+            "problems": problems,
+            "ok": not problems and not failed,
+            **({"wiki": verified["wiki"]} if "wiki" in verified else {}),
+        }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0 if payload["ok"] else 1
 
@@ -628,8 +685,9 @@ def handle_archive(args: argparse.Namespace) -> int:
         return 0
 
     if action == "verify":
-        problems = verify_archive(paths, limits_from_args(args))
-        print(json.dumps({"ok": not problems, "problems": problems}, indent=2))
+        verified = {}
+        problems = verify_archive(paths, limits_from_args(args), report=verified)
+        print(json.dumps({"ok": not problems, "problems": problems, **verified}, indent=2))
         return 0 if not problems else 1
 
     if action == "turns":

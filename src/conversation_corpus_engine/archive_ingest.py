@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import itertools
 import json
@@ -27,6 +28,7 @@ from . import (
 )
 from .archive_author import AUTHORS, author_of, container_of
 from .archive_limits import SHARD_BYTES
+from .archive_lineage import record_generation
 from .archive_model import (
     SCHEMA,
     Conversation,
@@ -64,6 +66,8 @@ FINGERPRINT_EXCLUDED_KEYS = frozenset({"source_root", "error", "build_options", 
 
 SOURCE_EXPORT = "export"
 SOURCE_LIBRARY = "library"
+# The origin of an outer export ZIP named with `--export-zip`: hashed, never opened by a reader.
+EXPORT_ARCHIVE_ORIGIN = "export_archive"
 
 
 @dataclass(frozen=True)
@@ -232,6 +236,16 @@ class ArchivePaths:
         return self.root / layout.TOPICS_FILENAME
 
     @property
+    def lineage(self) -> Path:
+        """The ledger of generations (what each ingest added, changed or removed)."""
+        return self.root / layout.LINEAGE_FILENAME
+
+    @property
+    def digests(self) -> Path:
+        """The content digest of every conversation as of the latest generation."""
+        return self.root / layout.DIGESTS_FILENAME
+
+    @property
     def vault(self) -> Path:
         return self.root / layout.VAULT_DIRNAME
 
@@ -322,7 +336,12 @@ class ArchivePaths:
         if isinstance(manifest, dict):
             info = manifest.get("providers", {}).get(provider)
             if isinstance(info, dict) and "status" in info:
-                return info.get("status") == "ok"
+                if info.get("status") == "ok":
+                    return True
+                # A failed rebuild keeps the previous shards and their receipt, and the totals
+                # still count them: every reader of the store must see them, and `verify` flags
+                # the provider as failed.
+                return retained_after_failure(info) and bool(self.conversation_files(provider))
         return bool(self.conversation_files(provider))
 
     def feed(self, provider: str) -> Path:
@@ -391,6 +410,10 @@ class ArchivePaths:
     @property
     def site_pages(self) -> Path:
         return self.site / layout.SITE_PAGES_DIRNAME
+
+    @property
+    def site_hubs(self) -> Path:
+        return self.site / layout.SITE_HUBS_DIRNAME
 
     @property
     def site_home(self) -> Path:
@@ -578,6 +601,43 @@ class MergeInputLoss(ValueError):
     """A merge would omit inputs which contributed to the existing provider."""
 
 
+# What a reader or its source can raise while a provider is read; the ingest isolates the
+# provider on any of these, and the merge check treats them as "cannot be checked".
+READ_ERRORS = (
+    OSError,
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+    IndexError,
+    sqlite3.Error,
+    zlib.error,
+)
+
+
+def receipt_holds_shards(info: dict[str, Any]) -> bool:
+    """True when a provider's receipt describes conversation shards that exist in the store."""
+    return info.get("status") in {"ok", "failed"} and (
+        bool(info.get("conversations")) or bool(info.get("layout", {}).get("shards"))
+    )
+
+
+def retained_after_failure(info: dict[str, Any]) -> bool:
+    """True for a failed provider whose previous shards and receipt were kept (`failed_attempt`
+    holds the new, failed receipt)."""
+    return (
+        info.get("status") == "failed" and "failed_attempt" in info and receipt_holds_shards(info)
+    )
+
+
+def _would_be_absent(spec: ProviderSpec, root: Path, options: dict[str, Any]) -> bool:
+    """True when this call has nothing to read for the provider: no source of its own, no extra
+    live-capture file and no supplement (the library pages a ChatGPT build can take)."""
+    own = root.exists() and spec.module.detect(root)
+    extra_files = options.get("chatgpt_extra_files", []) if spec.name == "chatgpt" else []
+    return not (own or extra_files or (spec.supplement is not None and spec.supplement(options)))
+
+
 def _check_merge_inputs(
     previous: dict[str, Any], sources: dict[str, Path], options: dict[str, Any]
 ) -> None:
@@ -602,42 +662,87 @@ def _check_merge_inputs(
                     f"{name}: library inputs would be lost; provide the complete --library-root "
                     "(or library --source), or explicitly acknowledge removal with --allow-input-loss"
                 )
-        if name == "chatgpt":
-            required_uids = set(old.get("live_capture_uids", []))
-            if required_uids:
-                available_uids: set[str] = set()
-                tracker = SourceTracker(
-                    root, archive_read_chatgpt.READER, hash_cache=options.get("source_hash_cache")
-                )
-                try:
-                    for conversation in _chatgpt(root, tracker, options):
-                        finalize_conversation(conversation)
-                        available_uids.add(conversation.uid)
-                        if required_uids <= available_uids:
-                            break
-                except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
-                    raise MergeInputLoss(
-                        "chatgpt: live capture inputs cannot be checked; supply complete readable inputs "
-                        "or explicitly acknowledge removal with --allow-input-loss"
-                    ) from exc
-                if required_uids - available_uids:
-                    raise MergeInputLoss(
-                        "chatgpt: live capture records would be lost; supply the previous records "
-                        "in --chatgpt-extra or the account export, or acknowledge removal with --allow-input-loss"
-                    )
-                continue
-            old_files = old.get("build_options", {}).get("chatgpt_extra_files", [])
-            required = {Path(path).resolve() for path in old_files}
-            current = {
-                Path(path).resolve()
-                for path in options.get("chatgpt_extra_files", [])
-                if Path(path).is_file()
-            }
-            if required - current:
+        _check_live_capture_inputs(name, root, old, options)
+    # The specific refusals above come first; this one covers a source that is simply not there.
+    for name, root in sources.items():
+        if receipt_holds_shards(previous.get(name, {})) and _would_be_absent(
+            PROVIDER_SPECS[name], root, options
+        ):
+            raise MergeInputLoss(
+                f"{name}: the source is absent, so its previous conversations would be orphaned; "
+                "supply the source, or explicitly acknowledge removal with --allow-input-loss"
+            )
+
+
+def _check_live_capture_inputs(
+    name: str, root: Path, old: dict[str, Any], options: dict[str, Any]
+) -> None:
+    """Refuse a merge that would drop a captured identity the provider already holds.
+
+    Every provider whose inputs are live captures (the ChatGPT delta files, the Copilot pages
+    and reports, the local-session memory) records the normalized ids it read; the new inputs
+    must still carry each of them, in a capture or, for ChatGPT, in an account export.
+    """
+    spec = PROVIDER_SPECS[name]
+    required_uids = set(old.get("live_capture_uids", []))
+    if required_uids:
+        available_uids: set[str] = set()
+        if not _would_be_absent(spec, root, options):
+            tracker = SourceTracker(
+                root, spec.module.READER, hash_cache=options.get("source_hash_cache")
+            )
+            try:
+                for conversation in spec.open_reader(root, tracker, options):
+                    finalize_conversation(conversation)
+                    available_uids.add(conversation.uid)
+                    if required_uids <= available_uids:
+                        break
+            except READ_ERRORS as exc:
                 raise MergeInputLoss(
-                    "chatgpt: live capture inputs would be lost; repeat --chatgpt-extra, "
-                    "or explicitly acknowledge removal with --allow-input-loss"
-                )
+                    f"{name}: live capture inputs cannot be checked; supply complete readable "
+                    "inputs or explicitly acknowledge removal with --allow-input-loss"
+                ) from exc
+        if required_uids - available_uids:
+            where = (
+                "in --chatgpt-extra or the account export"
+                if name == "chatgpt"
+                else "in the capture source"
+            )
+            raise MergeInputLoss(
+                f"{name}: live capture records would be lost; supply the previous records "
+                f"{where}, or acknowledge removal with --allow-input-loss"
+            )
+        return
+    if name == "chatgpt":
+        old_files = old.get("build_options", {}).get("chatgpt_extra_files", [])
+        required = {Path(path).resolve() for path in old_files}
+        current = {
+            Path(path).resolve()
+            for path in options.get("chatgpt_extra_files", [])
+            if Path(path).is_file()
+        }
+        if required - current:
+            raise MergeInputLoss(
+                "chatgpt: live capture inputs would be lost; repeat --chatgpt-extra, "
+                "or explicitly acknowledge removal with --allow-input-loss"
+            )
+
+
+def _export_zips(options: dict[str, Any], provider: str) -> list[Path]:
+    """The outer export ZIPs the caller named for a provider (`--export-zip PROVIDER=PATH`)."""
+    return [Path(path) for path in (options.get("export_zips") or {}).get(provider, ())]
+
+
+def check_export_zips(export_zips: dict[str, list[Path]], selected: list[str]) -> None:
+    """Refuse an `--export-zip` for an unknown or unselected provider, or for a missing file."""
+    for name, zips in export_zips.items():
+        if name not in PROVIDER_SPECS:
+            raise ValueError(f"--export-zip names an unknown provider: {name}")
+        if name not in selected:
+            raise ValueError(f"--export-zip {name}: the provider is not part of this build")
+        for path in zips:
+            if not Path(path).is_file():
+                raise ValueError(f"--export-zip {name}: not a file: {path}")
 
 
 def _provider_build_options(
@@ -652,6 +757,7 @@ def _provider_build_options(
         ]
         if spec.name == "chatgpt"
         else [],
+        "export_zips": [str(Path(path).resolve()) for path in _export_zips(options, spec.name)],
         "include_attachment_text": bool(options.get("include_attachment_text")),
         "shard_bytes": int(options.get("shard_bytes") or SHARD_BYTES),
         "folder_entries": options.get("folder_entries"),
@@ -661,14 +767,9 @@ def _provider_build_options(
 def _ingest_provider(
     spec: ProviderSpec, root: Path, paths: ArchivePaths, options: dict[str, Any]
 ) -> dict[str, Any]:
-    own = root.exists() and spec.module.detect(root)
     extra_files = options.get("chatgpt_extra_files", []) if spec.name == "chatgpt" else []
     build_options = _provider_build_options(spec, root, options)
-    if (
-        not own
-        and not extra_files
-        and not (spec.supplement is not None and spec.supplement(options))
-    ):
+    if _would_be_absent(spec, root, options):
         return {
             "status": "absent",
             "source_root": str(root),
@@ -689,6 +790,8 @@ def _ingest_provider(
         path_origins={Path(path): "live_capture" for path in extra_files},
         hash_cache=options.get("source_hash_cache"),
     )
+    for zip_path in _export_zips(options, spec.name):
+        tracker.declare_input(zip_path, origin=EXPORT_ARCHIVE_ORIGIN)
     seen: dict[str, str] = {}
     library_uids: set[str] = set()
     live_capture_uids: set[str] = set()
@@ -751,16 +854,7 @@ def _ingest_provider(
             if conversation.last_activity:
                 activity.append(conversation.last_activity)
         shards = writer.close()
-    except (
-        OSError,
-        ValueError,
-        KeyError,
-        TypeError,
-        AttributeError,
-        IndexError,
-        sqlite3.Error,
-        zlib.error,
-    ) as exc:
+    except READ_ERRORS as exc:
         error = f"{type(exc).__name__}: {exc}"
     if error:
         writer.close()
@@ -774,6 +868,8 @@ def _ingest_provider(
             "inputs": tracker.inputs(),
         }
     _publish_shards(paths, spec.name, build, folder_entries=options.get("folder_entries"))
+    # The digests of what this provider now holds, for the lineage of generations.
+    options.setdefault("lineage_digests", {})[spec.name] = seen
     # Resolve each shard's on-disk path (flat or grouped) for its checksum.
     on_disk = {p.name: p for p in paths.shard_files(spec.name)}
     for shard in shards:
@@ -857,6 +953,12 @@ def ingest(
     if library_root is not None:
         options["library_root"] = library_root.resolve()
     sources = resolve_sources(export_root, providers, overrides, library_root)
+    export_zips = {
+        name: [Path(path) for path in zips]
+        for name, zips in (options.get("export_zips") or {}).items()
+    }
+    check_export_zips(export_zips, list(sources))
+    options["export_zips"] = export_zips
     report: dict[str, Any] = {}
     if merge and paths.manifest.is_file():
         report.update(load_manifest(paths)["providers"])
@@ -865,10 +967,17 @@ def ingest(
         }
         if not allow_input_loss:
             _check_merge_inputs(report, sources, options)
+    # Without --merge the manifest lists only this call's providers, but a provider that fails
+    # still has its previous shards on disk: its previous receipt is the one to keep. An
+    # unreadable previous manifest keeps nothing; it never blocks a rebuild.
+    prior: dict[str, Any] = {}
+    if not merge and paths.manifest.is_file():
+        with contextlib.suppress(ValueError, OSError, KeyError, TypeError):
+            prior = load_manifest(paths)["providers"]
     for name, root in sources.items():
-        previous = report.get(name)
+        previous = report.get(name) if merge else prior.get(name)
         result = _ingest_provider(PROVIDER_SPECS[name], root, paths, options)
-        if previous and result["status"] == "failed":
+        if previous and result["status"] == "failed" and (merge or receipt_holds_shards(previous)):
             # _ingest_provider leaves the previous shards in place on failure. Keep their
             # original input/identity receipt too, so a later retry cannot bypass protection.
             result = {
@@ -901,6 +1010,9 @@ def ingest(
                 name: str(path.resolve()) for name, path in (overrides or {}).items()
             },
             "library_root": str(library_root.resolve()) if library_root is not None else None,
+            "export_zips": {
+                name: [str(path.resolve()) for path in zips] for name, zips in export_zips.items()
+            },
             "merge": merge,
             "allow_input_loss": allow_input_loss,
         },
@@ -916,6 +1028,21 @@ def ingest(
         },
     }
     write_json_atomic(paths.manifest, manifest)
+    try:
+        day = latest_activity_day(manifest)
+    except ValueError:  # no provider reports any activity: the generation has no day
+        day = ""
+    record_generation(
+        paths,
+        manifest,
+        options.get("lineage_digests", {}),
+        read=sources.keys(),
+        day=day,
+        digest_store=lambda name: {
+            conversation.uid: content_digest(conversation)
+            for conversation in iter_store(paths, [name])
+        },
+    )
     return manifest
 
 

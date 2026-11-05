@@ -9,6 +9,7 @@ NAME_PLACEHOLDERS = {
     "__STYLE__": layout.SITE_STYLE_FILENAME,
     "__HOME__": layout.SITE_HOME_FILENAME,
     "__GRAPH_PAGE__": layout.SITE_GRAPH_PAGE_FILENAME,
+    "__CHANGES_PAGE__": layout.SITE_CHANGES_PAGE_FILENAME,
     "__HOME_SCRIPT__": layout.SITE_HOME_SCRIPT_FILENAME,
     "__GRAPH_SCRIPT__": layout.SITE_GRAPH_SCRIPT_FILENAME,
     "__INDEX_DATA__": layout.SITE_INDEX_DATA_FILENAME,
@@ -96,12 +97,22 @@ details { margin: 6px 0; } summary { cursor: pointer; }
   margin: 14px 0; padding: 4px 14px 10px; }
 .page article.msg > header { color: var(--muted); font-size: .8rem; padding-top: 8px; text-transform: uppercase; letter-spacing: .04em; }
 .page article.user { border-left: 4px solid var(--accent); }
+.page article.author-human > header, .page article.author-human summary { color: var(--fg);
+  font-weight: 600; }
 .page .body { overflow-wrap: anywhere; }
 .page .body pre { background: rgba(127,127,127,.12); padding: 10px; border-radius: 8px; overflow-x: auto; }
 .page .body code { font: .88em ui-monospace, SFMono-Regular, Menlo, monospace; }
-.page .related li { margin: 2px 0; }
+.page .related li, .page .backlinks li { margin: 2px 0; }
+.page .backlinks { margin-top: 24px; border-top: 1px solid var(--line); }
+.page .backlinks li.hub { color: var(--muted); }
+.page .history { margin-top: 16px; }
+.page ul.hub-rows { list-style: none; padding: 0; }
+.page ul.hub-rows li { margin: 4px 0; }
 .page h1 { font-size: 1.4rem; margin: 18px 0 6px; }
 .attach { color: var(--muted); font-size: .85rem; margin: 6px 0 0; }
+.page nav.toc { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 8px 14px; margin: 14px 0; font-size: .92rem; }
+.page nav.toc ol { margin: 4px 0 0; padding-left: 1.4em; }
 .banner { color: var(--muted); font-size: .85rem; border-left: 3px solid var(--line); padding-left: 10px; }
 canvas#map { width: 100%; height: 70vh; background: var(--card); border: 1px solid var(--line);
   border-radius: 10px; }
@@ -125,7 +136,7 @@ INDEX_HTML = """\
 <header class="top">
   <h1>AI Archive</h1>
   <p id="stats">Loading…</p>
-  <nav><a href="__GRAPH_PAGE__">Topic map</a><a href="#coverage">Coverage</a></nav>
+  <nav><a href="__GRAPH_PAGE__">Topic map</a><a href="__CHANGES_PAGE__">Recent changes</a><a href="#coverage">Coverage</a></nav>
 </header>
 <noscript><p>This archive needs JavaScript for search. Conversation pages under
 <code>__PAGES__/</code> work without it.</p></noscript>

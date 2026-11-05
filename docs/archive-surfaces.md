@@ -87,7 +87,8 @@ whole build:
 | `manifest-all-vault.json` | the files the vault build generated, kept beside the manifest so the vault holds only notes and Obsidian's own settings; a rebuild prunes what it no longer writes, and removes the `.cce-vault-manifest.json` an earlier build left inside the vault |
 | `database-all-turns/` | the turn store: SQLite shards by author (`container-all-authored`, `container-all-machine`), provider and month, each with two FTS5 indexes (see *The two containers*) |
 | `graph-all/` | `index-all-nodes.jsonl`, `index-all-edges.jsonl`, `graph-all.graphml`, `report-all-graph.json` |
-| `site-all/` | open `home-all.html` directly, or use `cce archive serve`; pages sit in the same month folders as the vault |
+| `index-all-lineage.jsonl`, `index-all-digests.jsonl` | the lineage of generations: what each ingest added, changed or removed against the one before (append-only), and the content digest of every conversation as of the latest one (see *The site is a wiki*) |
+| `site-all/` | open `home-all.html` directly, or use `cce archive serve`; conversation pages sit in the same month folders as the vault; `hubs/` holds one page per topic hub; `report-all-changes.html` is the recent-changes page (see *The site is a wiki*) |
 | `feed-<p>-prompts.jsonl`, `receipt-<p>-prompts-<16hex>-<yyyymmdd>.json` | the prompt feed and its receipt, written by `cce archive project feed` (see *The prompt feed*) |
 
 ### The bounded layout (layout version 3)
@@ -219,17 +220,27 @@ cce archive ingest --export-root "$EXPORTS" --library-root "$OLD_STORE" --provid
 built one provider at a time and a failed one is read again alone; without it the manifest lists
 exactly the providers of the call. Before any selected provider is written, a merge checks its
 previous library and live-capture inputs. A library generation that lacks previously bridged
-source IDs refuses the merge. Live captures are checked by their normalized conversation IDs:
-omitting a delta file or refreshing a fixed filename with only newer records cannot remove
-earlier records, even when two input files share a basename. A complete account export may
-replace a delta if it contains all of those identities. Intentional removal requires
+source IDs refuses the merge. Live captures are checked by their normalized conversation IDs
+for every live-capture provider (the ChatGPT delta files, `copilot`, `copilotreports` and
+`localmemory`): omitting a capture file or refreshing a fixed filename with only newer records
+cannot remove earlier records, even when two input files share a basename. A complete account
+export may replace a ChatGPT delta if it contains all of those identities. A merge also refuses
+a selected provider whose source is absent (a missing or wrong folder) when the store already
+holds conversations for it, since the provider's receipt would become `absent` and its shards
+would be orphaned. Intentional removal requires
 `--allow-input-loss`, which is recorded in the
 manifest. Older manifests without the source-ID list use their existing library record count
 as the compatibility check; they cannot prove identity preservation within an equal-size
 replacement generation. Providers not selected keep their original input and build receipts.
 Captured identities remain protected across later merges after an account export absorbs them.
-A failed provider rebuild retains the previous shards and their input receipt, alongside a
-separate failed-attempt receipt; failure does not erase the protection for the next retry.
+A failed provider rebuild, with or without `--merge`, retains the previous shards and their
+input receipt, alongside a separate failed-attempt receipt (a provider that had no shards before
+has nothing to retain, and an unreadable previous manifest retains nothing); failure does not erase the protection for the next retry. The
+manifest totals keep counting those retained conversations, so the vault, site, search store,
+graph and turn store keep serving them too (the surfaces and the totals never disagree), and
+`cce archive verify` fails with `provider X failed: … (serving the N conversation(s) retained
+from the previous build)` until the provider is read again. The ingest summary marks such a
+provider `"retained": true`. The feed and corpus projections still skip any failed provider.
 Older live captures without recorded IDs cannot provide the same identity-level assurance;
 retain their original complete inputs for the first build that writes these receipts.
 
@@ -237,11 +248,30 @@ The manifest records effective build options and the files actually read, with t
 byte size and declared origin (`account_export`, `live_capture`, or `library_generation`). The
 library database and its pointer are both hashed, and the generation's record/evidence/report
 fingerprints are carried with them. A hash cache reads a shared library database only once per
-ingest. Live captures are listed separately from account-export shards in the channel report.
+ingest. Each input is keyed by its path relative to the provider's source root. A file outside
+the root (a delta, a library database) is keyed by its basename; when two inputs would share a
+key they are qualified as `external/<first 12 hex of the content SHA-256>/<name>`, so
+`source_files` and `inputs` never collapse them and no key holds an absolute host path. The
+`source_file` on each conversation row keeps the plain name and is paired with its
+`source_sha256`. Live captures are listed separately from account-export shards in the channel
+report: for ChatGPT, `channels.read` counts the export's shard files on one line and the delta
+files kept outside the export folder on the next, and together they equal the ChatGPT entries
+of `source_files` (a delta sits in `source_files` too, so a build with 29 shards and one delta
+lists 30 files and reports "29 conversation shard file(s)" plus "1 extra live capture
+file(s)"). This holds for a plain account export plus deltas; a library-bridged build also
+lists the library database and pointer in `source_files`, and its library line counts records,
+not files. A delta placed inside the export folder under a shard name (`conversations-NNN.json`)
+is counted on both lines and read twice (the second read folds as a duplicate); keep deltas
+outside the export folder.
 Origins describe the ingestion route; they are not a claim about who authored the text. An
-outer export ZIP that was unpacked before ingestion is not an input unless a reader opens it;
-preserve its original checksum in the capture receipt. Private source paths in build receipts
-belong in the private store, not in the code repository.
+outer export ZIP that was unpacked before ingestion is not read by any reader, so it is recorded
+only when named: `--export-zip PROVIDER=PATH` (repeatable) hashes the ZIP and records its
+SHA-256, byte size and the origin `export_archive` in that provider's `inputs` (not in
+`source_files`, which lists what a reader opened) and its path in the build options. The
+provider must be part of the build and the file must exist, or the command exits 2. Naming a ZIP
+changes the source fingerprint, as any recorded input does. A ZIP that is not named is not
+recorded; preserve its original checksum in the capture receipt. Private source paths in build
+receipts belong in the private store, not in the code repository.
 
 A conversation larger than a shard (one Antigravity session is
 about 170 MiB) is never cut: its shard is that one row, the manifest marks it `oversize_row`, and
@@ -432,6 +462,72 @@ Message text is neutralised: `[[links]]`, `![[embeds]]`, `#tags` and leading `#`
 conversation cannot create vault structure. Rebuilds track the files they generated, prune the
 stale ones, and never touch notes you add yourself.
 
+## The site is a wiki
+
+The static site behaves like a wiki without a server and without a script on any conversation,
+hub or changes page (the CSP is the same one as before: no `script-src`). Every page stays under
+`--note-bytes`; each of the sections below is measured into the page budget, and none of them
+moves an existing conversation page URL.
+
+- **Message anchors.** Every message on a conversation page is a link target `#message-N` (N is
+  its 1-based place in the conversation, the fragment the library records use); a message split
+  across pieces keeps that id on its first piece and numbers the others `message-N-piece-K`. An
+  id is stable across rebuilds.
+- **Table of contents.** A page with three or more headings gets a contents list linking to
+  them (`message-N-hK`). The list is capped at 40 entries and each label at 60 characters, and is
+  shortened before a page may pass the cap; the headings themselves stay whole in the text.
+- **What links here.** The first page of every conversation lists the notes that link to it,
+  read from the vault's own wikilink graph (`archive_vault.incoming_links`): the hub notes
+  that list it (provider, month, topic, collection) and the conversations that link to it
+  (their *Related* lines), the first 25 by title with the count of the rest. A continuation
+  note counts as the note it continues. The section is always present.
+- **Topic pages.** Every topic hub has one static page, `site-all/hubs/topic-all-<term>.html`
+  (continued on `part-all-pNNN-<hex>` pages past the cap, spilled into bucket folders like the
+  vault's hubs). Topic chips and the topic entries under *What links here* link to them; a
+  term with no hub name keeps filtering the home page. Provider, month and collection hubs stay
+  vault-only.
+- **Author labels.** A message names its author after its role (`User · human`,
+  `Assistant · machine`) and carries `author-human` or `author-machine`: the two containers of
+  the turn store.
+- **Recent changes and history.** Each ingest records a *generation*: the source fingerprint of
+  its manifest, its parent's fingerprint, and the uids it added, changed (the content digest
+  differs; where a conversation was read from does not count) or removed against the generation
+  before, in `index-all-lineage.jsonl`, with the digests of the latest generation in
+  `index-all-digests.jsonl`. A generation is named by its fingerprint and the data's own latest
+  day, never a clock, and re-ingesting unchanged sources adds nothing. The first generation lists
+  everything as added; with `--merge`, a provider carried over from a store that predates the
+  lineage is digested from the shards it already holds, so it is part of that first generation
+  and not "added" by the next merge. `report-all-changes.html` lists exactly what the latest generation
+  added, changed and removed (continued on linked pages past the cap) above a table of the last
+  20 generations, and each conversation page ends with a *History* section: its newest 8
+  revisions, linking to their row on that page while the generation is still in the table.
+  Nothing is derived by diffing pages.
+
+`cce archive verify` (and the verify that closes `build`) reports a `wiki` block (pages,
+messages and messages anchored, pages with a table of contents, backlink and history pages,
+turns by author, topic pages against topic hubs, generations, the `lineage` status and its note,
+recent-changes rows, links checked, dangling links) and fails when: a link, a fragment
+included, points at nothing (the home page's `#t=<term>` search fragment on a link to the home
+page is the one fragment that is not looked up as an anchor; any other fragment, one with an
+`=` included, must name an anchor of the page it points at); a message has no anchor or an id
+repeats; a page with three headings has no contents list; a page's *What links here* differs
+from the vault graph; a topic page is missing, has no hub, or lists other conversations than
+its hub; a message has no single author class or the labelled turns differ from the manifest's
+author counts; the lineage is broken (a ledger that holds no generation, digests with no
+ledger, a ledger that does not chain or does not end at the manifest); the recent-changes page
+differs from the latest generation; or a page's history differs from the ledger.
+
+`verify` only reads. A store ingested before the lineage existed has neither lineage file, and
+that is not a failure: it passes with `lineage` status `absent` and a note in the wiki block,
+zero generations, an empty recent-changes page and no page history. It stays that way until
+`cce archive build` records its first generation (an ingest or merge does too, and
+`cce archive site` then shows it); that first generation lists everything as added, and the
+status becomes `recorded`. The pass depends on the site agreeing with the lineage: a site that
+lists changes or history while no ledger backs them still fails, as does any lineage that
+exists and is inconsistent. (A site built before the wiki features also lacks anchors, backlinks
+and history sections, and fails those checks until `cce archive site` rebuilds it; that is the
+site being stale, not the lineage.)
+
 ## Data-grounding rules the surfaces follow
 
 - Scope is stated, not implied: every provider reports discovered / empty / duplicate / skipped
@@ -463,6 +559,10 @@ only once, and which independent copy has been verified.
 ## Known limits
 
 - Topic hubs are lexical (TF-IDF); they are a navigation aid, not a semantic ontology.
+- The lineage ledger is append-only and carries every uid a generation touched; a first
+  generation of a very large archive is one long row. It is not rotated.
+- *What links here* shows 25 conversations and the recent-changes page lists the latest
+  generation only; the full history of one page is in its *History* section.
 - Attachment contents (images, PDFs, audio) are not searchable.
 - The bridge from this layer into engine corpora and federation (families, entities, review
   queue) is not built yet; the two layers share a store but not an index.

@@ -79,7 +79,10 @@ def iter_conversations(root: Path, tracker: SourceTracker) -> Iterator[Conversat
     counters: dict[str, Any] = {}
     for conversation in iter_documents([_source(root)], report=counters):
         tracker.note("report_files")
-        tracker.provenance(Path(conversation.provenance["source_path"]))
+        declared = tracker.provenance(Path(conversation.provenance["source_path"]))
+        # The tracker's declared origin is what the ingest reads to record a live capture's
+        # identity; the document extractor's own provenance does not carry it.
+        conversation.provenance["source_origin"] = declared["source_origin"]
         for key in HOST_KEYS:
             conversation.provenance.pop(key, None)
         conversation.extra.pop("original_refs", None)

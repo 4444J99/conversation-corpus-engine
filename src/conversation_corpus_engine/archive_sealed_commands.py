@@ -35,6 +35,10 @@ def configure(parser: argparse.ArgumentParser) -> None:
     _unlock_options(init)
     init.add_argument("--key", type=Path, required=True)
     init.add_argument("--trust", type=Path, required=True)
+    fingerprint = commands.add_parser(
+        "fingerprint", help="Print the fingerprint of a public recipient file (read-only)"
+    )
+    fingerprint.add_argument("--recipient", type=Path, required=True)
     for action in (
         "publish",
         "plan",
@@ -57,12 +61,25 @@ def configure(parser: argparse.ArgumentParser) -> None:
             child.add_argument("--recipient", type=Path, action="append", required=True)
             child.add_argument("--rotate", action="store_true")
             child.add_argument("--budget", type=int, default=512 * 1024 * 1024)
+            child.add_argument(
+                "--audit-budget",
+                type=int,
+                default=None,
+                help="Cap on Git history bytes inspected before publishing (default 512 MiB)",
+            )
         if action in {"restore", "unit", "units"}:
             child.add_argument("--out", type=Path, required=True)
         if action == "unit":
             child.add_argument("--id-file", type=Path, required=True)
         if action == "repair":
             child.add_argument("--mirror", type=Path, required=True)
+        if action == "audit-history":
+            child.add_argument(
+                "--budget",
+                type=int,
+                default=None,
+                help="Cap on Git history bytes inspected (default 512 MiB)",
+            )
 
 
 def add_sealed_parser(subparsers: Any) -> None:
@@ -96,6 +113,14 @@ def _dispatch(args: argparse.Namespace, sealed: Any) -> dict[str, Any]:
     def read(path: Path) -> Any:
         return json.loads(sealed.private_path(path).read_bytes())
 
+    if args.sealed_action == "fingerprint":
+        from .archive_sealed_crypto import recipient_fingerprint  # noqa: PLC0415 - optional dep
+
+        # Public recipient record only: no unlock, no private material, nothing written.
+        return {
+            "algorithm": "sha256",
+            "fingerprint": recipient_fingerprint(read(args.recipient)),
+        }
     passphrase = None
     if args.passphrase_file:
         path = sealed.private_path(args.passphrase_file)
@@ -139,6 +164,7 @@ def _dispatch(args: argparse.Namespace, sealed: Any) -> dict[str, Any]:
             [read(path) for path in args.recipient],
             rotate=args.rotate,
             budget=args.budget,
+            audit_budget=args.audit_budget,
         )
     if args.sealed_action == "verify":
         return sealed.verify(args.repo, identity, args.trust)
@@ -149,7 +175,7 @@ def _dispatch(args: argparse.Namespace, sealed: Any) -> dict[str, Any]:
     if args.sealed_action == "status":
         return sealed.storage_status(args.repo, identity, args.trust)
     if args.sealed_action == "audit-history":
-        return sealed.audit_history(args.repo, identity, args.trust)
+        return sealed.audit_history(args.repo, identity, args.trust, budget=args.budget)
     out = sealed.private_path(args.out)
     if args.sealed_action == "unit":
         unit_id = sealed.private_path(args.id_file).read_text().strip()

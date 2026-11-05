@@ -85,6 +85,12 @@ def collect_owner_segments(
 
     Each annotation references a whole message. Duplicate references are rejected to
     prevent inflated profile frequencies. Uncovered portions remain unknown.
+
+    A message that is unchanged across several accepted revisions of one source is
+    counted once: each span is keyed by ``(uid, sequence, message_id, span text digest)``
+    plus its occurrence ordinal among identical spans of that message and whether it is
+    owner-eligible, so repeated identical spans inside one message still count separately
+    and a span first seen unattributed can still count once when a later revision asserts it.
     """
     require_text(owner_id, "owner_id")
     if not isinstance(annotations, list):
@@ -92,6 +98,7 @@ def collect_owner_segments(
     owner: list[str] = []
     other: list[str] = []
     seen: set[tuple[str, str, str, int]] = set()
+    counted: set[tuple[str, str, str, str, int, bool]] = set()
     for entry in annotations:
         if not isinstance(entry, dict):
             raise ValueError("annotation entry must be an object")
@@ -103,8 +110,24 @@ def collect_owner_segments(
         if identity in seen:
             raise ValueError("duplicate annotation for canonical source message")
         seen.add(identity)
+        ordinals: dict[str, int] = {}
         for span in attributed_spans(message["text"], entry.get("attribution")):
-            (owner if owner_profile_eligible(span, owner_id) else other).append(span["text"])
+            span_digest = text_digest(span["text"])
+            ordinal = ordinals.get(span_digest, 0)
+            ordinals[span_digest] = ordinal + 1
+            eligible = owner_profile_eligible(span, owner_id)
+            span_identity = (
+                ref["uid"],
+                ref["sequence"],
+                ref["message_id"],
+                span_digest,
+                ordinal,
+                eligible,
+            )
+            if span_identity in counted:
+                continue
+            counted.add(span_identity)
+            (owner if eligible else other).append(span["text"])
     return owner, other
 
 

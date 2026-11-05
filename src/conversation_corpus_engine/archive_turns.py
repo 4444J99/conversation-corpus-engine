@@ -31,7 +31,12 @@ from typing import Any, NamedTuple
 from . import archive_layout as layout
 from .archive_author import AUTHOR_BY_CONTAINER, AUTHORS, CONTAINER_BY_AUTHOR, HUMAN, MACHINE
 from .archive_database import fts_query
-from .archive_ingest import ArchivePaths, load_manifest, require_inside
+from .archive_ingest import (
+    ArchivePaths,
+    load_manifest,
+    require_inside,
+    retained_after_failure,
+)
 from .archive_model import Conversation, iter_conversations, sha256_file, write_json_atomic
 from .archive_shard import UNDATED, parse_shard_subject, shard_sort_key
 from .archive_topics import load_enrichment
@@ -315,7 +320,7 @@ def verify_turn_store(paths: ArchivePaths) -> list[str]:
     expected = {
         name: info.get("authors", {})
         for name, info in manifest["providers"].items()
-        if info.get("status") == "ok"
+        if info.get("status") == "ok" or retained_after_failure(info)
     }
     found: dict[str, dict[str, int]] = {}
     for container, info in turns.get("containers", {}).items():

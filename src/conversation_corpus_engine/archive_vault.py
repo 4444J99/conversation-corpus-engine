@@ -18,7 +18,7 @@ from .archive_ingest import (
 from .archive_layout import wikilink
 from .archive_limits import Limits
 from .archive_model import Conversation, Message, write_json_atomic, write_text_atomic
-from .archive_naming import NameLedger
+from .archive_naming import NameLedger, parse_name
 from .archive_shard import part_folder, plan_conversation_folders, plan_flat_folders
 from .archive_split import fit_blocks, pack, paginate_rows, utf8_size
 from .archive_text import FenceTracker
@@ -544,6 +544,61 @@ def verify_vault(paths: ArchivePaths) -> list[str]:
                 dangling[target] += 1
     problems += [f"dangling wikilink [[{t}]] x{n}" for t, n in sorted(dangling.items())[:20]]
     return problems
+
+
+HUB_PREFIXES = ("provider-", "month-", "topic-", "collection-")
+
+
+def part_owners(names: set[str]) -> dict[str, str]:
+    """Which note each continuation (`part-...`) note continues.
+
+    A part's name hashes the name of the note it continues, so the owners are found by minting
+    the part names of every conversation note and hub in order (p002, p003, ...) until one is
+    not a note of the vault.
+    """
+    owners: dict[str, str] = {}
+    for name in names:
+        if name.startswith(layout.CONVERSATION_PREFIX):
+            scope = parse_name(name).scope
+        elif name.startswith(HUB_PREFIXES):
+            scope = "all"
+        else:
+            continue
+        number = 2
+        while scope and (part := layout.part_name(scope, number, name)) in names:
+            owners[part] = name
+            number += 1
+    return owners
+
+
+def incoming_links(paths: ArchivePaths) -> dict[str, set[str]]:
+    """The vault's wikilink graph, backwards: for each conversation note, the notes that link to it.
+
+    A continuation note counts as the note it continues, so a long thread does not link to
+    itself and a hub that spills onto continuation pages still links every row it holds. A
+    note is never its own source. Only the links Obsidian would resolve are counted
+    (`link_targets`). An archive with no vault has no links.
+    """
+    manifest_path = paths.vault_manifest
+    if not manifest_path.is_file():
+        return {}
+    notes = [
+        rel
+        for rel in json.loads(manifest_path.read_text(encoding="utf-8")).get("files", [])
+        if rel.endswith(".md")
+    ]
+    owners = part_owners({Path(rel).stem for rel in notes})
+    incoming: dict[str, set[str]] = defaultdict(set)
+    for rel in notes:
+        source_file = paths.vault / rel
+        if not source_file.is_file():
+            continue
+        stem = Path(rel).stem
+        source = owners.get(stem, stem)
+        for target in set(link_targets(source_file.read_text(encoding="utf-8"))):
+            if target.startswith(layout.CONVERSATION_PREFIX) and target != source:
+                incoming[target].add(source)
+    return dict(incoming)
 
 
 def count_conversation_notes(paths: ArchivePaths) -> int:

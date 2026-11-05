@@ -452,12 +452,50 @@ class SourceTracker:
         except ValueError:
             return path.name
 
+    def _keys(self) -> dict[Path, str]:
+        """The manifest key of every input read, unique across the inputs.
+
+        A file under the root keeps its relative path. A file outside it (a delta, a library
+        database) is keyed by its basename, so two of them with one name would collapse into one
+        entry; those, and any that share a name with a file under the root, are qualified by a
+        prefix of their own content digest (`external/<digest>/<name>`). The key never holds an
+        absolute path, and an input nobody collides with keeps its plain name.
+        """
+        names = {path: self.relative(path) for path in self._inputs}
+        counts = Counter(names.values())
+        keys: dict[Path, str] = {}
+        for path, name in names.items():
+            inside = path.is_relative_to(self.root)
+            if counts[name] > 1 and not inside:
+                digest = self._inputs[path]["sha256"][:12]
+                keys[path] = f"external/{digest}/{name}"
+            else:
+                keys[path] = name
+        return keys
+
     def hashes(self) -> dict[str, str]:
-        return {self.relative(path): digest for path, digest in sorted(self._hashes.items())}
+        keys = self._keys()
+        return {keys[path]: digest for path, digest in sorted(self._hashes.items())}
 
     def inputs(self) -> list[dict[str, Any]]:
         """Files actually read, including container bytes and the caller-declared origin."""
-        return sorted(self._inputs.values(), key=lambda item: (item["source_file"], item["sha256"]))
+        keys = self._keys()
+        return sorted(
+            ({**item, "source_file": keys[path]} for path, item in self._inputs.items()),
+            key=lambda item: (item["source_file"], item["sha256"]),
+        )
+
+    def declare_input(self, path: Path, *, origin: str) -> None:
+        """Record a file the build was handed but no reader opens (the outer export ZIP the
+        export was unpacked from): its SHA-256, size and origin join `inputs`, not `hashes`."""
+        resolved = path.resolve()
+        if resolved not in self._inputs:
+            self._inputs[resolved] = {
+                "source_file": self.relative(path),
+                "sha256": sha256_file(path, self._hash_cache),
+                "size_bytes": resolved.stat().st_size,
+                "origin": origin,
+            }
 
     def provenance(
         self, path: Path, *, member: str = "", origin: str | None = None

@@ -21,8 +21,9 @@ def _write_transcript(root: Path, name: str, turns: list[dict[str, str]]) -> Pat
 class PersonaExtractTests(unittest.TestCase):
     def test_no_source_returns_curated_scaffold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            payload = extract_persona_lexicon(Path(tmp), "claude")
+            payload = extract_persona_lexicon(Path(tmp), "claude", allow_curated=True)
         self.assertEqual(payload["status"], "VACUUM (SCAFFOLDED)")
+        self.assertTrue(payload["curated_fallback"])
         self.assertEqual(payload["yearning_method"], "curated")
         self.assertIn("real participant", payload["ideal_yearning"])
         self.assertEqual(payload["archetypal_pattern"], "Initiation Architect")

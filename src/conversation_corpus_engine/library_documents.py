@@ -13,6 +13,7 @@ import hashlib
 import io
 import mimetypes
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -25,11 +26,27 @@ from collections.abc import Iterator
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from .archive_model import Conversation, Message, to_iso
 
-READER_VERSION = "library-documents@1.2.0"
+READER_VERSION = "library-documents@1.3.0"
 DEFAULT_MAX_BYTES = 20 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 4096
+# Directory packages recorded as one document and never descended into when selected.
+PACKAGE_DIRECTORY_SUFFIXES = frozenset({".textbundle", ".numbers", ".key"})
+# Formats with no text reader: they receive a receipt naming the format, not silence.
+KNOWN_UNSUPPORTED_SUFFIXES = {".numbers": "numbers", ".key": "key"}
+TEXTBUNDLE_TEXT_NAMES = frozenset({"text.md", "text.markdown", "text.txt"})
+# Reasons for which the cause is an unavailable tool or placeholder, not a bad document.
+UNAVAILABLE_REASONS = frozenset(
+    {
+        "pdf_extractor_unavailable",
+        "pages_preview_unavailable",
+        "pages_native_extractor_unavailable",
+        "legacy_converter_unavailable",
+    }
+)
 TEXT_SUFFIXES = frozenset(
     {
         ".md",
@@ -398,6 +415,209 @@ def _pages_text(data: bytes, maximum: int) -> tuple[str, dict[str, Any]]:
     }
 
 
+def _textutil_convert(data: bytes, suffix: str, maximum: int) -> str:
+    """Convert legacy Word or RTF bytes to UTF-8 text with macOS ``textutil``."""
+    executable = shutil.which("textutil")
+    if executable is None:
+        raise RuntimeError("legacy_converter_unavailable")
+    with tempfile.TemporaryDirectory(prefix="cce-legacy-") as folder:
+        # textutil infers the input format from the extension.
+        source_path, output_path = Path(folder) / f"input{suffix}", Path(folder) / "output.txt"
+        source_path.write_bytes(data)
+        source_path.chmod(0o600)
+        output_path.touch(mode=0o600)
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os,resource,sys; resource.setrlimit(resource.RLIMIT_FSIZE,(int(sys.argv[1]),int(sys.argv[1]))); resource.setrlimit(resource.RLIMIT_CPU,(25,25)); os.execv(sys.argv[2],sys.argv[2:])",
+                str(maximum + 1),
+                executable,
+                "-convert",
+                "txt",
+                "-encoding",
+                "UTF-8",
+                "-output",
+                str(output_path),
+                str(source_path),
+            ],
+            check=True,
+            timeout=30,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if output_path.stat().st_size > maximum:
+            raise ValueError("converted text exceeds byte limit")
+        return _utf8_text(output_path.read_bytes())
+
+
+# Injectable seam: ``(data, suffix, maximum) -> text``. Tests replace it so no host tool is needed.
+_LEGACY_CONVERTER = _textutil_convert
+
+
+def _legacy_text(data: bytes, suffix: str, maximum: int) -> tuple[str, dict[str, Any]]:
+    return _LEGACY_CONVERTER(data, suffix, maximum), {
+        "extractor": "textutil@1",
+        "extraction_scope": "converted_text_no_layout_or_media",
+    }
+
+
+def _zip_index(archive: zipfile.ZipFile) -> dict[str, zipfile.ZipInfo]:
+    infos = archive.infolist()
+    if len(infos) > MAX_ARCHIVE_ENTRIES:
+        raise ValueError("archive has too many entries")
+    names = [info.filename for info in infos]
+    if len(set(names)) != len(names):
+        raise ValueError("archive has duplicate member names")
+    return {info.filename: info for info in infos}
+
+
+def _zip_read(archive: zipfile.ZipFile, name: str, budget: list[int]) -> bytes:
+    """Read one member, charging its real expanded size against a shared byte budget."""
+    with archive.open(name) as member:
+        data = member.read(max(budget[0], 0) + 1)
+    budget[0] -= len(data)
+    if budget[0] < 0:
+        raise ValueError("archive expanded content exceeds byte limit")
+    return data
+
+
+def _epub_text(data: bytes, maximum: int) -> tuple[str, dict[str, Any]]:
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        members = _zip_index(archive)
+        budget = [maximum]
+        container = _safe_xml(_zip_read(archive, "META-INF/container.xml", budget))
+        opf_path = next(
+            (
+                element.get("full-path", "")
+                for element in container.iter()
+                if element.tag.rsplit("}", 1)[-1] == "rootfile"
+            ),
+            "",
+        )
+        if not opf_path or opf_path not in members:
+            raise ValueError("EPUB package document is missing")
+        package = _safe_xml(_zip_read(archive, opf_path, budget))
+        manifest: dict[str, str] = {}
+        spine: list[str] = []
+        for element in package.iter():
+            tag = element.tag.rsplit("}", 1)[-1]
+            if tag == "item" and element.get("id") and element.get("href"):
+                manifest[element.get("id", "")] = element.get("href", "")
+            elif tag == "itemref" and element.get("idref"):
+                spine.append(element.get("idref", ""))
+        if not spine:
+            raise ValueError("EPUB has no reading order")
+        base = posixpath.dirname(opf_path)
+        parts: list[str] = []
+        chapters: list[str] = []
+        for idref in spine:
+            href = unquote(manifest.get(idref, "").split("#", 1)[0])
+            member = posixpath.normpath(posixpath.join(base, href))
+            if not href or member.startswith(("..", "/")) or member not in members:
+                raise ValueError("EPUB reading order references a missing member")
+            if posixpath.splitext(member)[1].lower() not in {".xhtml", ".html", ".htm", ".xml"}:
+                continue
+            text, _ = _html_text(_zip_read(archive, member, budget))
+            chapters.append(member)
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts), {
+        "extractor": "epub-xhtml@1",
+        "extraction_scope": "spine_text_no_images_or_styles",
+        "extraction_parts": chapters,
+    }
+
+
+def _textbundle_member(names: list[str]) -> str:
+    """Pick the single shallowest text member of a bundle: root or one top-level folder."""
+    found = [
+        name
+        for name in names
+        if not name.startswith("__MACOSX/")
+        and name.count("/") <= 1
+        and posixpath.basename(name).lower() in TEXTBUNDLE_TEXT_NAMES
+    ]
+    if not found:
+        raise ValueError("TextBundle has no text member")
+    shallowest = min(name.count("/") for name in found)
+    chosen = [name for name in found if name.count("/") == shallowest]
+    if len(chosen) != 1:
+        raise ValueError("TextBundle text member is ambiguous")
+    return chosen[0]
+
+
+def _textbundle_zip_text(data: bytes, maximum: int) -> tuple[str, dict[str, Any]]:
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        members = _zip_index(archive)
+        name = _textbundle_member(list(members))
+        text = _utf8_text(_zip_read(archive, name, [maximum]))
+    return text, {"extractor": "textbundle@1", "extraction_parts": [name]}
+
+
+def _textbundle_member_of_folder(path: Path) -> tuple[Path, os.stat_result]:
+    names = [item.name for item in path.iterdir() if item.name.lower() in TEXTBUNDLE_TEXT_NAMES]
+    if len(names) != 1:
+        raise ValueError("TextBundle text member is missing or ambiguous")
+    member = path / names[0]
+    info = member.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("TextBundle text member is not a regular file")
+    return member, info
+
+
+def _package_stats(path: Path) -> tuple[int, bool]:
+    """Total regular-file bytes and whether any child is cloud-only; uses lstat only."""
+    size, dataless = 0, False
+    for directory, _dirs, files in os.walk(path, followlinks=False):
+        for name in files:
+            try:
+                info = (Path(directory) / name).lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                size += info.st_size
+                dataless = dataless or _is_dataless(info)
+    return size, dataless
+
+
+def _is_dataless(info: Any) -> bool:
+    return bool(getattr(info, "st_flags", 0) & getattr(stat, "SF_DATALESS", 0x40000000))
+
+
+def _unsupported(suffix: str, provenance: dict[str, Any]) -> str:
+    if suffix in KNOWN_UNSUPPORTED_SUFFIXES:
+        provenance["known_unsupported_format"] = KNOWN_UNSUPPORTED_SUFFIXES[suffix]
+    return "unsupported_format"
+
+
+def _extract_body(
+    suffix: str, data: bytes, maximum: int, provenance: dict[str, Any]
+) -> tuple[str, str]:
+    """Return ``(body, reason)`` for one regular file; a nonempty reason means no body."""
+    if suffix in TEXT_SUFFIXES:
+        provenance["extractor"] = "utf8@1"
+        return _utf8_text(data), ""
+    readers = {
+        ".html": lambda: _html_text(data),
+        ".htm": lambda: _html_text(data),
+        ".fdx": lambda: _fdx_text(data),
+        ".pages": lambda: _pages_text(data, maximum),
+        ".docx": lambda: _docx_text(data, maximum),
+        ".pdf": lambda: _pdf_text(data, maximum),
+        ".doc": lambda: _legacy_text(data, suffix, maximum),
+        ".rtf": lambda: _legacy_text(data, suffix, maximum),
+        ".epub": lambda: _epub_text(data, maximum),
+        ".textbundle": lambda: _textbundle_zip_text(data, maximum),
+        ".textpack": lambda: _textbundle_zip_text(data, maximum),
+    }
+    if suffix not in readers:
+        return "", _unsupported(suffix, provenance)
+    body, extraction = readers[suffix]()
+    provenance.update(extraction)
+    return body, ""
+
+
 def _record(path: Path, root: Path, source: dict, report: dict) -> Conversation | None:
     relative = path.relative_to(root).as_posix()
     identity = hashlib.sha256(f"{source['id']}\0{relative}".encode()).hexdigest()[:32]
@@ -417,7 +637,9 @@ def _record(path: Path, root: Path, source: dict, report: dict) -> Conversation 
         file_report["reason"] = "symlink_not_followed"
         report["counts"]["excluded"] += 1
         return None
-    if not stat.S_ISREG(info.st_mode):
+    suffix = path.suffix.lower()
+    package = stat.S_ISDIR(info.st_mode) and suffix in PACKAGE_DIRECTORY_SUFFIXES
+    if not package and not stat.S_ISREG(info.st_mode):
         _finding(report, source["id"], relative, "not_regular_file")
         file_report["status"] = "excluded"
         report["counts"]["excluded"] += 1
@@ -428,7 +650,7 @@ def _record(path: Path, root: Path, source: dict, report: dict) -> Conversation 
         "source_path": str(path),
         "source_root": str(root),
         "source_uri": path.as_uri(),
-        "size_bytes": info.st_size,
+        "size_bytes": _package_stats(path)[0] if package else info.st_size,
         "modified_ns": info.st_mtime_ns,
         "modified_at": to_iso(info.st_mtime),
         "mime_type": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
@@ -439,35 +661,28 @@ def _record(path: Path, root: Path, source: dict, report: dict) -> Conversation 
     if created:
         provenance["created_at"] = created
     body, reason = "", ""
-    if getattr(info, "st_flags", 0) & getattr(stat, "SF_DATALESS", 0x40000000):
+    if _is_dataless(info):
         reason = "cloud_placeholder_not_hydrated"
-    elif info.st_size > maximum:
+    elif not package and info.st_size > maximum:
         reason = "size_limit"
     else:
         try:
-            data = _safe_bytes(path, info, maximum)
-            provenance["source_sha256"] = hashlib.sha256(data).hexdigest()
-            suffix = path.suffix.lower()
-            if suffix in TEXT_SUFFIXES:
-                body = _utf8_text(data)
-                provenance["extractor"] = "utf8@1"
-            elif suffix in {".html", ".htm"}:
-                body, extraction = _html_text(data)
-                provenance.update(extraction)
-            elif suffix == ".fdx":
-                body, extraction = _fdx_text(data)
-                provenance.update(extraction)
-            elif suffix == ".pages":
-                body, extraction = _pages_text(data, maximum)
-                provenance.update(extraction)
-            elif suffix == ".docx":
-                body, extraction = _docx_text(data, maximum)
-                provenance.update(extraction)
-            elif suffix == ".pdf":
-                body, extraction = _pdf_text(data, maximum)
-                provenance.update(extraction)
+            if package:
+                if suffix == ".textbundle":
+                    member, member_info = _textbundle_member_of_folder(path)
+                    if _is_dataless(member_info):
+                        reason = "cloud_placeholder_not_hydrated"
+                    else:
+                        data = _safe_bytes(member, member_info, maximum)
+                        provenance["source_sha256"] = hashlib.sha256(data).hexdigest()
+                        provenance.update(extractor="textbundle@1", extraction_parts=[member.name])
+                        body = _utf8_text(data)
+                else:
+                    body, reason = "", _unsupported(suffix, provenance)
             else:
-                reason = "unsupported_format"
+                data = _safe_bytes(path, info, maximum)
+                provenance["source_sha256"] = hashlib.sha256(data).hexdigest()
+                body, reason = _extract_body(suffix, data, maximum, provenance)
             if len(body.encode("utf-8")) > maximum:
                 raise ValueError("extracted text exceeds byte limit")
             if not reason and not body.strip():
@@ -481,16 +696,7 @@ def _record(path: Path, root: Path, source: dict, report: dict) -> Conversation 
             zipfile.BadZipFile,
             subprocess.SubprocessError,
         ) as error:
-            reason = (
-                str(error)
-                if str(error)
-                in {
-                    "pdf_extractor_unavailable",
-                    "pages_preview_unavailable",
-                    "pages_native_extractor_unavailable",
-                }
-                else "extraction_error"
-            )
+            reason = str(error) if str(error) in UNAVAILABLE_REASONS else "extraction_error"
             _finding(report, source["id"], relative, reason, type(error).__name__)
             report["counts"]["errors"] += 1
     status = (
@@ -498,13 +704,14 @@ def _record(path: Path, root: Path, source: dict, report: dict) -> Conversation 
         if reason
         else ("partial" if provenance.get("extraction_complete") is False else "full")
     )
-    if reason and reason not in {
-        "extraction_error",
-        "pdf_extractor_unavailable",
-        "pages_preview_unavailable",
-        "pages_native_extractor_unavailable",
-    }:
-        _finding(report, source["id"], relative, reason)
+    if reason and reason != "extraction_error" and reason not in UNAVAILABLE_REASONS:
+        _finding(
+            report,
+            source["id"],
+            relative,
+            reason,
+            str(provenance.get("known_unsupported_format", "")),
+        )
     coverage_reason = (
         provenance.get("partial_reason", "preview_only") if status == "partial" else reason
     )
@@ -609,6 +816,13 @@ def iter_documents(sources: list[dict], *, report: dict | None = None) -> Iterat
                     counts["excluded"] += 1
                 elif path.is_symlink():
                     _record(path, root, source, report)
+                elif path.suffix.lower() in PACKAGE_DIRECTORY_SUFFIXES and any(
+                    _matches(relative, pattern) for pattern in include
+                ):
+                    # One document per package; its members are never separate records.
+                    row = _record(path, root, source, report)
+                    if row is not None:
+                        yield row
                 else:
                     retained.append(name)
             dirs[:] = retained
@@ -631,3 +845,85 @@ def iter_documents(sources: list[dict], *, report: dict | None = None) -> Iterat
                 row = _record(path, root, source, report)
                 if row is not None:
                     yield row
+
+
+DOCUMENT_SUFFIXES = (
+    TEXT_SUFFIXES
+    | PACKAGE_DIRECTORY_SUFFIXES
+    | frozenset(
+        {".html", ".htm", ".fdx", ".pages", ".docx", ".pdf", ".doc", ".rtf", ".epub", ".textpack"}
+    )
+)
+
+
+def iter_document_files(root: Path) -> Iterator[dict[str, Any]]:
+    """List document-type files under ``root`` with cloud-only (dataless) detection.
+
+    Only ``lstat`` is used, so listing never hydrates a placeholder or reads bytes.
+    Symlinks are skipped, and each package directory counts as one document. ``state`` is
+    ``dataless`` when the entry (or any package member) is cloud-only, else ``local``.
+    """
+    root = Path(root).expanduser().absolute()
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("enumeration root must be an existing directory and not a symlink")
+    for directory, dirs, files in os.walk(root, followlinks=False):
+        folder = Path(directory)
+        retained: list[str] = []
+        for name in sorted(dirs):
+            path = folder / name
+            if path.is_symlink():
+                continue
+            if path.suffix.lower() in PACKAGE_DIRECTORY_SUFFIXES:
+                size, dataless = _package_stats(path)
+                yield _document_entry(path, root, size, dataless, package=True)
+            else:
+                retained.append(name)
+        dirs[:] = retained
+        for name in sorted(files):
+            path = folder / name
+            if path.suffix.lower() not in DOCUMENT_SUFFIXES:
+                continue
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                yield _document_entry(path, root, info.st_size, _is_dataless(info), package=False)
+
+
+def _document_entry(
+    path: Path, root: Path, size: int, dataless: bool, *, package: bool
+) -> dict[str, Any]:
+    return {
+        "path": path.relative_to(root).as_posix(),
+        "extension": path.suffix.lower(),
+        "size_bytes": size,
+        "state": "dataless" if dataless else "local",
+        "package": package,
+    }
+
+
+def summarize_document_files(entries: Iterator[dict[str, Any]] | list[dict[str, Any]]) -> dict:
+    """Counts by extension and state for entries from :func:`iter_document_files`."""
+    by_extension: dict[str, dict[str, int]] = {}
+    by_state = {"local": 0, "dataless": 0}
+    total_bytes = dataless_bytes = 0
+    for entry in entries:
+        counts = by_extension.setdefault(entry["extension"], {"local": 0, "dataless": 0})
+        counts[entry["state"]] += 1
+        by_state[entry["state"]] += 1
+        total_bytes += entry["size_bytes"]
+        if entry["state"] == "dataless":
+            dataless_bytes += entry["size_bytes"]
+    return {
+        "files_total": sum(by_state.values()),
+        "by_extension": {key: by_extension[key] for key in sorted(by_extension)},
+        "by_state": by_state,
+        "total_bytes": total_bytes,
+        "dataless_bytes": dataless_bytes,
+    }
+
+
+def enumerate_documents(root: Path) -> dict[str, Any]:
+    """Summarize document-type files under ``root`` without reading or hydrating any."""
+    return summarize_document_files(iter_document_files(root))

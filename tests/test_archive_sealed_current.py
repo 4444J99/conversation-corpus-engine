@@ -36,7 +36,7 @@ def test_bounded_ingest_shards_have_atoms_and_clone_restores_exact_bytes(archive
     selection = sorted(p.relative_to(source).as_posix() for p in source.rglob("shard-*.jsonl"))
     assert selection
     owner = sealed.create_identity(
-        tmp_path / "owner", "synthetic", "owner", passphrase=b"synthetic"
+        tmp_path / "owner", "synthetic", "owner", passphrase=b"synthetic-owner"
     )
     trust = sealed.create_trust(tmp_path / "trust", owner)
     repo = tmp_path / "cipher"
@@ -86,7 +86,9 @@ def test_capacity_plan_is_deterministic_read_only_and_includes_history(tmp_path)
     source = tmp_path / "source"
     source.mkdir()
     (source / "note").write_bytes(b"synthetic bytes")
-    owner = sealed.create_identity(tmp_path / "owner", "synthetic", "owner", passphrase=b"unlock")
+    owner = sealed.create_identity(
+        tmp_path / "owner", "synthetic", "owner", passphrase=b"synthetic-unlock"
+    )
     trust = sealed.create_trust(tmp_path / "trust", owner)
     repo = tmp_path / "cipher"
     args = source, ["note"], repo, owner, trust, [owner.recipient()]
@@ -132,7 +134,9 @@ def test_reverting_or_reselecting_content_reuses_authenticated_retained_objects(
     source.mkdir()
     note = source / "note"
     note.write_bytes(b"original synthetic bytes")
-    owner = sealed.create_identity(tmp_path / "owner", "synthetic", "owner", passphrase=b"unlock")
+    owner = sealed.create_identity(
+        tmp_path / "owner", "synthetic", "owner", passphrase=b"synthetic-unlock"
+    )
     trust = sealed.create_trust(tmp_path / "trust", owner)
     repo = tmp_path / "cipher"
     args = source, ["note"], repo, owner, trust, [owner.recipient()]
@@ -156,7 +160,9 @@ def test_capacity_forecast_covers_actual_first_git_commit(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     (source / "note").write_bytes(b"synthetic bytes")
-    owner = sealed.create_identity(tmp_path / "owner", "synthetic", "owner", passphrase=b"unlock")
+    owner = sealed.create_identity(
+        tmp_path / "owner", "synthetic", "owner", passphrase=b"synthetic-unlock"
+    )
     trust = sealed.create_trust(tmp_path / "trust", owner)
     repo = tmp_path / "cipher"
     args = source, ["note"], repo, owner, trust, [owner.recipient()]

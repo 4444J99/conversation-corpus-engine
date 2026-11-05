@@ -276,7 +276,7 @@ class CceMcpServer:
                     result = library_mcp.call_tool(self.library_store_root, name, args)
                 except KeyError as exc:
                     raise ValueError("library record, version or digest not found") from exc
-                return text_result(pretty_json(result), result)
+                return text_result(library_mcp.render_text(name, args, result), result)
         except (ValueError, FileNotFoundError) as exc:
             return text_result(str(exc), {"error": str(exc)}, is_error=True)
         raise KeyError(name)
