@@ -23,7 +23,14 @@ JSON exists only after explicit unlocking in process memory. Publication remains
 its format, algorithms and recipient semantics are unchanged. Credential files are mode 0600 on
 POSIX and outside Git. Supply exact passphrase bytes from a mode-0600 private file with
 `--passphrase-file`, or a protected producer through `--passphrase-stdin`. The CLI has no secret
-argument and does not print keys or passphrases. Keep the passphrase separate from its credential;
+argument and does not print keys or passphrases. Creating a **new** identity requires a passphrase
+of at least 12 bytes (12 ASCII characters; the exact file bytes count, so a trailing newline counts)
+and fails with `passphrase-too-short` before anything is written. Unlocking an existing
+identity never enforces a minimum, so credentials made earlier keep working. Credential, trust
+and recipient files are created mode 0600; reading a credential or a `--passphrase-file` whose mode
+grants any group or other access fails with `credential-permissions`. Directories created on the way
+to a new credential file are mode 0700; existing directories are left as they are.
+Keep the passphrase separate from its credential;
 this software cannot protect a key when an attacker can read both or inspect an unlocked process.
 A strong passphrase and protected recovery custody remain operator responsibilities.
 

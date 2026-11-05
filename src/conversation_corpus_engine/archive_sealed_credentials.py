@@ -14,6 +14,13 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from .archive_sealed_crypto import FORMAT, Identity, SealedError, canonical, decrypt, encrypt
 
 KEY_FORMAT = "cce-protected-identity.v1"
+# Applies only when a NEW identity is created; unlocking never enforces a minimum.
+MIN_NEW_PASSPHRASE_BYTES = 12
+
+
+def require_new_passphrase(passphrase: bytes | None) -> None:
+    if isinstance(passphrase, bytes) and len(passphrase) < MIN_NEW_PASSPHRASE_BYTES:
+        raise SealedError("passphrase-too-short")
 
 
 def _key(passphrase: bytes | None, salt: bytes) -> bytes:

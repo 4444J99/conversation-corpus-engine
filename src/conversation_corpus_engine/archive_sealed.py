@@ -100,10 +100,29 @@ def _sync_directory(directory: Path) -> None:
         os.close(fd)
 
 
+def _make_private_dirs(directory: Path) -> None:
+    """Create missing directories (ancestors included) as 0700; existing ones are untouched.
+
+    Path.mkdir(parents=True, mode=...) applies the mode to the leaf only, leaving new ancestors at
+    the umask default (typically 0755), so each missing level is created and set explicitly.
+    """
+    missing = []
+    probe = directory
+    while not probe.exists() and probe != probe.parent:
+        missing.append(probe)
+        probe = probe.parent
+    for created in reversed(missing):
+        try:
+            created.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        created.chmod(0o700)
+
+
 def _write(path: Path, data: bytes, *, exclusive: bool = False) -> None:
     """Write via a same-directory temp file, fsync, then rename/link; remove the temp on failure."""
     safe_path(path)
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _make_private_dirs(path.parent)
     fd, name = tempfile.mkstemp(prefix=".cce-", dir=path.parent)
     temp = Path(name)
     try:
@@ -150,8 +169,12 @@ def load_legacy_identity(path: Path) -> Identity:
 
 def create_identity(path: Path, app_id: str, instance_id: str, *, passphrase: bytes) -> Identity:
     """Create a passphrase-protected owner/device credential, never a plaintext key file."""
-    from .archive_sealed_credentials import protect_identity  # noqa: PLC0415
+    from .archive_sealed_credentials import (  # noqa: PLC0415
+        protect_identity,
+        require_new_passphrase,
+    )
 
+    require_new_passphrase(passphrase)
     path = private_path(path)
     if not app_id or not instance_id:
         raise SealedError("identity-label-required")
