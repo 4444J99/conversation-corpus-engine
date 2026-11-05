@@ -44,6 +44,8 @@ CHUNK = 512 * 1024
 DEFAULT_BUDGET = 512 * 1024 * 1024
 MAX_MANIFEST = 16 * 1024 * 1024
 MAX_UNIT = 4 * 1024 * 1024
+HISTORY_GIT_TIMEOUT_SECONDS = 30
+HISTORY_MAX_COMMITS = 10000
 HEX = re.compile(r"[0-9a-f]{64}")
 
 
@@ -361,6 +363,7 @@ def publish(
     *,
     rotate: bool = False,
     budget: int = DEFAULT_BUDGET,
+    audit_budget: int | None = None,
     _plan_only: bool = False,
 ) -> dict[str, Any]:
     source, repo = safe_path(source), safe_path(repo)
@@ -391,7 +394,7 @@ def publish(
     _tree(repo)
     _check_retained(repo, trust)
     if git_root is not None:
-        audit_history(repo, identity, trust_path)
+        audit_history(repo, identity, trust_path, budget=audit_budget)
     if budget < 0:
         raise SealedError("invalid-budget")
     if _plan_only:
@@ -614,6 +617,7 @@ def plan_capacity(
     *,
     rotate: bool = False,
     budget: int = DEFAULT_BUDGET,
+    audit_budget: int | None = None,
 ) -> dict[str, Any]:
     """Forecast selected content and a conservative next Git snapshot without writing.
 
@@ -629,6 +633,7 @@ def plan_capacity(
         recipients,
         rotate=rotate,
         budget=budget,
+        audit_budget=audit_budget,
         _plan_only=True,
     )
 
@@ -728,22 +733,29 @@ def repair(repo: Path, mirror: Path, identity: Identity, trust_path: Path) -> di
     return {"repaired": len(replacements), "repaired_head": repaired_head}
 
 
-def audit_history(repo: Path, identity: Identity, trust_path: Path) -> dict[str, int]:
+def audit_history(
+    repo: Path, identity: Identity, trust_path: Path, *, budget: int | None = None
+) -> dict[str, int]:
     """Authenticate reachable history with bounded Git output and hash-only blob caching.
 
+    `budget` caps the total Git output inspected and, at one entry per 4 KiB, the retained hash
+    metadata; it defaults to DEFAULT_BUDGET and is independent of the storage budget.
     Historical credentials are required. Unreachable/reflog/server-side objects still require
     separate host custody inspection. Neither Git diagnostics nor private paths are echoed.
     """
     import selectors  # noqa: PLC0415 - keep the bounded subprocess helper local to the audit
     import time  # noqa: PLC0415
 
+    cap = DEFAULT_BUDGET if budget is None else budget
+    if cap < 0:
+        raise SealedError("invalid-budget")
     repo = safe_path(repo)
     trust = _trust(trust_path)
     inspected = 0
 
     def git(*args: str, limit: int = 1024 * 1024) -> bytes:
         nonlocal inspected
-        limit = min(limit, DEFAULT_BUDGET - inspected)
+        limit = min(limit, cap - inspected)
         if limit <= 0:
             raise SealedError("history-audit-limit")
         try:
@@ -753,7 +765,7 @@ def audit_history(repo: Path, identity: Identity, trust_path: Path) -> dict[str,
                 try:
                     assert process.stdout is not None
                     data = bytearray()
-                    deadline = time.monotonic() + 30
+                    deadline = time.monotonic() + HISTORY_GIT_TIMEOUT_SECONDS
                     with selectors.DefaultSelector() as selector:
                         selector.register(process.stdout, selectors.EVENT_READ)
                         while True:
@@ -779,8 +791,8 @@ def audit_history(repo: Path, identity: Identity, trust_path: Path) -> dict[str,
         except (OSError, subprocess.SubprocessError) as exc:
             raise SealedError("history-inspection-failed") from exc
 
-    refs = git("rev-list", "--max-count=10001", "--all").decode().splitlines()
-    if len(refs) > 10000:
+    refs = git("rev-list", f"--max-count={HISTORY_MAX_COMMITS + 1}", "--all").decode().splitlines()
+    if len(refs) > HISTORY_MAX_COMMITS:
         raise SealedError("history-audit-limit")
     for ref in git("for-each-ref", "--format=%(refname) %(objecttype)").decode().splitlines():
         name, kind = ref.split(" ", 1)
@@ -795,7 +807,7 @@ def audit_history(repo: Path, identity: Identity, trust_path: Path) -> dict[str,
     heads: set[str] = set()
     object_oids: dict[str, str] = {}
     # Minimum padded objects are 4 KiB; also bound hash/set overhead independently of bytes.
-    metadata_limit = max(1, DEFAULT_BUDGET // 4096)
+    metadata_limit = max(1, cap // 4096)
     allowed_entries = 0
 
     def allow(manifest: dict) -> None:

@@ -189,6 +189,13 @@ epochs; a newly enrolled device may lack old-epoch access. It rejects unknown pa
 plaintext even if deleted from the current worktree. It does not inspect Git reflogs, unreachable
 objects, provider caches, hidden server refs, branch-name privacy, or other copies. Begin with a
 fresh dedicated repository; this is an audit, **not sanitization** of a formerly plaintext repo.
+The audit is bounded: it inspects at most 10,000 commits, gives each Git subprocess 30 seconds,
+and stops with `history-audit-limit` once the Git output it has read (and the hash metadata it
+retains, one entry per 4 KiB of cap) exceeds an aggregate cap. The cap defaults to 512 MiB and
+is set with `audit-history --budget BYTES`; `publish` and `plan` take the same cap for their
+pre-publication history audit as `--audit-budget BYTES`. It is independent of the storage
+`--budget`, so a small storage forecast budget does not abort history auditing. Raise the cap
+for a long history rather than disabling it; a negative value is refused (`invalid-budget`).
 Only `main`/`master` branches, matching remote-tracking refs and lightweight `snapshot-N` tags
 are accepted. Annotated tags, notes, replace refs and arbitrary ref names are refused; annotated
 tag messages can otherwise carry plaintext outside the commit-tree audit.
