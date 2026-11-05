@@ -60,15 +60,36 @@ supported. Annotation offsets apply to the extractor's message string: content
 parts are joined with one space, as in the existing transcript adapter. Prefer
 canonical Library messages when exact provider normalization matters.
 Unannotated imported text and old pair summaries cannot enter a strict profile.
-Strict profiles with source input do not substitute curated assistant yearnings
-when owner evidence is absent. The no-source scaffold remains explicitly marked
-as a scaffold.
+Strict profiles never substitute curated assistant-generated yearnings when owner
+evidence is absent, with or without source input. With no owner-evidenced spans the
+strict profile is empty and says so: `owner_evidence` is `"none"`, `curated_fallback`
+is `false`, and a call with no source at all reports the status
+`VACUUM (NO OWNER-EVIDENCED SPANS)` with an `empty_reason`. Curated text is reachable
+only through the explicit opt-in `--allow-curated` (Python keyword `allow_curated=True`,
+strict mode only). Its output is labelled: `curated_fallback: true`, `yearning_method:
+"curated"`, assurance `curated_scaffold_not_owner_evidence`, and the Markdown and CLI
+text name it. The curated text is assistant-generated, never owner evidence, and
+owner-evidenced vocabulary always replaces it (`owner_evidence: "spans"`).
 
 To request historical role heuristics explicitly, add `--mode legacy-role`.
 JSON, Markdown, and human-readable CLI output label this mode. Its assurance is
 `role_heuristic_not_authorship`; it must not be treated as verified owner writing.
 The Python function `extract_persona_lexicon` has the same strict default and
 keyword-only `mode` option.
+
+`--write` saves `persona-extract-<persona>-<timestamp>.json` and `.md` under
+`docs/storefront/_generated/` of the project root. That directory is git-ignored in
+this repository (`/docs/storefront/_generated/`) because the files can hold private
+owner text; another `--project-root` is not covered by this repository's ignore rule,
+so keep its generated directory out of version control yourself. The persona id (and
+any `timestamp`) must be a safe filename token: path separators, NUL bytes, empty and
+dots-only values are rejected with an error and nothing is written; other unusual
+characters become `-` with a short digest of the original appended so distinct ids
+cannot collide. Without a `timestamp` the stem ends in `latest`, and the existing
+`-latest` files are **overwritten** by every write; they are labelled as such. Each
+output begins with a marker naming the attribution mode (a `generated_marker` object
+first in the JSON, an HTML comment first in the Markdown) including
+`curated_fallback` and the assurance label.
 
 For canonical source revisions, use:
 
@@ -81,7 +102,11 @@ The input is a JSON list, each entry containing `source` and `attribution`.
 `source` uses the exact canonical reference described below, without `start` and
 `end`; span boundaries belong to its whole-message annotation. The chosen set of
 messages is explicit, and duplicate references are rejected to prevent inflated
-frequencies. The Python equivalent is
+frequencies. A message left unchanged across several accepted revisions of one source
+may be annotated in each revision; each distinct span is counted once, keyed by source
+`uid`, `sequence`, `message_id`, and the SHA-256 of the span text (plus its occurrence
+ordinal among identical spans of that message and its owner eligibility, so a phrase
+that really repeats inside one message still counts each time). The Python equivalent is
 `extract_persona_lexicon(project_root, owner_id, library=library,
 annotations=entries)`. All canonical source resolution uses existing
 `Library.history` and `Library.record` APIs; there is no second identity database.
