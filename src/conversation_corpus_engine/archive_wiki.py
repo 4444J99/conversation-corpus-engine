@@ -10,6 +10,7 @@ changes) add their own keys to the same report.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
@@ -17,9 +18,58 @@ from urllib.parse import unquote, urlsplit
 
 from . import archive_layout as layout
 from .archive_ingest import ArchivePaths, load_index
-from .archive_naming import InvalidName, conversation_uid
+from .archive_layout import CONVERSATION_PREFIX
+from .archive_naming import InvalidName, conversation_uid, parse_name
+from .archive_vault import incoming_links
 
 MESSAGE_ID_RE = re.compile(r"message-(\d+)")
+# A page lists at most this many conversations under "What links here" (and says how many more).
+BACKLINK_LIMIT = 25
+BACKLINK_LABEL_CHARS = 80
+
+
+@dataclass(frozen=True)
+class Backlinks:
+    """What links to one conversation, from the vault's wikilink graph.
+
+    `hubs` are the hub notes that list it (provider, month, topic, collection), by note name.
+    `conversations` are the uids of the conversations whose notes link to it, in the order a page
+    lists them (title, then uid); a page shows the first `BACKLINK_LIMIT`.
+    """
+
+    hubs: tuple[str, ...] = ()
+    conversations: tuple[str, ...] = ()
+
+
+def hub_label(name: str) -> str:
+    """A reader's name for a hub note: `topic · lantern`, `month · 2025-06`, `provider · claude`."""
+    parts = parse_name(name)
+    subject = parts.subject or parts.scope or name
+    if parts.kind == "month" and len(subject) == 6:
+        subject = f"{subject[:4]}-{subject[4:]}"
+    return f"{parts.kind} · {subject}"
+
+
+def backlinks_by_uid(incoming: dict[str, set[str]], titles: dict[str, str]) -> dict[str, Backlinks]:
+    """Turn the vault graph into one `Backlinks` per conversation that has a page.
+
+    A source conversation with no page (it is not in the index) is left out, so every
+    conversation listed has somewhere to point.
+    """
+    found: dict[str, Backlinks] = {}
+    for target_note, sources in incoming.items():
+        target = conversation_uid(target_note)
+        hubs = tuple(sorted(name for name in sources if not name.startswith(CONVERSATION_PREFIX)))
+        uids = [
+            conversation_uid(name)
+            for name in sources
+            if name.startswith(CONVERSATION_PREFIX) and conversation_uid(name) in titles
+        ]
+        uids.sort(key=lambda uid: (titles[uid].casefold(), uid))
+        found[target] = Backlinks(hubs=hubs, conversations=tuple(uids))
+    return found
+
+
 # The most problems of one kind a report lists; the counts above them say how many there were.
 PROBLEM_LIMIT = 20
 # A page lists its headings as a table of contents from this many (the build and the check agree).
@@ -36,9 +86,30 @@ class PageFacts(HTMLParser):
         self.hrefs: list[str] = []
         self.classes: dict[str, int] = {}
         self.heading_ids: list[str] = []
+        # The "What links here" section: its total, its hub notes and the pages it links.
+        self.backlink_total = -1
+        self.backlink_hubs: list[str] = []
+        self.backlink_pages: list[str] = []
+        self._in_backlinks = False
+        self._in_page_item = False
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "li":
+            self._in_page_item = False
+        elif tag == "section":
+            self._in_backlinks = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
+        if tag == "section" and values.get("class") == "backlinks":
+            self._in_backlinks = True
+            self.backlink_total = int(values.get("data-total") or -1)
+        elif self._in_backlinks and tag == "li":
+            self._in_page_item = values.get("class") == "page"
+            if values.get("class") == "hub":
+                self.backlink_hubs.append(str(values.get("data-note")))
+        elif self._in_backlinks and self._in_page_item and tag == "a":
+            self.backlink_pages.append(str(values.get("href")))
         anchor = values.get("id")
         if anchor:
             if anchor in self.ids:
@@ -133,6 +204,8 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
         "messages": 0,
         "messages_anchored": 0,
         "toc_pages": 0,
+        "backlink_pages": 0,
+        "links_listed": 0,
         "links_checked": 0,
         "dangling_links": 0,
         "problems": problems,
@@ -140,8 +213,10 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
     if not root.is_dir():
         problems.append(f"site missing: {root}")
         return report
-    expected = {row["uid"]: int(row["message_count"]) for row in load_index(paths)}
+    rows = load_index(paths)
+    expected = {row["uid"]: int(row["message_count"]) for row in rows}
     report["messages"] = sum(expected.values())
+    seen_backlinks: dict[str, PageFacts] = {}
     anchored: dict[str, int] = {}  # a bitmask of the message numbers a conversation's pages carry
     wanted: dict[Path, set[str]] = {}
     link_problems: list[str] = []
@@ -160,6 +235,12 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
         uid, first = owner
         if first:
             report["pages"] += 1
+            count = facts.classes.get("section.backlinks", 0)
+            if count == 1:
+                report["backlink_pages"] += 1
+                seen_backlinks[uid] = facts
+            else:
+                page_problems.append(f"{uid}: {count} backlinks section(s), expected exactly one")
         mask = anchored.get(uid, 0)
         for anchor in facts.ids:
             match = MESSAGE_ID_RE.fullmatch(anchor)
@@ -187,6 +268,7 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
                 f"{' and more' if len(missing) > 5 else ''}"
                 f"{', anchors past the last message' if extra else ''}"
             )
+    page_problems += _backlink_problems(paths, rows, seen_backlinks, report)
     for target, fragments in wanted.items():
         found = parse_page(target).ids
         for fragment in sorted(fragments - found):
@@ -197,6 +279,41 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
     problems += _limited(page_problems)
     problems += _limited(link_problems)
     return report
+
+
+def _listed_uid(href: str) -> str:
+    try:
+        return conversation_uid(Path(unquote(urlsplit(href).path)).stem)
+    except InvalidName:
+        return href
+
+
+def _backlink_problems(
+    paths: ArchivePaths,
+    rows: list[dict[str, Any]],
+    seen: dict[str, PageFacts],
+    report: dict[str, Any],
+) -> list[str]:
+    """Hold each page's "What links here" to the vault's own wikilink graph."""
+    titles = {row["uid"]: row["title"] for row in rows}
+    wanted = backlinks_by_uid(incoming_links(paths), titles)
+    problems = []
+    for uid, facts in sorted(seen.items()):
+        expected = wanted.get(uid, Backlinks())
+        listed = [_listed_uid(href) for href in facts.backlink_pages]
+        report["links_listed"] += len(listed)
+        want = list(expected.conversations[:BACKLINK_LIMIT])
+        if (
+            facts.backlink_total != len(expected.conversations)
+            or listed != want
+            or sorted(facts.backlink_hubs) != sorted(expected.hubs)
+        ):
+            problems.append(
+                f"{uid}: backlinks differ from the vault graph (page lists {len(listed)} of "
+                f"{facts.backlink_total} and {len(facts.backlink_hubs)} hub(s); the vault has "
+                f"{len(expected.conversations)} and {len(expected.hubs)} hub(s))"
+            )
+    return problems
 
 
 def _limited(items: list[str]) -> list[str]:

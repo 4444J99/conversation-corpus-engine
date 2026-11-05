@@ -99,7 +99,9 @@ details { margin: 6px 0; } summary { cursor: pointer; }
 .page .body { overflow-wrap: anywhere; }
 .page .body pre { background: rgba(127,127,127,.12); padding: 10px; border-radius: 8px; overflow-x: auto; }
 .page .body code { font: .88em ui-monospace, SFMono-Regular, Menlo, monospace; }
-.page .related li { margin: 2px 0; }
+.page .related li, .page .backlinks li { margin: 2px 0; }
+.page .backlinks { margin-top: 24px; border-top: 1px solid var(--line); }
+.page .backlinks li.hub { color: var(--muted); }
 .page h1 { font-size: 1.4rem; margin: 18px 0 6px; }
 .attach { color: var(--muted); font-size: .85rem; margin: 6px 0 0; }
 .page nav.toc { background: var(--card); border: 1px solid var(--line); border-radius: 10px;

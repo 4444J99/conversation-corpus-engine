@@ -37,7 +37,15 @@ from .archive_site_assets import (
 from .archive_split import fit_blocks, pack, utf8_size
 from .archive_text import render_markdown_html
 from .archive_topics import load_enrichment
-from .archive_wiki import TOC_MIN_HEADINGS
+from .archive_vault import incoming_links
+from .archive_wiki import (
+    BACKLINK_LABEL_CHARS,
+    BACKLINK_LIMIT,
+    TOC_MIN_HEADINGS,
+    Backlinks,
+    backlinks_by_uid,
+    hub_label,
+)
 from .corpus_store import CorpusWriteAuthorization
 
 SNIPPET_CHARS = 160
@@ -56,7 +64,10 @@ HTML_GROWTH = 6
 TOC_MAX_ENTRIES = 40
 TOC_LABEL_CHARS = 60
 TOC_RESERVE = 8192
-SINGLE_PAGE_MARGIN = 8192 + TOC_RESERVE
+# The most a "What links here" section can weigh (BACKLINK_LIMIT labelled links and about a dozen
+# hub names), kept out of the single-page shortcut so a conversation near the cap is measured.
+BACKLINKS_RESERVE = 20480
+SINGLE_PAGE_MARGIN = 8192 + TOC_RESERVE + BACKLINKS_RESERVE
 HEADING_RE = re.compile(r'<h[3-6] id="([^"]+)">(.*?)</h[3-6]>')
 TAG_RE = re.compile(r"<[^>]+>")
 # A deliberately long relative path and a deep prefix, used to measure the largest a page's own
@@ -157,6 +168,7 @@ def _shell(
     body: str,
     nav: str,
     toc: str = "",
+    backlinks: str = "",
 ) -> str:
     """One page: the document around a group of message blocks."""
     title = conversation.title or "Untitled"
@@ -180,7 +192,7 @@ def _shell(
         f"<p>{topic_links}</p>"
         '<p class="banner">Conversation text is a record of speech acts, not of verified events.'
         "</p>"
-        f"{related_html}\n{toc}{nav}\n{body}\n{nav}\n"
+        f"{related_html}\n{toc}{nav}\n{body}\n{nav}\n{backlinks}"
         f'<p class="muted">Source: {_esc(provenance.get("source_file", ""))} · sha256 '
         f"{_esc(str(provenance.get('source_sha256', ''))[:16])}…</p>"
         "</div></body></html>\n"
@@ -199,6 +211,42 @@ def _related_html(
         if row["uid"] in titles
     )
     return f'<section class="related"><h2>Related</h2><ul>{items}</ul></section>'
+
+
+def backlinks_html(
+    backlinks: Backlinks, titles: dict[str, str], href_for: Callable[[str], str]
+) -> str:
+    """The "What links here" section of a conversation's first page.
+
+    Hub notes that list the conversation are named (a hub with a page of its own, a topic once
+    topic pages exist, links to it); the conversations that link to it are links, the first
+    `BACKLINK_LIMIT` of them, with the number left over. The section is always present.
+    """
+    shown = backlinks.conversations[:BACKLINK_LIMIT]
+    total = len(backlinks.conversations)
+    items = "".join(
+        f'<li class="hub" data-note="{_esc(name)}">{_esc(hub_label(name))}</li>'
+        for name in backlinks.hubs
+    )
+    items += "".join(
+        f'<li class="page"><a href="{_esc(href_for(uid))}">'
+        f"{_esc(_short_label(titles.get(uid, uid)))}</a></li>"
+        for uid in shown
+    )
+    if not items:
+        body = '<p class="muted">No other page links here.</p>'
+    else:
+        body = f"<ul>{items}</ul>"
+        if total > len(shown):
+            body += f'<p class="muted">… and {total - len(shown)} more page(s) link here.</p>'
+    return f'<section class="backlinks" data-total="{total}"><h2>What links here</h2>{body}</section>\n'
+
+
+def _short_label(text: str) -> str:
+    label = " ".join(str(text).split())
+    if len(label) > BACKLINK_LABEL_CHARS:
+        label = label[: BACKLINK_LABEL_CHARS - 1].rstrip() + "…"
+    return label or "Untitled"
 
 
 def page_headings(body: str) -> list[tuple[str, str]]:
@@ -256,6 +304,7 @@ def page_groups(
     topics: list[str],
     titles: dict[str, str],
     note_bytes: int,
+    backlinks: Backlinks | None = None,
 ) -> list[list[str]]:
     """Group a conversation's message blocks into pages that will fit `note_bytes` once wrapped.
 
@@ -267,6 +316,7 @@ def page_groups(
     worst_style = f"{WORST_PREFIX}{layout.SITE_STYLE_FILENAME}"
     worst_link = WORST_PREFIX + WORST_PATH
     worst_nav = _nav_html(3, 1, worst_link, worst_link, worst_link)
+    worst_backlinks = backlinks_html(backlinks or Backlinks(), titles, lambda _uid: worst_link)
     first = _shell(
         conversation,
         part=1,
@@ -277,6 +327,7 @@ def page_groups(
         related_html=_related_html(related, titles, lambda _uid: WORST_PREFIX + WORST_PATH),
         body="",
         nav=worst_nav,
+        backlinks=worst_backlinks,
     )
     later = _shell(
         conversation,
@@ -305,6 +356,7 @@ def page_groups(
             related_html=_related_html(related, titles, lambda _uid: worst_link),
             body="",
             nav="",
+            backlinks=worst_backlinks,
         )
         room = note_bytes - utf8_size(alone)
         if room >= 1024:
@@ -373,6 +425,7 @@ def render_pages(
     titles: dict[str, str],
     page_of: Callable[[str], str | None],
     note_bytes: int,
+    backlinks: Backlinks | None = None,
 ) -> list[str]:
     """The pages of a conversation, each at most `note_bytes`, linked to each other."""
     total = len(groups)
@@ -400,6 +453,11 @@ def render_pages(
                 body=body,
                 nav=_nav_html(total, index, _relative(paths[0], source), previous, following),
                 toc=_toc_html(headings, shown),
+                backlinks=(
+                    backlinks_html(backlinks or Backlinks(), titles, _href_from(source, page_of))
+                    if index == 0
+                    else ""
+                ),
             )
             # The table of contents is navigation, not record: when a page would pass the cap it
             # is shortened (then dropped) before the page is refused.
@@ -422,6 +480,7 @@ def render_page(
     topics: list[str],
     titles: dict[str, str],
     note_bytes: int | None = None,
+    backlinks: Backlinks | None = None,
 ) -> list[str]:
     """A conversation as pages, for a caller that is not planning folders (a test, a preview).
 
@@ -429,7 +488,12 @@ def render_page(
     """
     cap = note_bytes or Limits().note_bytes
     groups = page_groups(
-        conversation, related=related, topics=topics, titles=titles, note_bytes=cap
+        conversation,
+        related=related,
+        topics=topics,
+        titles=titles,
+        note_bytes=cap,
+        backlinks=backlinks,
     )
     paths = page_paths(conversation, layout.UNDATED_DIRNAME, len(groups), Limits().folder_entries)
     return render_pages(
@@ -444,6 +508,7 @@ def render_page(
             f"{layout.conversation_note_for_uid(uid)}.html"
         ),
         note_bytes=cap,
+        backlinks=backlinks,
     )
 
 
@@ -534,6 +599,9 @@ def build_site(
     rows = load_index(paths)
     titles = {row["uid"]: row["title"] for row in rows}
     enrichment = load_enrichment(paths)
+    # "What links here" is read from the vault's own wikilink graph, so the site and the vault
+    # cannot disagree about which notes link to a conversation.
+    backlinks = backlinks_by_uid(incoming_links(paths), titles)
     written: set[str] = set()
     ledger = NameLedger()
 
@@ -549,6 +617,7 @@ def build_site(
             topics=extra.get("topics", []),
             titles=titles,
             note_bytes=limits.note_bytes,
+            backlinks=backlinks.get(conversation.uid),
         )
 
     # Pass one: how many pages each conversation takes, so the folder plan is exact.
@@ -587,6 +656,7 @@ def build_site(
             titles=titles,
             page_of=first_page.get,
             note_bytes=limits.note_bytes,
+            backlinks=backlinks.get(conversation.uid),
         )
         for rel, text in zip(paths_, rendered, strict=True):
             emit(rel, text)

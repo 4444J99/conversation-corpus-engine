@@ -212,3 +212,171 @@ def _build_headed_site(env: Any) -> Path:
     build_vault(env.paths, env.auth)
     build_site(env.paths, env.auth)
     return env.paths.site_page("chatgpt", "chatgpt-headed")
+
+
+# --- (2) backlinks from the vault wikilink graph ----------------------------------------------
+
+
+class _Backlinks(HTMLParser):
+    """The `What links here` section of a page: its links, its hub labels and its total."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sections = 0
+        self.inside = False
+        self.in_page = False
+        self.hrefs: list[str] = []
+        self.hubs: list[str] = []
+        self.total = -1
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "section" and values.get("class") == "backlinks":
+            self.sections += 1
+            self.inside = True
+            self.total = int(values.get("data-total") or -1)
+        elif self.inside and tag == "a" and self.in_page and values.get("href"):
+            self.hrefs.append(str(values["href"]))
+        elif self.inside and tag == "li":
+            self.in_page = values.get("class") == "page"
+            if values.get("class") == "hub":
+                self.hubs.append(str(values.get("data-note")))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "li":
+            self.in_page = False
+        if tag == "section":
+            self.inside = False
+
+
+def backlinks_of(text: str) -> _Backlinks:
+    parsed = _Backlinks()
+    parsed.feed(text)
+    return parsed
+
+
+def page_uid(href: str) -> str:
+    return re.sub(r"^conversation-", "", Path(href).stem)
+
+
+def test_the_vault_graph_lists_who_links_to_a_conversation(built) -> None:
+    incoming = importlib.import_module("conversation_corpus_engine.archive_vault").incoming_links(
+        built.paths
+    )
+    target = "conversation-chatgpt-aaaa1111"
+    assert "provider-chatgpt" in incoming[target]
+    assert any(name.startswith("month-all-") for name in incoming[target])
+    assert target not in incoming[target], "a note is not its own backlink"
+    assert all(not name.startswith("part-") for sources in incoming.values() for name in sources)
+
+
+def test_every_conversation_page_has_one_backlinks_section_with_its_related_sources(built) -> None:
+    enrichment = importlib.import_module(
+        "conversation_corpus_engine.archive_topics"
+    ).load_enrichment(built.paths)
+    expected: dict[str, set[str]] = {}
+    for uid, row in enrichment.items():
+        for neighbour in row.get("similar", []):
+            expected.setdefault(neighbour["uid"], set()).add(uid)
+    assert expected, "the fixture must hold related conversations for this to prove anything"
+    for row in load_index(built.paths):
+        text = built.paths.site_page(row["provider"], row["uid"]).read_text("utf-8")
+        section = backlinks_of(text)
+        assert section.sections == 1, row["uid"]
+        listed = {page_uid(href) for href in section.hrefs}
+        assert listed == expected.get(row["uid"], set()), row["uid"]
+        assert row["uid"] not in listed
+        assert f"provider-{row['provider']}" in section.hubs
+
+
+def test_a_page_with_no_incoming_conversation_link_says_so() -> None:
+    conversation = conv("chatgpt", "lonely", "Lonely")
+    (page,) = render_page(conversation, related=[], topics=[], titles={})
+    section = backlinks_of(page)
+    assert section.sections == 1 and section.total == 0
+    assert "No other page links here" in page
+
+
+def test_backlinks_are_capped_and_say_how_many_more() -> None:
+    site = importlib.import_module("conversation_corpus_engine.archive_site")
+    wikimod = wiki()
+    uids = [f"chatgpt-src{number:03d}" for number in range(60)]
+    titles = {uid: f"Source {uid}" for uid in uids}
+    html_text = site.backlinks_html(
+        wikimod.Backlinks(hubs=("topic-all-lantern",), conversations=tuple(uids)),
+        titles,
+        lambda uid: f"../{uid}.html",
+    )
+    section = backlinks_of(html_text)
+    assert section.total == 60
+    assert len(section.hrefs) == wikimod.BACKLINK_LIMIT
+    assert section.hubs == ["topic-all-lantern"]
+    assert f"and {60 - wikimod.BACKLINK_LIMIT} more" in html_text
+
+
+def _build_chatgpt(env: Any, payload: list[dict[str, Any]], limits: Limits | None = None) -> None:
+    """Build every stage over an invented ChatGPT export, at the given limits."""
+    root = env.export.parent / "export-chatgpt"
+    (root / "chatgpt").mkdir(parents=True, exist_ok=True)
+    (root / "chatgpt" / "conversations-000.json").write_text(json.dumps(payload), encoding="utf-8")
+    ingest(export_root=root, paths=env.paths, authorization=env.auth)
+    build_analysis(env.paths)
+    build_vault(env.paths, env.auth, limits=limits)
+    build_site(env.paths, env.auth, limits=limits)
+
+
+def test_backlinks_fold_continuation_notes_into_their_owner(archive_env) -> None:
+    small = Limits.scaled(note_bytes=6144, folder_entries=40, shard_bytes=65536)
+    long_text = "\n".join(f"line {number} " + "word " * 30 for number in range(300))
+    payload = [
+        gpt_conversation("longone", "Long one", [("user", "ask"), ("assistant", long_text)])
+    ] + [
+        gpt_conversation(
+            f"short{number:02d}", f"Short {number}", [("user", "q"), ("assistant", "a")]
+        )
+        for number in range(150)
+    ]
+    _build_chatgpt(archive_env, payload, small)
+    incoming = importlib.import_module("conversation_corpus_engine.archive_vault").incoming_links(
+        archive_env.paths
+    )
+    assert all(not name.startswith("part-") for sources in incoming.values() for name in sources)
+    generated = json.loads(archive_env.paths.vault_manifest.read_text("utf-8"))["files"]
+    assert any(Path(rel).name.startswith("part-all-") for rel in generated), "a hub spilled over"
+    assert any(Path(rel).parent.name.startswith("conversation-") for rel in generated), "split"
+    # the provider hub holds 151 rows at a 6 KiB cap, so it continues on part notes; a row that
+    # sits only on a continuation page must still count the provider hub as a source.
+    assert all("provider-chatgpt" in sources for sources in incoming.values())
+    assert len(incoming) == 151
+    long_page = archive_env.paths.site_page("chatgpt", "chatgpt-longone").read_text("utf-8")
+    assert "conversation-chatgpt-longone" not in " ".join(backlinks_of(long_page).hrefs)
+
+
+def test_verify_fails_on_a_page_without_its_backlinks_section(built) -> None:
+    page = built.paths.site_page("chatgpt", "chatgpt-aaaa1111")
+    page.write_text(
+        page.read_text("utf-8").replace('class="backlinks"', 'class="other"'), encoding="utf-8"
+    )
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    assert any("chatgpt-aaaa1111" in item and "backlinks" in item for item in problems)
+
+
+def test_verify_fails_when_backlinks_differ_from_the_vault_graph(built) -> None:
+    enrichment = importlib.import_module(
+        "conversation_corpus_engine.archive_topics"
+    ).load_enrichment(built.paths)
+    source, row = next((uid, r) for uid, r in enrichment.items() if r.get("similar"))
+    target = row["similar"][0]["uid"]
+    page = built.paths.site_page(target.partition("-")[0], target)
+    text = page.read_text("utf-8")
+    start = text.index('<li class="page">')
+    end = text.index("</li>", start) + len("</li>")
+    page.write_text(text[:start] + text[end:], encoding="utf-8")
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    assert any(target in item and "backlinks" in item for item in problems), (source, problems)
+
+
+def test_verify_wiki_block_counts_backlink_pages(built) -> None:
+    report = wiki().verify_site_wiki(built.paths)
+    assert report["problems"] == []
+    assert report["backlink_pages"] == report["pages"] == 24
