@@ -649,3 +649,241 @@ def test_verify_counts_authors_against_the_manifest(built) -> None:
     report = wiki().verify_site_wiki(built.paths)
     manifest = json.loads(built.paths.manifest.read_text("utf-8"))
     assert report["authors"] == manifest["totals"]["authors"]
+
+
+# --- (5) recent changes and page history from the lineage of generations ----------------------
+
+
+def lineage_of(paths: Any) -> list[dict[str, Any]]:
+    lineage = importlib.import_module("conversation_corpus_engine.archive_lineage")
+    return lineage.load_lineage(paths)
+
+
+def rebuild(env: Any) -> None:
+    ingest(export_root=env.export, paths=env.paths, authorization=env.auth)
+    build_analysis(env.paths)
+    build_vault(env.paths, env.auth)
+    build_database(env.paths, env.auth)
+    build_site(env.paths, env.auth)
+
+
+def edit_export(env: Any) -> dict[str, str]:
+    """Change one conversation, add one and drop one; returns the uids of each."""
+    path = env.export / "chatgpt" / "conversations-000.json"
+    payload = json.loads(path.read_text("utf-8"))
+    kept = [item for item in payload if item["conversation_id"] != "cccc3333p"]
+    for item in kept:
+        if item["conversation_id"] == "bbbb2222":
+            item["mapping"]["bbbb2222-0"]["message"]["content"]["parts"][0] += " and then some"
+    kept.append(
+        gpt_conversation("dddd4444", "Fresh arrival", [("user", "brand new"), ("assistant", "ok")])
+    )
+    path.write_text(json.dumps(kept), encoding="utf-8")
+    return {
+        "added": "chatgpt-dddd4444",
+        "changed": "chatgpt-bbbb2222",
+        "removed": "chatgpt-cccc3333p",
+    }
+
+
+class _Changes(HTMLParser):
+    """The rows of a recent-changes page: (uid or href, kind), and its generation anchors."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[tuple[str, str]] = []
+        self.anchors: list[str] = []
+        self._kind = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "tr" and values.get("id"):
+            self.anchors.append(str(values["id"]))
+        if tag == "li" and values.get("class") == "change":
+            self._kind = str(values.get("data-change"))
+            self.rows.append((str(values.get("data-uid")), self._kind))
+
+
+def change_rows(env: Any) -> list[tuple[str, str]]:
+    root = env.paths.site
+    first = root / "report-all-changes.html"
+    found: list[tuple[str, str]] = []
+    for path in [first, *sorted(root.glob("part-all-*.html"))]:
+        parsed = _Changes()
+        parsed.feed(path.read_text("utf-8"))
+        found += parsed.rows
+    return found
+
+
+def test_ingest_records_the_first_generation_with_every_conversation_added(built) -> None:
+    records = lineage_of(built.paths)
+    manifest = json.loads(built.paths.manifest.read_text("utf-8"))
+    assert len(records) == 1
+    (first,) = records
+    assert first["generation"] == 1 and first["parent"] == ""
+    assert first["fingerprint"] == manifest["source_fingerprint"]
+    assert first["added"] == sorted(row["uid"] for row in load_index(built.paths))
+    assert first["changed"] == [] and first["removed"] == []
+    assert set(first) == {
+        "generation",
+        "fingerprint",
+        "parent",
+        "day",
+        "conversations",
+        "added",
+        "changed",
+        "removed",
+    }, "no wall-clock field: a generation is named by its fingerprint and the data's own day"
+
+
+def test_ingesting_an_unchanged_export_again_adds_no_generation(built) -> None:
+    before = lineage_of(built.paths)
+    ingest(export_root=built.export, paths=built.paths, authorization=built.auth)
+    assert lineage_of(built.paths) == before
+
+
+def test_a_changed_export_records_exactly_what_was_added_changed_and_removed(built) -> None:
+    uids = edit_export(built)
+    rebuild(built)
+    first, second = lineage_of(built.paths)
+    assert second["generation"] == 2 and second["parent"] == first["fingerprint"]
+    assert second["added"] == [uids["added"]]
+    assert second["changed"] == [uids["changed"]]
+    assert second["removed"] == [uids["removed"]]
+    manifest = json.loads(built.paths.manifest.read_text("utf-8"))
+    assert second["fingerprint"] == manifest["source_fingerprint"] != first["fingerprint"]
+
+
+def test_a_failed_or_untouched_provider_keeps_its_digests_across_a_merge(built) -> None:
+    before = lineage_of(built.paths)
+    ingest(
+        export_root=built.export,
+        paths=built.paths,
+        authorization=built.auth,
+        providers=["chatgpt"],
+        merge=True,
+    )
+    assert lineage_of(built.paths) == before, "claude was not read, so it did not change"
+
+
+def test_the_recent_changes_page_lists_exactly_the_latest_added_and_changed_uids(built) -> None:
+    uids = edit_export(built)
+    rebuild(built)
+    rows = change_rows(built)
+    assert sorted(rows) == sorted(
+        [(uids["added"], "added"), (uids["changed"], "changed"), (uids["removed"], "removed")]
+    )
+    text = (built.paths.site / "report-all-changes.html").read_text("utf-8")
+    assert parse(text).scripts == 0 and "default-src &#x27;none&#x27;" in text
+    assert "Generation 2" in text and "Generation 1" in text
+    assert wiki().verify_site_wiki(built.paths)["problems"] == []
+
+
+def test_the_first_generation_lists_every_conversation_as_added(built) -> None:
+    rows = change_rows(built)
+    assert sorted(uid for uid, kind in rows if kind == "added") == sorted(
+        row["uid"] for row in load_index(built.paths)
+    )
+    assert {kind for _, kind in rows} == {"added"}
+
+
+def test_the_home_page_links_to_recent_changes(built) -> None:
+    assert "report-all-changes.html" in built.paths.site_home.read_text("utf-8")
+
+
+class _History(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sections = 0
+        self.entries: list[tuple[int, str]] = []
+        self.total = -1
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "section" and values.get("class") == "history":
+            self.sections += 1
+            self.total = int(values.get("data-total") or -1)
+        if tag == "li" and values.get("class") == "revision":
+            self.entries.append(
+                (int(str(values.get("data-generation"))), str(values.get("data-change")))
+            )
+
+
+def history_of(env: Any, uid: str) -> _History:
+    parsed = _History()
+    parsed.feed(env.paths.site_page(uid.partition("-")[0], uid).read_text("utf-8"))
+    return parsed
+
+
+def test_each_page_shows_its_own_history_newest_first(built) -> None:
+    uids = edit_export(built)
+    rebuild(built)
+    changed = history_of(built, uids["changed"])
+    assert changed.sections == 1 and changed.entries == [(2, "changed"), (1, "added")]
+    assert history_of(built, uids["added"]).entries == [(2, "added")]
+    untouched = history_of(built, "chatgpt-aaaa1111")
+    assert untouched.entries == [(1, "added")] and untouched.total == 1
+
+
+def test_a_page_with_no_recorded_lineage_says_so() -> None:
+    (page,) = render_page(conv("chatgpt", "nohist", "No history"), related=[], topics=[], titles={})
+    assert 'class="history"' in page and "No generation history recorded" in page
+
+
+def test_a_generation_changes_page_that_outgrows_the_cap_continues_on_linked_parts(
+    archive_env,
+) -> None:
+    small = Limits.scaled(note_bytes=6144, folder_entries=40, shard_bytes=65536)
+    payload = [
+        gpt_conversation(f"item{n:03d}", f"Item {n}", [("user", "q"), ("assistant", "a")])
+        for n in range(120)
+    ]
+    _build_chatgpt(archive_env, payload, small)
+    root = archive_env.paths.site
+    parts = sorted(root.glob("part-all-*.html"))
+    assert parts, "120 added conversations at a 6 KiB cap must continue on part pages"
+    for path in [root / "report-all-changes.html", *parts]:
+        assert len(path.read_bytes()) <= small.note_bytes
+    assert len(change_rows(archive_env)) == 120
+    assert wiki().verify_site_wiki(archive_env.paths)["problems"] == []
+
+
+def test_verify_fails_when_the_recent_changes_page_misses_a_uid(built) -> None:
+    page = built.paths.site / "report-all-changes.html"
+    text = page.read_text("utf-8")
+    start = text.index('<li class="change"')
+    end = text.index("</li>", start) + len("</li>")
+    page.write_text(text[:start] + text[end:], encoding="utf-8")
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    assert any("recent changes" in item for item in problems)
+
+
+def test_verify_fails_when_a_page_history_differs_from_the_lineage(built) -> None:
+    page = built.paths.site_page("chatgpt", "chatgpt-aaaa1111")
+    page.write_text(
+        page.read_text("utf-8").replace('data-generation="1"', 'data-generation="7"'),
+        encoding="utf-8",
+    )
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    assert any("chatgpt-aaaa1111" in item and "history" in item for item in problems)
+
+
+def test_verify_fails_when_the_lineage_is_missing_or_behind_the_manifest(built) -> None:
+    lineage_file = built.paths.lineage
+    saved = lineage_file.read_text("utf-8")
+    fingerprint = lineage_of(built.paths)[0]["fingerprint"]
+    lineage_file.unlink()
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    assert any("lineage" in item and "missing" in item for item in problems)
+    lineage_file.write_text(saved.replace(fingerprint, "0" * 64), encoding="utf-8")
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    assert any("lineage" in item and "manifest" in item for item in problems)
+
+
+def test_verify_reports_the_lineage_in_its_wiki_block(built) -> None:
+    edit_export(built)
+    rebuild(built)
+    report = wiki().verify_site_wiki(built.paths)
+    assert report["problems"] == []
+    assert report["generations"] == 2
+    assert report["recent_changes"] == 3

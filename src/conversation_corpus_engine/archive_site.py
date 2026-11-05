@@ -21,6 +21,7 @@ from .archive_ingest import (
     require_inside,
 )
 from .archive_limits import Limits
+from .archive_lineage import CHANGE_KINDS, history_by_uid, load_lineage
 from .archive_model import Conversation, Message, write_text_atomic
 from .archive_naming import NameLedger
 from .archive_shard import part_folder, plan_conversation_folders, plan_flat_folders
@@ -41,8 +42,11 @@ from .archive_vault import incoming_links
 from .archive_wiki import (
     BACKLINK_LABEL_CHARS,
     BACKLINK_LIMIT,
+    HISTORY_LIMIT,
+    RECENT_GENERATIONS,
     TOC_MIN_HEADINGS,
     Backlinks,
+    History,
     backlinks_by_uid,
     hub_label,
 )
@@ -67,7 +71,9 @@ TOC_RESERVE = 8192
 # The most a "What links here" section can weigh (BACKLINK_LIMIT labelled links and about a dozen
 # hub names), kept out of the single-page shortcut so a conversation near the cap is measured.
 BACKLINKS_RESERVE = 20480
-SINGLE_PAGE_MARGIN = 8192 + TOC_RESERVE + BACKLINKS_RESERVE
+# The most a "History" section can weigh (HISTORY_LIMIT revisions with links).
+HISTORY_RESERVE = 4096
+SINGLE_PAGE_MARGIN = 8192 + TOC_RESERVE + BACKLINKS_RESERVE + HISTORY_RESERVE
 HEADING_RE = re.compile(r'<h[3-6] id="([^"]+)">(.*?)</h[3-6]>')
 TAG_RE = re.compile(r"<[^>]+>")
 # A deliberately long relative path and a deep prefix, used to measure the largest a page's own
@@ -173,6 +179,7 @@ def _shell(
     nav: str,
     toc: str = "",
     backlinks: str = "",
+    history: str = "",
 ) -> str:
     """One page: the document around a group of message blocks.
 
@@ -200,7 +207,7 @@ def _shell(
         f"<p>{topic_links}</p>"
         '<p class="banner">Conversation text is a record of speech acts, not of verified events.'
         "</p>"
-        f"{related_html}\n{toc}{nav}\n{body}\n{nav}\n{backlinks}"
+        f"{related_html}\n{toc}{nav}\n{body}\n{nav}\n{backlinks}{history}"
         f'<p class="muted">Source: {_esc(provenance.get("source_file", ""))} · sha256 '
         f"{_esc(str(provenance.get('source_sha256', ''))[:16])}…</p>"
         "</div></body></html>\n"
@@ -268,6 +275,33 @@ def backlinks_html(
     return f'<section class="backlinks" data-total="{total}"><h2>What links here</h2>{body}</section>\n'
 
 
+def history_html(history: History, changes_href: str) -> str:
+    """The "History" section of a conversation's first page, from the lineage of generations.
+
+    The newest `HISTORY_LIMIT` revisions are listed, each linking to its row on the recent-changes
+    page while that generation is still among the rows it keeps. The section is always present.
+    """
+    entries = history.entries
+    shown = entries[:HISTORY_LIMIT]
+    items = ""
+    for generation, kind in shown:
+        label = f"Generation {generation} · {kind}"
+        if generation in history.shown:
+            label = f'<a href="{_esc(changes_href)}#g{generation}">{label}</a>'
+        items += (
+            f'<li class="revision" data-generation="{generation}" data-change="{kind}">{label}</li>'
+        )
+    if not items:
+        body = '<p class="muted">No generation history recorded.</p>'
+    else:
+        body = f"<ul>{items}</ul>"
+        if len(entries) > len(shown):
+            body += f'<p class="muted">… and {len(entries) - len(shown)} earlier revision(s).</p>'
+    return (
+        f'<section class="history" data-total="{len(entries)}"><h2>History</h2>{body}</section>\n'
+    )
+
+
 def _short_label(text: str) -> str:
     label = " ".join(str(text).split())
     if len(label) > BACKLINK_LABEL_CHARS:
@@ -331,6 +365,7 @@ def page_groups(
     titles: dict[str, str],
     note_bytes: int,
     backlinks: Backlinks | None = None,
+    history: History | None = None,
 ) -> list[list[str]]:
     """Group a conversation's message blocks into pages that will fit `note_bytes` once wrapped.
 
@@ -350,6 +385,7 @@ def page_groups(
         lambda _uid: worst_link,
         lambda name: worst_topic if name.startswith("topic-") else "",
     )
+    worst_history = history_html(history or History(), worst_link)
     first = _shell(
         conversation,
         part=1,
@@ -361,6 +397,7 @@ def page_groups(
         body="",
         nav=worst_nav,
         backlinks=worst_backlinks,
+        history=worst_history,
     )
     later = _shell(
         conversation,
@@ -390,6 +427,7 @@ def page_groups(
             body="",
             nav="",
             backlinks=worst_backlinks,
+            history=worst_history,
         )
         room = note_bytes - utf8_size(alone)
         if room >= 1024:
@@ -460,6 +498,7 @@ def render_pages(
     note_bytes: int,
     backlinks: Backlinks | None = None,
     topic_page: Callable[[str], str | None] | None = None,
+    history: History | None = None,
 ) -> list[str]:
     """The pages of a conversation, each at most `note_bytes`, linked to each other.
 
@@ -508,6 +547,13 @@ def render_pages(
                     if index == 0
                     else ""
                 ),
+                history=(
+                    history_html(
+                        history or History(), _relative(layout.SITE_CHANGES_PAGE_FILENAME, source)
+                    )
+                    if index == 0
+                    else ""
+                ),
             )
             # The table of contents is navigation, not record: when a page would pass the cap it
             # is shortened (then dropped) before the page is refused.
@@ -532,6 +578,7 @@ def render_page(
     note_bytes: int | None = None,
     backlinks: Backlinks | None = None,
     topic_page: Callable[[str], str | None] | None = None,
+    history: History | None = None,
 ) -> list[str]:
     """A conversation as pages, for a caller that is not planning folders (a test, a preview).
 
@@ -545,6 +592,7 @@ def render_page(
         titles=titles,
         note_bytes=cap,
         backlinks=backlinks,
+        history=history,
     )
     paths = page_paths(conversation, layout.UNDATED_DIRNAME, len(groups), Limits().folder_entries)
     return render_pages(
@@ -561,13 +609,21 @@ def render_page(
         note_bytes=cap,
         backlinks=backlinks,
         topic_page=topic_page,
+        history=history,
     )
 
 
 def _hub_shell(
-    heading: str, intro: str, rows: str, *, home_href: str, style_href: str, nav: str
+    heading: str,
+    intro: str,
+    rows: str,
+    *,
+    home_href: str,
+    style_href: str,
+    nav: str,
+    lead: str = "",
 ) -> str:
-    """One hub page: a heading, what it holds, and a list of conversations."""
+    """One hub page: a heading, what it holds (and any `lead` HTML), and a list of rows."""
     return (
         "<!doctype html>\n"
         '<html lang="en"><head><meta charset="utf-8">'
@@ -581,7 +637,7 @@ def _hub_shell(
         f'<p class="muted">{_esc(intro)}</p>'
         '<p class="banner">Conversation text is a record of speech acts, not of verified events.'
         "</p>"
-        f'{nav}\n<ul class="hub-rows">\n{rows}\n</ul>\n{nav}\n'
+        f'{lead}{nav}\n<ul class="hub-rows">\n{rows}\n</ul>\n{nav}\n'
         "</div></body></html>\n"
     )
 
@@ -683,6 +739,158 @@ def topic_page_names(name: str, pages: int) -> list[str]:
     return [name] + [layout.part_name("all", number, name) for number in range(2, pages + 1)]
 
 
+def _change_row(item: dict[str, Any], href: str) -> str:
+    """One row of the recent-changes page; a removed conversation has no page to link."""
+    kind = item["change"]
+    if href:
+        label = f'<a href="{_esc(href)}">{_esc(_short_label(item["title"]))}</a>'
+        detail = f"{kind} · {_esc(item['provider'])} · {item['message_count']} msg"
+    else:
+        label = f"<code>{_esc(item['uid'])}</code>"
+        detail = kind
+    return (
+        f'<li class="change" data-change="{kind}" data-uid="{_esc(item["uid"])}">{label} '
+        f'<span class="muted">— {detail}</span></li>'
+    )
+
+
+def _day_label(day: str) -> str:
+    return f"{day[:4]}-{day[4:6]}-{day[6:]}" if len(day) == 8 else "—"
+
+
+def _generations_table(ledger: list[dict[str, Any]]) -> str:
+    """The last `RECENT_GENERATIONS` generations, newest first; each row is a link target."""
+    rows = "".join(
+        f'<tr id="g{record["generation"]}"><td>Generation {record["generation"]}</td>'
+        f"<td>{_esc(_day_label(record['day']))}</td>"
+        f'<td class="num">{len(record["added"])}</td><td class="num">{len(record["changed"])}</td>'
+        f'<td class="num">{len(record["removed"])}</td>'
+        f"<td><code>{_esc(record['fingerprint'][:16])}</code></td></tr>"
+        for record in reversed(ledger[-RECENT_GENERATIONS:])
+    )
+    return (
+        '<table class="generations"><thead><tr><th>Generation</th><th>Last activity</th>'
+        '<th class="num">Added</th><th class="num">Changed</th><th class="num">Removed</th>'
+        f"<th>Source fingerprint</th></tr></thead><tbody>{rows}</tbody></table>\n"
+    )
+
+
+def changes_plan(
+    ledger: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    first_page: dict[str, str],
+    note_bytes: int,
+) -> tuple[str, str, str, list[list[dict[str, Any]]]]:
+    """The recent-changes page: (title, intro, lead, the rows of each page).
+
+    It lists every conversation the latest generation added, changed or removed against the one
+    before it (a first generation lists everything as added), and carries a table of the last
+    generations above the list. Like a hub it continues on linked pages when it outgrows the cap.
+    """
+    title = "Recent changes"
+    by_uid = {row["uid"]: row for row in rows}
+    items: list[dict[str, Any]] = []
+    if not ledger:
+        intro = "No generation lineage is recorded for this archive; run `cce archive ingest`."
+        lead = ""
+    else:
+        latest = ledger[-1]
+        for kind in CHANGE_KINDS:
+            for uid in latest[kind]:
+                known = by_uid.get(uid, {})
+                items.append(
+                    {
+                        "uid": uid,
+                        "change": kind,
+                        "title": known.get("title") or uid,
+                        "provider": known.get("provider") or uid.partition("-")[0],
+                        "message_count": known.get("message_count", 0),
+                    }
+                )
+        items.sort(key=lambda i: (CHANGE_KINDS.index(i["change"]), i["title"].casefold(), i["uid"]))
+        number = latest["generation"]
+        against = (
+            f"against generation {number - 1}"
+            if number > 1
+            else "(the first: every conversation counts as added)"
+        )
+        intro = (
+            f"Generation {number}, the latest, {against}: {len(latest['added'])} added, "
+            f"{len(latest['changed'])} changed, {len(latest['removed'])} removed."
+        )
+        lead = _generations_table(ledger)
+    worst_home = f"{WORST_PREFIX}{layout.SITE_HOME_FILENAME}"
+    worst_style = f"{WORST_PREFIX}{layout.SITE_STYLE_FILENAME}"
+    worst_link = WORST_PREFIX + WORST_PATH
+    kwargs = {
+        "home_href": worst_home,
+        "style_href": worst_style,
+        "nav": _nav_html(3, 1, worst_link, worst_link, worst_link),
+    }
+    first_budget = (
+        note_bytes - utf8_size(_hub_shell(title, intro, "", lead=lead, **kwargs)) - NAV_RESERVE
+    )
+    budget = (
+        note_bytes - utf8_size(_hub_shell(f"{title} — continued", "", "", **kwargs)) - NAV_RESERVE
+    )
+    if budget < 1024:
+        raise ValueError(f"note_bytes {note_bytes} leaves no room for rows beside a page")
+    lines = [
+        _change_row(
+            item, WORST_PREFIX + first_page[item["uid"]] if item["uid"] in first_page else ""
+        )
+        for item in items
+    ]
+    grouped, start = [], 0
+    for page in paginate_rows([], lines, first_budget, budget):
+        grouped.append(items[start : start + len(page)])
+        start += len(page)
+    return title, intro, lead, grouped
+
+
+def changes_page_names(pages: int) -> list[str]:
+    """The file stems of the recent-changes pages: the page, then its `part-...` continuations."""
+    return topic_page_names(layout.SITE_CHANGES_NAME, pages)
+
+
+def render_changes_pages(
+    plan: tuple[str, str, str, list[list[dict[str, Any]]]],
+    first_page: dict[str, str],
+    note_bytes: int,
+) -> Iterator[tuple[str, str]]:
+    """The recent-changes pages as (site-root path, html), beside the home page."""
+    title, intro, lead, grouped = plan
+    rels = [f"{name}.html" for name in changes_page_names(len(grouped))]
+    for index, page_rows in enumerate(grouped):
+        source = rels[index]
+        nav = _nav_html(
+            len(grouped),
+            index,
+            _relative(rels[0], source),
+            _relative(rels[index - 1], source) if index else "",
+            _relative(rels[index + 1], source) if index + 1 < len(grouped) else "",
+        )
+        text = _hub_shell(
+            title if index == 0 else f"{title} — continued",
+            intro if index == 0 else "",
+            "\n".join(
+                _change_row(
+                    r, _relative(first_page[r["uid"]], source) if r["uid"] in first_page else ""
+                )
+                for r in page_rows
+            ),
+            home_href=_relative(layout.SITE_HOME_FILENAME, source),
+            style_href=_relative(layout.SITE_STYLE_FILENAME, source),
+            nav=nav,
+            lead=lead if index == 0 else "",
+        )
+        if utf8_size(text) > note_bytes:
+            raise ValueError(
+                f"recent changes: page {index + 1} is {utf8_size(text)} bytes, cap is {note_bytes}"
+            )
+        yield source, text
+
+
 def _provider_summary(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     out = []
     for name, info in manifest["providers"].items():
@@ -773,6 +981,14 @@ def build_site(
     # "What links here" is read from the vault's own wikilink graph, so the site and the vault
     # cannot disagree about which notes link to a conversation.
     backlinks = backlinks_by_uid(incoming_links(paths), titles)
+    # History and recent changes are read from the lineage of generations, never by diffing pages.
+    generations = load_lineage(paths)
+    revisions = history_by_uid(generations)
+    in_window = frozenset(record["generation"] for record in generations[-RECENT_GENERATIONS:])
+
+    def history_of(uid: str) -> History:
+        return History(tuple(revisions.get(uid, ())), in_window)
+
     written: set[str] = set()
     ledger = NameLedger()
 
@@ -789,6 +1005,7 @@ def build_site(
             titles=titles,
             note_bytes=limits.note_bytes,
             backlinks=backlinks.get(conversation.uid),
+            history=history_of(conversation.uid),
         )
 
     # Pass one: how many pages each conversation takes, so the folder plan is exact.
@@ -807,6 +1024,10 @@ def build_site(
         uid: f"{layout.SITE_PAGES_DIRNAME}/{plan[uid]}/{layout.conversation_note_for_uid(uid)}.html"
         for uid in counts
     }
+
+    changes = changes_plan(generations, rows, first_page, limits.note_bytes)
+    for rel, text in render_changes_pages(changes, first_page, limits.note_bytes):
+        emit(rel, text)
 
     # One static page per topic hub, planned now (the conversation pages link to them) and written
     # beside the conversations in the structural `hubs` folder.
@@ -854,6 +1075,7 @@ def build_site(
             note_bytes=limits.note_bytes,
             backlinks=backlinks.get(conversation.uid),
             topic_page=topic_first.get,
+            history=history_of(conversation.uid),
         )
         for rel, text in zip(paths_, rendered, strict=True):
             emit(rel, text)

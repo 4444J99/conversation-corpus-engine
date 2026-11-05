@@ -29,6 +29,10 @@ MANIFEST_FILENAME = derive_name("manifest", scope="all") + ".json"
 DATABASE_FILENAME = derive_name("database", scope="all", subject="search") + ".sqlite"
 ENRICHMENT_FILENAME = derive_name("index", scope="all", subject="enrichment") + ".jsonl"
 TOPICS_FILENAME = derive_name("report", scope="all", subject="topics") + ".json"
+# The lineage of generations: what each ingest added, changed or removed against the one before
+# (an append-only ledger), and the content digest of every conversation as of the latest one.
+LINEAGE_FILENAME = derive_name("index", scope="all", subject="lineage") + ".jsonl"
+DIGESTS_FILENAME = derive_name("index", scope="all", subject="digests") + ".jsonl"
 VAULT_DIRNAME = derive_name("vault", scope="all")
 # The list of files the vault build generated; it sits beside the manifest, not inside the vault.
 VAULT_MANIFEST_FILENAME = derive_name("manifest", scope="all", subject="vault") + ".json"
@@ -57,6 +61,10 @@ GRAPH_SUMMARY_FILENAME = derive_name("report", scope="all", subject="graph") + "
 # --- the site -------------------------------------------------------------------------------
 
 SITE_PAGES_DIRNAME = "conversations"
+# The page that lists what the latest generation added, changed or removed (it continues on
+# `part-all-pNNN-<hex>` pages beside it when it outgrows the page cap).
+SITE_CHANGES_NAME = derive_name("report", scope="all", subject="changes")
+SITE_CHANGES_PAGE_FILENAME = SITE_CHANGES_NAME + ".html"
 # The site's hub pages (one per topic) sit in the same structural folder the vault's hubs do.
 SITE_HUBS_DIRNAME = VAULT_HUBS_DIRNAME
 SITE_HOME_FILENAME = HOME_NOTE + ".html"

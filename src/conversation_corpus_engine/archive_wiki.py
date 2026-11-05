@@ -20,6 +20,7 @@ from . import archive_layout as layout
 from .archive_author import AUTHORS
 from .archive_ingest import ArchivePaths, load_index, load_manifest
 from .archive_layout import CONVERSATION_PREFIX
+from .archive_lineage import CHANGE_KINDS, history_by_uid, load_lineage
 from .archive_naming import InvalidName, conversation_uid, parse_name
 from .archive_vault import incoming_links, part_owners
 
@@ -40,6 +41,25 @@ class Backlinks:
 
     hubs: tuple[str, ...] = ()
     conversations: tuple[str, ...] = ()
+
+
+# A page lists this many of its own revisions (and says how many earlier ones there were); the
+# recent-changes page carries a row for each of the last RECENT_GENERATIONS generations, and a
+# revision links to its row there while it is still in that window.
+HISTORY_LIMIT = 8
+RECENT_GENERATIONS = 20
+
+
+@dataclass(frozen=True)
+class History:
+    """One conversation's revisions, newest first, from the lineage of generations.
+
+    `entries` are (generation, kind) pairs, kind being `added`, `changed` or `removed`; `shown`
+    are the generations the recent-changes page has a row for, so a revision can link to it.
+    """
+
+    entries: tuple[tuple[int, str], ...] = ()
+    shown: frozenset[int] = frozenset()
 
 
 def hub_label(name: str) -> str:
@@ -97,6 +117,11 @@ class PageFacts(HTMLParser):
         # message's first piece (a split message has one first piece), by anchor.
         self.unlabelled_articles = 0
         self.authors: dict[str, str] = {}
+        # The "History" section of a conversation (its total and (generation, kind) revisions),
+        # and the rows of a recent-changes page as (uid, kind).
+        self.history_total = -1
+        self.revisions: list[tuple[int, str]] = []
+        self.changes: list[tuple[str, str]] = []
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "li":
@@ -125,6 +150,14 @@ class PageFacts(HTMLParser):
                 self.backlink_hubs.append(str(values.get("data-note")))
         elif self._in_backlinks and self._in_page_item and tag == "a":
             self.backlink_pages.append(str(values.get("href")))
+        if tag == "section" and values.get("class") == "history":
+            self.history_total = int(values.get("data-total") or -1)
+        elif tag == "li" and values.get("class") == "revision":
+            self.revisions.append(
+                (int(values.get("data-generation") or -1), str(values.get("data-change")))
+            )
+        elif tag == "li" and values.get("class") == "change":
+            self.changes.append((str(values.get("data-uid")), str(values.get("data-change"))))
         anchor = values.get("id")
         if anchor:
             if anchor in self.ids:
@@ -223,6 +256,9 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
         "topic_pages": 0,
         "topic_hubs": 0,
         "backlink_pages": 0,
+        "history_pages": 0,
+        "generations": 0,
+        "recent_changes": 0,
         "links_listed": 0,
         "links_checked": 0,
         "dangling_links": 0,
@@ -235,6 +271,7 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
     expected = {row["uid"]: int(row["message_count"]) for row in rows}
     report["messages"] = sum(expected.values())
     seen_backlinks: dict[str, PageFacts] = {}
+    history_seen: dict[str, PageFacts] = {}
     hub_pages: dict[str, set[str]] = {}  # hub page file stem -> the conversations it lists
     anchored: dict[str, int] = {}  # a bitmask of the message numbers a conversation's pages carry
     wanted: dict[Path, set[str]] = {}
@@ -267,6 +304,12 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
                 seen_backlinks[uid] = facts
             else:
                 page_problems.append(f"{uid}: {count} backlinks section(s), expected exactly one")
+            count = facts.classes.get("section.history", 0)
+            if count == 1:
+                report["history_pages"] += 1
+                history_seen[uid] = facts
+            else:
+                page_problems.append(f"{uid}: {count} history section(s), expected exactly one")
         if facts.unlabelled_articles:
             page_problems.append(
                 f"{uid}: {facts.unlabelled_articles} message article(s) in {relative} lack "
@@ -312,6 +355,7 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
     incoming = incoming_links(paths)
     page_problems += _backlink_problems(incoming, rows, seen_backlinks, report)
     page_problems += _topic_problems(hub_pages, incoming, report)
+    page_problems += _lineage_problems(paths, root, history_seen, report)
     for target, fragments in wanted.items():
         found = parse_page(target).ids
         for fragment in sorted(fragments - found):
@@ -329,6 +373,79 @@ def _listed_uid(href: str) -> str:
         return conversation_uid(Path(unquote(urlsplit(href).path)).stem)
     except InvalidName:
         return href
+
+
+def _lineage_problems(
+    paths: ArchivePaths, root: Path, history_seen: dict[str, PageFacts], report: dict[str, Any]
+) -> list[str]:
+    """Hold the recent-changes page and each page's history to the lineage of generations.
+
+    The lineage must exist, chain from generation to generation and end at the manifest it
+    belongs to; the recent-changes page must list exactly what the latest generation added,
+    changed and removed; and every page's history must be the lineage's own account of it.
+    """
+    ledger = load_lineage(paths)
+    report["generations"] = len(ledger)
+    problems = []
+    if not paths.lineage.is_file():
+        problems.append("generation lineage missing: run `cce archive ingest`")
+    for index, record in enumerate(ledger, 1):
+        parent = ledger[index - 2]["fingerprint"] if index > 1 else ""
+        if record.get("generation") != index or record.get("parent") != parent:
+            problems.append(f"generation lineage is broken at generation {index}")
+            break
+    try:
+        fingerprint = load_manifest(paths)["source_fingerprint"]
+    except (FileNotFoundError, ValueError, KeyError):
+        fingerprint = ""
+    if ledger and fingerprint and ledger[-1]["fingerprint"] != fingerprint:
+        problems.append(
+            f"generation lineage is behind the manifest: its last generation is for "
+            f"{ledger[-1]['fingerprint'][:12]}, the manifest is {fingerprint[:12]}"
+        )
+    first = root / layout.SITE_CHANGES_PAGE_FILENAME
+    if not first.is_file():
+        problems.append(f"recent changes page missing: {first.name}")
+    else:
+        pages = [first]
+        number = 2
+        while (
+            part := root / f"{layout.part_name('all', number, layout.SITE_CHANGES_NAME)}.html"
+        ).is_file():
+            pages.append(part)
+            number += 1
+        listed: list[tuple[str, str]] = []
+        window_ids: set[str] = set()
+        for page in pages:
+            facts = parse_page(page)
+            listed += facts.changes
+            window_ids |= {item for item in facts.ids if re.fullmatch(r"g\d+", item)}
+        report["recent_changes"] = len(listed)
+        if ledger:
+            latest = ledger[-1]
+            want = {(uid, kind) for kind in CHANGE_KINDS for uid in latest[kind]}
+            if len(listed) != len(set(listed)) or set(listed) != want:
+                problems.append(
+                    f"recent changes lists {len(listed)} row(s), the latest generation "
+                    f"({latest['generation']}) has {len(want)}: "
+                    f"{len(want - set(listed))} missing, {len(set(listed) - want)} extra"
+                )
+            window = {f"g{record['generation']}" for record in ledger[-RECENT_GENERATIONS:]}
+            if window_ids != window:
+                problems.append("recent changes generation table differs from the lineage")
+    revisions = history_by_uid(ledger)
+    for uid, facts in sorted(history_seen.items()):
+        want_entries = revisions.get(uid, [])
+        if (
+            facts.history_total != len(want_entries)
+            or facts.revisions != want_entries[:HISTORY_LIMIT]
+        ):
+            problems.append(
+                f"{uid}: history differs from the lineage (page lists {facts.revisions} of "
+                f"{facts.history_total}; the lineage has {want_entries[:HISTORY_LIMIT]} of "
+                f"{len(want_entries)})"
+            )
+    return problems
 
 
 def _topic_problems(
