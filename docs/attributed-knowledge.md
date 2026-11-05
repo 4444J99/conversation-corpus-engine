@@ -77,6 +77,20 @@ JSON, Markdown, and human-readable CLI output label this mode. Its assurance is
 The Python function `extract_persona_lexicon` has the same strict default and
 keyword-only `mode` option.
 
+`--write` saves `persona-extract-<persona>-<timestamp>.json` and `.md` under
+`docs/storefront/_generated/` of the project root. That directory is git-ignored in
+this repository (`/docs/storefront/_generated/`) because the files can hold private
+owner text; another `--project-root` is not covered by this repository's ignore rule,
+so keep its generated directory out of version control yourself. The persona id (and
+any `timestamp`) must be a safe filename token: path separators, NUL bytes, empty and
+dots-only values are rejected with an error and nothing is written; other unusual
+characters become `-` with a short digest of the original appended so distinct ids
+cannot collide. Without a `timestamp` the stem ends in `latest`, and the existing
+`-latest` files are **overwritten** by every write; they are labelled as such. Each
+output begins with a marker naming the attribution mode (a `generated_marker` object
+first in the JSON, an HTML comment first in the Markdown) including
+`curated_fallback` and the assurance label.
+
 For canonical source revisions, use:
 
 ```bash
