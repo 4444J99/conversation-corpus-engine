@@ -14,7 +14,7 @@ import shutil
 import subprocess
 import tempfile
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -68,23 +68,54 @@ def private_path(path: Path) -> Path:
     return path
 
 
+def _publish_exclusive(temp: Path, path: Path) -> None:
+    """Make a fully written temp file visible at `path` only if nothing exists there.
+
+    A hard link is an atomic create-if-absent: an interrupted or failed write can never leave a
+    truncated object at its final name, and a concurrent creator surfaces as FileExistsError.
+    """
+    try:
+        os.link(temp, path)
+    except FileExistsError:
+        raise
+    except OSError:
+        # Filesystem without hard links: callers hold the publisher lock, so check then rename.
+        if path.exists() or path.is_symlink():
+            raise FileExistsError(path) from None
+        temp.replace(path)
+
+
+def _sync_directory(directory: Path) -> None:
+    # Best effort: make the new directory entry durable. Not every platform can open a directory.
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        with suppress(OSError):
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _write(path: Path, data: bytes, *, exclusive: bool = False) -> None:
+    """Write via a same-directory temp file, fsync, then rename/link; remove the temp on failure."""
     safe_path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if exclusive:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(data)
-        return
     fd, name = tempfile.mkstemp(prefix=".cce-", dir=path.parent)
+    temp = Path(name)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        Path(name).replace(path)
+        if exclusive:
+            _publish_exclusive(temp, path)
+        else:
+            temp.replace(path)
+        _sync_directory(path.parent)
     finally:
-        Path(name).unlink(missing_ok=True)
+        temp.unlink(missing_ok=True)
 
 
 def create_legacy_identity(path: Path, app_id: str, instance_id: str) -> Identity:
