@@ -35,6 +35,10 @@ def configure(parser: argparse.ArgumentParser) -> None:
     _unlock_options(init)
     init.add_argument("--key", type=Path, required=True)
     init.add_argument("--trust", type=Path, required=True)
+    fingerprint = commands.add_parser(
+        "fingerprint", help="Print the fingerprint of a public recipient file (read-only)"
+    )
+    fingerprint.add_argument("--recipient", type=Path, required=True)
     for action in (
         "publish",
         "plan",
@@ -109,6 +113,14 @@ def _dispatch(args: argparse.Namespace, sealed: Any) -> dict[str, Any]:
     def read(path: Path) -> Any:
         return json.loads(sealed.private_path(path).read_bytes())
 
+    if args.sealed_action == "fingerprint":
+        from .archive_sealed_crypto import recipient_fingerprint  # noqa: PLC0415 - optional dep
+
+        # Public recipient record only: no unlock, no private material, nothing written.
+        return {
+            "algorithm": "sha256",
+            "fingerprint": recipient_fingerprint(read(args.recipient)),
+        }
     passphrase = None
     if args.passphrase_file:
         path = sealed.private_path(args.passphrase_file)

@@ -39,6 +39,23 @@ does not enroll itself. The owner must verify each device key's fingerprint thro
 independent trusted channel before selecting it. Every snapshot grants each listed device access
 to all selected content. Use a separate vault/trust root for a smaller disclosure scope.
 
+Print a recipient's fingerprint with the read-only `fingerprint` command. It needs no unlock,
+writes nothing and accepts only a public recipient record (exactly `app_id`, `instance_id` and a
+lowercase 64-hex `encryption_public`); a credential file, a malformed record or any extra field is
+refused with `invalid-recipient` and nothing from the file is echoed:
+
+```bash
+cce sealed fingerprint --recipient "$PRIVATE/device.recipient.json"
+# {"algorithm": "sha256", "fingerprint": "<64 hex characters>"}
+```
+
+The fingerprint is SHA-256 over `cce-sealed.v1:recipient-fingerprint:` followed by the canonical
+JSON of the recipient record, so it covers the public key **and** its app/instance labels: a
+changed label or key yields a different value. The device owner runs this on the device and reads
+the value to the publisher over an independent channel; the publisher runs it on the recipient
+file they are about to enroll and compares the two before running `publish`. The labels
+themselves are not printed.
+
 ## Reproducible workflow
 
 Paths below are placeholders. `PRIVATE` is a protected directory **outside Git**, `SOURCE` is
