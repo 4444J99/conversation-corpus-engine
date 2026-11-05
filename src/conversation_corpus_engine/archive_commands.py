@@ -22,6 +22,7 @@ from .archive_ingest import (
     ArchivePaths,
     MergeInputLoss,
     authorize_archive,
+    check_export_zips,
     failed_providers,
     has_bounded_layout,
     ingest,
@@ -387,6 +388,14 @@ def add_archive_parser(subparsers: Any) -> None:
             default=[],
             help="extra ChatGPT conversation JSON (live delta); wins over export shards",
         )
+        parser.add_argument(
+            "--export-zip",
+            action="append",
+            default=[],
+            metavar="PROVIDER=PATH",
+            help="the outer export ZIP a provider's folder was unpacked from: its SHA-256 and "
+            "size are recorded in the manifest (the ZIP itself is not read)",
+        )
         parser.add_argument("--include-attachment-text", action="store_true")
         parser.add_argument(
             "--library-root",
@@ -521,6 +530,18 @@ def _overrides(raw: list[str]) -> dict[str, Path]:
     return out
 
 
+def _export_zips(raw: list[str]) -> dict[str, list[Path]]:
+    out: dict[str, list[Path]] = {}
+    for item in raw:
+        name, sep, value = item.partition("=")
+        if not sep or name not in PROVIDER_SPECS or not value:
+            raise ValueError(
+                f"--export-zip must be PROVIDER=PATH with a known provider, got: {item}"
+            )
+        out.setdefault(name, []).append(Path(value))
+    return out
+
+
 def _handle_project(args: argparse.Namespace) -> int:
     if args.target not in {"feed", "corpus"}:
         raise ValueError(f"unsupported projection: {args.target}")
@@ -608,9 +629,16 @@ def handle_archive(args: argparse.Namespace) -> int:
 
     if action in {"ingest", "build"}:
         providers = args.provider or None
+        try:
+            export_zips = _export_zips(args.export_zip)
+            check_export_zips(export_zips, providers or list(PROVIDER_SPECS))
+        except ValueError as exc:
+            print(f"archive refused: {exc}", file=sys.stderr)
+            return 2
         options = {
             "chatgpt_extra_files": args.chatgpt_extra,
             "include_attachment_text": args.include_attachment_text,
+            "export_zips": export_zips,
         }
         stages = ("ingest",) if action == "ingest" else STAGES
         limits = limits_from_args(args)

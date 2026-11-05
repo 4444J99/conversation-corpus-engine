@@ -255,9 +255,14 @@ key they are qualified as `external/<first 12 hex of the content SHA-256>/<name>
 `source_sha256`. Live captures are listed separately from account-export shards in the channel
 report.
 Origins describe the ingestion route; they are not a claim about who authored the text. An
-outer export ZIP that was unpacked before ingestion is not an input unless a reader opens it;
-preserve its original checksum in the capture receipt. Private source paths in build receipts
-belong in the private store, not in the code repository.
+outer export ZIP that was unpacked before ingestion is not read by any reader, so it is recorded
+only when named: `--export-zip PROVIDER=PATH` (repeatable) hashes the ZIP and records its
+SHA-256, byte size and the origin `export_archive` in that provider's `inputs` (not in
+`source_files`, which lists what a reader opened) and its path in the build options. The
+provider must be part of the build and the file must exist, or the command exits 2. Naming a ZIP
+changes the source fingerprint, as any recorded input does. A ZIP that is not named is not
+recorded; preserve its original checksum in the capture receipt. Private source paths in build
+receipts belong in the private store, not in the code repository.
 
 A conversation larger than a shard (one Antigravity session is
 about 170 MiB) is never cut: its shard is that one row, the manifest marks it `oversize_row`, and

@@ -65,6 +65,8 @@ FINGERPRINT_EXCLUDED_KEYS = frozenset({"source_root", "error", "build_options", 
 
 SOURCE_EXPORT = "export"
 SOURCE_LIBRARY = "library"
+# The origin of an outer export ZIP named with `--export-zip`: hashed, never opened by a reader.
+EXPORT_ARCHIVE_ORIGIN = "export_archive"
 
 
 @dataclass(frozen=True)
@@ -711,6 +713,23 @@ def _check_live_capture_inputs(
             )
 
 
+def _export_zips(options: dict[str, Any], provider: str) -> list[Path]:
+    """The outer export ZIPs the caller named for a provider (`--export-zip PROVIDER=PATH`)."""
+    return [Path(path) for path in (options.get("export_zips") or {}).get(provider, ())]
+
+
+def check_export_zips(export_zips: dict[str, list[Path]], selected: list[str]) -> None:
+    """Refuse an `--export-zip` for an unknown or unselected provider, or for a missing file."""
+    for name, zips in export_zips.items():
+        if name not in PROVIDER_SPECS:
+            raise ValueError(f"--export-zip names an unknown provider: {name}")
+        if name not in selected:
+            raise ValueError(f"--export-zip {name}: the provider is not part of this build")
+        for path in zips:
+            if not Path(path).is_file():
+                raise ValueError(f"--export-zip {name}: not a file: {path}")
+
+
 def _provider_build_options(
     spec: ProviderSpec, root: Path, options: dict[str, Any]
 ) -> dict[str, Any]:
@@ -723,6 +742,7 @@ def _provider_build_options(
         ]
         if spec.name == "chatgpt"
         else [],
+        "export_zips": [str(Path(path).resolve()) for path in _export_zips(options, spec.name)],
         "include_attachment_text": bool(options.get("include_attachment_text")),
         "shard_bytes": int(options.get("shard_bytes") or SHARD_BYTES),
         "folder_entries": options.get("folder_entries"),
@@ -755,6 +775,8 @@ def _ingest_provider(
         path_origins={Path(path): "live_capture" for path in extra_files},
         hash_cache=options.get("source_hash_cache"),
     )
+    for zip_path in _export_zips(options, spec.name):
+        tracker.declare_input(zip_path, origin=EXPORT_ARCHIVE_ORIGIN)
     seen: dict[str, str] = {}
     library_uids: set[str] = set()
     live_capture_uids: set[str] = set()
@@ -914,6 +936,12 @@ def ingest(
     if library_root is not None:
         options["library_root"] = library_root.resolve()
     sources = resolve_sources(export_root, providers, overrides, library_root)
+    export_zips = {
+        name: [Path(path) for path in zips]
+        for name, zips in (options.get("export_zips") or {}).items()
+    }
+    check_export_zips(export_zips, list(sources))
+    options["export_zips"] = export_zips
     report: dict[str, Any] = {}
     if merge and paths.manifest.is_file():
         report.update(load_manifest(paths)["providers"])
@@ -965,6 +993,9 @@ def ingest(
                 name: str(path.resolve()) for name, path in (overrides or {}).items()
             },
             "library_root": str(library_root.resolve()) if library_root is not None else None,
+            "export_zips": {
+                name: [str(path.resolve()) for path in zips] for name, zips in export_zips.items()
+            },
             "merge": merge,
             "allow_input_loss": allow_input_loss,
         },

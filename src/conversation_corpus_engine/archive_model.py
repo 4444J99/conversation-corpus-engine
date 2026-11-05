@@ -485,6 +485,18 @@ class SourceTracker:
             key=lambda item: (item["source_file"], item["sha256"]),
         )
 
+    def declare_input(self, path: Path, *, origin: str) -> None:
+        """Record a file the build was handed but no reader opens (the outer export ZIP the
+        export was unpacked from): its SHA-256, size and origin join `inputs`, not `hashes`."""
+        resolved = path.resolve()
+        if resolved not in self._inputs:
+            self._inputs[resolved] = {
+                "source_file": self.relative(path),
+                "sha256": sha256_file(path, self._hash_cache),
+                "size_bytes": resolved.stat().st_size,
+                "origin": origin,
+            }
+
     def provenance(
         self, path: Path, *, member: str = "", origin: str | None = None
     ) -> dict[str, Any]:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -234,3 +235,94 @@ def test_inputs_that_share_a_basename_keep_separate_source_files(
     for key in [*info["source_files"], *(item["source_file"] for item in info["inputs"])]:
         assert not key.startswith("/") and str(tmp_path) not in key
     assert info["source_files"]["conversations-000.json"]
+
+
+# --- A6: the outer export ZIP's own checksum ------------------------------------------------------
+
+
+def _outer_zip(path: Path) -> Path:
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("grok/placeholder.txt", "synthetic")
+    return path
+
+
+def test_the_outer_export_zip_is_hashed_into_the_manifest(archive_env, tmp_path: Path) -> None:
+    outer = _outer_zip(tmp_path / "export-bundle.zip")
+    manifest = ingest(
+        **_kwargs(archive_env, providers=["grok"], options={"export_zips": {"grok": [outer]}})
+    )
+    info = manifest["providers"]["grok"]
+    (entry,) = [item for item in info["inputs"] if item["origin"] == "export_archive"]
+    assert entry["source_file"] == "export-bundle.zip"
+    assert entry["sha256"] == hashlib.sha256(outer.read_bytes()).hexdigest()
+    assert entry["size_bytes"] == outer.stat().st_size
+    # It is a container the export came from, not a file a reader opened.
+    assert "export-bundle.zip" not in info["source_files"]
+    assert manifest["build_options"]["export_zips"] == {"grok": [str(outer.resolve())]}
+    plain = ingest(**_kwargs(archive_env, providers=["grok"]))
+    assert plain["source_fingerprint"] != manifest["source_fingerprint"]
+    assert plain["build_options"]["export_zips"] == {}
+
+
+def test_command_line_export_zip_records_the_checksum(
+    archive_env, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    outer = _outer_zip(tmp_path / "bundle.zip")
+    common = [
+        "--project-root",
+        str(archive_env.project),
+        "--corpus-store-root",
+        str(archive_env.store),
+        "--export-root",
+        str(archive_env.export),
+    ]
+    code, _, err = _cce(
+        monkeypatch,
+        capsys,
+        "archive",
+        "ingest",
+        *common,
+        "--provider",
+        "grok",
+        "--export-zip",
+        f"grok={outer}",
+    )
+    assert code == 0, err
+    manifest = json.loads(archive_env.paths.manifest.read_text(encoding="utf-8"))
+    digest = hashlib.sha256(outer.read_bytes()).hexdigest()
+    inputs = manifest["providers"]["grok"]["inputs"]
+    assert [item["sha256"] for item in inputs if item["origin"] == "export_archive"] == [digest]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--export-zip", "nobody=BUNDLE"],
+        ["--export-zip", "grok=MISSING"],
+        ["--export-zip", "BUNDLE"],
+        ["--provider", "chatgpt", "--export-zip", "grok=BUNDLE"],
+    ],
+)
+def test_command_line_export_zip_refuses_a_bad_request(
+    archive_env, tmp_path: Path, monkeypatch, capsys, arguments: list[str]
+) -> None:
+    outer = _outer_zip(tmp_path / "bundle.zip")
+    arguments = [
+        item.replace("BUNDLE", str(outer)).replace("MISSING", str(tmp_path / "missing.zip"))
+        for item in arguments
+    ]
+    code, _, err = _cce(
+        monkeypatch,
+        capsys,
+        "archive",
+        "ingest",
+        "--project-root",
+        str(archive_env.project),
+        "--corpus-store-root",
+        str(archive_env.store),
+        "--export-root",
+        str(archive_env.export),
+        *arguments,
+    )
+    assert code == 2 and "--export-zip" in err
+    assert not archive_env.paths.manifest.exists()
