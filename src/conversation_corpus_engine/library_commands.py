@@ -94,10 +94,14 @@ def passage_window(match: dict[str, int], text_length: int, limit: int) -> int:
     return max(0, min(centre - limit // 2, text_length - limit))
 
 
-def _sequences(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _sequences(
+    payload: dict[str, Any], uid: str | None = None
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Main and alternate message sequences; a single-record read names the record it refuses."""
     alternates = payload["extra"].get("alternate_messages", [])
     if not isinstance(alternates, list) or any(not isinstance(item, dict) for item in alternates):
-        raise ValueError("alternate message sequence is malformed")
+        where = f" in record {uid}" if uid else ""
+        raise ValueError(f"alternate message sequence is malformed{where}")
     return payload["messages"], alternates
 
 
@@ -200,7 +204,7 @@ def read_record(
     ):
         raise ValueError("message_end must be an integer greater than message")
     payload = library.record(uid, version=version, digest=digest)
-    main, alternates = _sequences(payload)
+    main, alternates = _sequences(payload, uid)
     messages = main if sequence == "main" else alternates
     result = _record_header(
         library,
@@ -340,7 +344,7 @@ def record_toc(
     ):
         raise ValueError(f"toc_limit must be an integer from 1 to {MAX_TOC_ENTRIES}")
     payload = library.record(uid, version=version, digest=digest)
-    main, alternates = _sequences(payload)
+    main, alternates = _sequences(payload, uid)
     messages = main if sequence == "main" else alternates
     result = _record_header(
         library,

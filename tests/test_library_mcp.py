@@ -2,11 +2,15 @@
 
 import json
 import math
+import re
+import sqlite3
+import zlib
 
 import pytest
 
 from conversation_corpus_engine import library_mcp
 from conversation_corpus_engine.archive_model import Conversation, Message
+from conversation_corpus_engine.library_commands import PASSAGE_LIMIT
 from conversation_corpus_engine.library_mcp import READ_TOOL, SEARCH_TOOL
 from conversation_corpus_engine.library_store import Library
 from conversation_corpus_engine.mcp_server import CceMcpServer
@@ -373,3 +377,252 @@ def test_budgeted_and_compact_calls_use_compact_wire_text_default_stays_pretty(
     assert "\n" not in text and json.loads(text) == slim["structuredContent"]
     stated = slim["structuredContent"]["token_estimate"]["tokens"]
     assert math.ceil(len(text.encode()) / 4) <= stated
+
+
+SENTINEL = "sentinelaltcontent"
+# Shapes Library.put stores and indexes without complaint but the read adapters cannot interpret.
+MALFORMED_ALTERNATES = [
+    pytest.param(SENTINEL, id="string"),
+    pytest.param([1, SENTINEL], id="non-dict-items"),
+    pytest.param({"key": SENTINEL}, id="mapping"),
+]
+
+
+def synthetic(source_id: str, title: str, text: str, extra: dict | None = None) -> Conversation:
+    return Conversation(
+        provider="chatgpt",
+        source_id=source_id,
+        title=title,
+        messages=[Message(role="user", text=text)],
+        extra=extra or {},
+    )
+
+
+@pytest.fixture
+def mount(tmp_path, monkeypatch):
+    """Build a small private library from the given records and return its tool caller."""
+
+    def build(*records: Conversation):
+        path = tmp_path / "small-library.sqlite"
+        with Library.create(path) as library:
+            for record in records:
+                library.put(record)
+        monkeypatch.setattr(library_mcp, "open_library", lambda root: (tmp_path, Library(path)))
+
+        def call(name, **arguments):
+            return library_mcp.call_tool(tmp_path, name, arguments)
+
+        return call
+
+    return build
+
+
+@pytest.mark.parametrize("alternates", MALFORMED_ALTERNATES)
+def test_default_search_degrades_one_malformed_hit_instead_of_failing_the_page(mount, alternates):
+    good = synthetic("good", "badalt good", "badalt body")
+    bad = synthetic("bad", "badalt record", "badalt body", {"alternate_messages": alternates})
+    result = mount(good, bad)(SEARCH_TOOL, query="badalt")
+    assert result["total"] == 2 and result["returned"] == 2 and result["next_offset"] is None
+    by_uid = {hit["uid"]: hit for hit in result["hits"]}
+    assert set(by_uid) == {good.uid, bad.uid}
+    fallback = by_uid[bad.uid]["read"]
+    assert set(fallback) == {"uid", "message", "offset", "limit", "located", "locator_error"}
+    assert fallback["uid"] == bad.uid and fallback["message"] == 0 and fallback["offset"] == 0
+    assert fallback["limit"] == PASSAGE_LIMIT and fallback["located"] is False
+    assert isinstance(fallback["locator_error"], str) and fallback["locator_error"]
+    assert set(by_uid[bad.uid]) >= LEGACY_HIT_KEYS
+    intact = by_uid[good.uid]["read"]
+    assert set(intact) == {"uid", "message", "offset", "limit"}
+    assert SENTINEL not in json.dumps(result)
+
+
+# Record `name` holds `lead` filler messages and then the first message with the query term, so
+# a located hit points at message `lead`; the malformed record is `omega`, placed mid-ranking.
+LEADS = {"alpha": 0, "beta": 2, "gamma": 3, "omega": 1, "delta": 4}
+SHORT_KEYS = {short: long for long, short in library_mcp.COMPACT_KEYS.items()}
+
+
+def paged_record(name: str, extra: dict | None = None) -> Conversation:
+    lead = LEADS[name]
+    messages = [Message(role="user", text="plain filler words") for _ in range(lead)]
+    messages.append(Message(role="assistant", text=f"pagemark finding of {name}"))
+    return Conversation(
+        provider="chatgpt",
+        source_id=name,
+        title=f"Synthetic {name}",
+        messages=messages,
+        extra=extra or {},
+    )
+
+
+def paged_library(mount, alternates=SENTINEL):
+    records = [
+        paged_record(name, {"alternate_messages": alternates} if name == "omega" else None)
+        for name in LEADS
+    ]
+    return mount(*records)
+
+
+def unpacked(result: dict, compact: bool) -> dict:
+    """Page summary with long keys, so default and compact responses are checked alike."""
+    if not compact:
+        return {
+            "total": result["total"],
+            "returned": result["returned"],
+            "next_offset": result["next_offset"],
+            "reads": {hit["uid"]: dict(hit["read"]) for hit in result["hits"]},
+        }
+    return {
+        "total": result["n"],
+        "returned": result["c"],
+        "next_offset": result["no"],
+        "reads": {
+            hit["i"]: {
+                "uid": hit["i"],
+                **{SHORT_KEYS[key]: value for key, value in hit["r"].items()},
+            }
+            for hit in result["h"]
+        },
+    }
+
+
+SEARCH_MODES = [
+    pytest.param({}, id="default"),
+    pytest.param({"compact": True}, id="default-compact"),
+    pytest.param({"depth": "L0"}, id="l0"),
+    pytest.param({"depth": "L0", "compact": True}, id="l0-compact"),
+    pytest.param({"budget_tokens": 20000}, id="budgeted"),
+    pytest.param({"depth": "L0", "budget_tokens": 1200, "compact": True}, id="l0-budgeted"),
+]
+
+
+@pytest.mark.parametrize("alternates", MALFORMED_ALTERNATES)
+@pytest.mark.parametrize("mode", SEARCH_MODES)
+def test_one_malformed_record_among_several_leaves_the_other_hits_and_counts_intact(
+    mount, mode, alternates
+):
+    call = paged_library(mount, alternates)
+    result = call(SEARCH_TOOL, query="pagemark", **mode)
+    page = unpacked(result, mode.get("compact", False))
+    uids = {name: paged_record(name).uid for name in LEADS}
+    assert page["total"] == len(LEADS) and page["returned"] == len(LEADS)
+    assert page["next_offset"] is None and not {"truncated", "tr"} & set(result)
+    assert set(page["reads"]) == set(uids.values())
+    for name, uid in uids.items():
+        read = page["reads"][uid]
+        if name == "omega":
+            assert read == {
+                "uid": uid,
+                "message": 0,
+                "offset": 0,
+                "limit": PASSAGE_LIMIT,
+                "located": False,
+                "locator_error": read["locator_error"],
+            }
+            assert read["locator_error"] and SENTINEL not in read["locator_error"]
+            continue
+        assert read == {"uid": uid, "message": LEADS[name], "offset": 0, "limit": PASSAGE_LIMIT}
+        passage = call(READ_TOOL, **read)
+        assert (
+            passage["message"] == LEADS[name] and f"pagemark finding of {name}" in passage["text"]
+        )
+    assert SENTINEL not in json.dumps(result)
+
+
+def test_compact_search_carries_the_located_and_locator_error_keys_without_a_uid(mount):
+    result = paged_library(mount)(SEARCH_TOOL, query="pagemark", depth="L0", compact=True)
+    bad_uid = paged_record("omega").uid
+    degraded = next(hit for hit in result["h"] if hit["i"] == bad_uid)["r"]
+    assert set(degraded) == {"m", "o", "l", "lc", "le"} and degraded["lc"] is False
+    intact = next(hit for hit in result["h"] if hit["i"] != bad_uid)["r"]
+    assert set(intact) == {"m", "o", "l"}
+    assert library_mcp.COMPACT_KEYS["locator_error"] == "le"
+
+
+def test_pagination_and_truncation_stay_exact_across_a_malformed_record(mount):
+    call = paged_library(mount)
+    uids = {paged_record(name).uid for name in LEADS}
+    for arguments in ({"limit": 2}, {"limit": 5, "budget_tokens": 230}):
+        seen, offset, pages = [], 0, 0
+        while offset is not None:
+            result = call(SEARCH_TOOL, query="pagemark", depth="L0", offset=offset, **arguments)
+            assert result["total"] == len(LEADS) and result["total_exact"] is True
+            assert result["returned"] == len(result["hits"]) >= 1
+            seen.extend(hit["uid"] for hit in result["hits"])
+            offset, pages = result["next_offset"], pages + 1
+            assert pages <= len(LEADS)
+        assert pages > 1 and sorted(seen) == sorted(uids)
+
+
+def test_single_record_reads_of_a_malformed_record_raise_an_error_naming_it(mount):
+    good = synthetic("good", "badalt good", "badalt body")
+    bad = synthetic("bad", "badalt record", "badalt body", {"alternate_messages": SENTINEL})
+    call = mount(good, bad)
+    for arguments in (
+        {},
+        {"sequence": "alternate"},
+        {"around_query": "badalt"},
+        {"message_end": 1},
+        {"toc": True},
+    ):
+        with pytest.raises(ValueError, match=re.escape(bad.uid)) as raised:
+            call(READ_TOOL, uid=bad.uid, **arguments)
+        assert SENTINEL not in str(raised.value)
+    assert call(READ_TOOL, uid=good.uid)["text"] == "badalt body"
+
+
+def test_server_answers_a_page_with_a_malformed_hit_and_names_the_record_on_a_single_read(
+    mount, tmp_path
+):
+    good = synthetic("good", "badalt good", "badalt body")
+    bad = synthetic("bad", "badalt record", "badalt body", {"alternate_messages": SENTINEL})
+    mount(good, bad)
+    server = CceMcpServer(default_project_root=tmp_path, library_store_root=tmp_path)
+    page = server.call_tool(SEARCH_TOOL, {"query": "badalt", "depth": "L0"})
+    assert page["isError"] is False and page["structuredContent"]["total"] == 2
+    assert SENTINEL not in page["content"][0]["text"]
+    single = server.call_tool(READ_TOOL, {"uid": bad.uid})
+    assert single["isError"] is True and bad.uid in single["content"][0]["text"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        IndexError,
+        RecursionError,
+        pytest.param(zlib.error, id="zlib.error"),
+    ],
+)
+def test_every_malformed_data_error_class_degrades_only_its_own_hit(mount, monkeypatch, error):
+    call = paged_library(mount, [])
+    bad_uid = paged_record("beta").uid
+    real = library_mcp.passage_handoff
+
+    def handoff(payload, query, *args):
+        if payload["uid"] == bad_uid:
+            raise error(SENTINEL)
+        return real(payload, query, *args)
+
+    monkeypatch.setattr(library_mcp, "passage_handoff", handoff)
+    result = call(SEARCH_TOOL, query="pagemark", depth="L0")
+    reads = {hit["uid"]: hit["read"] for hit in result["hits"]}
+    assert result["total"] == result["returned"] == len(LEADS) == len(reads)
+    assert reads[bad_uid]["located"] is False
+    assert f"({error.__name__})" in reads[bad_uid]["locator_error"]
+    assert [uid for uid, read in reads.items() if "locator_error" in read] == [bad_uid]
+    assert SENTINEL not in json.dumps(result)
+
+
+def test_a_database_failure_is_not_a_malformed_record_and_still_fails_the_call(mount, monkeypatch):
+    call = paged_library(mount, [])
+
+    def broken(payload, query, *args):
+        raise sqlite3.OperationalError("database is unavailable")
+
+    monkeypatch.setattr(library_mcp, "passage_handoff", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        call(SEARCH_TOOL, query="pagemark", depth="L0")

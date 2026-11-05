@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import json
 import math
+import zlib
 from pathlib import Path
 from typing import Any
 
 from .archive_database import fts_query
-from .library_commands import open_library, passage_handoff, read_record, record_toc
+from .library_commands import PASSAGE_LIMIT, open_library, passage_handoff, read_record, record_toc
 from .library_store import Library
 
 SEARCH_TOOL = "cce_library_search"
@@ -27,6 +28,17 @@ MAX_BUDGET = 20000
 MIN_BUDGET = 100
 TITLE_CHARS = 80
 TOKEN_BASIS = "bytes/4"
+# What a malformed stored record can raise while its read locator is computed. Anything else (a
+# database failure, for example) is not a property of one record and still fails the whole call.
+LOCATOR_ERRORS = (
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+    IndexError,
+    RecursionError,
+    zlib.error,
+)
 
 # Short keys for compact responses (search and read). Values are unique across both tools.
 COMPACT_KEYS = {
@@ -48,6 +60,7 @@ COMPACT_KEYS = {
     "message": "m",
     "sequence": "sq",
     "located": "lc",
+    "locator_error": "le",
     "provider": "p",
     "kind": "k",
     "wing": "w",
@@ -129,7 +142,8 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "type": "boolean",
                     "description": "Short keys: n total, nx total exact, o offset, c returned, "
                     "no next offset, h hits, tr truncated, tk estimated tokens, i uid, t title, "
-                    "s score, r read locator (m message, o offset, l limit, sq sequence).",
+                    "s score, r read locator (m message, o offset, l limit, sq sequence, lc located, "
+                    "le locator error).",
                 },
             },
             ["query"],
@@ -280,6 +294,22 @@ def _one_line(title: str) -> str:
     return line if len(line) <= TITLE_CHARS else line[: TITLE_CHARS - 3] + "..."
 
 
+def _locator(library: Library, uid: str, query: str) -> dict[str, Any]:
+    """Read arguments of a hit's best passage. A record whose stored shape cannot be interpreted
+    degrades to a start-of-record locator (located false, with a content-free reason), so one
+    malformed record never fails the page that lists it."""
+    try:
+        return passage_handoff(library.record(uid), query)
+    except LOCATOR_ERRORS as error:
+        return {
+            "message": 0,
+            "offset": 0,
+            "limit": PASSAGE_LIMIT,
+            "located": False,
+            "locator_error": f"stored record could not be located ({type(error).__name__})",
+        }
+
+
 def _search(
     library: Library,
     generation: Path,
@@ -329,7 +359,7 @@ def _search(
     total = found["total"]
 
     def entry(hit: dict[str, Any]) -> dict[str, Any]:
-        read = {"uid": hit["uid"], **passage_handoff(library.record(hit["uid"]), query)}
+        read = {"uid": hit["uid"], **_locator(library, hit["uid"], query)}
         if compact:
             read.pop("uid")
         base = {"uid": hit["uid"], "title": _one_line(hit["title"])} if depth == "L0" else dict(hit)
