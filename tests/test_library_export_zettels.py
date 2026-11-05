@@ -3,20 +3,44 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import re
 from pathlib import Path
 
 import pytest
+from markdown_it import MarkdownIt
 
 from conversation_corpus_engine import library_commands
 from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.attributed_knowledge import ZETTEL_SCHEMA
 from conversation_corpus_engine.cli import build_parser
-from conversation_corpus_engine.library_export import export_library, verify_export
+from conversation_corpus_engine.library_export import _inert_lines, export_library, verify_export
 from conversation_corpus_engine.library_store import Library
 
 PAGE_LIMIT = 16 * 1024
+# Lines Markdown reads as structure: "=" or "-" underlines turn the line above into a
+# heading, and runs of "-", "*" or "_" (spaces allowed) are thematic breaks.
+RULE_LIKE_LINES = [
+    "===",
+    "---",
+    "=",
+    "-",
+    "======",
+    "------",
+    "  ===  ",
+    "   ---",
+    "\t---",
+    "- - -",
+    "-- --",
+    "  - - -  ",
+    "= = =",
+    "-=-",
+    "***",
+    "___",
+    "* * *",
+    "_ _ _",
+]
 FRONTMATTER_KEYS = [
     "id",
     "type",
@@ -40,6 +64,11 @@ BASELINE_TREE_DIGEST = "571e1bbccad147dc97f5a4c7ced9925f8dc396f118b0374b154329fc
 
 def sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def rule_like(line: str) -> bool:
+    """True when the line holds only setext/thematic-break marker characters."""
+    return bool(line.strip(" \t")) and set(line) <= set("-=*_ \t")
 
 
 def annotation(text: str, author: str = "owner", author_id: str = "rob") -> dict:
@@ -431,6 +460,75 @@ def test_hostile_text_never_becomes_a_live_link_or_heading(tmp_path: Path) -> No
         assert "<script>" not in text
         assert "\n# Not a heading" not in text
         assert "[[" not in text
+        assert verify_export(destination) == []
+
+
+@pytest.mark.parametrize("marker", RULE_LIKE_LINES)
+def test_rule_like_lines_are_inert_whatever_surrounds_them(marker: str) -> None:
+    for text in (f"Looks like text\n{marker}\nAnother", f"{marker}\nAfter", f"Before\n\n{marker}"):
+        inert = _inert_lines(text)
+        assert [line for line in inert.split("\n") if rule_like(line)] == [], (marker, inert)
+        # Quoted the way a source quotation is, no quoted line is a marker line either.
+        quoted = "\n".join("> " + line for line in inert.split("\n"))
+        assert [line for line in quoted.split("\n") if rule_like(line.removeprefix("> "))] == []
+        assert html.unescape(inert) == text
+
+
+def test_setext_underlines_are_escaped_and_read_the_same() -> None:
+    hostile = "Looks like text\n===\nAnother\n---"
+    inert = _inert_lines(hostile)
+    assert inert == "Looks like text\n&#61;==\nAnother\n&#45;--"
+    # Reversible in meaning: a reader (or an unescape) gets the original text back.
+    assert html.unescape(inert) == hostile
+    assert _inert_lines("  === \n\t- - -") == "  &#61;== \n\t&#45; - -"
+
+
+def test_ordinary_lines_with_hyphens_and_equals_are_left_alone() -> None:
+    text = "well-known = fine\n-1\n- item\n== note\na---b\n\n  indented - text"
+    assert _inert_lines(text) == text
+
+
+def test_inert_lines_stay_reversible_for_hostile_mixed_text() -> None:
+    hostile = "<b>x</b> & [y](z)\n***\n___\n- - -\n===\n\n---\n# h\n`c` *e* _u_ |t| !i"
+    assert html.unescape(_inert_lines(hostile)) == hostile
+    assert all(not rule_like(line) for line in _inert_lines(hostile).split("\n"))
+
+
+def test_setext_and_break_lines_never_become_headings_or_rules_on_a_page(tmp_path: Path) -> None:
+    with populate(tmp_path, records=1) as library:
+        hostile = "Looks like text\n===\nAnother\n---\nThird\n- - -\n***\n___\nLast\n  ==="
+        library.put(
+            Conversation(
+                provider="chatgpt",
+                source_id="setext",
+                title="Setext",
+                messages=[Message(role="user", text=hostile, id="s")],
+            )
+        )
+        ref = reference(library, "chatgpt-setext", end=300)
+        item = zettel(library, 1, [ref], body=hostile)
+        item["attribution"] = annotation(item["body"], "agent", "model")
+        destination = tmp_path / "export"
+        export_library(library, destination, zettels=envelope([item]))
+        _, body = frontmatter(page(destination, item["id"]))
+        lines = body.split("\n")
+        # Both the body paragraph and the blockquoted source text carry the hostile lines.
+        assert sum(1 for line in lines if line == "Looks like text") == 1
+        assert sum(1 for line in lines if line == "> Looks like text") == 1
+        for line in lines:
+            assert not rule_like(line.removeprefix("> ")), line
+        unescaped = html.unescape(body)
+        assert unescaped.count("Looks like text\n===\nAnother\n---\nThird\n- - -\n***\n___") == 1
+        assert unescaped.count("> Looks like text\n> ===\n> Another\n> ---") == 1
+        # A CommonMark parser sees only the page's own headings and no thematic break.
+        tokens = MarkdownIt("commonmark").parse(body)
+        assert [t.type for t in tokens if t.type == "hr"] == []
+        headings = [
+            tokens[index + 1].content
+            for index, token in enumerate(tokens)
+            if token.type == "heading_open"
+        ]
+        assert headings == ["Idea 1", "Authorship", "Review", "Sources", "Source 1"]
         assert verify_export(destination) == []
 
 

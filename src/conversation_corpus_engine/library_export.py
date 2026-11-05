@@ -53,6 +53,7 @@ _QUOTE_LIMIT = 400
 _ZETTEL_PAGE = re.compile(r"vault/zettels/[0-9a-f]{16}\.md\Z")
 _ZETTEL_HUB = re.compile(r"vault/hubs/zettels-[1-9][0-9]*\.md\Z")
 _INERT = re.compile(r"[\[\]`\\*_#|!]")
+_RULE_LINE = re.compile(r"([ \t]*)([-=])([-= \t]*)")
 _FRONTMATTER_ESCAPES = str.maketrans(
     {
         "[": "\\u005b",
@@ -391,12 +392,21 @@ def _clip(text: str, limit: int) -> tuple[str, bool]:
     return (text[:limit], True) if len(text) > limit else (text, False)
 
 
+def _inert_line(line: str) -> str:
+    text = _INERT.sub(lambda match: f"&#{ord(match[0])};", html.escape(line, quote=False))
+    # A line of only "=" or "-" markers is a setext underline (it turns the line above
+    # into a heading, also inside a blockquote) and "- - -" is a thematic break. "*" and
+    # "_" runs are already entities. Entity-escape the first marker so the line renders
+    # as the same text without any structure.
+    rule = _RULE_LINE.fullmatch(text)
+    if rule:
+        return f"{rule[1]}&#{ord(rule[2])};{rule[3]}"
+    return text
+
+
 def _inert_lines(text: str) -> str:
     """Keep line structure but neutralize each line like a title."""
-    return "\n".join(
-        _INERT.sub(lambda match: f"&#{ord(match[0])};", html.escape(line, quote=False))
-        for line in text.splitlines()
-    )
+    return "\n".join(_inert_line(line) for line in text.splitlines())
 
 
 def _span_label(span: dict[str, Any], limit: int = 80) -> str:
