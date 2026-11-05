@@ -254,9 +254,14 @@ key they are qualified as `external/<first 12 hex of the content SHA-256>/<name>
 `source_file` on each conversation row keeps the plain name and is paired with its
 `source_sha256`. Live captures are listed separately from account-export shards in the channel
 report: for ChatGPT, `channels.read` counts the export's shard files on one line and the delta
-files on the next, and together they equal the ChatGPT entries of `source_files` (a delta sits
-in `source_files` too, so a build with 29 shards and one delta lists 30 files and reports
-"29 conversation shard file(s)" plus "1 extra live capture file(s)").
+files kept outside the export folder on the next, and together they equal the ChatGPT entries
+of `source_files` (a delta sits in `source_files` too, so a build with 29 shards and one delta
+lists 30 files and reports "29 conversation shard file(s)" plus "1 extra live capture
+file(s)"). This holds for a plain account export plus deltas; a library-bridged build also
+lists the library database and pointer in `source_files`, and its library line counts records,
+not files. A delta placed inside the export folder under a shard name (`conversations-NNN.json`)
+is counted on both lines and read twice (the second read folds as a duplicate); keep deltas
+outside the export folder.
 Origins describe the ingestion route; they are not a claim about who authored the text. An
 outer export ZIP that was unpacked before ingestion is not read by any reader, so it is recorded
 only when named: `--export-zip PROVIDER=PATH` (repeatable) hashes the ZIP and records its
