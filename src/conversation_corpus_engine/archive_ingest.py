@@ -28,6 +28,7 @@ from . import (
 )
 from .archive_author import AUTHORS, author_of, container_of
 from .archive_limits import SHARD_BYTES
+from .archive_lineage import record_generation
 from .archive_model import (
     SCHEMA,
     Conversation,
@@ -235,6 +236,16 @@ class ArchivePaths:
         return self.root / layout.TOPICS_FILENAME
 
     @property
+    def lineage(self) -> Path:
+        """The ledger of generations (what each ingest added, changed or removed)."""
+        return self.root / layout.LINEAGE_FILENAME
+
+    @property
+    def digests(self) -> Path:
+        """The content digest of every conversation as of the latest generation."""
+        return self.root / layout.DIGESTS_FILENAME
+
+    @property
     def vault(self) -> Path:
         return self.root / layout.VAULT_DIRNAME
 
@@ -399,6 +410,10 @@ class ArchivePaths:
     @property
     def site_pages(self) -> Path:
         return self.site / layout.SITE_PAGES_DIRNAME
+
+    @property
+    def site_hubs(self) -> Path:
+        return self.site / layout.SITE_HUBS_DIRNAME
 
     @property
     def site_home(self) -> Path:
@@ -853,6 +868,8 @@ def _ingest_provider(
             "inputs": tracker.inputs(),
         }
     _publish_shards(paths, spec.name, build, folder_entries=options.get("folder_entries"))
+    # The digests of what this provider now holds, for the lineage of generations.
+    options.setdefault("lineage_digests", {})[spec.name] = seen
     # Resolve each shard's on-disk path (flat or grouped) for its checksum.
     on_disk = {p.name: p for p in paths.shard_files(spec.name)}
     for shard in shards:
@@ -1011,6 +1028,21 @@ def ingest(
         },
     }
     write_json_atomic(paths.manifest, manifest)
+    try:
+        day = latest_activity_day(manifest)
+    except ValueError:  # no provider reports any activity: the generation has no day
+        day = ""
+    record_generation(
+        paths,
+        manifest,
+        options.get("lineage_digests", {}),
+        read=sources.keys(),
+        day=day,
+        digest_store=lambda name: {
+            conversation.uid: content_digest(conversation)
+            for conversation in iter_store(paths, [name])
+        },
+    )
     return manifest
 
 

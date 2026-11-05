@@ -186,7 +186,9 @@ def test_a_full_build_writes_only_names_the_contract_accepts(full_build) -> None
     assert top == [
         "database-all-turns",
         "graph-all",
+        "index-all-digests.jsonl",
         "index-all-enrichment.jsonl",
+        "index-all-lineage.jsonl",
         "manifest-all-vault.json",
         "manifest-all.json",
         "provider-chatgpt",

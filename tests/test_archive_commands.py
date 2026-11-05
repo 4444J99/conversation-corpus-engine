@@ -55,7 +55,10 @@ def test_build_runs_every_stage_and_verifies(cli_env) -> None:
 def test_verify_search_and_titles_commands(cli_env, monkeypatch, capsys) -> None:
     _, common, _, _, _ = cli_env
     code, out, _ = _cce(monkeypatch, capsys, "archive", "verify", *common)
-    assert code == 0 and json.loads(out) == {"ok": True, "problems": []}
+    verified = json.loads(out)
+    wiki = verified.pop("wiki")  # the site's wiki checks, reported beside the verdict
+    assert code == 0 and verified == {"ok": True, "problems": []}
+    assert wiki["problems"] == [] and wiki["dangling_links"] == 0 and wiki["pages"] > 0
     code, out, _ = _cce(monkeypatch, capsys, "archive", "search", "kubernetes", "--json", *common)
     hits = json.loads(out)
     assert code == 0 and {"chatgpt", "claude"} <= {h["provider"] for h in hits}
@@ -67,6 +70,31 @@ def test_verify_search_and_titles_commands(cli_env, monkeypatch, capsys) -> None
         monkeypatch, capsys, "archive", "search", "rollout", "--titles", "--json", *common
     )
     assert [h["uid"] for h in json.loads(out)] == ["chatgpt-aaaa1111"]
+
+
+def test_verify_passes_with_a_note_on_a_store_that_predates_the_lineage_until_build_baselines_it(
+    cli_env, monkeypatch, capsys
+) -> None:
+    env, common, _, _, _ = cli_env
+    env.paths.lineage.unlink()
+    env.paths.digests.unlink()
+    code, _, _ = _cce(monkeypatch, capsys, "archive", "site", *common)
+    assert code == 0
+    code, out, _ = _cce(monkeypatch, capsys, "archive", "verify", *common)
+    verified = json.loads(out)
+    assert code == 0 and verified["ok"] is True and verified["problems"] == []
+    lineage = verified["wiki"]["lineage"]
+    assert lineage["status"] == "absent" and "cce archive build" in lineage["note"]
+    assert verified["wiki"]["generations"] == 0 and verified["wiki"]["recent_changes"] == 0
+    assert not env.paths.lineage.exists() and not env.paths.digests.exists(), "verify never writes"
+    args = ("archive", "build", "--export-root", str(env.export), *common)
+    code, out, _ = _cce(monkeypatch, capsys, *args)
+    baselined = json.loads(out)
+    assert code == 0 and baselined["ok"] is True
+    assert baselined["wiki"]["lineage"] == {"status": "recorded", "note": ""}
+    assert baselined["wiki"]["generations"] == 1
+    code, out, _ = _cce(monkeypatch, capsys, "archive", "verify", *common)
+    assert code == 0 and json.loads(out)["wiki"]["lineage"]["status"] == "recorded"
 
 
 def test_verify_detects_tampering_across_surfaces(cli_env, monkeypatch, capsys) -> None:
