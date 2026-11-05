@@ -106,6 +106,9 @@ def message_html_blocks(message: Message, max_block: int, number: int = 0) -> li
     label = ROLE_LABELS.get(message.role, message.role.title())
     if kind not in {"text", "code"}:
         label = f"{label} · {kind}"
+    # `human` (the person typed or wrote it) or `machine` (everything else): the two containers
+    # of the turn store, so a reader sees who wrote a turn and not only which role it had.
+    author = message.author
     names = [a.name for a in message.attachments if a.name]
     attachments = ""
     if names:
@@ -123,17 +126,15 @@ def message_html_blocks(message: Message, max_block: int, number: int = 0) -> li
         if index == 0:
             body += attachments
         tag = f"{label} · piece {index + 1}/{total}" if total > 1 else label
-        head = f"{_esc(tag)} · {_esc(_stamp(message.ts))}"
+        head = f"{_esc(tag)} · {author} · {_esc(_stamp(message.ts))}"
         ident = f' id="{anchor}"' if anchor else ""
+        classes = f"msg {_esc(message.role)} author-{author}"
         if kind in COLLAPSED_KINDS:
             return (
-                f'<article class="msg {_esc(message.role)}"{ident}><details>'
+                f'<article class="{classes}"{ident}><details>'
                 f"<summary>{head}</summary>{body}</details></article>"
             )
-        return (
-            f'<article class="msg {_esc(message.role)}"{ident}><header>{head}</header>{body}'
-            "</article>"
-        )
+        return f'<article class="{classes}"{ident}><header>{head}</header>{body}</article>'
 
     return fit_blocks(message.text, render, max_block)
 

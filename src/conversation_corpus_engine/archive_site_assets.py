@@ -96,6 +96,8 @@ details { margin: 6px 0; } summary { cursor: pointer; }
   margin: 14px 0; padding: 4px 14px 10px; }
 .page article.msg > header { color: var(--muted); font-size: .8rem; padding-top: 8px; text-transform: uppercase; letter-spacing: .04em; }
 .page article.user { border-left: 4px solid var(--accent); }
+.page article.author-human > header, .page article.author-human summary { color: var(--fg);
+  font-weight: 600; }
 .page .body { overflow-wrap: anywhere; }
 .page .body pre { background: rgba(127,127,127,.12); padding: 10px; border-radius: 8px; overflow-x: auto; }
 .page .body code { font: .88em ui-monospace, SFMono-Regular, Menlo, monospace; }

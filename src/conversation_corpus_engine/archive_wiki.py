@@ -17,7 +17,8 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from . import archive_layout as layout
-from .archive_ingest import ArchivePaths, load_index
+from .archive_author import AUTHORS
+from .archive_ingest import ArchivePaths, load_index, load_manifest
 from .archive_layout import CONVERSATION_PREFIX
 from .archive_naming import InvalidName, conversation_uid, parse_name
 from .archive_vault import incoming_links, part_owners
@@ -92,6 +93,10 @@ class PageFacts(HTMLParser):
         self.backlink_pages: list[str] = []
         self._in_backlinks = False
         self._in_page_item = False
+        # Message articles: how many carry no single author class, and the author of each
+        # message's first piece (a split message has one first piece), by anchor.
+        self.unlabelled_articles = 0
+        self.authors: dict[str, str] = {}
 
     def handle_endtag(self, tag: str) -> None:
         if tag == "li":
@@ -101,6 +106,16 @@ class PageFacts(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
+        if tag == "article":
+            found = [
+                item.removeprefix("author-")
+                for item in str(values.get("class") or "").split()
+                if item.startswith("author-")
+            ]
+            if len(found) != 1 or found[0] not in AUTHORS:
+                self.unlabelled_articles += 1
+            elif MESSAGE_ID_RE.fullmatch(str(values.get("id"))):
+                self.authors[str(values["id"])] = found[0]
         if tag == "section" and values.get("class") == "backlinks":
             self._in_backlinks = True
             self.backlink_total = int(values.get("data-total") or -1)
@@ -204,6 +219,7 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
         "messages": 0,
         "messages_anchored": 0,
         "toc_pages": 0,
+        "authors": {author: 0 for author in AUTHORS},
         "topic_pages": 0,
         "topic_hubs": 0,
         "backlink_pages": 0,
@@ -251,6 +267,13 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
                 seen_backlinks[uid] = facts
             else:
                 page_problems.append(f"{uid}: {count} backlinks section(s), expected exactly one")
+        if facts.unlabelled_articles:
+            page_problems.append(
+                f"{uid}: {facts.unlabelled_articles} message article(s) in {relative} lack "
+                "exactly one author class"
+            )
+        for author in facts.authors.values():
+            report["authors"][author] += 1
         mask = anchored.get(uid, 0)
         for anchor in facts.ids:
             match = MESSAGE_ID_RE.fullmatch(anchor)
@@ -278,6 +301,14 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
                 f"{' and more' if len(missing) > 5 else ''}"
                 f"{', anchors past the last message' if extra else ''}"
             )
+    try:
+        counted = load_manifest(paths).get("totals", {}).get("authors")
+    except (FileNotFoundError, ValueError):
+        counted = None
+    if counted and {author: counted.get(author, 0) for author in AUTHORS} != report["authors"]:
+        page_problems.append(
+            f"site labels {report['authors']} turns by author, the manifest counts {counted}"
+        )
     incoming = incoming_links(paths)
     page_problems += _backlink_problems(incoming, rows, seen_backlinks, report)
     page_problems += _topic_problems(hub_pages, incoming, report)

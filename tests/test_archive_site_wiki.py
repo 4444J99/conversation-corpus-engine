@@ -16,7 +16,8 @@ from archive_support import conv, gpt_conversation
 from conversation_corpus_engine.archive_database import build_database
 from conversation_corpus_engine.archive_ingest import ingest, load_index
 from conversation_corpus_engine.archive_limits import Limits
-from conversation_corpus_engine.archive_site import build_site, render_page
+from conversation_corpus_engine.archive_model import Message
+from conversation_corpus_engine.archive_site import build_site, render_message_html, render_page
 from conversation_corpus_engine.archive_topics import build_analysis
 from conversation_corpus_engine.archive_vault import build_vault
 
@@ -558,3 +559,93 @@ def test_topic_pages_keep_every_generated_name_inside_the_naming_contract(built)
     report = naming.verify_names(built.paths.root)
     assert report["ok"], report
     assert site_topic_pages(built.paths)
+
+
+# --- (4) per-turn author-class labels -----------------------------------------------------------
+
+
+class _Articles(HTMLParser):
+    """The author class each message article carries (first pieces only: one per message)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.authors: dict[str, str] = {}
+        self.unlabelled = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "article":
+            return
+        values = dict(attrs)
+        classes = str(values.get("class") or "").split()
+        found = [item.removeprefix("author-") for item in classes if item.startswith("author-")]
+        if len(found) != 1:
+            self.unlabelled += 1
+        elif re.fullmatch(r"message-\d+", str(values.get("id"))):
+            self.authors[str(values["id"])] = found[0]
+
+
+def authors_of(text: str) -> _Articles:
+    parsed = _Articles()
+    parsed.feed(text)
+    return parsed
+
+
+def test_a_turn_is_labelled_human_or_machine_from_its_author() -> None:
+    typed = Message(role="user", text="hello", channel="typed", ts="2025-01-01T00:00:00Z")
+    written = Message(role="user", text="a note", channel="written", ts="2025-01-01T00:00:00Z")
+    injected = Message(role="user", text="<harness>", channel="system", ts="2025-01-01T00:00:00Z")
+    reply = Message(role="assistant", text="hi", channel="reply", ts="2025-01-01T00:00:00Z")
+    out = {
+        name: render_message_html(m)
+        for name, m in (("t", typed), ("w", written), ("i", injected), ("r", reply))
+    }
+    assert "author-human" in out["t"] and "User · human" in out["t"]
+    assert "author-human" in out["w"]
+    assert "author-machine" in out["i"] and "User · machine" in out["i"]
+    assert "author-machine" in out["r"] and "Assistant · machine" in out["r"]
+
+
+def test_a_collapsed_turn_keeps_its_role_first_and_names_its_author() -> None:
+    message = Message(
+        role="assistant",
+        text="inner",
+        ts="2025-01-01T00:00:00Z",
+        channel="thinking",
+        meta={"kind": "reasoning"},
+    )
+    text = render_message_html(message)
+    assert "<details><summary>Assistant · reasoning · machine" in text
+    assert "author-machine" in text
+
+
+def test_every_message_article_on_a_built_site_carries_its_author_class(built) -> None:
+    manifest = json.loads(built.paths.manifest.read_text("utf-8"))
+    human = machine = 0
+    for row in load_index(built.paths):
+        parsed = authors_of(built.paths.site_page(row["provider"], row["uid"]).read_text("utf-8"))
+        assert parsed.unlabelled == 0, row["uid"]
+        human += sum(1 for item in parsed.authors.values() if item == "human")
+        machine += sum(1 for item in parsed.authors.values() if item == "machine")
+    assert (human, machine) == (
+        manifest["totals"]["authors"]["human"],
+        manifest["totals"]["authors"]["machine"],
+    )
+    assert human > 0 and machine > 0
+
+
+def test_verify_fails_on_a_wrong_or_missing_author_label(built) -> None:
+    page = built.paths.site_page("chatgpt", "chatgpt-aaaa1111")
+    text = page.read_text("utf-8")
+    assert "author-human" in text
+    page.write_text(text.replace("author-human", "author-machine", 1), encoding="utf-8")
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    assert any("author" in item for item in problems)
+    page.write_text(text.replace("author-human", "other", 1), encoding="utf-8")
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    assert any("author" in item and "chatgpt-aaaa1111" in item for item in problems)
+
+
+def test_verify_counts_authors_against_the_manifest(built) -> None:
+    report = wiki().verify_site_wiki(built.paths)
+    manifest = json.loads(built.paths.manifest.read_text("utf-8"))
+    assert report["authors"] == manifest["totals"]["authors"]
