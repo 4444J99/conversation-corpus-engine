@@ -8,6 +8,7 @@ import pytest
 
 from conversation_corpus_engine import library_commands
 from conversation_corpus_engine.archive_model import Conversation, Message
+from conversation_corpus_engine.archive_sealed_units import project_units
 from conversation_corpus_engine.attributed_knowledge import (
     collect_owner_segments,
     export_zettels,
@@ -16,7 +17,7 @@ from conversation_corpus_engine.attributed_knowledge import (
 )
 from conversation_corpus_engine.attribution import attributed_spans
 from conversation_corpus_engine.cli import build_parser
-from conversation_corpus_engine.library_store import Library
+from conversation_corpus_engine.library_store import Library, canonical_json
 from conversation_corpus_engine.persona_extract import (
     extract_persona_lexicon,
     render_persona_extract_markdown,
@@ -724,3 +725,66 @@ def test_later_revision_asserting_a_previously_unattributed_span_still_counts_on
     owner, other = collect_owner_segments(library, entries, "rob")
     assert owner == ["source"]
     assert other == ["😀 café source", "😀 café "]
+
+
+def _full_reviewed_zettel(ref):
+    body = "My derived idea: café ☕"
+    title = "A synthesis"
+    alternate = {
+        **ref,
+        "sequence": "alternate",
+        "message_id": "a1",
+        "start": 0,
+        "end": 9,
+        "text_digest": digest("alternate source"),
+    }
+    return {
+        "id": "idea-permanent-17",
+        "title": title,
+        "body": body,
+        "created": "2026-02-01",
+        "updated": "2026-02-02",
+        "review": {
+            "status": "reviewed",
+            "reviewer": "rob",
+            "evidence": ["review receipt 1", "review receipt 2 ☕"],
+        },
+        "relationships": [
+            {"type": "supports", "target": "idea-older-3"},
+            {"type": "contradicts", "target": "idea-outside-batch-9"},
+        ],
+        "attribution": annotation(body, [span(0, 16), span(17, len(body), "agent", "model")]),
+        "title_attribution": annotation(title, [span(0, len(title), "agent", "model")]),
+        "sources": [
+            {
+                "source": ref,
+                "attribution": annotation("😀 café source", [span(2, 6, "third_party", "writer")]),
+            },
+            {"source": alternate},
+        ],
+    }
+
+
+def test_atom_wrapper_round_trips_the_full_reviewed_zettel_byte_for_byte(canonical, tmp_path):
+    library, _, ref = canonical
+    zettel = _full_reviewed_zettel(ref)
+    exported = export_zettels(library, [zettel])["zettels"][0]
+    atom = zettel_atoms(library, [zettel])[0]
+    assert canonical_json(atom["zettel"]) == canonical_json(exported)
+    # Every field the wrapper claims to preserve is present in the complete Zettel.
+    assert atom["zettel"]["relationships"] == zettel["relationships"]
+    assert atom["zettel"]["review"] == zettel["review"]
+    assert atom["zettel"]["title_spans"][0]["author"] == "agent"
+    assert [s["source"]["sequence"] for s in atom["zettel"]["sources"]] == ["main", "alternate"]
+    assert atom["zettel"]["sources"][0]["text"] == "café"
+    assert atom["zettel"]["sources"][0]["attributed_spans"][0]["author"] == "third_party"
+    assert atom["derived_from"] == [s["source"] for s in atom["zettel"]["sources"]]
+    # JSONL serialisation and the sealed-archive projection must not alter it either.
+    path = tmp_path / "ideas.atoms.jsonl"
+    path.write_text(json.dumps(atom, ensure_ascii=False) + "\n", encoding="utf-8")
+    (row,) = list(project_units(path, "ideas.atoms.jsonl"))
+    assert canonical_json(row["zettel"]) == canonical_json(exported)
+    assert canonical_json(row) == canonical_json(atom)
+    # The preserved Zettel is itself a valid input that re-wraps to the same bytes.
+    again = zettel_atoms(library, [atom["zettel"]])[0]
+    assert canonical_json(again) == canonical_json(atom)
