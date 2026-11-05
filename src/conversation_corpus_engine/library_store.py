@@ -617,6 +617,25 @@ class Library:
             counts[label] = dict(
                 self.connection.execute(f"SELECT {column},COUNT(*) FROM records GROUP BY {column}")
             )
+        # The reason lives in the stored revision payload; it is not a records column, so
+        # existing stores need no migration. Only non-full records are decoded.
+        reasons: dict[str, dict[str, int]] = {}
+        unexplained = 0
+        for row in self.connection.execute(
+            "SELECT r.body_status AS body_status, o.payload AS payload FROM records r "
+            "JOIN objects o ON o.digest=r.current_digest WHERE r.body_status!='full'"
+        ):
+            if check_callback:
+                check_callback()
+            extra = json.loads(zlib.decompress(row["payload"])).get("extra") or {}
+            reason = extra.get("body_reason")
+            if isinstance(reason, str) and reason:
+                by_reason = reasons.setdefault(row["body_status"], {})
+                by_reason[reason] = by_reason.get(reason, 0) + 1
+            else:
+                unexplained += 1
+        counts["body_reasons"] = reasons
+        counts["unexplained_non_full"] = unexplained
         counts["raw_revision_bytes"] = self.connection.execute(
             "SELECT COALESCE(SUM(raw_bytes),0) FROM objects"
         ).fetchone()[0]
