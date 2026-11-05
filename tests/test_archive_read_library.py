@@ -25,6 +25,8 @@ from conversation_corpus_engine.archive_model import (
     SourceTracker,
     sha256_file,
 )
+from conversation_corpus_engine.archive_search import build_search_store
+from conversation_corpus_engine.archive_search import search as search_archive
 from conversation_corpus_engine.corpus_store import register_corpus_store
 from conversation_corpus_engine.library_store import Library
 
@@ -592,3 +594,102 @@ def test_a_snippet_is_the_first_thing_the_person_wrote_not_a_harness_turn(
     assert by_uid["claudecode-root-1"].index_row()["snippet"] == "please refactor the parser"
     # A subagent session has no human turn at all, so it has no snippet to borrow.
     assert by_uid["claudecode-sub-1"].index_row()["snippet"] == ""
+
+
+def _single_record_library(tmp_path: Path, record: Conversation) -> Path:
+    root = tmp_path / "single-library" / "library-all"
+    database = root / GENERATION / "library.sqlite"
+    database.parent.mkdir(parents=True)
+    with Library.create(database) as library:
+        library.put(record)
+    (root / "current.json").write_text(json.dumps({"generation": GENERATION}), encoding="utf-8")
+    return root
+
+
+BODY_TERM = "zymurgyquartz"
+
+
+@pytest.mark.parametrize(
+    ("family_provider", "kind"),
+    [("googledrive", "document"), ("applenotes", "note")],
+)
+@pytest.mark.parametrize(
+    ("channel", "typed_chars"),
+    [("typed", None), ("typed", 0), ("project", 0), ("written", 0)],
+)
+def test_library_family_bodies_are_found_by_body_search(
+    archive_env,
+    tmp_path: Path,
+    family_provider: str,
+    kind: str,
+    channel: str,
+    typed_chars: int | None,
+) -> None:
+    """A library-family user turn is the person's own text, so its body must be searchable.
+
+    The human container indexes only the first `typed_chars` characters of a turn; a library
+    record that arrives with `typed_chars` of 0 on a human channel must not make the whole
+    body invisible to `cce archive search`.
+    """
+    body = f"intro paragraph then the distinctive word {BODY_TERM} appears in the middle"
+    record = _conversation(
+        family_provider,
+        "doc-fts",
+        [
+            Message(
+                role="user",
+                text=body,
+                id="m1",
+                channel=channel,
+                ts="2026-03-04T10:01:00Z",
+                typed_chars=typed_chars,
+            )
+        ],
+        kind=kind,
+        wing="authored",
+        lane="writing",
+        body_status="partial",
+    )
+    root = _single_record_library(tmp_path, record)
+    manifest = _ingest(archive_env, root, [family_provider])
+    # Authorship is unchanged: the turn stays the person's.
+    assert manifest["providers"][family_provider]["authors"] == {HUMAN: 1, MACHINE: 0}
+    build_search_store(archive_env.paths, archive_env.auth)
+    hits = search_archive(archive_env.paths, BODY_TERM)
+    assert [(hit["uid"], hit["provider"], hit["author"]) for hit in hits] == [
+        (f"{family_provider}-doc-fts", family_provider, HUMAN)
+    ]
+    stored = next(iter_store(archive_env.paths, [family_provider]))
+    assert [m.author for m in stored.messages] == [HUMAN]
+
+
+def test_googledrive_body_fts(archive_env, tmp_path: Path) -> None:
+    """Pins the cause: a typed Drive turn whose capture left `typed_chars` at 0 was never indexed."""
+    record = _conversation(
+        "googledrive",
+        "doc-body",
+        [
+            Message(
+                role="user",
+                text=f"title line\n\nthe body mentions {BODY_TERM} once",
+                id="m1",
+                channel="typed",
+                ts="2026-03-04T10:01:00Z",
+                typed_chars=0,
+            )
+        ],
+        kind="document",
+        wing="authored",
+        lane="writing",
+        body_status="partial",
+    )
+    _ingest(archive_env, _single_record_library(tmp_path, record), ["googledrive"])
+    stored = next(iter_store(archive_env.paths, ["googledrive"]))
+    assert [(m.channel, m.author, m.typed_chars) for m in stored.messages] == [
+        ("typed", HUMAN, len(stored.messages[0].text))
+    ]
+    build_search_store(archive_env.paths, archive_env.auth)
+    assert [h["uid"] for h in search_archive(archive_env.paths, BODY_TERM)] == [
+        "googledrive-doc-body"
+    ]
+    assert search_archive(archive_env.paths, BODY_TERM, providers=["googledrive"], authors=[HUMAN])

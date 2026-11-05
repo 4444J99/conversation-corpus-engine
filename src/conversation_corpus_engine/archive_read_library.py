@@ -43,7 +43,7 @@ from .archive_author import HUMAN_CHANNELS
 from .archive_model import Conversation, SourceTracker
 from .archive_provenance import BASIS_KEY, reclassify_typed_turns
 
-READER = "archive_read_library@2"
+READER = "archive_read_library@3"
 POINTER = "current.json"
 DATABASE = "library.sqlite"
 WRITTEN = "written"
@@ -247,11 +247,16 @@ def _convert(row: dict[str, Any], payload: dict[str, Any], family: Family) -> Co
     }
     if family.authored:
         for message in conversation.messages:
-            # A turn already on a human channel stays as the library wrote it.
-            if message.role == "user" and message.channel not in HUMAN_CHANNELS:
+            if message.role != "user":
+                continue
+            # A turn already on a human channel keeps its channel as the library wrote it.
+            if message.channel not in HUMAN_CHANNELS:
                 message.channel = WRITTEN
-                message.typed_chars = len(message.text)
                 message.meta[BASIS_KEY] = f"authored:{family.kind}"
+            # The whole text of an authored record is the person's, so all of it is indexed: the
+            # human container's full-text index stops at `typed_chars`, and a capture that left
+            # it at 0 on a typed turn would make the body invisible to search.
+            message.typed_chars = len(message.text)
     return conversation
 
 
