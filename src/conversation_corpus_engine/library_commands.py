@@ -13,6 +13,7 @@ from .attributed_knowledge import ZETTEL_SCHEMA, export_zettels, zettel_atoms
 from .corpus_store import CorpusStoreError
 from .library_analysis import AnalysisLimits, export_analysis
 from .library_build import build_library, current_generation, publish_library, verify_candidate
+from .library_export import export_library, verify_export
 from .library_store import Library
 from .paths import default_project_root
 from .persona_extract import extract_persona_lexicon
@@ -144,6 +145,22 @@ def add_library_parser(subparsers: Any) -> None:
         default="json",
         help="Reviewed envelope or explicit sealed-archive knowledge atoms",
     )
+    export = sub.add_parser(
+        "export", help="Write the private reading export, optionally with reviewed Zettel pages"
+    )
+    common(export)
+    export.add_argument("--out", type=Path, required=True, help="New export directory")
+    export.add_argument(
+        "--zettels", type=Path, help="Private reviewed-Zettels JSON envelope to render as pages"
+    )
+    verify_export = sub.add_parser(
+        "verify-export", help="Verify an export directory, including its Zettel pages and anchors"
+    )
+    common(verify_export)
+    verify_export.add_argument("directory", type=Path)
+    verify_export.add_argument(
+        "--zettels", type=Path, help="Reviewed-Zettels envelope whose count the pages must match"
+    )
     profile = sub.add_parser(
         "profile", help="Strict owner profile from explicit canonical message annotations"
     )
@@ -198,8 +215,43 @@ def _progress(value: dict[str, Any]) -> None:
     print(json.dumps({"library_progress": value}, sort_keys=True), file=sys.stderr, flush=True)
 
 
+def _load_zettel_envelope(path: Path) -> dict[str, Any]:
+    envelope = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(envelope, dict) or envelope.get("schema") != ZETTEL_SCHEMA:
+        raise ValueError("unsupported reviewed Zettel envelope schema")
+    return envelope
+
+
+def _verify_export_command(args: argparse.Namespace) -> int:
+    reviewed = None
+    if args.zettels is not None:
+        entries = _load_zettel_envelope(args.zettels).get("zettels")
+        if not isinstance(entries, list):
+            raise ValueError("zettels must be a list")
+        reviewed = sum(
+            isinstance(entry, dict)
+            and isinstance(entry.get("review"), dict)
+            and entry["review"].get("status") == "reviewed"
+            for entry in entries
+        )
+    problems = verify_export(args.directory, expected_zettels=reviewed)
+    pages = args.directory / "vault" / "zettels"
+    report = {
+        "directory": str(args.directory),
+        "exported": len(list(pages.glob("*.md"))) if pages.is_dir() else 0,
+        "reviewed": reviewed,
+        "unresolved_anchors": sum(p.startswith("unresolved source anchor") for p in problems),
+        "valid": not problems,
+        "problems": problems,
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 1 if problems else 0
+
+
 def handle_library(args: argparse.Namespace) -> int:
     try:
+        if args.action == "verify-export":
+            return _verify_export_command(args)
         store = configured_store(args.store_root)
         if args.action == "build":
             manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
@@ -230,10 +282,11 @@ def handle_library(args: argparse.Namespace) -> int:
         else:
             generation, library = open_library(store)
             with library:
-                if args.action == "zettels":
-                    envelope = json.loads(args.input.read_text(encoding="utf-8"))
-                    if not isinstance(envelope, dict) or envelope.get("schema") != ZETTEL_SCHEMA:
-                        raise ValueError("unsupported reviewed Zettel envelope schema")
+                if args.action == "export":
+                    envelope = _load_zettel_envelope(args.zettels) if args.zettels else None
+                    result = export_library(library, args.out, zettels=envelope)
+                elif args.action == "zettels":
+                    envelope = _load_zettel_envelope(args.input)
                     exporter = zettel_atoms if args.format == "atoms-jsonl" else export_zettels
                     result = exporter(library, envelope.get("zettels"))
                 elif args.action == "profile":

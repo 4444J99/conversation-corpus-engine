@@ -11,7 +11,9 @@ import csv
 import hashlib
 import html
 import io
+import itertools
 import json
+import math
 import os
 import re
 import shlex
@@ -26,6 +28,8 @@ from urllib.parse import unquote, urlsplit
 
 from .archive_text import FenceTracker
 from .archive_vault import INLINE_CODE_RE
+from .attributed_knowledge import ZETTEL_SCHEMA, export_zettels
+from .attribution import ASSURANCE
 from .library_blocks import render_blocks, split_blocks
 from .library_store import Library, canonical_json
 
@@ -42,6 +46,26 @@ _EVIDENCE = (
 )
 _LINK = re.compile(r"(?<!!)\[[^\]\n]*\]\(([^)\n]*)\)")
 _CHUNK = 1024 * 1024
+ZETTEL_PAGE_LIMIT = 16 * 1024
+ZETTEL_HUB_SIZE = 100
+_ZETTEL_ID_LIMIT = 512
+_QUOTE_LIMIT = 400
+_ZETTEL_PAGE = re.compile(r"vault/zettels/[0-9a-f]{16}\.md\Z")
+_ZETTEL_HUB = re.compile(r"vault/hubs/zettels-[1-9][0-9]*\.md\Z")
+_INERT = re.compile(r"[\[\]`\\*_#|!]")
+_FRONTMATTER_ESCAPES = str.maketrans(
+    {
+        "[": "\\u005b",
+        "]": "\\u005d",
+        "<": "\\u003c",
+        ">": "\\u003e",
+        "&": "\\u0026",
+        "`": "\\u0060",
+        "\x85": "\\u0085",
+        " ": "\\u2028",
+        " ": "\\u2029",
+    }
+)
 
 
 def _check(callback: Callable[..., Any] | None, **kwargs: Any) -> None:
@@ -181,6 +205,7 @@ def _record_note(
     repeated: set[str],
     known: set[str],
     callback: Callable[..., Any] | None,
+    citations: list[dict[str, Any]] | None = None,
 ) -> Iterator[str]:
     uid = row["uid"]
     yield f"# {_plain(row['title']) or 'Untitled'}\n\n{_EVIDENCE}\n\n[Library home](../Home.md)\n\n"
@@ -240,6 +265,11 @@ def _record_note(
                     + render_blocks(split_blocks(str(message.get("text", ""))), {})
                     + "\n"
                 )
+    if citations:
+        yield "\n## Zettels citing this record\n\n"
+        for citation in citations:
+            _check(callback)
+            yield _citation_line(citation)
 
 
 def _block_note(
@@ -258,6 +288,340 @@ def _block_note(
         number = occurrence["message_index"] + 1
         normalization = ", ".join(json.loads(occurrence["normalization"])) or "none"
         yield f"- [{_plain(occurrence['title']) or uid} / {uid} / message {number}](../records/{uid}.md#message-{number}); characters {occurrence['start']}:{occurrence['end']}; normalization: {_plain(normalization)}\n"
+
+
+def _inert(value: Any, limit: int | None = None) -> str:
+    """One inert line: HTML and every Markdown link/heading/emphasis opener neutralized.
+
+    ``limit`` clips the source text before escaping so an entity is never cut in half.
+    """
+    text = " ".join(str(value).split())
+    text = html.escape(text if limit is None else text[:limit], quote=False)
+    return _INERT.sub(lambda match: f"&#{ord(match[0])};", text)
+
+
+def _frontmatter_value(value: Any) -> str:
+    """A YAML double-quoted scalar that no Markdown link scanner can read as a link."""
+    return json.dumps(str(value), ensure_ascii=False).translate(_FRONTMATTER_ESCAPES)
+
+
+def _zettel_hash(identity: str) -> str:
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+
+
+def _zettel_path(identity: str) -> str:
+    return f"vault/zettels/{_zettel_hash(identity)}.md"
+
+
+def _zettel_plan(
+    library: Library, envelope: dict[str, Any], rows: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Validate the reviewed envelope against the library and derive every cross reference."""
+    if not isinstance(envelope, dict) or envelope.get("schema") != ZETTEL_SCHEMA:
+        raise ValueError("unsupported reviewed Zettel envelope schema")
+    by_uid = {row["uid"]: row for row in rows}
+    items = sorted(
+        export_zettels(library, envelope.get("zettels"))["zettels"], key=lambda z: z["id"]
+    )
+    hashes: dict[str, str] = {}
+    for item in items:
+        if len(item["id"]) > _ZETTEL_ID_LIMIT:
+            raise ValueError(f"Zettel id too long for a page ({_ZETTEL_ID_LIMIT} characters max)")
+        digest = _zettel_hash(item["id"])
+        if digest in hashes.values():
+            raise ValueError("Zettel page hash collision")
+        hashes[item["id"]] = digest
+        for entry in item["sources"]:
+            if _uid(entry["source"]["uid"]) not in by_uid:
+                raise ValueError("Zettel source record is absent from this export")
+    citations: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    inbound: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for item in items:
+        for entry in item["sources"]:
+            ref = entry["source"]
+            row = by_uid[ref["uid"]]
+            citations[ref["uid"]].append(
+                {
+                    "hash": hashes[item["id"]],
+                    "title": _inert(item["title"], 120) or "Untitled",
+                    "version": ref["version"],
+                    "sequence": ref["sequence"],
+                    "message": ref["message"],
+                    "start": ref["start"],
+                    "end": ref["end"],
+                    "historical": not _is_current(ref, row),
+                }
+            )
+        for relationship in item["relationships"]:
+            if relationship["target"] in hashes:
+                inbound[relationship["target"]].append((relationship["type"], item["id"]))
+    for values in citations.values():
+        values.sort(key=lambda c: (c["hash"], c["sequence"], c["message"], c["start"], c["end"]))
+    return {
+        "items": items,
+        "hashes": hashes,
+        "titles": {item["id"]: item["title"] for item in items},
+        "position": {item["id"]: index for index, item in enumerate(items)},
+        "rows": by_uid,
+        "citations": dict(citations),
+        "inbound": {key: sorted(set(value)) for key, value in inbound.items()},
+    }
+
+
+def _is_current(ref: dict[str, Any], row: dict[str, Any]) -> bool:
+    return (
+        ref["version"] == row["current_version"] and ref["revision_digest"] == row["current_digest"]
+    )
+
+
+def _citation_line(citation: dict[str, Any]) -> str:
+    what = "alternate message" if citation["sequence"] == "alternate" else "message"
+    line = (
+        f"- [{citation['title']}](../zettels/{citation['hash']}.md) - {what} "
+        f"{citation['message'] + 1}, characters {citation['start']}:{citation['end']}"
+    )
+    if citation["historical"]:
+        line += f"; revision {_inert(citation['version'])} is historical and this note shows a later revision"
+    return line + "\n"
+
+
+def _clip(text: str, limit: int) -> tuple[str, bool]:
+    return (text[:limit], True) if len(text) > limit else (text, False)
+
+
+def _inert_lines(text: str) -> str:
+    """Keep line structure but neutralize each line like a title."""
+    return "\n".join(
+        _INERT.sub(lambda match: f"&#{ord(match[0])};", html.escape(line, quote=False))
+        for line in text.splitlines()
+    )
+
+
+def _span_label(span: dict[str, Any]) -> str:
+    who = span["author"] + (f":{span['author_id']}" if span.get("author_id") else "")
+    return f"{who} {span['start']}-{span['end']} {span['assertion_status']}"
+
+
+def _render_zettel(item: dict[str, Any], plan: dict[str, Any], scale: int) -> str:
+    def cap(base: int) -> int:
+        return max(1, base // scale)
+
+    hashes, rows = plan["hashes"], plan["rows"]
+    identity = item["id"]
+    hub = plan["position"][identity] // ZETTEL_HUB_SIZE + 1
+    title, title_cut = _clip(" ".join(item["title"].split()), cap(300))
+    title += "..." if title_cut else ""
+    body, body_cut = _clip(item["body"], cap(3000))
+    authors = sorted({span["author"] for span in item["body_attribution"]})
+    author = authors[0] if len(authors) == 1 else ("mixed" if authors else "unknown")
+    spans = [("body", s) for s in item["body_attribution"]] + [
+        ("title", s) for s in item["title_spans"]
+    ]
+    shown_spans = spans[: cap(12)]
+    sources = item["sources"][: cap(32)]
+    relationships = item["relationships"][: cap(24)]
+
+    def tuple_of(entry: dict[str, Any]) -> str:
+        ref = entry["source"]
+        mark = "a" if ref["sequence"] == "alternate" else "m"
+        return (
+            f"cce:{ref['uid']}@{ref['version']}#{mark}{ref['message']}:{ref['start']}-{ref['end']}"
+            f" sha256:{ref['text_digest']}"
+        )
+
+    links: list[str] = []
+    for link in (
+        *(f"records/{entry['source']['uid']}.md" for entry in sources),
+        *(
+            f"zettels/{hashes[relationship['target']]}.md"
+            for relationship in relationships
+            if relationship["target"] in hashes
+        ),
+    ):
+        if link not in links:
+            links.append(link)
+    summary = _clip(" ".join(item["body"].split()), 200)[0]
+    front = ["---", f"id: {_frontmatter_value(identity)}", 'type: "zettel"']
+    front += [f"title: {_frontmatter_value(title)}", f"summary: {_frontmatter_value(summary)}"]
+    front += [
+        f"created: {_frontmatter_value(item.get('created', '') or '')}",
+        f"updated: {_frontmatter_value(item.get('updated', '') or '')}",
+        f"author: {_frontmatter_value(author)}",
+        "authorship:",
+    ]
+    front += [f"  - {_frontmatter_value(f'{part} {_span_label(s)}')}" for part, s in shown_spans]
+    # Omissions are stated in the visible sections below, never as pseudo entries here.
+    front += ['status: "reviewed"', "sources:"]
+    front += [f"  - {_frontmatter_value(tuple_of(entry))}" for entry in sources]
+    front += ["links:", *(f"  - {_frontmatter_value(link)}" for link in links)]
+    front += ["aliases:", f"  - {_frontmatter_value(identity)}", "tags:"]
+    front += [
+        f"  - {_frontmatter_value(tag)}" for tag in ("zettel", f"author-{author}", "reviewed")
+    ]
+    front.append("---")
+    out = ["\n".join(front), f"\n# {_inert(title) or 'Untitled'}\n\n{_EVIDENCE}\n\n"]
+    out.append(f"[Library home](../Home.md) - [All Zettels](../hubs/zettels-{hub}.md)\n\n")
+    out.append(f"Zettel ID: {_inert(identity)}\n\n{_inert_lines(body)}\n")
+    if body_cut:
+        out.append(
+            f"\nBody truncated: {len(body)} of {len(item['body'])} characters shown; the full text is in the reviewed envelope.\n"
+        )
+    out.append("\n## Authorship\n\n")
+    out.append(f"- Assurance: {ASSURANCE}\n")
+    for part, span in shown_spans:
+        out.append(f"- {part.title()}: {_inert(_span_label(span))}\n")
+    if len(spans) > len(shown_spans):
+        out.append(f"- Authorship spans truncated: {len(spans) - len(shown_spans)} not shown\n")
+    review = item["review"]
+    out.append(f"\n## Review\n\n- Reviewer: {_inert(review['reviewer'], cap(300))}\n")
+    for evidence in review["evidence"][: cap(8)]:
+        out.append(f"- Evidence: {_inert(evidence, cap(300))}\n")
+    if relationships:
+        out.append("\n## Relationships\n\n")
+        for relationship in relationships:
+            kind = _inert(relationship["type"], cap(80))
+            target = relationship["target"]
+            if target in hashes:
+                label = _inert(plan["titles"][target], 120) or "Untitled"
+                out.append(f"- {kind}: [{label}]({hashes[target]}.md)\n")
+            else:
+                out.append(f"- {kind}: {_inert(target, cap(200))} (not present in this export)\n")
+        if len(item["relationships"]) > len(relationships):
+            out.append(
+                f"- Relationships truncated: {len(item['relationships']) - len(relationships)} not shown\n"
+            )
+    out.append("\n## Sources\n")
+    for number, entry in enumerate(sources, 1):
+        ref = entry["source"]
+        row = rows[ref["uid"]]
+        label = _inert(row["title"], 120) or ref["uid"]
+        anchor = (
+            f"#{'alternate' if ref['sequence'] == 'alternate' else 'message'}-{ref['message'] + 1}"
+        )
+        out.append(f"\n### Source {number}\n\n`{tuple_of(entry)}`\n\n")
+        if _is_current(ref, row):
+            out.append(f"- Record: [{label}](../records/{ref['uid']}.md{anchor})\n")
+        else:
+            out.append(
+                f"- Record: [{label}](../records/{ref['uid']}.md) - revision {_inert(ref['version'])} is a historical revision; the current note shows a later one\n"
+            )
+        out.append(
+            f"- Role: {_inert(entry['role'])}; channel: {_inert(entry['channel']) or 'Not recorded'}; message time: {_inert(entry['message_timestamp']) or 'Not recorded'}\n"
+        )
+        for span in entry["attributed_spans"][: cap(6)]:
+            out.append(f"- Quoted text attribution: {_inert(_span_label(span))}\n")
+        quote, cut = _clip(entry["text"], max(1, _QUOTE_LIMIT // scale))
+        out.append(
+            "\n"
+            + "\n".join("> " + line for line in (_inert_lines(quote).split("\n") or [""]))
+            + "\n"
+        )
+        if cut:
+            out.append(
+                f"\nQuotation truncated: {len(quote)} of {len(entry['text'])} characters shown; the exact span is {ref['start']}-{ref['end']}.\n"
+            )
+    if len(item["sources"]) > len(sources):
+        out.append(f"\nSources truncated: {len(item['sources']) - len(sources)} not shown.\n")
+    linked = plan["inbound"].get(identity, [])
+    if linked:
+        out.append("\n## Linked from\n\n")
+        for kind, other_id in linked[: cap(24)]:
+            label = _inert(plan["titles"][other_id], 120) or "Untitled"
+            out.append(f"- [{label}]({hashes[other_id]}.md) ({_inert(kind, cap(80))})\n")
+    return "".join(out)
+
+
+def _zettel_page(item: dict[str, Any], plan: dict[str, Any]) -> str:
+    for scale in (1, 2, 4, 8, 16, 32):
+        text = _render_zettel(item, plan, scale)
+        if len(text.encode("utf-8")) <= ZETTEL_PAGE_LIMIT:
+            return text
+    raise ValueError(f"Zettel page cannot fit {ZETTEL_PAGE_LIMIT} bytes: {item['id'][:80]!r}")
+
+
+def _zettel_hub(plan: dict[str, Any], number: int, pages: int) -> Iterator[str]:
+    items = plan["items"][(number - 1) * ZETTEL_HUB_SIZE : number * ZETTEL_HUB_SIZE]
+    yield f"# Zettels, page {number} of {pages}\n\n[Library home](../Home.md)\n\n"
+    yield f"{len(plan['items'])} reviewed Zettels; this page lists {len(items)}.\n\n"
+    if number > 1:
+        yield f"[Previous page](zettels-{number - 1}.md)\n\n"
+    if number < pages:
+        yield f"[Next page](zettels-{number + 1}.md)\n\n"
+    for item in items:
+        yield (
+            f"- [{_inert(item['title'], 200) or 'Untitled'}](../zettels/{plan['hashes'][item['id']]}.md)"
+            f" - {_inert(item['id'])} - sources: {len(item['sources'])}\n"
+        )
+
+
+def _zettel_graph_rows(plan: dict[str, Any]) -> Iterator[str]:
+    hashes = plan["hashes"]
+    for item in plan["items"]:
+        yield (
+            canonical_json(
+                {
+                    "type": "node",
+                    "id": "zettel:" + hashes[item["id"]],
+                    "kind": "zettel",
+                    "path": _zettel_path(item["id"]),
+                    "zettel_id": item["id"],
+                    "reviewer": item["review"]["reviewer"],
+                }
+            )
+            + "\n"
+        )
+    absent: set[str] = set()
+    for item in plan["items"]:
+        for relationship in item["relationships"]:
+            target = relationship["target"]
+            if target not in hashes and target not in absent:
+                absent.add(target)
+                yield (
+                    canonical_json(
+                        {
+                            "type": "node",
+                            "id": "zettel:" + _zettel_hash(target),
+                            "kind": "unresolved_zettel",
+                            "present": False,
+                            "zettel_id": target,
+                        }
+                    )
+                    + "\n"
+                )
+    for item in plan["items"]:
+        source = "zettel:" + hashes[item["id"]]
+        for entry in item["sources"]:
+            ref = entry["source"]
+            yield (
+                canonical_json(
+                    {
+                        "type": "edge",
+                        "kind": "derived_from",
+                        "source": source,
+                        "target": ref["uid"],
+                        "version": ref["version"],
+                        "sequence": ref["sequence"],
+                        "message_index": ref["message"],
+                        "start": ref["start"],
+                        "end": ref["end"],
+                        "text_digest": ref["text_digest"],
+                    }
+                )
+                + "\n"
+            )
+        for relationship in item["relationships"]:
+            target = relationship["target"]
+            yield (
+                canonical_json(
+                    {
+                        "type": "edge",
+                        "kind": "relation:" + relationship["type"],
+                        "source": source,
+                        "target": "zettel:" + (hashes.get(target) or _zettel_hash(target)),
+                    }
+                )
+                + "\n"
+            )
 
 
 def _graph_rows(
@@ -418,13 +782,22 @@ def _agent_entry(destination: Path) -> str:
 
 
 def export_library(
-    library: Library, destination: Path, *, check_callback: Callable[..., Any] | None = None
+    library: Library,
+    destination: Path,
+    *,
+    check_callback: Callable[..., Any] | None = None,
+    zettels: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Create all reading derivatives, refusing any existing owned output.
 
     ``check_callback`` receives impending write deltas as ``bytes_written`` and
     receives no arguments at cooperative deadline checkpoints. Exceptions leave
     the candidate intact for diagnosis; publication belongs to the builder.
+
+    ``zettels`` is an optional ``cce.reviewed-zettels.v1`` envelope. It is validated
+    against this library before anything is written; every reviewed Zettel then gets
+    a page, a hub entry, graph rows and backlinks on the records it cites. Without it
+    the output is byte-for-byte what it was before this option existed.
     """
     destination = _absolute(destination)
     _no_symlinks(destination)
@@ -452,6 +825,7 @@ def export_library(
         if not _DIGEST.fullmatch(row["digest"]):
             raise ValueError("unsafe block digest")
         repeated.add(row["digest"])
+    plan = _zettel_plan(library, zettels, rows) if zettels is not None else None
     destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     destination.chmod(0o700)
     for entry in destination.iterdir():
@@ -462,11 +836,27 @@ def export_library(
         _check(check_callback)
         writer.text(
             f"vault/records/{row['uid']}.md",
-            _record_note(library, row, repeated, known, check_callback),
+            _record_note(
+                library,
+                row,
+                repeated,
+                known,
+                check_callback,
+                plan["citations"].get(row["uid"]) if plan else None,
+            ),
         )
     for digest in sorted(repeated):
         _check(check_callback)
         writer.text(f"vault/blocks/{digest}.md", _block_note(library, digest, check_callback))
+    zettel_pages = 0
+    if plan:
+        for item in plan["items"]:
+            _check(check_callback)
+            writer.text(_zettel_path(item["id"]), _zettel_page(item, plan))
+        zettel_pages = max(1, math.ceil(len(plan["items"]) / ZETTEL_HUB_SIZE))
+        for number in range(1, zettel_pages + 1):
+            _check(check_callback)
+            writer.text(f"vault/hubs/zettels-{number}.md", _zettel_hub(plan, number, zettel_pages))
     for wing in _WINGS:
         facets.setdefault(("wing", wing), [])
     for (facet, value), members in sorted(facets.items()):
@@ -501,13 +891,18 @@ def export_library(
                 home.append(
                     f"- [{_plain(value) or 'Unspecified'}](hubs/{Path(_facet_path(facet, value)).name}) - {len(members)} records\n"
                 )
+    if plan:
+        home.append(
+            f"\n## Zettels\n\n- [Reviewed Zettels](hubs/zettels-1.md) - {len(plan['items'])} Zettels\n"
+        )
     home.append(
         "\n## Reading and reuse\n\n[Bounded agent retrieval](../agent-entry.md). Shared-passage links have backlinks to every original occurrence. Source bodies are inert Markdown evidence; generated navigation links are separate.\n\nThe Notion ZIP contains the same Markdown files and CSV. Import may alter links or anchors; verify those in Notion.\n"
     )
     writer.text("vault/Home.md", home)
     writer.text("agent-entry.md", _agent_entry(destination))
     writer.text("library-index.jsonl", (canonical_json(_index_row(row)) + "\n" for row in rows))
-    writer.text("graph.jsonl", _graph_rows(library, rows, repeated, check_callback))
+    graph = _graph_rows(library, rows, repeated, check_callback)
+    writer.text("graph.jsonl", itertools.chain(graph, _zettel_graph_rows(plan)) if plan else graph)
     writer.text("records.csv", _csv_rows(rows, check_callback))
     notion_members = sorted(
         path for path in writer.files if path.endswith(".md") or path == "records.csv"
@@ -535,8 +930,10 @@ def export_library(
         "files": sorted([*writer.files, "export-manifest.json"]),
         "notion_members": notion_members,
     }
+    if plan:
+        inventory["zettels"] = len(plan["items"])
     writer.text("export-manifest.json", canonical_json(inventory) + "\n")
-    return {
+    result = {
         "records": len(rows),
         "blocks": len(repeated),
         "files": len(writer.files),
@@ -544,6 +941,10 @@ def export_library(
         "index": "library-index.jsonl",
         "notion": "notion-import.zip",
     }
+    if plan:
+        result["zettels"] = len(plan["items"])
+        result["zettel_hub_pages"] = zettel_pages
+    return result
 
 
 def _markdown(path: Path, callback: Callable[..., Any] | None) -> Iterator[str]:
@@ -563,13 +964,81 @@ def _anchors(path: Path, callback: Callable[..., Any] | None) -> set[str]:
     return result
 
 
+def _verify_zettel_pages(
+    destination: Path,
+    existing: set[str],
+    declared: int | None,
+    expected: int | None,
+    callback: Callable[..., Any] | None,
+) -> list[str]:
+    """Count Zettel pages on disk against the manifest and envelope; bind id to file name."""
+    problems: list[str] = []
+    pages = sorted(path for path in existing if path.startswith("vault/zettels/"))
+    for relative in pages:
+        _check(callback)
+        if not _ZETTEL_PAGE.fullmatch(relative):
+            problems.append(f"unexpected Zettel page name: {relative}")
+            continue
+        try:
+            with (destination / relative).open(encoding="utf-8") as stream:
+                head = [stream.readline().rstrip("\n") for _ in range(3)]
+            identity = json.loads(head[1].removeprefix("id: "))
+            if head[0] != "---" or not head[1].startswith("id: ") or head[2] != 'type: "zettel"':
+                raise ValueError("frontmatter missing")
+            if relative != _zettel_path(identity):
+                problems.append(f"Zettel page name does not match its id: {relative}")
+        except (OSError, UnicodeError, ValueError, TypeError) as error:
+            problems.append(f"unreadable Zettel frontmatter {relative}: {error}")
+    if declared is None and pages:
+        problems.append("Zettel pages present but the manifest declares none")
+    if declared is not None and len(pages) != declared:
+        problems.append(
+            f"zettel page count differs from manifest: pages={len(pages)} manifest={declared}"
+        )
+    if expected is not None and len(pages) != expected:
+        problems.append(
+            f"zettel page count differs from reviewed envelope: pages={len(pages)} reviewed={expected}"
+        )
+    if declared is not None:
+        hubs = sorted(path for path in existing if _ZETTEL_HUB.fullmatch(path))
+        wanted = {f"vault/hubs/zettels-{n}.md" for n in range(1, max(1, -(-declared // 100)) + 1)}
+        if set(hubs) != wanted:
+            problems.append("Zettel hub pages differ from the declared pagination")
+        entries = 0
+        for relative in hubs:
+            try:
+                count = sum(
+                    "](../zettels/" in line
+                    for line in (destination / relative).read_text(encoding="utf-8").splitlines()
+                )
+            except (OSError, UnicodeError) as error:
+                problems.append(f"unreadable Zettel hub {relative}: {error}")
+                continue
+            if count > ZETTEL_HUB_SIZE:
+                problems.append(f"Zettel hub exceeds {ZETTEL_HUB_SIZE} entries: {relative}")
+            entries += count
+        if entries != declared:
+            problems.append(f"zettel hub entries differ from manifest: {entries} of {declared}")
+    for relative in pages:
+        if (destination / relative).stat().st_size > ZETTEL_PAGE_LIMIT:
+            problems.append(f"Zettel page exceeds {ZETTEL_PAGE_LIMIT} bytes: {relative}")
+    return problems
+
+
 def verify_export(
-    destination: Path, *, check_callback: Callable[..., Any] | None = None
+    destination: Path,
+    *,
+    check_callback: Callable[..., Any] | None = None,
+    expected_zettels: int | None = None,
 ) -> list[str]:
     """Check inventory, generated links/anchors, identity graph and ZIP parity.
 
     Source file links are provenance, not a request to read or fetch those files.
     No network access is performed. Build-level hashes bind these verified files.
+    ``expected_zettels`` is the reviewed-Zettel count of the envelope the export was
+    built from; the Zettel pages found on disk must match it exactly. A Zettel source
+    link whose ``#message-N`` or ``#alternate-N`` anchor is absent is reported as an
+    unresolved source anchor.
     """
     destination = _absolute(destination)
     problems: list[str] = []
@@ -591,6 +1060,11 @@ def verify_export(
             "vault/hubs/wing-ai.md",
             "vault/hubs/wing-authored.md",
         }
+        declared = manifest.get("zettels")
+        if declared is not None:
+            if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0:
+                raise ValueError("invalid Zettel count")
+            required.add("vault/hubs/zettels-1.md")
         if len(expected) != len(manifest["files"]) or not required <= expected:
             raise ValueError("invalid export inventory")
         for relative in expected:
@@ -611,6 +1085,9 @@ def verify_export(
         problems.append(f"unexpected export file: {relative}")
     if any(problem.startswith("symlink in export:") for problem in problems):
         return problems
+    problems.extend(
+        _verify_zettel_pages(destination, existing, declared, expected_zettels, check_callback)
+    )
 
     anchors: dict[Path, set[str]] = {}
     for relative in sorted(expected & existing):
@@ -640,7 +1117,12 @@ def verify_export(
                         if linked not in anchors:
                             anchors[linked] = _anchors(linked, check_callback)
                         if target.fragment not in anchors[linked]:
-                            problems.append(f"missing anchor in {relative}: {match[1]}")
+                            kind = (
+                                "unresolved source anchor"
+                                if _ZETTEL_PAGE.fullmatch(relative)
+                                else "missing anchor"
+                            )
+                            problems.append(f"{kind} in {relative}: {match[1]}")
         except (OSError, UnicodeError) as error:
             problems.append(f"unreadable Markdown {relative}: {error}")
 
@@ -686,6 +1168,8 @@ def verify_export(
             problems.append("graph records differ from library index")
         if sum(kind == "block" for kind in nodes.values()) != manifest["blocks"]:
             problems.append("graph block count differs from manifest")
+        if sum(kind == "zettel" for kind in nodes.values()) != (declared or 0):
+            problems.append("graph Zettel count differs from manifest")
         if missing_endpoint:
             problems.append("graph has missing endpoint")
     except (OSError, ValueError, KeyError, TypeError) as error:
