@@ -20,7 +20,7 @@ from . import archive_layout as layout
 from .archive_ingest import ArchivePaths, load_index
 from .archive_layout import CONVERSATION_PREFIX
 from .archive_naming import InvalidName, conversation_uid, parse_name
-from .archive_vault import incoming_links
+from .archive_vault import incoming_links, part_owners
 
 MESSAGE_ID_RE = re.compile(r"message-(\d+)")
 # A page lists at most this many conversations under "What links here" (and says how many more).
@@ -204,6 +204,8 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
         "messages": 0,
         "messages_anchored": 0,
         "toc_pages": 0,
+        "topic_pages": 0,
+        "topic_hubs": 0,
         "backlink_pages": 0,
         "links_listed": 0,
         "links_checked": 0,
@@ -217,6 +219,7 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
     expected = {row["uid"]: int(row["message_count"]) for row in rows}
     report["messages"] = sum(expected.values())
     seen_backlinks: dict[str, PageFacts] = {}
+    hub_pages: dict[str, set[str]] = {}  # hub page file stem -> the conversations it lists
     anchored: dict[str, int] = {}  # a bitmask of the message numbers a conversation's pages carry
     wanted: dict[Path, set[str]] = {}
     link_problems: list[str] = []
@@ -229,6 +232,13 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
         report["dangling_links"] += dangling
         if facts.duplicate_ids:
             page_problems.append(f"duplicate anchor ids in {relative}: {facts.duplicate_ids[:3]}")
+        if relative.startswith(f"{layout.SITE_HUBS_DIRNAME}/"):
+            hub_pages[path.stem] = {
+                _listed_uid(href)
+                for href in facts.hrefs
+                if Path(urlsplit(href).path).stem.startswith(CONVERSATION_PREFIX)
+            }
+            continue
         owner = _conversation_of(path, root)
         if owner is None:
             continue
@@ -268,7 +278,9 @@ def verify_site_wiki(paths: ArchivePaths) -> dict[str, Any]:
                 f"{' and more' if len(missing) > 5 else ''}"
                 f"{', anchors past the last message' if extra else ''}"
             )
-    page_problems += _backlink_problems(paths, rows, seen_backlinks, report)
+    incoming = incoming_links(paths)
+    page_problems += _backlink_problems(incoming, rows, seen_backlinks, report)
+    page_problems += _topic_problems(hub_pages, incoming, report)
     for target, fragments in wanted.items():
         found = parse_page(target).ids
         for fragment in sorted(fragments - found):
@@ -288,15 +300,53 @@ def _listed_uid(href: str) -> str:
         return href
 
 
+def _topic_problems(
+    hub_pages: dict[str, set[str]], incoming: dict[str, set[str]], report: dict[str, Any]
+) -> list[str]:
+    """Hold the site's topic pages to the vault's topic hubs: the same set, each the same rows.
+
+    A continuation page belongs to the topic whose name its own name hashes (the same rule the
+    vault's continuation notes follow). The vault's rows are its hub notes' wikilinks.
+    """
+    owners = part_owners(set(hub_pages))
+    on_site: dict[str, set[str]] = {}
+    problems = []
+    for stem, uids in sorted(hub_pages.items()):
+        topic = stem if stem.startswith("topic-") else owners.get(stem, "")
+        if not topic:
+            problems.append(f"hub page {stem} belongs to no topic page")
+            continue
+        on_site.setdefault(topic, set()).update(uids)
+    in_vault: dict[str, set[str]] = {}
+    for target, sources in incoming.items():
+        for source in sources:
+            if source.startswith("topic-"):
+                in_vault.setdefault(source, set()).add(conversation_uid(target))
+    report["topic_pages"] = len(on_site)
+    report["topic_hubs"] = len(in_vault)
+    for name in sorted(in_vault.keys() - on_site.keys()):
+        problems.append(f"topic hub {name} has no topic page on the site")
+    for name in sorted(on_site.keys() - in_vault.keys()):
+        problems.append(f"topic page {name} matches no topic hub in the vault")
+    for name in sorted(on_site.keys() & in_vault.keys()):
+        if on_site[name] != in_vault[name]:
+            problems.append(
+                f"topic page {name} lists {len(on_site[name])} conversation(s), its hub lists "
+                f"{len(in_vault[name])} ({len(in_vault[name] - on_site[name])} missing, "
+                f"{len(on_site[name] - in_vault[name])} extra)"
+            )
+    return problems
+
+
 def _backlink_problems(
-    paths: ArchivePaths,
+    incoming: dict[str, set[str]],
     rows: list[dict[str, Any]],
     seen: dict[str, PageFacts],
     report: dict[str, Any],
 ) -> list[str]:
     """Hold each page's "What links here" to the vault's own wikilink graph."""
     titles = {row["uid"]: row["title"] for row in rows}
-    wanted = backlinks_by_uid(incoming_links(paths), titles)
+    wanted = backlinks_by_uid(incoming, titles)
     problems = []
     for uid, facts in sorted(seen.items()):
         expected = wanted.get(uid, Backlinks())

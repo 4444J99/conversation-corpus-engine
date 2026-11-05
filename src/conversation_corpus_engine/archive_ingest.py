@@ -393,6 +393,10 @@ class ArchivePaths:
         return self.site / layout.SITE_PAGES_DIRNAME
 
     @property
+    def site_hubs(self) -> Path:
+        return self.site / layout.SITE_HUBS_DIRNAME
+
+    @property
     def site_home(self) -> Path:
         return self.site / layout.SITE_HOME_FILENAME
 

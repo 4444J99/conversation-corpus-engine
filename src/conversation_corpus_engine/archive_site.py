@@ -4,8 +4,8 @@ import html
 import json
 import posixpath
 import re
-from collections import Counter
-from collections.abc import Callable
+from collections import Counter, defaultdict
+from collections.abc import Callable, Iterator
 from itertools import combinations
 from pathlib import Path
 from typing import Any
@@ -23,7 +23,7 @@ from .archive_ingest import (
 from .archive_limits import Limits
 from .archive_model import Conversation, Message, write_text_atomic
 from .archive_naming import NameLedger
-from .archive_shard import part_folder, plan_conversation_folders
+from .archive_shard import part_folder, plan_conversation_folders, plan_flat_folders
 from .archive_site_assets import (
     APP_JS,
     CSP_APP,
@@ -34,7 +34,7 @@ from .archive_site_assets import (
     STYLE_CSS,
     fill_names,
 )
-from .archive_split import fit_blocks, pack, utf8_size
+from .archive_split import fit_blocks, pack, paginate_rows, utf8_size
 from .archive_text import render_markdown_html
 from .archive_topics import load_enrichment
 from .archive_vault import incoming_links
@@ -76,6 +76,9 @@ WORST_PREFIX = "../" * 8
 WORST_PATH = (
     f"{layout.SITE_PAGES_DIRNAME}/month-all-202506/day-all-20250614/bucket-all-b999/"
     f"conversation-{'x' * 72}.html"
+)
+WORST_TOPIC_PATH = (
+    f"{layout.SITE_HUBS_DIRNAME}/bucket-all-b999/bucket-all-b999/topic-all-{'x' * 40}.html"
 )
 
 
@@ -163,19 +166,23 @@ def _shell(
     parts: int,
     home_href: str,
     style_href: str,
-    topics: list[str],
+    topics: list[tuple[str, str]],
     related_html: str,
     body: str,
     nav: str,
     toc: str = "",
     backlinks: str = "",
 ) -> str:
-    """One page: the document around a group of message blocks."""
+    """One page: the document around a group of message blocks.
+
+    `topics` are (term, link) pairs: the link goes to the topic's page, or filters the home page
+    for a term that has no page.
+    """
     title = conversation.title or "Untitled"
     heading = title if parts == 1 else f"{title} — part {part} of {parts}"
     provenance = conversation.provenance
     topic_links = " ".join(
-        f'<a class="topic" href="{home_href}#t={quote(term)}">{_esc(term)}</a>' for term in topics
+        f'<a class="topic" href="{_esc(href)}">{_esc(term)}</a>' for term, href in topics
     )
     return (
         "<!doctype html>\n"
@@ -213,21 +220,39 @@ def _related_html(
     return f'<section class="related"><h2>Related</h2><ul>{items}</ul></section>'
 
 
+def _topic_chips(
+    topics: list[str], home_href: str, topic_href: Callable[[str], str] | None
+) -> list[tuple[str, str]]:
+    """Each topic term with the link its chip carries: its topic page when it has one."""
+    return [
+        (term, (topic_href(term) if topic_href else "") or f"{home_href}#t={quote(term)}")
+        for term in topics
+    ]
+
+
 def backlinks_html(
-    backlinks: Backlinks, titles: dict[str, str], href_for: Callable[[str], str]
+    backlinks: Backlinks,
+    titles: dict[str, str],
+    href_for: Callable[[str], str],
+    hub_href: Callable[[str], str] | None = None,
 ) -> str:
     """The "What links here" section of a conversation's first page.
 
-    Hub notes that list the conversation are named (a hub with a page of its own, a topic once
-    topic pages exist, links to it); the conversations that link to it are links, the first
-    `BACKLINK_LIMIT` of them, with the number left over. The section is always present.
+    Hub notes that list the conversation are named, and linked when the site has a page for them
+    (a topic hub has; `hub_href` answers `""` for the rest); the conversations that link to it
+    are links, the first `BACKLINK_LIMIT` of them, with the number left over. The section is
+    always present.
     """
     shown = backlinks.conversations[:BACKLINK_LIMIT]
     total = len(backlinks.conversations)
-    items = "".join(
-        f'<li class="hub" data-note="{_esc(name)}">{_esc(hub_label(name))}</li>'
-        for name in backlinks.hubs
-    )
+
+    def hub_item(name: str) -> str:
+        target = hub_href(name) if hub_href else ""
+        label = _esc(hub_label(name))
+        inner = f'<a href="{_esc(target)}">{label}</a>' if target else label
+        return f'<li class="hub" data-note="{_esc(name)}">{inner}</li>'
+
+    items = "".join(hub_item(name) for name in backlinks.hubs)
     items += "".join(
         f'<li class="page"><a href="{_esc(href_for(uid))}">'
         f"{_esc(_short_label(titles.get(uid, uid)))}</a></li>"
@@ -316,14 +341,21 @@ def page_groups(
     worst_style = f"{WORST_PREFIX}{layout.SITE_STYLE_FILENAME}"
     worst_link = WORST_PREFIX + WORST_PATH
     worst_nav = _nav_html(3, 1, worst_link, worst_link, worst_link)
-    worst_backlinks = backlinks_html(backlinks or Backlinks(), titles, lambda _uid: worst_link)
+    worst_topic = WORST_PREFIX + WORST_TOPIC_PATH
+    worst_topics = _topic_chips(topics, worst_home, lambda term: worst_topic)
+    worst_backlinks = backlinks_html(
+        backlinks or Backlinks(),
+        titles,
+        lambda _uid: worst_link,
+        lambda name: worst_topic if name.startswith("topic-") else "",
+    )
     first = _shell(
         conversation,
         part=1,
         parts=99999,
         home_href=worst_home,
         style_href=worst_style,
-        topics=topics,
+        topics=worst_topics,
         related_html=_related_html(related, titles, lambda _uid: WORST_PREFIX + WORST_PATH),
         body="",
         nav=worst_nav,
@@ -335,7 +367,7 @@ def page_groups(
         parts=99999,
         home_href=worst_home,
         style_href=worst_style,
-        topics=topics,
+        topics=worst_topics,
         related_html="",
         body="",
         nav=worst_nav,
@@ -352,7 +384,7 @@ def page_groups(
             parts=1,
             home_href=worst_home,
             style_href=worst_style,
-            topics=topics,
+            topics=worst_topics,
             related_html=_related_html(related, titles, lambda _uid: worst_link),
             body="",
             nav="",
@@ -426,8 +458,13 @@ def render_pages(
     page_of: Callable[[str], str | None],
     note_bytes: int,
     backlinks: Backlinks | None = None,
+    topic_page: Callable[[str], str | None] | None = None,
 ) -> list[str]:
-    """The pages of a conversation, each at most `note_bytes`, linked to each other."""
+    """The pages of a conversation, each at most `note_bytes`, linked to each other.
+
+    `topic_page` answers the site-root path of a topic hub's page (`topic-all-<term>`), or None
+    when the site has none; a topic chip and a backlink to a topic hub link there.
+    """
     total = len(groups)
     pages: list[str] = []
     for index, group in enumerate(groups):
@@ -437,14 +474,24 @@ def render_pages(
         body = "\n".join(group)
         headings = page_headings(body)
         shown = min(len(headings), TOC_MAX_ENTRIES)
+        home_href = _relative(layout.SITE_HOME_FILENAME, source)
+
+        def hub_href(name: str, source: str = source) -> str:
+            target = topic_page(name) if topic_page and name.startswith("topic-") else None
+            return _relative(target, source) if target else ""
+
+        def topic_href(term: str) -> str:
+            name = layout.topic_note(term)
+            return hub_href(name) if name else ""
+
         while True:
             page = _shell(
                 conversation,
                 part=index + 1,
                 parts=total,
-                home_href=_relative(layout.SITE_HOME_FILENAME, source),
+                home_href=home_href,
                 style_href=_relative(layout.SITE_STYLE_FILENAME, source),
-                topics=topics,
+                topics=_topic_chips(topics, home_href, topic_href),
                 related_html=(
                     _related_html(related, titles, _href_from(source, page_of))
                     if index == 0
@@ -454,7 +501,9 @@ def render_pages(
                 nav=_nav_html(total, index, _relative(paths[0], source), previous, following),
                 toc=_toc_html(headings, shown),
                 backlinks=(
-                    backlinks_html(backlinks or Backlinks(), titles, _href_from(source, page_of))
+                    backlinks_html(
+                        backlinks or Backlinks(), titles, _href_from(source, page_of), hub_href
+                    )
                     if index == 0
                     else ""
                 ),
@@ -481,6 +530,7 @@ def render_page(
     titles: dict[str, str],
     note_bytes: int | None = None,
     backlinks: Backlinks | None = None,
+    topic_page: Callable[[str], str | None] | None = None,
 ) -> list[str]:
     """A conversation as pages, for a caller that is not planning folders (a test, a preview).
 
@@ -509,7 +559,127 @@ def render_page(
         ),
         note_bytes=cap,
         backlinks=backlinks,
+        topic_page=topic_page,
     )
+
+
+def _hub_shell(
+    heading: str, intro: str, rows: str, *, home_href: str, style_href: str, nav: str
+) -> str:
+    """One hub page: a heading, what it holds, and a list of conversations."""
+    return (
+        "<!doctype html>\n"
+        '<html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f'<meta http-equiv="Content-Security-Policy" content="{_esc(CSP_PAGE)}">'
+        '<meta name="referrer" content="no-referrer">'
+        f"<title>{_esc(heading)}</title>"
+        f'<link rel="stylesheet" href="{style_href}"></head>'
+        f'<body class="page"><div class="wrap"><nav class="top"><a href="{home_href}">'
+        f"← Archive</a></nav><h1>{_esc(heading)}</h1>"
+        f'<p class="muted">{_esc(intro)}</p>'
+        '<p class="banner">Conversation text is a record of speech acts, not of verified events.'
+        "</p>"
+        f'{nav}\n<ul class="hub-rows">\n{rows}\n</ul>\n{nav}\n'
+        "</div></body></html>\n"
+    )
+
+
+def _hub_row(row: dict[str, Any], href: str) -> str:
+    when = (row.get("created") or row.get("last_activity") or "")[:10] or "undated"
+    return (
+        f'<li class="row"><a href="{_esc(href)}">{_esc(_short_label(row["title"]))}</a> '
+        f'<span class="muted">— {_esc(row["provider"])} · {row["message_count"]} msg · '
+        f"{_esc(when)}</span></li>"
+    )
+
+
+def topic_hub_plans(
+    by_topic: dict[str, list[dict[str, Any]]], first_page: dict[str, str], note_bytes: int
+) -> list[tuple[str, str, str, list[list[dict[str, Any]]]]]:
+    """For each topic hub: (note name, title, intro, the rows of each of its pages).
+
+    Rows are the vault hub's rows in the vault hub's order. A page is measured with the longest
+    links it could carry (the folder plan does not exist yet), so every page fits `note_bytes`
+    once its real links are written, and a topic that outgrows a page continues on the next.
+    """
+    worst_home = f"{WORST_PREFIX}{layout.SITE_HOME_FILENAME}"
+    worst_style = f"{WORST_PREFIX}{layout.SITE_STYLE_FILENAME}"
+    worst_link = WORST_PREFIX + WORST_PATH
+    worst_nav = _nav_html(3, 1, worst_link, worst_link, worst_link)
+    plans = []
+    for term in sorted(by_topic):
+        name = layout.topic_note(term)
+        if name is None:
+            continue
+        items = sorted(
+            by_topic[term],
+            key=lambda r: (r.get("created") or r.get("last_activity") or "", r["uid"]),
+        )
+        title = f"Topic: {term}"
+        intro = (
+            f"{len(items)} conversations across {len({r['provider'] for r in items})} provider(s)."
+        )
+        kwargs = {"home_href": worst_home, "style_href": worst_style, "nav": worst_nav}
+        first_budget = note_bytes - utf8_size(_hub_shell(title, intro, "", **kwargs)) - NAV_RESERVE
+        budget = (
+            note_bytes
+            - utf8_size(_hub_shell(f"{title} — continued", "", "", **kwargs))
+            - NAV_RESERVE
+        )
+        if budget < 1024:
+            raise ValueError(f"note_bytes {note_bytes} leaves no room for rows beside a topic page")
+        lines = [_hub_row(row, WORST_PREFIX + first_page[row["uid"]]) for row in items]
+        grouped, start = [], 0
+        for page in paginate_rows([], lines, first_budget, budget):
+            grouped.append(items[start : start + len(page)])
+            start += len(page)
+        plans.append((name, title, intro, grouped))
+    return plans
+
+
+def render_topic_pages(
+    plans: list[tuple[str, str, str, list[list[dict[str, Any]]]]],
+    first_page: dict[str, str],
+    folders: dict[str, str],
+    note_bytes: int,
+) -> Iterator[tuple[str, str]]:
+    """Every topic page as (site-root path, html); the first page of a hub has the hub's name."""
+    for name, title, intro, grouped in plans:
+        names = topic_page_names(name, len(grouped))
+        rels = [
+            f"{layout.SITE_HUBS_DIRNAME}/{folders[each]}/{each}.html"
+            if folders[each]
+            else f"{layout.SITE_HUBS_DIRNAME}/{each}.html"
+            for each in names
+        ]
+        for index, page_rows in enumerate(grouped):
+            source = rels[index]
+            nav = _nav_html(
+                len(grouped),
+                index,
+                _relative(rels[0], source),
+                _relative(rels[index - 1], source) if index else "",
+                _relative(rels[index + 1], source) if index + 1 < len(grouped) else "",
+            )
+            text = _hub_shell(
+                title if index == 0 else f"{title} — continued",
+                intro if index == 0 else "",
+                "\n".join(_hub_row(r, _relative(first_page[r["uid"]], source)) for r in page_rows),
+                home_href=_relative(layout.SITE_HOME_FILENAME, source),
+                style_href=_relative(layout.SITE_STYLE_FILENAME, source),
+                nav=nav,
+            )
+            if utf8_size(text) > note_bytes:
+                raise ValueError(
+                    f"{name}: page {index + 1} is {utf8_size(text)} bytes, cap is {note_bytes}"
+                )
+            yield source, text
+
+
+def topic_page_names(name: str, pages: int) -> list[str]:
+    """The file stems of a topic's pages: the hub's own name, then its `part-...` continuations."""
+    return [name] + [layout.part_name("all", number, name) for number in range(2, pages + 1)]
 
 
 def _provider_summary(manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -637,6 +807,31 @@ def build_site(
         for uid in counts
     }
 
+    # One static page per topic hub, planned now (the conversation pages link to them) and written
+    # beside the conversations in the structural `hubs` folder.
+    by_topic: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        for term in dict.fromkeys(enrichment.get(row["uid"], {}).get("topics", [])):
+            if layout.topic_note(term):
+                by_topic[term].append(row)
+    topic_plans = topic_hub_plans(by_topic, first_page, limits.note_bytes)
+    topic_names = {
+        stem: name
+        for name, _, _, grouped in topic_plans
+        for stem in topic_page_names(name, len(grouped))
+    }
+    topic_folders = plan_flat_folders(topic_names, limits.folder_entries)
+    topic_first = {
+        name: (
+            f"{layout.SITE_HUBS_DIRNAME}/{topic_folders[name]}/{name}.html"
+            if topic_folders[name]
+            else f"{layout.SITE_HUBS_DIRNAME}/{name}.html"
+        )
+        for name, _, _, _ in topic_plans
+    }
+    for rel, text in render_topic_pages(topic_plans, first_page, topic_folders, limits.note_bytes):
+        emit(rel, text)
+
     # Pass two: write.
     pages = parts = 0
     for conversation in iter_store(paths):
@@ -657,6 +852,7 @@ def build_site(
             page_of=first_page.get,
             note_bytes=limits.note_bytes,
             backlinks=backlinks.get(conversation.uid),
+            topic_page=topic_first.get,
         )
         for rel, text in zip(paths_, rendered, strict=True):
             emit(rel, text)
@@ -695,4 +891,10 @@ def build_site(
     emit(layout.SITE_HOME_SCRIPT_FILENAME, fill_names(APP_JS))
     emit(layout.SITE_GRAPH_SCRIPT_FILENAME, fill_names(GRAPH_JS))
     removed = _prune(root, written)
-    return {"pages": pages, "parts": parts, "files": len(written), "removed_stale": removed}
+    return {
+        "pages": pages,
+        "parts": parts,
+        "topic_pages": len(topic_plans),
+        "files": len(written),
+        "removed_stale": removed,
+    }

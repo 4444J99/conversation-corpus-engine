@@ -380,3 +380,181 @@ def test_verify_wiki_block_counts_backlink_pages(built) -> None:
     report = wiki().verify_site_wiki(built.paths)
     assert report["problems"] == []
     assert report["backlink_pages"] == report["pages"] == 24
+
+
+# --- (3) one static page per topic hub ----------------------------------------------------------
+
+
+class _Links(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.hrefs: list[str] = []
+        self.chips: list[tuple[str, str]] = []
+        self.hub_links: list[str] = []
+        self.scripts = 0
+        self.titles: list[str] = []
+        self._chip = ""
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        values = dict(attrs)
+        if tag == "script":
+            self.scripts += 1
+        if tag == "a" and values.get("href"):
+            self.hrefs.append(str(values["href"]))
+            if values.get("class") == "topic":
+                self._chip = str(values["href"])
+        if tag == "li" and values.get("class") == "hub":
+            self._chip = "hub"
+
+    def handle_data(self, data: str) -> None:
+        if self._chip and self._chip != "hub":
+            self.chips.append((data, self._chip))
+            self._chip = ""
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a":
+            self._chip = ""
+
+
+def links_of(text: str) -> _Links:
+    parsed = _Links()
+    parsed.feed(text)
+    return parsed
+
+
+def vault_topic_hubs(paths: Any) -> set[str]:
+    files = json.loads(paths.vault_manifest.read_text("utf-8"))["files"]
+    return {
+        Path(rel).stem
+        for rel in files
+        if Path(rel).stem.startswith("topic-all-") and rel.endswith(".md")
+    }
+
+
+def site_topic_pages(paths: Any) -> dict[str, Path]:
+    return {
+        path.stem: path
+        for path in sorted(paths.site.joinpath("hubs").rglob("topic-all-*.html"))
+        if paths.site.joinpath("hubs").is_dir()
+    }
+
+
+def test_every_topic_hub_has_exactly_one_static_topic_page(built) -> None:
+    hubs = vault_topic_hubs(built.paths)
+    assert hubs, "the fixture must carry topics"
+    pages = site_topic_pages(built.paths)
+    assert set(pages) == hubs
+    enrichment = importlib.import_module(
+        "conversation_corpus_engine.archive_topics"
+    ).load_enrichment(built.paths)
+    layout = importlib.import_module("conversation_corpus_engine.archive_layout")
+    for name, path in pages.items():
+        text = path.read_text("utf-8")
+        parsed = links_of(text)
+        assert parsed.scripts == 0
+        assert "default-src &#x27;none&#x27;" in text and "script-src" not in text
+        listed = {page_uid(href) for href in parsed.hrefs if "conversation-" in href}
+        want = {
+            uid
+            for uid, row in enrichment.items()
+            if any(layout.topic_note(term) == name for term in row.get("topics", []))
+        }
+        assert listed == want, name
+
+
+def test_topic_chips_and_backlinks_link_to_the_topic_pages(built) -> None:
+    layout = importlib.import_module("conversation_corpus_engine.archive_layout")
+    pages = site_topic_pages(built.paths)
+    enrichment = importlib.import_module(
+        "conversation_corpus_engine.archive_topics"
+    ).load_enrichment(built.paths)
+    checked = 0
+    for uid, row in enrichment.items():
+        page = built.paths.site_page(uid.partition("-")[0], uid)
+        parsed = links_of(page.read_text("utf-8"))
+        chips = {label: href for label, href in parsed.chips}
+        for term in row.get("topics", []):
+            name = layout.topic_note(term)
+            assert name in pages, term
+            assert (page.parent / chips[term]).resolve() == pages[name].resolve()
+            assert "#t=" not in chips[term]
+            checked += 1
+    assert checked > 5
+
+
+def test_a_term_without_a_hub_name_still_filters_the_home_page() -> None:
+    conversation = conv("chatgpt", "chips", "Chips")
+    (page,) = render_page(
+        conversation,
+        related=[],
+        topics=["lantern", "two words"],
+        titles={},
+        topic_page=lambda name: "hubs/" + name + ".html",
+    )
+    chips = dict(links_of(page).chips)
+    assert chips["lantern"].endswith("hubs/topic-all-lantern.html")
+    assert "home-all.html#t=two%20words" in chips["two words"]
+
+
+def test_a_topic_page_that_outgrows_the_cap_continues_on_linked_parts(archive_env) -> None:
+    small = Limits.scaled(note_bytes=6144, folder_entries=40, shard_bytes=65536)
+    payload = [
+        gpt_conversation(
+            f"lamp{number:03d}",
+            f"Lamp {number}",
+            [("user", "lantern wick lantern oil"), ("assistant", "lantern lantern wick")],
+        )
+        for number in range(40)
+    ] + [
+        gpt_conversation(
+            f"misc{number:03d}",
+            f"Misc {number}",
+            [("user", f"unrelated{number}x thing"), ("assistant", "short")],
+        )
+        for number in range(360)
+    ]
+    _build_chatgpt(archive_env, payload, small)
+    pages = site_topic_pages(archive_env.paths)
+    assert "topic-all-lantern" in pages
+    folder = pages["topic-all-lantern"].parent
+    parts = sorted(folder.glob("part-all-*.html"))
+    assert parts, "forty rows at a 6 KiB cap must spill onto a continuation page"
+    listed: set[str] = set()
+    for path in [pages["topic-all-lantern"], *parts]:
+        text = path.read_text("utf-8")
+        assert len(text.encode("utf-8")) <= small.note_bytes
+        listed |= {page_uid(h) for h in links_of(text).hrefs if "conversation-" in h}
+    assert listed == {f"chatgpt-lamp{number:03d}" for number in range(40)}
+    assert wiki().verify_site_wiki(archive_env.paths)["problems"] == []
+
+
+def test_verify_fails_on_a_missing_stray_or_wrong_topic_page(built) -> None:
+    pages = site_topic_pages(built.paths)
+    name, path = next(iter(pages.items()))
+    saved = path.read_text("utf-8")
+    path.unlink()
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    assert any(name in item and "topic" in item for item in problems)
+    path.write_text(saved, encoding="utf-8")
+    stray = path.parent / "topic-all-nothingmatches.html"
+    stray.write_text(saved, encoding="utf-8")
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    assert any("topic-all-nothingmatches" in item for item in problems)
+    stray.unlink()
+    links = links_of(saved).hrefs
+    victim = next(h for h in links if "conversation-" in h)
+    path.write_text(saved.replace(victim, "../../index-nope.html"), encoding="utf-8")
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    assert any(name in item and "topic" in item for item in problems)
+
+
+def test_verify_reports_topic_counts(built) -> None:
+    report = wiki().verify_site_wiki(built.paths)
+    assert report["topic_pages"] == report["topic_hubs"] == len(vault_topic_hubs(built.paths)) > 0
+
+
+def test_topic_pages_keep_every_generated_name_inside_the_naming_contract(built) -> None:
+    naming = importlib.import_module("conversation_corpus_engine.archive_naming")
+    report = naming.verify_names(built.paths.root)
+    assert report["ok"], report
+    assert site_topic_pages(built.paths)

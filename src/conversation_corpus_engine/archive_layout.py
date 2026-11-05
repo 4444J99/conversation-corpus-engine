@@ -57,6 +57,8 @@ GRAPH_SUMMARY_FILENAME = derive_name("report", scope="all", subject="graph") + "
 # --- the site -------------------------------------------------------------------------------
 
 SITE_PAGES_DIRNAME = "conversations"
+# The site's hub pages (one per topic) sit in the same structural folder the vault's hubs do.
+SITE_HUBS_DIRNAME = VAULT_HUBS_DIRNAME
 SITE_HOME_FILENAME = HOME_NOTE + ".html"
 SITE_GRAPH_PAGE_FILENAME = derive_name("graph", scope="all") + ".html"
 SITE_STYLE_FILENAME = SITE_DIRNAME + ".css"

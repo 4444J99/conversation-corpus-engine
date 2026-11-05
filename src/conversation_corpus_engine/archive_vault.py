@@ -549,7 +549,7 @@ def verify_vault(paths: ArchivePaths) -> list[str]:
 HUB_PREFIXES = ("provider-", "month-", "topic-", "collection-")
 
 
-def _part_owners(names: set[str]) -> dict[str, str]:
+def part_owners(names: set[str]) -> dict[str, str]:
     """Which note each continuation (`part-...`) note continues.
 
     A part's name hashes the name of the note it continues, so the owners are found by minting
@@ -587,7 +587,7 @@ def incoming_links(paths: ArchivePaths) -> dict[str, set[str]]:
         for rel in json.loads(manifest_path.read_text(encoding="utf-8")).get("files", [])
         if rel.endswith(".md")
     ]
-    owners = _part_owners({Path(rel).stem for rel in notes})
+    owners = part_owners({Path(rel).stem for rel in notes})
     incoming: dict[str, set[str]] = defaultdict(set)
     for rel in notes:
         source_file = paths.vault / rel
