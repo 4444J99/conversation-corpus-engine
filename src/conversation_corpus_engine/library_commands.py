@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import Any
 
 from .archive_database import PHRASE_RE, WORD_RE
-from .archive_text import FenceTracker
 from .attributed_knowledge import ZETTEL_SCHEMA, export_zettels, zettel_atoms
 from .corpus_store import CorpusStoreError, require_git_private
 from .library_analysis import AnalysisLimits, export_analysis
@@ -318,9 +317,10 @@ def _read_range(
 
 
 def _atx_heading(line: str) -> tuple[int, str] | None:
-    """(level, title) of an ATX heading line (CommonMark: up to three spaces of indent, one to six
-    `#`, then a space or tab; an optional closing run of `#` after whitespace is not the title).
-    Linear in the line: nothing here backtracks. A heading with no title is not an entry."""
+    """(level, title) of an ATX heading line, or None for any other line (CommonMark: up to three
+    spaces of indent, one to six `#`, then a space, a tab or the end of the line; an optional
+    closing run of `#` after whitespace is not part of the title, which may be empty).
+    Linear in the line: nothing here backtracks."""
     body = line.rstrip("\r\n")
     stripped = body.lstrip(" ")
     if len(body) - len(stripped) > 3:
@@ -333,21 +333,112 @@ def _atx_heading(line: str) -> tuple[int, str] | None:
     unclosed = title.rstrip("#")
     if unclosed != title and (not unclosed or unclosed[-1] in " \t"):
         title = unclosed.rstrip(" \t")
-    return (level, title) if title else None
+    return level, title
+
+
+FENCE_LINE_RE = re.compile(r"(`{3,}|~{3,})(.*)")
+ITEM_MARKER_RE = re.compile(r"([-*+]|(\d{1,9})[.)])(?=[ \t]|$)")
+THEMATIC_BREAK_RE = re.compile(r"([-*_])(?:[ \t]*\1){2,}[ \t]*")
+SETEXT_UNDERLINE_RE = re.compile(r"=+[ \t]*")
+TAB_STOP = 4
+
+
+def _indentation(body: str, start: int = 0) -> tuple[int, str]:
+    """(column reached, rest of the line) after the leading spaces and tabs, a tab running to the
+    next multiple of four, counting from column `start`."""
+    column, index = start, 0
+    while index < len(body) and body[index] in " \t":
+        column += 1 if body[index] == " " else TAB_STOP - column % TAB_STOP
+        index += 1
+    return column, body[index:]
 
 
 def _headings(text: str) -> list[tuple[int, int, str]]:
-    """(character offset of the line, level, title) of every ATX heading outside fenced code.
+    """(character offset of the line, level, title) of every top-level ATX heading outside code.
 
-    Lines end at `\\n`, `\\r\\n` or `\\r` only, as in CommonMark; the other separators that
-    `str.splitlines` honours (U+2028, form feed, ...) are ordinary characters. Fences follow the
-    shared `FenceTracker`, so a tilde fence is not closed by backticks and a longer fence holds a
-    shorter one."""
-    found, position, tracker = [], 0, FenceTracker()
+    This follows CommonMark for what decides whether a heading line is one:
+
+    * Lines end at `\\n`, `\\r\\n` or `\\r` only; the other separators `str.splitlines` honours
+      (U+2028, form feed, ...) are ordinary characters, and so is a no-break space.
+    * A fence opens on three or more backticks or tildes indented 0-3 spaces. A tab, four spaces
+      or any other character before it makes the line indented code or paragraph text. It closes
+      only on the same character, at least as long, indented 0-3 spaces and followed by nothing.
+    * Inside a list item (lines after a marker, indented to its content offset) a fence may be
+      indented further: 0-3 columns past the content offset, and the same for its closing line. A
+      line indented less than the content offset ends the item, and a fence open in it, unless it
+      continues the item's paragraph; a heading, a rule or a fence always ends it. Items nest.
+    * A heading inside a list item or a quote is not top level, and is not listed.
+    """
+    found: list[tuple[int, int, str]] = []
+    position = 0
+    fence: tuple[str, int, int] | None = None  # character, length and container of the open fence
+    items: list[int] = []  # content offsets of the open list items, outermost first
+    paragraph = False  # the last line was paragraph text, which a lazy continuation may extend
+    blank = True
     for line in LINE_RE.findall(text):
-        if not tracker.feed(line) and (heading := _atx_heading(line)):
-            found.append((position, *heading))
-        position += len(line)
+        start, position = position, position + len(line)
+        body = line.rstrip("\r\n")
+        columns, rest = _indentation(body)
+        if not rest:
+            blank = True
+            continue
+        after_blank, blank = blank, False
+        if fence is not None:
+            character, length, container = fence
+            if container and columns < container:
+                fence = None  # the list item ended, and its fence with it: read the line afresh
+            else:
+                closing = FENCE_LINE_RE.match(rest)
+                if (
+                    closing
+                    and closing.group(1)[0] == character
+                    and len(closing.group(1)) >= length
+                    and not closing.group(2).strip(" \t")
+                    and columns - container <= 3
+                ):
+                    fence = None
+                continue
+        depth = sum(1 for offset in items if offset <= columns)  # the items this line is within
+        container = items[depth - 1] if depth else 0
+        relative = columns - container
+        opener = FENCE_LINE_RE.match(rest)
+        if opener and relative <= 3 and not (opener.group(1)[0] == "`" and "`" in opener.group(2)):
+            del items[depth:]
+            fence = (opener.group(1)[0], len(opener.group(1)), container)
+            paragraph = False
+            continue
+        if relative <= 3 and THEMATIC_BREAK_RE.fullmatch(rest):
+            del items[depth:]
+            paragraph = False
+            continue
+        if relative <= 3 and (marker := ITEM_MARKER_RE.match(rest)):
+            innermost = items[-1] if items else 0
+            within_paragraph = paragraph and not after_blank and columns >= innermost
+            content_column, content = _indentation(rest[marker.end() :], columns + marker.end())
+            gap = content_column - (columns + marker.end())
+            numbered = marker.group(2)
+            if not within_paragraph or (content and (not numbered or int(numbered) == 1)):
+                del items[depth:]
+                items.append(columns + marker.end() + (gap if content and 1 <= gap <= 4 else 1))
+                first = FENCE_LINE_RE.match(content)
+                if first and not (first.group(1)[0] == "`" and "`" in first.group(2)):
+                    fence = (first.group(1)[0], len(first.group(1)), items[-1])
+                    paragraph = False
+                else:
+                    paragraph = bool(content) and _atx_heading(content) is None
+                continue
+        if relative <= 3 and (heading := _atx_heading(" " * relative + rest)):
+            if container == 0 and heading[1]:
+                found.append((start, *heading))
+            del items[depth:]
+            paragraph = False
+            continue
+        if after_blank or not paragraph:
+            del items[depth:]  # a new block; otherwise this lazily continues the paragraph
+        if relative <= 3 and paragraph and not after_blank and SETEXT_UNDERLINE_RE.fullmatch(rest):
+            paragraph = False
+        else:
+            paragraph = relative <= 3 or (paragraph and not after_blank)
     return found
 
 

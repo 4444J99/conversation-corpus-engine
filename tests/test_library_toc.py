@@ -7,6 +7,7 @@ of a top-level ATX heading that is not inside fenced code, and nothing else may 
 
 from __future__ import annotations
 
+import random
 import re
 import time
 
@@ -15,6 +16,7 @@ from markdown_it import MarkdownIt
 
 from conversation_corpus_engine import library_mcp
 from conversation_corpus_engine.archive_model import Conversation, Message
+from conversation_corpus_engine.library_commands import _headings
 from conversation_corpus_engine.library_mcp import READ_TOOL
 from conversation_corpus_engine.library_store import Library
 
@@ -219,3 +221,162 @@ def test_the_alternate_branch_has_its_own_fence_aware_table(toc):
     _, call = toc("# Main only\n", alternates=[alternate])
     assert listed(call(sequence="alternate")["toc"]) == expected_headings(alternate)
     assert [entry["heading"] for entry in call()["toc"]] == ["Main only"]
+
+
+# --- fences are fences only where CommonMark says so: indentation and list context ---------------
+
+INDENT_CASES = {
+    "four-space-fence-is-indented-code": "# Top\n\n    ```\n# After\n    ```\n## Last\n",
+    "tab-fence-is-indented-code": "# Top\n\n\t```\n# After\n\t```\n## Last\n",
+    "paragraph-text-before-an-indented-fence-line": "# Top\n\ntext\n    ```\n## Last\n",
+    "line-separator-before-backticks-is-text": "# Top\n\n\u2028```\n# After\n```\n## Last\n",
+    "form-feed-before-backticks-is-text": "# Top\n\n\x0c```\n# After\n```\n## Last\n",
+    "no-break-space-before-backticks-is-text": "# Top\n\n\u00a0```\n# After\n```\n## Last\n",
+    "three-space-fence-is-a-fence": "# Top\n\n   ```\n# inside\n   ```\n## Last\n",
+    "closing-fence-indented-four-does-not-close": (
+        "# Top\n\n```\n# inside\n    ```\n# still inside\n```\n## Last\n"
+    ),
+    "list-item-fence": "# Top\n\n- item\n\n  ```\n  # inside\n  ```\n\n## Last\n",
+    "ordered-item-fence-indented-past-the-marker": (
+        "# Top\n\n1. step\n\n       ```\n       # inside\n       ```\n\n## Last\n"
+    ),
+    "item-fence-ends-with-its-item": (
+        "# Top\n\n- item\n\n  ```\n  # inside\n## Last\n  # not a heading\n"
+    ),
+    "outdented-line-after-a-list-leaves-it": ("- item\n\n    ```\n# After\n    ```\n## Last\n"),
+    "indented-fence-after-the-list-ended-is-code": (
+        "- item\n\npara\n\n    ```\n# After\n    ```\n"
+    ),
+    "item-first-line-opens-a-fence": "- ```\n  # inside\n  ```\n\n# After\n",
+}
+
+
+@pytest.mark.parametrize("name", INDENT_CASES)
+def test_fence_indentation_and_list_context_follow_commonmark(toc, name):
+    text = INDENT_CASES[name]
+    _, call = toc(text)
+    result = call()
+    want = expected_headings(text)
+    assert listed(result["toc"]) == want, (name, want)
+    assert result["toc_total"] == len(want)
+
+
+WORDS = ["alpha", "beta", "gamma", "delta", "kappa", "lumen", "onyx", "prism", "quartz", "rune"]
+ODD_LINES = [" ```", "\x0c```", " # x", "\x0c# not", " ```", "　# y", "\u0085```"]
+
+
+def phrase(rng: random.Random) -> str:
+    return " ".join(rng.choice(WORDS) for _ in range(rng.randint(1, 4)))
+
+
+def fence_lines(rng: random.Random, outer: str = "", extra: int = 0) -> list[str]:
+    """A fenced block whose lines all sit `outer` columns in (a list item's content offset)."""
+    char, count = rng.choice("`~"), rng.randint(3, 5)
+    opener = " " * (extra if outer else rng.randint(0, 3))
+    info = rng.choice(["", "", "python", "text x"])
+    body = [
+        rng.choice(
+            ["# fake heading", "## another", "text", "```", "~~~", "````", "~~~~~", "``` py", ""]
+        )
+        for _ in range(rng.randint(0, 4))
+    ]
+    lines = [outer + opener + char * count + info] + [outer + line if line else "" for line in body]
+    if rng.random() < 0.85:
+        closer = " " * (extra if outer else rng.randint(0, 3))
+        lines.append(outer + closer + char * (count + rng.randint(0, 2)))
+    return lines
+
+
+def list_lines(rng: random.Random) -> list[str]:
+    ordered = rng.random() < 0.4
+    start = rng.choice([1, 1, 2, 7, 10])
+    lines: list[str] = []
+    for position in range(rng.randint(1, 3)):
+        marker = f"{start + position}." if ordered else rng.choice("-*+")
+        lead = " " * rng.randint(0, 2)
+        gap = " " * rng.randint(1, 3)
+        offset = len(lead) + len(marker) + len(gap)
+        lines.append(f"{lead}{marker}{gap}{phrase(rng)}")
+        for _ in range(rng.randint(0, 2)):
+            kind = rng.choice(["fence", "fence", "heading", "text", "code"])
+            lines.append("")
+            inner = " " * offset
+            if kind == "fence":
+                lines += fence_lines(rng, inner, rng.randint(0, 3))
+            elif kind == "heading":
+                lines.append(inner + "# " + phrase(rng))  # a heading inside the item
+            elif kind == "text":
+                lines.append(inner + phrase(rng))
+            else:
+                lines.append(inner + "    " + rng.choice(["```", "# code", "plain"]))
+    return lines
+
+
+def block_lines(rng: random.Random) -> list[str]:
+    kind = rng.choices(
+        ["paragraph", "heading", "fence", "lookalike", "odd", "list", "quote", "rule", "setext"],
+        weights=[3, 4, 4, 3, 2, 3, 1, 1, 1],
+    )[0]
+    if kind == "heading":
+        level = rng.randint(1, 6)
+        closing = rng.choice(["", "", " ##", " #####"])
+        return [" " * rng.randint(0, 3) + "#" * level + " " + phrase(rng) + closing]
+    if kind == "fence":
+        return fence_lines(rng)
+    if kind == "lookalike":
+        prefix = rng.choice(["    ", "\t", "     ", "   \t"])
+        return [
+            prefix + rng.choice(["```", "~~~", "# not a heading", "code"])
+            for _ in range(rng.randint(1, 3))
+        ]
+    if kind == "odd":
+        return [rng.choice(ODD_LINES), *(phrase(rng) for _ in range(rng.randint(0, 1)))]
+    if kind == "list":
+        return list_lines(rng)
+    if kind == "quote":
+        return ["> " + rng.choice(["# quoted", "text", "```", "~~~", "code"]) for _ in range(2)]
+    if kind == "rule":
+        return [rng.choice(["---", "***", "___", "- - -", " ***"])]
+    if kind == "setext":
+        return [phrase(rng), rng.choice(["=====", "-----"])]
+    return [phrase(rng) for _ in range(rng.randint(1, 3))]
+
+
+def generated_document(index: int) -> str:
+    rng = random.Random(index)
+    lines: list[str] = []
+    for _ in range(rng.randint(2, 9)):
+        block = block_lines(rng)
+        if lines and not (lines[-1].lstrip(" ").startswith("#") and rng.random() < 0.1):
+            lines.append("")
+        lines += block
+    ending = rng.choices(["\n", "\r\n", "\r"], weights=[70, 15, 15])[0]
+    return ending.join(lines) + (ending if rng.random() < 0.7 else "")
+
+
+def oracle_entries(text: str) -> list[tuple[int, int, str]]:
+    """(character offset, level, title) of each top-level ATX heading, from markdown-it-py."""
+    starts = [0] + [match.end() for match in LINE_END.finditer(text)]
+    tokens = MarkdownIt().parse(text)
+    return [
+        (starts[token.map[0]], len(token.markup), tokens[number + 1].content)
+        for number, token in enumerate(tokens)
+        if token.type == "heading_open" and token.level == 0 and token.markup.startswith("#")
+    ]
+
+
+def test_headings_agree_with_an_independent_commonmark_parser_over_generated_documents():
+    """1,500 documents built from headings, fenced code (both characters, any length, indented 0-3
+    columns), indented code, lines that only look indented (tab, U+2028, form feed, no-break
+    space), lists with fences nested at their content offset, quotes, rules and setext headings,
+    with LF, CRLF and CR line ends. Every top-level ATX heading must come out at the same offset,
+    level and title as markdown-it-py reports, and nothing else may."""
+    mismatches = []
+    for index in range(1500):
+        text = generated_document(index)
+        if _headings(text) != oracle_entries(text):
+            mismatches.append(index)
+    assert not mismatches, (
+        f"{len(mismatches)} of 1500 documents differ; first: "
+        f"{[(i, generated_document(i)) for i in mismatches[:2]]}"
+    )
