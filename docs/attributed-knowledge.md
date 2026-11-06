@@ -438,7 +438,7 @@ Add `--json` to the report for JSON, and `--ledger /private/ledger.jsonl` (below
 command to let the owner's reviews decide what is eligible. Nothing is eligible without one.
 
 `--library` accepts a `library.sqlite` file, a generation folder or a store folder; without it
-`--store-root` or the library store variable is used. Every command opens the generation
+`--store-root` (alias `--corpus-store-root`) or the library store variable is used. Every command opens the generation
 read-only (SQLite `mode=ro`) and never writes into it. The only files a command writes are the
 ones you name (`--out`, `--ledger`), and each is subject to the output rules below.
 `--limit-records N` scans the first N records in uid order and `--deadline-seconds` (default 900,
@@ -501,8 +501,11 @@ span can reach a strict profile.
 **Scope, plainly.** The gate protects against honest mistakes, systematic over-claiming, naive
 fabrication and sample, seed and ledger shopping. It does **not** protect against a process that
 holds the owner's permissions and deliberately writes the owner's identity: such a process can
-append ledger rows, or write a sample with a recomputed digest, under the owner's name, and
-nothing here can tell them from the owner's own. That is stated, not solved.
+append ledger rows under the owner's name, and nothing here can tell them from the owner's own.
+The same goes for rows `review-record` cannot write: one span reviewed as two rules or strata
+(the ledger quarantines them, and `append_rows` already refuses to append them) or a `drawn`
+count that does not match its sample; they need a direct write to the ledger file and are outside
+the guarantee. That is stated, not solved.
 
 A (rule, length stratum) is profile-eligible only when the owner-review ledger holds at least
 100 reviewed **texts** of that rule and stratum at the current rules version, at least 95 percent
@@ -558,8 +561,8 @@ precision is over rows drawn: a drawn row the ledger holds no row for also count
 (reported as `missing_rows`). The next `review-sample` leaves out the spans the owner already
 reviewed and every other span with the same text (same rule, stratum and `text_key`, however it
 is spelled), blank rows included, so a text is never shown twice and a blank row is never drawn
-again to be skipped again. **A sample is recorded once**, in order, into the one ledger it was drawn against (see below), so answer every
-row you can in that one recording: a row left blank is recorded as `unsure` for good.
+again to be skipped again. **A sample is recorded once**, into a ledger in the state it was drawn against (see
+below), so answer every row you can in that one recording: a row left blank is recorded as `unsure` for good.
 
 Which ledger rows count, in order: a row is **stale** (another rules version or an older ledger
 schema) and ignored; a row whose reviewer is not the `--owner-id` identity is a **non-owner row**,
@@ -581,7 +584,8 @@ if one of them was a `no`, the precision is overstated, so look at `quarantined_
 supplies; `--owner-id` is self-reported. A process that can write the ledger and read the library
 can append rows with real span ids and the owner's name, and the gate cannot tell them from the
 owner's own; the sample digest and the library fingerprint are integrity checks that anyone can
-recompute (a header edited and re-digested passes them), not authentication. The gate protects against mistakes, omission and fabrication
+recompute (a header edited and re-digested passes them, though not the re-draw that follows),
+not authentication. The gate protects against mistakes, omission and fabrication
 (made-up ids, a rule or text edited in a row, an edited sample, a reviewer that is not the owner,
 blank rows dropped, samples chosen among many draws or ledgers), not against an adversary
 holding the owner's permissions.
@@ -619,9 +623,12 @@ hash, text key) entries of the owner's current rows in the ledger the draw exclu
 draw against no ledger, or against one with no rows of the owner, carries the digest of the empty
 list). `review-record` recomputes it
 from the target ledger, while holding the ledger's lock, and refuses a sample whose digest differs
-(`drawn against a different ledger state`). Every recording changes the ledger, so every sample can
-be recorded exactly once, in order, into exactly one ledger; to go on, draw again against the
-ledger as it now stands. Rows of other reviewers and of other versions are not part of the digest.
+(`drawn against a different ledger state`). Every recording changes the ledger, so a sample cannot be recorded twice into the same
+ledger, and to go on you draw again against the ledger as it now stands. This binds a sample to
+a ledger *state*, not to one file: a sample drawn against no rows of the owner (the first one)
+can be recorded into any ledger that holds no current rows of that owner, a new file or one with
+only other reviewers' rows, and a later sample only into a ledger in the state it was drawn
+against. Rows of other reviewers and of other versions are not part of the digest.
 
 The ledger is append-only JSONL, one object per line with exactly these keys: `schema`
 (`cce.attribution-review-ledger.v6`), `rules_version`, `span_id`, `rule`, `stratum` (`S`, `M` or
@@ -660,8 +667,10 @@ cce library attribute apply --library /private/store/library-all \
   --out /private/annotations-reviewed.json --owner-id rob --ledger /private/ledger.jsonl
 ```
 
-Every command line in these two blocks is run against a synthetic library by
-`tests/test_attribution_docs.py`, so a recipe that stops working fails the test suite.
+Every `cce library attribute` command line in the bash blocks of this section is run
+against a synthetic library by `tests/test_attribution_docs.py`, so a recipe that stops working
+fails the test suite. The `cce library profile` line of the first block is not run there (that
+command has its own tests).
 
 `review-sample` needs `--owner-id`: a sample is drawn for one owner. It draws, per rule and
 stratum, up to `--per-stratum` (alias `--per-rule`, default 100) distinct span texts, chosen by a
@@ -681,8 +690,10 @@ text sits and however it is spelled. Rows of other reviewers and rows of other v
 output. A sample file holds private text: keep it out of version control.
 
 `review-record` requires `--sample` (the file `review-sample` wrote), `--answers` and `--library`
-or `--store-root` (so the ledger is kept out of the store). `--answers` may be the very same file as
-`--sample`, filled in; a header line in the answers file is ignored, but it must be the header of
+or `--store-root` / `--corpus-store-root` (so the ledger is kept out of the store). `--ledger` must be a file of its
+own: one that is the same file as `--sample` or `--answers` (by path or by identity, so a hard
+link or a spelling in another case on a case-insensitive volume counts) is refused, because the
+verdicts would be appended to it. `--answers` may be the very same file as `--sample`, filled in; a header line in the answers file is ignored, but it must be the header of
 this sample (an answers file carrying another or an edited header is refused). It checks the digest
 of the sample and refuses one that was edited (a changed row, or a changed header field of any kind,
 such as the seed, the owner, the library, the census settings or the ledger state, changes the
@@ -692,5 +703,6 @@ sample again and refuses one whose rows are not that draw (below, **The rows are
 refuses an answer whose span id,
 rule and stratum are not a row of the sample, a span answered twice, a verdict other than `yes`,
 `no` or `unsure`, and a file with JSON nested too deeply to read (`unreadable`), all before
-anything is written. It stamps the current UTC time unless `--reviewed-at` is given. The engine's
-own functions take the time as a parameter and never read the clock.
+anything is written. It stamps the current UTC time unless `--reviewed-at` is given: the time is read once, at
+the command, and the engine's functions take timestamps as parameters (the ledger lock's
+30-second wait uses a monotonic timer, not a wall clock).

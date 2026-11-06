@@ -1292,6 +1292,17 @@ def _answers(path: Path, sample: ReviewSample) -> dict[str, str | None]:
     return answers
 
 
+def _same_file(first: Path, second: Path) -> bool:
+    """True if two paths name one file: the same resolved path, or an existing pair with one
+    device and inode (a hard link, or another spelling of a name on a case-insensitive volume)."""
+    if first.expanduser().resolve() == second.expanduser().resolve():
+        return True
+    try:
+        return first.samefile(second)
+    except OSError:
+        return False
+
+
 def _row_without_answer(row: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in row.items() if key != "verdict"}
 
@@ -1368,6 +1379,12 @@ def _review_record(args: argparse.Namespace) -> int:
     # The one place a clock is read, at the command boundary; the ledger helpers take the time.
     reviewed_at = args.reviewed_at or utc_stamp(datetime.now(UTC))
     reviewer = _identity(args.reviewer, "--reviewer")
+    for flag, other in (("--sample", args.sample), ("--answers", args.answers)):
+        if _same_file(args.ledger, other):
+            raise ValueError(
+                f"--ledger is the same file as {flag}: the ledger is append-only and must be a "
+                f"file of its own, or the verdicts would be written into the {flag[2:]} file"
+            )
     database = _database_path(args)
     ledger = check_ledger_path(args.ledger, library_roots(args, database))
     sample = parse_sample(args.sample.read_text(encoding="utf-8").split("\n"))

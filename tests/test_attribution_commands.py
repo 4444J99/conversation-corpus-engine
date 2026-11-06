@@ -1982,6 +1982,48 @@ def test_a_no_on_one_spelling_rejects_every_other_spelling_of_the_text(
     assert result["spans_withheld_as_rejected_twin"] + result["spans_withheld_by_verdict"] >= 6
 
 
+def test_review_record_refuses_a_ledger_that_is_the_sample_or_the_answers_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=5)
+    sample, answers = tmp_path / "sample.jsonl", tmp_path / "answers.jsonl"
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    answers_for(sample, answers, lambda row: "yes" if row["claim"] == "owner" else None)
+    sample_bytes, answer_bytes = sample.read_bytes(), answers.read_bytes()
+    alias = tmp_path / "alias.jsonl"
+    os.link(sample, alias)  # another name for the very same file
+    spelled_differently = tmp_path / "." / "sample.jsonl"
+    cases = {
+        "the sample": sample,
+        "the answers file": answers,
+        "another name for the sample": alias,
+        "a roundabout spelling of the sample": spelled_differently,
+    }
+    for name, ledger in cases.items():
+        code, _, err = record_answers(capsys, library, ledger, sample, answers)
+        assert code == 2 and "same file" in err and "ledger" in err, (name, err)
+        assert sample.read_bytes() == sample_bytes and answers.read_bytes() == answer_bytes, name
+    # The filled-in sample may be the sample and the answers at once; the ledger must be a file
+    # of its own.
+    code, _, err = record_answers(capsys, library, sample, sample, sample)
+    assert code == 2 and "same file" in err and sample.read_bytes() == sample_bytes
+    assert record_answers(capsys, library, tmp_path / "ledger.jsonl", sample, answers)[0] == 0
+
+
+def test_a_ledger_spelled_in_another_case_is_still_the_sample_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    if not case_insensitive(tmp_path):
+        pytest.skip("this volume is case sensitive: the test above covers the identity check")
+    library = build_library(tmp_path / "store" / "g", typed_records=5)
+    sample, answers = tmp_path / "sample.jsonl", tmp_path / "answers.jsonl"
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    answers_for(sample, answers, lambda row: "yes" if row["claim"] == "owner" else None)
+    before = sample.read_bytes()
+    code, _, err = record_answers(capsys, library, tmp_path / "SAMPLE.JSONL", sample, answers)
+    assert code == 2 and "same file" in err and sample.read_bytes() == before
+
+
 def test_review_record_needs_the_sample_it_answers(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2802,6 +2844,44 @@ def test_an_existing_output_is_refused_for_every_writer(
 
 
 # --- registration ----------------------------------------------------------------------------
+
+
+def test_corpus_store_root_is_an_alias_of_store_root_on_every_attribute_command() -> None:
+    parser = build_parser()
+    for words in (
+        ["--report"],
+        ["apply", "--out", "o.json"],
+        ["review-sample"],
+        ["review-record", "--ledger", "l", "--sample", "s", "--answers", "a", "--reviewer", "r"],
+    ):
+        args = parser.parse_args(["library", "attribute", *words, "--corpus-store-root", "/x"])
+        assert args.store_root == Path("/x"), words
+        args = parser.parse_args(["library", "attribute", *words, "--store-root", "/y"])
+        assert args.store_root == Path("/y"), words
+
+
+def test_a_first_sample_binds_to_a_ledger_state_not_to_one_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A sample drawn against no rows of the owner can be recorded into any ledger that holds
+    none (the docs say so); it cannot be recorded twice into the same ledger."""
+    library = build_library(tmp_path / "store" / "g", typed_records=5)
+    sample, answers = tmp_path / "sample.jsonl", tmp_path / "answers.jsonl"
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    answers_for(sample, answers, lambda row: "yes" if row["claim"] == "owner" else None)
+    first, second = tmp_path / "ledger-a.jsonl", tmp_path / "ledger-b.jsonl"
+    assert record_answers(capsys, library, first, sample, answers)[0] == 0
+    assert record_answers(capsys, library, second, sample, answers)[0] == 0
+    code, _, err = record_answers(capsys, library, first, sample, answers)
+    assert code == 2 and "different ledger state" in err
+    # Rows of other reviewers do not change the state, so such a ledger takes the sample too.
+    other = tmp_path / "ledger-c.jsonl"
+    foreign = [
+        {**json.loads(line), "reviewer": "someone-else"}
+        for line in first.read_text(encoding="utf-8").splitlines()
+    ]
+    other.write_text("".join(json.dumps(row) + "\n" for row in foreign), encoding="utf-8")
+    assert record_answers(capsys, library, other, sample, answers)[0] == 0
 
 
 def test_parser_registers_attribute_and_keeps_options_given_before_a_subcommand() -> None:

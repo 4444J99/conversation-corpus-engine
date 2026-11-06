@@ -19,7 +19,8 @@ How a partition is decided:
 
 Every span this engine produces has `profile_eligible=False`. A rule becomes eligible only through
 the precision gate (`review_statistics`), which reads an owner-review ledger; nothing in this
-module reads the clock or the filesystem except the explicit ledger helpers.
+module reads the wall clock (the ledger lock's wait uses a monotonic timer) or the filesystem
+except the explicit ledger helpers.
 """
 
 from __future__ import annotations
