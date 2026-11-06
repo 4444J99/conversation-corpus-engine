@@ -531,9 +531,13 @@ moves an existing conversation page URL.
   replaces the baseline and appends exactly one row flagged `"rebuilt": true`. That row lists no
   added, changed or removed uid, because the baseline that would say what changed is the one
   that cannot be trusted. No ledger row is deleted: a damaged ledger keeps every readable row
-  and a copy of the damaged file is saved beside it as `index-all-lineage.jsonl.damaged`. Not
+  and a copy of the damaged file is saved beside it as `index-all-lineage.jsonl.damaged`. A
+  ledger damaged in the middle (rows that still parse follow the unreadable line) is not
+  rebuilt, because the rebuild would drop those rows from the ledger: the ingest and `verify`
+  name the line, and the file has to be repaired by hand or restored from a copy. Not
   detectable: a ledger and a digest file both rolled back together to an earlier consistent
-  state.
+  state, and a ledger emptied of rows while a digest file remains (`verify` reports that one as
+  `empty`, an ingest does not refuse it).
 
 `cce archive verify` (and the verify that closes `build`) reports a `wiki` block (pages,
 messages and messages anchored, pages with a table of contents, backlink and history pages,

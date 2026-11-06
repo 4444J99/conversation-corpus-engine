@@ -15,12 +15,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from test_archive_failure_recovery import crash_at
+from test_archive_failure_recovery import crash_at, edit_export_again
 from test_archive_site_wiki import edit_export, lineage_of, rebuild
 
 from conversation_corpus_engine import archive_layout as layout
 from conversation_corpus_engine import archive_lineage
 from conversation_corpus_engine.archive_ingest import ArchivePaths, ingest
+from conversation_corpus_engine.archive_naming import verify_names
 from conversation_corpus_engine.archive_wiki import verify_site_wiki
 from conversation_corpus_engine.cli import main
 
@@ -216,6 +217,36 @@ def test_rebuild_lineage_keeps_the_readable_rows_and_a_copy_of_the_damaged_file(
     assert rows[1].get("rebuilt") is True and rows[1]["parent"] == ledger[0]["fingerprint"]
     copy = env.paths.lineage.with_name(env.paths.lineage.name + ".damaged")
     assert copy.read_bytes() == damaged, "the unreadable ledger is kept, not discarded"
+    assert verify_names(env.paths.root)["ok"], "the saved copy keeps a name the contract accepts"
+
+
+def test_a_ledger_damaged_in_the_middle_is_never_rebuilt_over_the_rows_after_it(
+    archive_env, monkeypatch, capsys
+) -> None:
+    """Rows that still parse after the bad line would be dropped from the live ledger by a
+    rebuild, which is "deletes no row" only in a copy. So the rebuild refuses, before it reads
+    anything, and the file is left as it is."""
+    env = archive_env
+    rebuild(env)
+    edit_export(env)
+    rebuild(env)
+    edit_export_again(env)
+    rebuild(env)
+    assert len(lineage_of(env.paths)) == 3
+    lines = env.paths.lineage.read_text(encoding="utf-8").splitlines(keepends=True)
+    lines[1] = '{"generation": 2, "fingerprint": \n'
+    env.paths.lineage.write_text("".join(lines), encoding="utf-8")
+    damaged = env.paths.lineage.read_bytes()
+    with pytest.raises(archive_lineage.LineageError, match="damaged in the middle") as raised:
+        archive_lineage.load_lineage(env.paths)
+    assert "1 more row" in str(raised.value) and REMEDY not in str(raised.value)
+    for extra in ([], ["--rebuild-lineage"]):
+        code, _, err = cce(monkeypatch, capsys, *archive_ingest_command(env, *extra))
+        assert code == 2 and "damaged in the middle" in err and "Traceback" not in err
+    assert env.paths.lineage.read_bytes() == damaged
+    assert not env.paths.lineage.with_name(env.paths.lineage.name + ".damaged").exists()
+    (problem,) = verify_site_wiki(env.paths)["problems"]
+    assert "damaged in the middle" in problem
 
 
 def test_a_ledger_that_is_not_made_of_rows_is_damaged_too(archive_env) -> None:

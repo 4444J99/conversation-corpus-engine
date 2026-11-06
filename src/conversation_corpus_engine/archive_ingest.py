@@ -954,8 +954,7 @@ def ingest(
     records the generation anyway as a rebuilt one (see `archive_lineage.record_generation`).
     """
     require_inside(authorization, paths.root)
-    if not rebuild_lineage:
-        check_lineage(paths)
+    check_lineage(paths, rebuild=rebuild_lineage)
     options = dict(options or {})
     options["source_hash_cache"] = {}
     options["protected_capture_uids"] = {}

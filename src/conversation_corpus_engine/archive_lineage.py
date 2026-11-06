@@ -48,26 +48,51 @@ class LineageError(ValueError):
     describe. Nothing has been changed when this is raised."""
 
 
-def read_ledger(paths: ArchivePaths) -> tuple[list[dict[str, Any]], str]:
-    """The ledger rows that can be read, and why the rest cannot ("" when all of it can).
+def read_ledger(paths: ArchivePaths) -> tuple[list[dict[str, Any]], str, int]:
+    """The ledger rows that can be read, why the rest cannot ("" when all of it can) and how many
+    rows still parse after the first unreadable line.
 
     A line that is not a JSON object (a write cut short leaves one at the end) ends the readable
-    rows: it and everything after it is the unreadable remainder.
+    rows: the rows before it are the ledger, and it and everything after it is the unreadable
+    remainder. Rows that parse after it are counted, not returned: a ledger with such rows was
+    damaged in the middle, not cut short, and dropping them would lose history.
     """
     if not paths.lineage.is_file():
-        return [], ""
+        return [], "", 0
     rows: list[dict[str, Any]] = []
+    damage, stranded = "", 0
     for number, raw in enumerate(paths.lineage.read_bytes().splitlines(), 1):
         if not raw.strip():
             continue
         try:
             row = json.loads(raw.decode("utf-8"))
+            reason = "" if isinstance(row, dict) else f"line {number} is not a generation row"
         except ValueError:  # includes UnicodeDecodeError and json.JSONDecodeError
-            return rows, f"line {number} is not JSON (the file may have been cut short)"
-        if not isinstance(row, dict):
-            return rows, f"line {number} is not a generation row"
-        rows.append(row)
-    return rows, ""
+            reason = f"line {number} is not JSON (the file may have been cut short)"
+        if reason:
+            damage = damage or reason
+        elif damage:
+            stranded += 1
+        else:
+            rows.append(row)
+    return rows, damage, stranded
+
+
+def damaged_ledger_error(
+    paths: ArchivePaths, rows: int, damage: str, stranded: int
+) -> LineageError:
+    name = paths.lineage.name
+    if stranded:
+        return LineageError(
+            f"{name} is damaged in the middle: {damage}, after {rows} readable generation(s), and "
+            f"{stranded} more row(s) that still parse follow it. A rebuild would drop them from "
+            "the ledger, so it refuses: repair the line by hand or restore the file from a copy"
+        )
+    return LineageError(
+        f"{name} is damaged: {damage}, after {rows} readable generation(s). Restore it from a "
+        f"copy, or run `{REBUILD_REMEDY}`: that keeps every readable row, saves a copy of the "
+        f"damaged file as {name}.damaged and records one generation flagged rebuilt"
+    )
 
 
 def load_lineage(paths: ArchivePaths) -> list[dict[str, Any]]:
@@ -76,14 +101,9 @@ def load_lineage(paths: ArchivePaths) -> list[dict[str, Any]]:
     A ledger with an unreadable line raises `LineageError` naming the file and the remedy: the
     rows after it would be guesses, and a bare JSON error says nothing about what to do.
     """
-    rows, damage = read_ledger(paths)
+    rows, damage, stranded = read_ledger(paths)
     if damage:
-        raise LineageError(
-            f"{paths.lineage.name} is damaged: {damage}, after {len(rows)} readable "
-            f"generation(s). Restore it from a copy, or run `{REBUILD_REMEDY}`: that keeps "
-            f"every readable row, saves a copy of the damaged file as {paths.lineage.name}.damaged "
-            f"and records one generation flagged rebuilt"
-        )
+        raise damaged_ledger_error(paths, len(rows), damage, stranded)
     return rows
 
 
@@ -165,11 +185,17 @@ def diverged_message(paths: ArchivePaths, ledger: list[dict[str, Any]]) -> str:
     )
 
 
-def check_lineage(paths: ArchivePaths) -> None:
-    """Raise `LineageError` if the lineage cannot be trusted, before an ingest reads anything."""
-    ledger = load_lineage(paths)
-    if baseline_state(paths, ledger) == "diverged":
-        raise LineageError(diverged_message(paths, ledger))
+def check_lineage(paths: ArchivePaths, *, rebuild: bool = False) -> None:
+    """Raise `LineageError` if the lineage cannot be trusted, before an ingest reads anything.
+
+    With `rebuild` a damaged ledger or a diverged baseline is accepted (that is what a rebuild
+    repairs), except a ledger damaged in the middle, which a rebuild would shorten.
+    """
+    rows, damage, stranded = read_ledger(paths)
+    if stranded or (damage and not rebuild):
+        raise damaged_ledger_error(paths, len(rows), damage, stranded)
+    if not rebuild and baseline_state(paths, rows) == "diverged":
+        raise LineageError(diverged_message(paths, rows))
 
 
 def finish_interrupted_commit(
@@ -260,7 +286,9 @@ def record_generation(
     cannot be trusted.
     """
     if rebuild:
-        ledger, damage = read_ledger(paths)
+        ledger, damage, stranded = read_ledger(paths)
+        if stranded:
+            raise damaged_ledger_error(paths, len(ledger), damage, stranded)
         if damage:
             _save_damaged_ledger(paths)
     else:
