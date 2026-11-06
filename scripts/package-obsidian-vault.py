@@ -826,19 +826,15 @@ def navigation_growth(
                                     resolved_final = rebased
                                     bound = max(
                                         bound,
-                                        max(
-                                            0,
-                                            len(quote(rebased, safe="/._-~").encode())
-                                            - len(parsed.path.encode()),
-                                        ),
+                                        0,
+                                        len(quote(rebased, safe="/._-~").encode())
+                                        - len(parsed.path.encode()),
                                     )
                             if (source_path / resolved_final).resolve() == agent_path:
                                 bound = max(
                                     bound,
-                                    max(
-                                        0,
-                                        len(b"agent-entry.md") - len(parsed.path.encode()),
-                                    ),
+                                    0,
+                                    len(b"agent-entry.md") - len(parsed.path.encode()),
                                 )
                         growth += bound
                     else:
