@@ -870,8 +870,12 @@ class Library:
 
         def source(match: str) -> tuple[str, list[Any]]:
             where = " AND ".join(["record_fts MATCH ?", *clauses])
+            # Joined on the row number, never on the stored ``uid`` column: reading that column
+            # loads the whole stored conversation body of every match (megabytes each), which
+            # made a common-word search on a large library take tens of seconds. ``put`` inserts
+            # each search row under its record's row number and ``verify`` checks that alignment.
             return (
-                "FROM record_fts JOIN records r ON r.uid=record_fts.uid WHERE " + where,
+                "FROM record_fts JOIN records r ON r.rowid=record_fts.rowid WHERE " + where,
                 [match, *filters],
             )
 
@@ -902,10 +906,51 @@ class Library:
                 [*params, limit + 1, offset],
             )
 
+        def ranked_page(match: str) -> list[sqlite3.Row]:
+            """The ranked page, in two steps. SQLite computes every selected column of every
+            match before it sorts, so selecting the excerpt in the ranking statement ran
+            ``snippet`` over thousands of stored bodies to keep nine. Step one ranks and pages
+            on row numbers alone; step two reads the excerpts of just those rows. Both steps
+            read one snapshot: a writer that commits between two separate statements would
+            otherwise drop a ranked row from the page."""
+            text, params = source(match)
+            own_snapshot = not self.connection.in_transaction
+            if own_snapshot:
+                self.connection.execute("BEGIN")
+            try:
+                keys = [
+                    row[0]
+                    for row in self.connection.execute(
+                        "SELECT record_fts.rowid "
+                        + text
+                        + " ORDER BY bm25(record_fts,0,5,1),r.uid LIMIT ? OFFSET ?",
+                        [*params, limit + 1, offset],
+                    )
+                ]
+                if not keys:
+                    return []
+                marks = ",".join("?" for _ in keys)
+                by_key = {
+                    row["key"]: row
+                    for row in self.connection.execute(
+                        "SELECT record_fts.rowid AS key,r.uid,r.title,r.provider,r.kind,r.wing,"
+                        "r.lane,r.current_version AS version,r.body_status,r.message_count,"
+                        "r.source_ref,snippet(record_fts,-1,'[',']','...',28) AS excerpt "
+                        "FROM record_fts JOIN records r ON r.rowid=record_fts.rowid "
+                        f"WHERE record_fts MATCH ? AND record_fts.rowid IN ({marks})",
+                        [match, *keys],
+                    )
+                }
+            finally:
+                if own_snapshot and self.connection.in_transaction:
+                    self.connection.execute("ROLLBACK")
+            return [by_key[key] for key in keys if key in by_key]
+
         def shape(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
             hits = []
             for row in rows[:limit]:
                 hit = dict(row)
+                hit.pop("key", None)
                 hit["title"] = hit["title"][:512]
                 hit["source_ref"] = hit["source_ref"][:2048]
                 for key in ("kind", "lane"):
@@ -975,7 +1020,7 @@ class Library:
             if total:
                 check()
                 with self._budget_scope(deadline):
-                    rows = page(match, " ORDER BY bm25(record_fts,0,5,1),r.uid").fetchall()
+                    rows = ranked_page(match)
         except _BudgetExpired:
             expired_in = steps[index][0]
             if total:
@@ -1116,6 +1161,13 @@ class Library:
             "SELECT uid FROM records EXCEPT SELECT uid FROM record_fts"
         ).fetchone():
             problems.append("record absent from search")
+        # Search joins its rows to records by row number, so every record must sit under the
+        # search row that carries its own uid.
+        if self.connection.execute(
+            "SELECT 1 FROM records r LEFT JOIN record_fts f ON f.rowid=r.rowid "
+            "WHERE f.uid IS NOT r.uid LIMIT 1"
+        ).fetchone():
+            problems.append("search identity is not aligned with its record row")
         if full:
             for row in self.connection.execute("SELECT digest,payload,raw_bytes FROM objects"):
                 if check_callback:
