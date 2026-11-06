@@ -711,6 +711,30 @@ def test_tool_output_shaped_runs_of_three_lines_are_machine(run_of_lines: str) -
     assert ranges(rule_log_trace(ctx(run_of_lines))) == [(0, len(run_of_lines))]
 
 
+@pytest.mark.parametrize(
+    "short_trace",
+    [
+        "java.lang.IllegalStateException: boom\n\tat com.x.Y.m(Y.java:10)",
+        "Caused by: java.io.IOException: closed\n\tat com.x.Z.n(Z.java:20)",
+        'Exception in thread "main" java.lang.Error: x\n\tat com.x.Main.main(Main.java:5)',
+        "TypeError: x is not a function\n    at run (a.js:1:2)",
+        "    at run (a.js:1:2)\n    at main (b.js:3:4)",
+    ],
+)
+def test_a_two_line_stack_trace_is_machine_output_even_below_three_lines(short_trace: str) -> None:
+    assert ranges(rule_log_trace(ctx(short_trace))) == [(0, len(short_trace))]
+    text = f"It failed:\n{short_trace}\nwhy?"
+    assert [s.author for s in run(text) if s.rule == "log_trace"] == ["agent"]
+    assert not any("Y.java" in text[s.start : s.end] for s in run(text) if s.author == "owner")
+
+
+def test_a_lone_frame_or_header_and_ordinary_two_line_runs_are_still_left_alone() -> None:
+    assert rule_log_trace(ctx("    at run (a.js:1:2)")) == []
+    assert rule_log_trace(ctx("TypeError: x is not a function")) == []
+    assert rule_log_trace(ctx("TypeError: x\nValueError: y")) == []
+    assert rule_log_trace(ctx("    at run (a.js:1:2)\nplain words after it")) == []
+
+
 def test_two_lines_or_a_blank_line_break_a_weak_run() -> None:
     assert rule_log_trace(ctx("ERROR: first\nERROR: second")) == []
     assert rule_log_trace(ctx("ERROR: a\nERROR: b\n\nERROR: c\nERROR: d")) == []

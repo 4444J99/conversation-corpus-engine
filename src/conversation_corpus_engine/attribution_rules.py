@@ -686,10 +686,12 @@ _WEAK_LOG = (
     re.compile(r"^(?:@@ -\d|diff --git |index [0-9a-f]{7,}\.\.[0-9a-f]{7,}|\+\+\+ \S|--- \S)"),
     re.compile(r"^[d\-l][rwx\-]{9}[@+.]?\s+\d+\s+\S"),
     re.compile(r"^(?:npm|yarn) (?:ERR!|WARN|error|warn)"),
-    re.compile(r"^\s+at\s+\S.*(?:\([^()]*\)|:\d+(?::\d+)?)\s*$"),
-    re.compile(
-        r"^(?:Exception in thread\b|Caused by:|(?:[\w$]+\.)*[\w$]*(?:Exception|Error)\b[:\s])"
-    ),
+)
+# A stack frame and an exception header: weak on their own, but a header with its frame, or two
+# frames, is a stack trace even when it is only two lines long.
+_STACK_FRAME = re.compile(r"^\s+at\s+\S.*(?:\([^()]*\)|:\d+(?::\d+)?)\s*$")
+_STACK_HEADER = re.compile(
+    r"^(?:Exception in thread\b|Caused by:|(?:[\w$]+\.)*[\w$]*(?:Exception|Error)\b[:\s])"
 )
 _TRACE_HEADER = re.compile(r"^\s*Traceback \(most recent call last\):\s*$")
 _TRACE_LAST = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Interrupt|Exit|Warning)\b(?::.*)?$")
@@ -719,6 +721,10 @@ def rule_log_trace(context: MessageContext) -> list[Claim]:
     for _, _, content in lines:
         if any(pattern.match(content) for pattern in _STRONG_LOG):
             kinds.append("strong")
+        elif _STACK_FRAME.match(content):
+            kinds.append("frame")
+        elif _STACK_HEADER.match(content):
+            kinds.append("header")
         elif any(pattern.match(content) for pattern in _WEAK_LOG):
             kinds.append("weak")
         else:
@@ -731,8 +737,11 @@ def rule_log_trace(context: MessageContext) -> list[Claim]:
         stop = index
         while stop < len(lines) and kinds[stop]:
             stop += 1
+        run_kinds = set(kinds[index:stop])
         if stop - index >= MIN_WEAK_RUN:
             claims.append((lines[index][0], lines[stop - 1][1], "tool-output-run"))
+        elif stop - index == 2 and "frame" in run_kinds and run_kinds <= {"frame", "header"}:
+            claims.append((lines[index][0], lines[stop - 1][1], "stack-trace"))
         else:
             strong = [i for i in range(index, stop) if kinds[i] == "strong"]
             for _, group in itertools.groupby(
