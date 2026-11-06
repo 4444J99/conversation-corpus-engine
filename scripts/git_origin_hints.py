@@ -19,8 +19,8 @@ The output has one `cce.origin-hints.v1` row per file with history, sorted by re
      "signals": [sorted unique strings such as "trailer:co-authored-by:claude"],
      "basis": "git-log"}
 
-A commit is agent-signed when any of these holds: a `Co-authored-by` trailer (any case) in the
-last paragraph of its message names an AI by name or email; the author or the committer name or
+A commit is agent-signed when any of these holds: a `Co-authored-by:` line (any case, anywhere in
+the message) names an AI by name or email; the author or the committer name or
 email names an AI; the message ends with the agent footer (`Generated with [Claude Code]`, or a
 line starting with the robot emoji and `Generated with`). An AI is named when a whole word of
 the name or email is one of claude, anthropic, gemini, chatgpt, openai, copilot, codex, opencode,
@@ -36,7 +36,11 @@ author name or an author email.
 WHAT THIS CANNOT SEE
 - Renames are not followed: a renamed file starts its history at the rename commit, and the
   commits before it belong to the old path (which is listed too, with `--all`).
-- A squashed or hand-rewritten commit by a human may contain agent text: it counts as human.
+- A squashed or hand-rewritten commit by a human may contain agent text: it counts as human
+  unless the message still holds a `Co-authored-by:` line of an AI (a local squash keeps them).
+  A line that merely quotes such a trailer is counted too: this errs toward agent.
+- A commit that deletes a file counts as touching it (so a human removing or moving an agent
+  file makes it `mixed`).
 - A human committing agent output without a trailer, a footer or an agent identity counts as
   human; an agent committing under a human identity does too.
 - Text that existed before the file entered git, or lived outside git, has no history here.
@@ -107,6 +111,10 @@ class InputError(Exception):
     """A problem with the arguments or the input files."""
 
 
+class GitFailure(Exception):
+    """Git failed on, or produced output that cannot be read for, one repository."""
+
+
 def ai_labels(text: str) -> frozenset[str]:
     """Which AI names a name or an address holds as whole words."""
     lowered = unicodedata.normalize("NFKC", text).casefold()
@@ -138,17 +146,16 @@ def identity_signals(
 
 
 def message_signals(message: str) -> frozenset[str]:
-    """Trailer and footer signals of a commit message."""
+    """Trailer and footer signals of a commit message. A `Co-authored-by:` line counts wherever
+    it stands in the message (a squash message holds the trailers of every squashed commit in
+    its middle); the agent footer counts when it is among the last non-empty lines."""
     signals: set[str] = set()
     lines = [line.rstrip() for line in message.replace("\r\n", "\n").split("\n")]
     while lines and not lines[-1].strip():
         lines.pop()
     if not lines:
         return frozenset()
-    start = len(lines)
-    while start > 0 and lines[start - 1].strip():
-        start -= 1
-    for line in lines[start:]:
+    for line in lines:
         match = _TRAILER.match(line.strip())
         if not match:
             continue
@@ -436,9 +443,15 @@ def hint_row(
 
 
 def write_atomically(out: Path | None, lines: Iterator[str]) -> None:
+    """Write the lines as they are produced to a private file and publish it only when the
+    iterator finished; on any error nothing is published (standard output included)."""
     if out is None:
-        for line in lines:
-            sys.stdout.write(line)
+        with tempfile.TemporaryFile("w+", encoding="utf-8", newline="\n") as spool:
+            for line in lines:
+                spool.write(line)
+            spool.seek(0)
+            while chunk := spool.read(READ_SIZE):
+                sys.stdout.write(chunk)
         return
     out.parent.mkdir(parents=True, exist_ok=True)
     descriptor, name = tempfile.mkstemp(dir=out.parent, prefix=f".{out.name}.", suffix=".part")
@@ -509,43 +522,57 @@ def run(args: argparse.Namespace) -> int:
             progress(f"missing repositories ({len(missing)}): {', '.join(missing)}")
             return EXIT_INPUT
     index = SignalIndex()
-    rows: list[tuple[str, str, dict[str, Any]]] = []
-    unmatched = 0
-    for number, name in enumerate(sorted(repos), 1):
-        progress(f"repo {number}/{len(repos)}: reading")
-        wanted_paths = set(wanted[name]) if wanted is not None else None
-        try:
-            result = read_repo(
-                repos[name],
-                wanted=wanted_paths,
-                limit=args.max_commits_per_repo,
-                index=index,
-                progress=progress,
+    totals = {"rows": 0, "unmatched": 0}
+
+    def lines() -> Iterator[str]:
+        """The output, repository by repository in name order and file by file in path order;
+        only one repository's files are held at a time."""
+        for number, name in enumerate(sorted(repos), 1):
+            progress(f"repo {number}/{len(repos)}: reading")
+            wanted_paths = set(wanted[name]) if wanted is not None else None
+            try:
+                result = read_repo(
+                    repos[name],
+                    wanted=wanted_paths,
+                    limit=args.max_commits_per_repo,
+                    index=index,
+                    progress=progress,
+                )
+            except subprocess.CalledProcessError as error:
+                raise GitFailure(
+                    f"git failed on repository {name} (exit {error.returncode}): {error.stderr}"
+                ) from None
+            except (OSError, ValueError) as error:
+                raise GitFailure(
+                    f"git output could not be read for repository {name}: {error}"
+                ) from None
+            spelled_rows: list[tuple[str, dict[str, Any]]] = []
+            for path in result.counts:
+                counts, mask = result.counts[path], result.masks.get(path, 0)
+                spellings = wanted[name][path] if wanted is not None else {path}
+                spelled_rows.extend(
+                    (
+                        spelled,
+                        hint_row(name, spelled, counts, mask, index, result.window_full),
+                    )
+                    for spelled in spellings
+                )
+            spelled_rows.sort(key=lambda item: item[0])
+            if wanted is not None:
+                totals["unmatched"] += len(wanted[name]) - len(result.counts)
+            progress(
+                f"repo {number}/{len(repos)}: {result.commits} commits, {len(result.counts)} files"
             )
-        except subprocess.CalledProcessError as error:
-            progress(f"git failed on repository {name} (exit {error.returncode}): {error.stderr}")
-            return EXIT_GIT
-        except (OSError, ValueError) as error:
-            progress(f"git output could not be read for repository {name}: {error}")
-            return EXIT_GIT
-        for path in sorted(result.counts):
-            counts, mask = result.counts[path], result.masks.get(path, 0)
-            spellings = sorted(wanted[name][path]) if wanted is not None else [path]
-            rows.extend(
-                (name, spelled, hint_row(name, spelled, counts, mask, index, result.window_full))
-                for spelled in spellings
-            )
-        if wanted is not None:
-            unmatched += len(wanted[name]) - len(result.counts)
-        progress(
-            f"repo {number}/{len(repos)}: {result.commits} commits, {len(result.counts)} files"
-        )
-    rows.sort(key=lambda item: (item[0], item[1]))
-    write_atomically(
-        args.out,
-        (json.dumps(row, ensure_ascii=True) + "\n" for _, _, row in rows),
-    )
-    progress(f"done: {len(rows)} hints, {unmatched} wanted files without history")
+            for _, row in spelled_rows:
+                totals["rows"] += 1
+                yield json.dumps(row, ensure_ascii=True) + "\n"
+
+    try:
+        write_atomically(args.out, lines())
+    except GitFailure as error:
+        progress(str(error))
+        return EXIT_GIT
+    progress(f"done: {totals['rows']} hints, {totals['unmatched']} wanted files without history")
     return 0
 
 

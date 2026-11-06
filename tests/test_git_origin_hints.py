@@ -145,7 +145,7 @@ def build_alpha(root: Path) -> Path:
     commit(
         repo,
         clock,
-        f"quote an old message\n\n{CLAUDE_TRAILER}\n\nthe line above only quotes it",
+        f"squash of two commits\n\n{CLAUDE_TRAILER}\n\nthe second squashed message follows",
         {"docs/human.md": "two"},
     )
     git(repo, "mv", "docs/agent.md", "docs/agent-renamed.md")
@@ -191,7 +191,7 @@ def expected_rows(repo: str = "alpha") -> list[dict]:
         row("docs/both.md", "mixed", 2, 1, CLAUDE_SIGNALS),
         row("docs/copilot.md", "agent", 1, 1, ["trailer:co-authored-by:copilot"]),
         row("docs/footer.md", "agent", 1, 1, ["footer:generated-with"]),
-        row("docs/human.md", "human", 2, 0, []),
+        row("docs/human.md", "mixed", 2, 1, CLAUDE_SIGNALS),
         row("docs/pat.md", "human", 1, 0, []),
         row("feat.md", "agent", 1, 1, CLAUDE_SIGNALS),
         row('quote"name.md', "human", 1, 0, []),
@@ -254,13 +254,14 @@ def test_merges_are_excluded_and_a_rename_is_not_followed(clones: Path, tmp_path
     assert rows["docs/agent-renamed.md"]["commits"]["total"] == 1
 
 
-def test_a_trailer_quoted_in_the_middle_of_a_message_is_not_a_signal(
+def test_a_trailer_in_the_middle_of_a_squash_message_still_counts(
     clones: Path, tmp_path: Path
 ) -> None:
     out = tmp_path / "hints.jsonl"
     run_tool("--repos-dir", clones, "--all", "--out", out)
     rows = {json.loads(line)["path"]: json.loads(line) for line in out.read_text().splitlines()}
-    assert rows["docs/human.md"]["origin"] == "human"
+    assert rows["docs/human.md"]["origin"] == "mixed"
+    assert rows["docs/human.md"]["commits"] == {"total": 2, "agent": 1, "human": 1}
 
 
 def test_a_bare_clone_gives_the_same_rows(clones: Path, tmp_path: Path) -> None:
@@ -366,6 +367,25 @@ def test_a_directory_that_is_not_a_repository_fails_with_exit_three(tmp_path: Pa
     assert not out.exists()
 
 
+def test_a_git_failure_leaves_standard_output_empty_even_after_good_repositories(
+    clones: Path, tmp_path: Path
+) -> None:
+    store = tmp_path / "store"
+    store.mkdir()
+    subprocess.run(
+        ["git", "clone", "-q", "--bare", str(clones / "alpha"), str(store / "alpha.git")],
+        check=True,
+        capture_output=True,
+        env={**os.environ, **ISOLATION},
+    )
+    (store / "zeta").mkdir()
+    (store / "zeta" / ".git").mkdir()
+    done = run_tool("--repos-dir", store, "--all")
+    assert done.returncode == 3
+    assert done.stdout == ""
+    assert "zeta" in done.stderr
+
+
 def test_a_repository_without_commits_gives_no_rows(tmp_path: Path) -> None:
     store = tmp_path / "store"
     (store / "empty").mkdir(parents=True)
@@ -457,7 +477,12 @@ def test_ai_names_match_as_whole_words(text: str, labels: set[str]) -> None:
         ("x\n\nco-authored-by: GEMINI <g@example.test>", {"trailer:co-authored-by:gemini"}),
         ("x\n\nCO-AUTHORED-BY: Codex", {"trailer:co-authored-by:codex"}),
         ("x\n\nCo-authored-by: Pat Example <pat@example.test>", set()),
-        (f"x\n\n{CLAUDE_TRAILER}\n\nmore text after", set()),
+        (f"x\n\n{CLAUDE_TRAILER}\n\nmore text after", set(CLAUDE_SIGNALS)),
+        (
+            f"first\n\n{CLAUDE_TRAILER}\n\nsecond squashed message\n\nSigned-off-by: A",
+            set(CLAUDE_SIGNALS),
+        ),
+        ("> Co-authored-by: Claude <noreply@anthropic.com>", set()),
         (f"x\n\n{FOOTER}", {"footer:generated-with"}),
         ("x\n\nGenerated with [Claude Code]", {"footer:generated-with"}),
         (

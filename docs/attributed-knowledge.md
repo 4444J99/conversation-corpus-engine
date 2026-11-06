@@ -695,8 +695,8 @@ python scripts/git_origin_hints.py --repos-dir /path/to/clones --all --out hints
 never a commit message, an author name or an address. A requested repository that is missing makes
 the tool exit 2 naming it (nothing is written).
 
-The three origins. A commit is **agent-signed** when a `Co-authored-by` trailer (any letter case,
-in the last paragraph of the message), the author or the committer (name or address) names an AI
+The three origins. A commit is **agent-signed** when a `Co-authored-by:` line (any letter case,
+anywhere in the message, so the trailers a squash message carries count), the author or the committer (name or address) names an AI
 by a whole word (claude, anthropic, gemini, chatgpt, openai, copilot, codex, opencode, cursor,
 antigravity, aider, devin, jules, dependabot, renovate, `github` `actions`, anything with
 `[bot]`, `noreply@anthropic.com`), or the message ends with the agent footer (`Generated with
@@ -718,7 +718,8 @@ two million rows, is refused (exit 2) instead of silently giving credit back.
 What git cannot see. Renames are not followed (a renamed file starts its history at the rename
 commit). A human squash or hand-rewrite can contain agent text and counts as human. A human
 committing agent output without a trailer, footer or agent identity counts as human, and an agent
-committing under a person's identity does too. Text from before the file entered git, or kept
+committing under a person's identity does too. A commit that deletes a file counts as touching it,
+so a person removing or moving an agent's file makes it `mixed`. Text from before the file entered git, or kept
 outside git, has no history. Files whose history was rewritten show only the rewritten history.
 Only commits reachable from `HEAD` are read, and merge commits are excluded. A person whose name
 or address holds one of the AI words as a whole word (a first name such as Jules or Claude) is read
@@ -734,12 +735,15 @@ case-sensitive: `/backup/<repo>/<path>` and `<repo>/<path>` match, `<path>` alon
 repository name), `x<repo>/<path>` and `<repo>/<path>/more` do not. The hint with the most
 components wins. If two matches of the same length disagree (two rows for one file, or two of the
 record's own paths) the record is ambiguous and therefore unknown, never owner; equal matches that
-agree are not ambiguous.
+agree are not ambiguous. The document reader stores `source_path` as the full path of the file and
+`source_file` relative to the configured source root, so a hint matches through whichever of them
+still holds the repository's folder name; a record whose paths no longer name the repository gets
+no hint.
 
 A sample drawn with `--origin-hints` can only be recorded with `review-record --origin-hints` and
 the same file, because `review-record` draws the sample again to check it. The report, `apply` and
-`review-sample` outputs carry `origin_hints.rows` when hints were used. Zettel derivation does not
-build record inputs in this version, so it takes no hints argument.
+`review-sample` outputs carry `origin_hints.rows` when hints were used. Review rows written under
+`@10` or earlier are stale and are reported as `stale_rows`.
 
 ### Reports, annotations and bounds
 
