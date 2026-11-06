@@ -355,8 +355,12 @@ def _atx_heading(line: str) -> tuple[int, str] | None:
 FENCE_LINE_RE = re.compile(r"(`{3,}|~{3,})(.*)")
 ITEM_MARKER_RE = re.compile(r"([-*+]|(\d{1,9})[.)])(?=[ \t]|$)")
 THEMATIC_BREAK_RE = re.compile(r"([-*_])(?:[ \t]*\1){2,}[ \t]*")
-SETEXT_UNDERLINE_RE = re.compile(r"=+[ \t]*")
+SETEXT_UNDERLINE_RE = re.compile(r"(?:=+|-+)[ \t]*")
 TAB_STOP = 4
+QUOTE, ITEM = "quote", "item"  # the two containers a heading can be inside of
+# Containers nested deeper than this are read as text: a line of ten thousand `>` costs a line's
+# worth of work per container, so the depth is bounded. markdown-it-py bounds it too (at 20).
+MAX_CONTAINERS = 32
 
 
 def _indentation(body: str, start: int = 0) -> tuple[int, str]:
@@ -369,92 +373,157 @@ def _indentation(body: str, start: int = 0) -> tuple[int, str]:
     return column, body[index:]
 
 
+def _advance(text: str, column: int, columns: int) -> tuple[str, int]:
+    """`text`, which starts at `column`, without up to `columns` columns of its leading spaces and
+    tabs. A tab that straddles the end leaves the rest of its width behind as spaces."""
+    index = 0
+    while index < len(text) and columns > 0 and text[index] in " \t":
+        width = 1 if text[index] == " " else TAB_STOP - column % TAB_STOP
+        if width > columns:
+            return " " * (width - columns) + text[index + 1 :], column + columns
+        columns -= width
+        column += width
+        index += 1
+    return text[index:], column
+
+
 def _headings(text: str) -> list[tuple[int, int, str]]:
     """(character offset of the line, level, title) of every top-level ATX heading outside code.
 
-    This follows CommonMark for what decides whether a heading line is one:
+    This follows CommonMark (as markdown-it-py reads it) for what decides whether a heading line
+    is one. Each line is matched against the containers still open (a block quote needs its `>`,
+    a list item needs its content offset or a blank line), and what is left is read as a new block
+    start inside the last container that matched:
 
     * Lines end at `\\n`, `\\r\\n` or `\\r` only; the other separators `str.splitlines` honours
-      (U+2028, form feed, ...) are ordinary characters, and so is a no-break space.
+      (U+2028, form feed, ...) are ordinary characters, and so is a no-break space. A title is
+      cut of spaces and tabs only, so a no-break space at its edge stays in it.
     * A fence opens on three or more backticks or tildes indented 0-3 spaces. A tab, four spaces
       or any other character before it makes the line indented code or paragraph text. It closes
       only on the same character, at least as long, indented 0-3 spaces and followed by nothing.
-    * Inside a list item (lines after a marker, indented to its content offset) a fence may be
-      indented further: 0-3 columns past the content offset, and the same for its closing line. A
-      line indented less than the content offset ends the item, and a fence open in it, unless it
-      continues the item's paragraph; a heading, a rule or a fence always ends it. Items nest.
+    * A block quote starts on `>` indented 0-3 spaces and an item on a marker followed by a space,
+      a tab or the end of the line. An item's content starts one column after the marker, or
+      after the spaces that follow it when there are one to four; with five or more, or with
+      nothing, the content is the first column after the marker, so five spaces make the first line
+      indented code. An item that starts empty ends at the next blank line. A fence in a quote or
+      an item may be indented 0-3 columns past its content start, and ends with its container.
+    * A line that matches no open container is a lazy continuation, and keeps them all open, only
+      if it would otherwise continue a paragraph: not after indented code, a fence or a heading,
+      and not when it starts a block (a quote, a heading, a fence, a rule or a list item that may
+      interrupt a paragraph: a bullet or `1.` with text). A heading, rule or fence ends the
+      containers it is not inside of.
     * A heading inside a list item or a quote is not top level, and is not listed.
+
+    HTML blocks and link reference definitions are not modelled: a line that markdown-it-py
+    reads as one is read here as paragraph text, so a document that has them can differ.
     """
     found: list[tuple[int, int, str]] = []
     position = 0
-    fence: tuple[str, int, int] | None = None  # character, length and container of the open fence
-    items: list[int] = []  # content offsets of the open list items, outermost first
-    paragraph = False  # the last line was paragraph text, which a lazy continuation may extend
-    blank = True
+    containers: list[
+        list[Any]
+    ] = []  # open containers, outermost first: kind, content offset, child
+    fence: tuple[str, int] | None = None  # character and length of the open fence
+    paragraph = False  # the open leaf block is a paragraph, which a lazy continuation may extend
     for line in LINE_RE.findall(text):
         start, position = position, position + len(line)
-        body = line.rstrip("\r\n")
-        columns, rest = _indentation(body)
-        if not rest:
-            blank = True
-            continue
-        after_blank, blank = blank, False
-        if fence is not None:
-            character, length, container = fence
-            if container and columns < container:
-                fence = None  # the list item ended, and its fence with it: read the line afresh
+        remaining, column, matched = line.rstrip("\r\n"), 0, 0
+        blank = not remaining.strip(" \t")
+        for kind, offset, has_child in containers:
+            reached, rest = _indentation(remaining, column)
+            if kind == QUOTE:
+                if not rest.startswith(">") or reached - column > 3:
+                    break
+                remaining, column = _advance(remaining, column, reached - column)
+                remaining, column = remaining[1:], column + 1
+                if remaining[:1] in (" ", "\t"):
+                    remaining, column = _advance(remaining, column, 1)
+            elif blank:
+                if not has_child:
+                    break  # an item that starts empty cannot go on past a blank line
+            elif reached - column >= offset:
+                remaining, column = _advance(remaining, column, offset)
             else:
+                break
+            matched += 1
+        whole = matched == len(containers)  # every open container goes on with this line
+        if not blank:
+            for entry in containers[:matched]:
+                entry[2] = True
+        if fence is not None:
+            if not whole:
+                fence = None  # its container ended, and it with it: read the line afresh
+            else:
+                reached, rest = _indentation(remaining, column)
                 closing = FENCE_LINE_RE.match(rest)
                 if (
                     closing
-                    and closing.group(1)[0] == character
-                    and len(closing.group(1)) >= length
+                    and closing.group(1)[0] == fence[0]
+                    and len(closing.group(1)) >= fence[1]
                     and not closing.group(2).strip(" \t")
-                    and columns - container <= 3
+                    and reached - column <= 3
                 ):
                     fence = None
                 continue
-        depth = sum(1 for offset in items if offset <= columns)  # the items this line is within
-        container = items[depth - 1] if depth else 0
-        relative = columns - container
-        opener = FENCE_LINE_RE.match(rest)
-        if opener and relative <= 3 and not (opener.group(1)[0] == "`" and "`" in opener.group(2)):
-            del items[depth:]
-            fence = (opener.group(1)[0], len(opener.group(1)), container)
+        interrupting = paragraph and whole  # the line would continue the open paragraph
+        ended = False  # the line was a leaf block of its own
+        while True:
+            reached, rest = _indentation(remaining, column)
+            relative = reached - column
+            if not rest or relative > 3:
+                break
+            if rest[0] == ">" and len(containers) < MAX_CONTAINERS:
+                del containers[matched:]
+                remaining, column = _advance(remaining, column, relative)
+                remaining, column = remaining[1:], column + 1
+                if remaining[:1] in (" ", "\t"):
+                    remaining, column = _advance(remaining, column, 1)
+                containers.append([QUOTE, 0, True])
+            elif heading := _atx_heading(rest):
+                del containers[matched:]
+                if not containers and heading[1]:
+                    found.append((start, *heading))
+                ended = True
+            elif (opener := FENCE_LINE_RE.match(rest)) and not (
+                opener.group(1)[0] == "`" and "`" in opener.group(2)
+            ):
+                del containers[matched:]
+                fence = (opener.group(1)[0], len(opener.group(1)))
+                ended = True
+            elif interrupting and SETEXT_UNDERLINE_RE.fullmatch(rest):
+                ended = True  # the paragraph is a setext heading, which is not listed
+            elif THEMATIC_BREAK_RE.fullmatch(rest):
+                del containers[matched:]
+                ended = True
+            elif len(containers) < MAX_CONTAINERS and (marker := ITEM_MARKER_RE.match(rest)):
+                content_column, content = _indentation(rest[marker.end() :], reached + marker.end())
+                numbered = marker.group(2)
+                if interrupting and (not content or (numbered and int(numbered) != 1)):
+                    break  # an empty item, or one not numbered 1, cannot interrupt a paragraph
+                gap = content_column - (reached + marker.end())
+                width = marker.end() + (gap if content and 1 <= gap <= 4 else 1)
+                del containers[matched:]
+                remaining, column = _advance(remaining, column, relative)
+                remaining, column = remaining[marker.end() :], column + marker.end()
+                remaining, column = _advance(remaining, column, width - marker.end())
+                containers.append([ITEM, relative + width, bool(content)])
+            else:
+                break
+            if ended:
+                break
+            matched, whole, interrupting = len(containers), True, False
+            paragraph = False
+        if ended:
             paragraph = False
             continue
-        if relative <= 3 and THEMATIC_BREAK_RE.fullmatch(rest):
-            del items[depth:]
+        reached, rest = _indentation(remaining, column)
+        if not rest:
+            del containers[matched:]
             paragraph = False
-            continue
-        if relative <= 3 and (marker := ITEM_MARKER_RE.match(rest)):
-            innermost = items[-1] if items else 0
-            within_paragraph = paragraph and not after_blank and columns >= innermost
-            content_column, content = _indentation(rest[marker.end() :], columns + marker.end())
-            gap = content_column - (columns + marker.end())
-            numbered = marker.group(2)
-            if not within_paragraph or (content and (not numbered or int(numbered) == 1)):
-                del items[depth:]
-                items.append(columns + marker.end() + (gap if content and 1 <= gap <= 4 else 1))
-                first = FENCE_LINE_RE.match(content)
-                if first and not (first.group(1)[0] == "`" and "`" in first.group(2)):
-                    fence = (first.group(1)[0], len(first.group(1)), items[-1])
-                    paragraph = False
-                else:
-                    paragraph = bool(content) and _atx_heading(content) is None
-                continue
-        if relative <= 3 and (heading := _atx_heading(" " * relative + rest)):
-            if container == 0 and heading[1]:
-                found.append((start, *heading))
-            del items[depth:]
-            paragraph = False
-            continue
-        if after_blank or not paragraph:
-            del items[depth:]  # a new block; otherwise this lazily continues the paragraph
-        if relative <= 3 and paragraph and not after_blank and SETEXT_UNDERLINE_RE.fullmatch(rest):
-            paragraph = False
+        elif not whole and paragraph:
+            continue  # a lazy continuation: every open container stays open
         else:
-            paragraph = relative <= 3 or (paragraph and not after_blank)
+            del containers[matched:]
+            paragraph = paragraph or reached - column <= 3  # indented text is a paragraph or code
     return found
 
 

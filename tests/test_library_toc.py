@@ -162,6 +162,21 @@ def test_a_very_long_line_is_listed_in_linear_time(toc):
     assert result["toc"][0]["heading"] == "#" * 100 and result["toc"][1]["heading"] == "after"
 
 
+@pytest.mark.parametrize("opener", [">", "> ", "- ", "1. ", "> - "])
+def test_a_line_of_thousands_of_nested_containers_is_scanned_in_linear_time(toc, opener):
+    """Each quote or item marker opens a container; the depth is bounded so a hostile line of
+    twenty thousand of them costs a line's worth of work, not its square. (markdown-it-py stops
+    reading a document at its own nesting limit, so it is not the reference here: the next line
+    is a heading outside every container and is listed.)"""
+    text = opener * 20000 + "# not top level\n# top level\n"
+    _, call = toc(text)
+    started = time.perf_counter()
+    result = call()
+    assert time.perf_counter() - started < 1.0
+    assert listed(result["toc"]) == [(text.index("# top level"), 1)]
+    assert [entry["heading"] for entry in result["toc"]] == ["top level"]
+
+
 def test_a_very_long_heading_title_is_clipped_but_its_offset_is_exact(toc):
     text = "intro\n# " + "long title " * 400 + "\n## short\n"
     _, call = toc(text)
@@ -379,4 +394,104 @@ def test_headings_agree_with_an_independent_commonmark_parser_over_generated_doc
     assert not mismatches, (
         f"{len(mismatches)} of 1500 documents differ; first: "
         f"{[(i, generated_document(i)) for i in mismatches[:2]]}"
+    )
+
+
+# --- list items and quotes the way markdown-it-py reads them, on a second family of documents ---
+
+
+def commonmark_entries(text: str) -> list[tuple[int, int, str]]:
+    """(character offset, level, title with its whitespace stripped) of each non-empty top-level
+    ATX heading, from markdown-it-py (the code under test lists none with an empty title)."""
+    return [
+        (offset, level, title.strip()) for offset, level, title in oracle_entries(text) if title
+    ]
+
+
+def listed_entries(text: str) -> list[tuple[int, int, str]]:
+    return [(offset, level, title.strip()) for offset, level, title in _headings(text)]
+
+
+# Each of these once differed from markdown-it-py (or exercises the same rule): a list marker
+# followed by five or more columns makes the first line indented code, which a following
+# unindented line cannot continue; an empty item ends at a blank line; a quote line is a block of
+# its own, never a lazy continuation of a list item's paragraph, and never one of its own
+# fence's lines.
+HARD_CASES = {
+    "marker-then-five-columns": "-     text\r\npara text\r\n   ###\tT U\r\n",
+    "ordered-marker-then-five-columns": "2)     item\n more words\n   ###\tend #  \n",
+    "plus-marker-then-five-columns": "+     text\npara text\r\n   #  A b\r",
+    "marker-then-five-columns-not-a-fence": "-     ```\r  ####### end #  \rmore words\r  ##  A b\r",
+    "empty-item-then-blank-line": "2)     \n\n   ##### \\# esc\n",
+    "empty-item-then-tab-line": "+ \r\t\r  ######\tx #\r",
+    "quote-is-not-a-lazy-continuation": "- text\n > quote\n  ##### x #\n",
+    "empty-quote-line-ends-the-paragraph": "> \r2)     \r   ### A b\n",
+    "fence-in-a-quote-ends-with-the-quote": "2)  \r   > ```\rpara text\r   ~~~~~~\t\r###   nb\r",
+    "heading-in-a-quote-is-not-a-paragraph": "1. text\n> # qh\n   ~~~~~~ js x\n##  T U\n",
+    "empty-item-then-quote-with-a-fence": "-\t\r   > ```\r `inline`\r   ~~~~~~python\r ######\tT\x0cV\r",
+    "heading-inside-an-item-stays-inside": "- item\n  # inside\n# outside\n",
+    "setext-dash-underline-ends-a-paragraph": "- a\n  b\n  ---\n# top\n",
+    "quoted-list-item-continues-in-the-quote": "> - a\n>   # inside\n# top\n",
+}
+
+
+@pytest.mark.parametrize("name", sorted(HARD_CASES))
+def test_headings_agree_with_markdown_it_on_the_cases_that_once_differed(name):
+    text = HARD_CASES[name]
+    assert listed_entries(text) == commonmark_entries(text)
+
+
+def probe_document(rng: random.Random) -> str:
+    """A document of up to 30 lines of fences, headings, list markers followed by 1 to 5 columns
+    or a tab, quotes, blank lines, rules, tab-indented code and text, with LF, CRLF, CR or mixed
+    line ends. No HTML block is ever generated: `_headings` does not model them."""
+
+    def piece() -> str:
+        kind = rng.random()
+        indent = " " * rng.choice([0, 0, 0, 1, 2, 3, 4, 5, 6, 8])
+        if kind < 0.18:
+            info = rng.choice(["", "python", " js x", "a`b", "~~", "\t"])
+            return f"{indent}{rng.choice('`~') * rng.randint(3, 6)}{info}"
+        if kind < 0.40:
+            title = rng.choice(
+                ["Title", "A b", "x #", "x ##", "#", "", "T U", "T\fV", " nb", "t\tt", "\\# esc"]
+                + ["end #  ", "T U", "no break"]
+            )
+            return f"{indent}{'#' * rng.randint(1, 7)}{rng.choice([' ', chr(9), '', '  '])}{title}"
+        if kind < 0.55:
+            marker = rng.choice(["-", "*", "+", "1.", "2)", "10."])
+            gap = rng.choice([" ", "  ", "\t", "     "])
+            return f"{indent}{marker}{gap}{rng.choice(['item', '# H', '```', '~~~~', '', 'text'])}"
+        if kind < 0.62:
+            return f"{indent}> {rng.choice(['quote', '# qh', '```', ''])}"
+        if kind < 0.68:
+            return rng.choice(["", "   ", "\t", "\f", " ", " "])
+        if kind < 0.72:
+            return f"{indent}{rng.choice(['---', '***', '___', '===', '- - -', '* * *'])}"
+        if kind < 0.76:
+            return "\t" + rng.choice(["```", "# tab", "~~~"])
+        return f"{indent}{rng.choice(['para text', 'more words', '`inline`', 'x'])}"
+
+    ending = rng.choice(["\n", "\r\n", "\r", "mixed"])
+    text = ""
+    for _ in range(rng.randint(1, 30)):
+        text += piece() + (rng.choice(["\n", "\r\n", "\r"]) if ending == "mixed" else ending)
+    return text.rstrip("\r\n") if rng.random() < 0.2 else text
+
+
+def test_headings_agree_with_markdown_it_over_3000_documents_without_html_blocks():
+    """Offset, level and title (whitespace stripped, so a no-break space at an edge compares as
+    markdown-it-py's own strip would) of every top-level ATX heading, on documents whose list
+    markers are followed by 1 to 5 columns, whose quotes hold fences and empty lines, and whose
+    items start empty. HTML blocks are the one thing `_headings` does not model, so none is
+    generated."""
+    rng = random.Random(7)
+    differing = []
+    for _ in range(3000):
+        text = probe_document(rng)
+        if listed_entries(text) != commonmark_entries(text):
+            differing.append(text)
+    assert not differing, (
+        f"{len(differing)} of 3000 documents differ; first: {differing[0]!r}: "
+        f"{listed_entries(differing[0])} against {commonmark_entries(differing[0])}"
     )
