@@ -679,9 +679,8 @@ def add_library_parser(subparsers: Any) -> Any:
     )
     zettels.add_argument(
         "--owner-id",
-        help="obsidian-md only: the owner's identity. A note is labelled human only when its "
-        "title, text and quotes are all asserted by this id and this id reviewed it; without it "
-        "no note is human",
+        help="removed: refused with a reason. Authorship of a note is derived by the attribution "
+        "rules; nobody types an owner identity",
     )
     export = sub.add_parser(
         "export", help="Write the private reading export, optionally with reviewed Zettel pages"
@@ -1017,8 +1016,11 @@ def handle_library(args: argparse.Namespace) -> int:
         if args.action == "zettels":
             if (args.format == "obsidian-md") != (args.out is not None):
                 raise ValueError("--out goes with --format obsidian-md, and only with it")
-            if args.owner_id is not None and args.format != "obsidian-md":
-                raise ValueError("--owner-id goes with --format obsidian-md, and only with it")
+            if args.owner_id is not None:
+                raise ValueError(
+                    "--owner-id is no longer used: who wrote each quoted word is derived by the "
+                    "attribution rules and nobody types an owner identity; remove the flag"
+                )
             if args.out is not None:
                 # The notes quote the library's text: authorise where they land before the
                 # library or the reviewed envelope is read.
@@ -1077,7 +1079,6 @@ def handle_library(args: argparse.Namespace) -> int:
                             envelope.get("zettels"),
                             args.out,
                             store_root=store,
-                            owner_id=args.owner_id,
                         )
                     else:
                         exporter = zettel_atoms if args.format == "atoms-jsonl" else export_zettels

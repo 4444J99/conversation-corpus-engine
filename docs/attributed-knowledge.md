@@ -279,7 +279,7 @@ short note that points back to the exact words it came from:
 
 ```bash
 cce library zettels --store-root /private/store --input /private/reviewed-ideas.json \
-  --format obsidian-md --out /private/wiki --owner-id rob
+  --format obsidian-md --out /private/wiki
 ```
 
 This writes one file per idea at `notes/zettel/<title>.md` under `--out`. It uses the same
@@ -293,7 +293,9 @@ What a note holds, in plain words:
 
 - **Frontmatter** in the Wiki Standard v1 order, flat, no nested properties: `id`, `type: zettel`,
   `title`, `summary` (at most 200 characters), `created`, `updated`, `author`, `authorship`,
-  `status`, `sources`, `links`, `aliases`, `tags`.
+  `authorship_basis`, `authorship_rules`, `authorship_note`, `status`, `sources`, `links`,
+  `aliases`, `tags`. The three `authorship_*` keys are flat extras that say how the label was
+  reached (see below).
 - **`sources`** holds one tuple per quote, `cce:<uid>@<version>#m<message>:<start>-<end>
   sha256:<digest>` (`#a` for an alternate message). The note body also shows the matching
   `cce library read ... --message N --offset START --limit LENGTH` line, so a reader can reopen
@@ -316,22 +318,49 @@ What a note holds, in plain words:
   KiB, a warning above 16 KiB, a refusal above 64 KiB), plus line, long-line, base64 and
   quote-count checks. Warnings are listed in the printed report. The idea text is never clipped.
 
-**Who wrote it.** `authorship` comes only from the attribution already in the envelope, and
-`status` is always `draft`; this command never marks an idea `stable`. A note is only as
-attributed as its weakest part: the title (`title_attribution`), the idea text and every quoted
-word must each pass the test for the label.
+**Who wrote it.** Nobody types an owner id or a reviewer string: CCE works out who wrote each
+quoted word itself, and `status` is always `draft` (this command never marks an idea `stable`).
+
+*The quotes.* For every quoted span CCE re-runs the deterministic authorship rules (the next
+section) on the stored message, with its real role, channel, typed-character count, record family
+and wrappers, over the whole library the same way `cce library attribute` does, and reads the class
+of every character in the quoted range. A quote is `owner` only when every visible character of
+the range is classed owner (typed text). If any character is agent, third party or unknown, the
+quote takes the weakest class present (third party or agent, then unknown; owner is the strongest)
+and the note records which classes and rules decided it under each source. Blank characters no
+rule claims (spaces, line breaks) belong to nobody and change nothing. A quote of a revision that
+is no longer the record's current one, or one whose derivation did not finish in time, is
+`unknown`: it is never credited.
+
+*The idea text and title.* The envelope declares who wrote them in an optional `text_origin`:
+
+- `agent`: an agent wrote them. An envelope without `text_origin` whose title and idea text are
+  all asserted as agent-written (`attribution` and `title_attribution`) is read the same way, so
+  older agent drafts still enter.
+- `quoted`: they are made only of the quotes. CCE checks it: the idea text must equal the quoted
+  words in order (spacing aside) and the title must be a piece of them.
+- `owner`: the owner wrote them. Nothing derives this, so it is never believed: it is
+  `generated`, basis `unverified`. Owner annotations in the envelope, an owner-looking author id
+  and a matching reviewer grant nothing either. The reviewer is kept as provenance only.
 
 | `authorship` | When |
 |---|---|
-| `agent` | The title and every span of the idea text are asserted as agent-written. This is how an agent's draft enters. The frontmatter `author` is the fixed label `agent`, never an id copied from the envelope. |
-| `human` | `--owner-id` names the owner, the envelope's reviewer is that owner, and the title, the idea text and every quoted word each carry an explicit, evidenced, profile-eligible owner assertion whose author id is that owner. `author` is the owner id. |
-| `generated` | Anything else: no attribution, an unannotated title, mixed, third party, disputed, retracted, an owner claim with no evidence or not profile-eligible, or a reviewer or author who is not the configured owner. |
+| `human` | `text_origin: quoted`, the text really is its quotes, and every quote derives to `owner`. `author` is the fixed label `owner`, basis `derived`. |
+| `agent` | `text_origin: agent` (or the older all-agent annotations), whatever the quotes are: the label says who wrote the note body and each quote shows its own derived class. Also `quoted` text whose weakest quote is agent. `author` is the fixed label `agent`. |
+| `generated` | Anything else: declared owner text, a quoted origin that is not made of the quotes, a weakest quote that is third party or unknown, or no origin at all. `author` is `unknown`. A `text_origin` other than the three above is refused before anything is written. |
 
-Without `--owner-id` (or the `owner_id` argument of `export_zettel_notes`) nothing is labelled
-`human`: the reviewer and the author ids are free strings in the same envelope, so only an owner
-identity given outside the envelope can grant the label. `--owner-id` goes with
-`--format obsidian-md` only. So unreviewed or unproven text is never labelled as owner-written.
-Attribution stays a supplied assertion; the note says so.
+**How honest the label is.** Three flat keys say how it was reached: `authorship_basis`
+(`derived` from the stored messages by the rules, `declared` by the reviewed envelope, or
+`unverified`), `authorship_rules` (the rules version, `cce.attribution-rules@6` today) and
+`authorship_note` (one sentence). A derived `human` is rules-derived, not owner-reviewed: the
+engine marks every span `profile_eligible: false` until its precision gate is met, and this
+command does not read the owner's review ledger, so the note says the rules' precision has not
+been reviewed by the owner. A declared `agent` is the envelope's word, not a check.
+
+**The old `--owner-id` flag** is removed. Passing it stops the run with a message that says so
+(accepting and ignoring it would suggest it still granted something). `export_zettel_notes` and
+`build_notes` no longer take `owner_id`; both take an optional `deadline_seconds` (default 900)
+for the library-wide derivation.
 
 **Agent drafts and the review step.** The intake accepts an idea whose text is agent-written
 (`attribution` spans with `author: agent`) and the note comes out `authorship: agent`,

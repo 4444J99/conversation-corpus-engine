@@ -169,7 +169,7 @@ def parse(path: Path) -> tuple[dict[str, Any], str]:
         if line.startswith("  - "):
             meta[key].append(json.loads(line[4:]))
         else:
-            assert re.fullmatch(r"[a-z]+:( .*)?", line), f"nested or odd frontmatter: {line!r}"
+            assert re.fullmatch(r"[a-z_]+:( .*)?", line), f"nested or odd frontmatter: {line!r}"
             key, _, rest = line.partition(":")
             meta[key] = [] if rest.strip() in ("", "[]") else json.loads(rest)
     return meta, "\n".join(lines[close + 1 :])
@@ -434,18 +434,21 @@ def parse_text(text: str) -> tuple[dict[str, Any], str]:
     return meta, "\n".join(lines[close + 1 :])
 
 
-def test_only_a_fully_asserted_reviewed_owner_text_is_credited_to_the_owner(tmp_path):
+def test_supplied_owner_assertions_and_a_matching_reviewer_never_grant_human(tmp_path):
     with make_library(tmp_path) as library:
         entry = zettel(library, 1, [source(library, ref(library, "kiln", 1), "owner")])
         entry["review"]["reviewer"] = "rob"
         entry["attribution"] = annotation(entry["body"], "owner", "rob")
         entry["title_attribution"] = annotation(entry["title"], "owner", "rob")
-        # Only with the configured owner id; without it nothing is human.
-        (unconfigured,) = build_notes(library, [entry])
-        assert unconfigured.authorship == "generated"
-        (note,) = build_notes(library, [entry], owner_id="rob")
+        # Owner credit is derived from the stored messages, never from the envelope's claims.
+        (note,) = build_notes(library, [entry])
         meta, _ = parse_text(note.text)
-        assert (meta["authorship"], meta["author"], meta["status"]) == ("human", "rob", "draft")
+        assert (meta["authorship"], meta["author"], meta["status"]) == (
+            "generated",
+            "unknown",
+            "draft",
+        )
+        assert meta["authorship_basis"] == "unverified"
 
 
 def test_ids_are_stable_and_come_from_the_created_date_and_a_hash(tmp_path):
