@@ -37,9 +37,10 @@ Measurement basis
   SQLite connection, not a cold disk. Warm: ``--repeats`` further full passes after a first pass.
 * Calls to unit: the number of tool calls a reader needs to reach the expected record or
   passage. Search pages are followed with ``next_offset``. A query with ``expected_text`` then
-  reads messages of the hit; ``expected_message`` is the message to start at (search hits do not
-  carry a message index today, so without it the reader starts at message 0 and follows
-  ``next_message``, one call per message). ``expected_text`` must fall inside one read window.
+  follows the hit's ``read`` arguments, including its message, character offset and sequence.
+  Older hits without a handoff start at message 0; subsequent reads follow ``next_offset`` and
+  ``next_message``. ``expected_message`` remains accepted as legacy query metadata but never
+  supplies a locator. ``expected_text`` must fall inside one read window.
 * Partial: a response is partial when its structured content carries ``partial: true``. Calls
   slower than ``--partial-after-s`` that are not flagged partial are counted for information;
   they are not a gate.
@@ -349,6 +350,7 @@ def run_query(
         return record
 
     found_rank = None
+    handoff: dict[str, Any] = {}
     offset: int | None = 0
     while offset is not None and len(calls) < args.max_calls:
         arguments = first_search_arguments(query, args.l0_limit)
@@ -359,6 +361,8 @@ def run_query(
         for position, hit in enumerate(structured.get("hits", [])):
             if hit.get("uid") == expected:
                 found_rank = offset + position + 1
+                if isinstance(hit.get("read"), dict):
+                    handoff = dict(hit["read"])
                 break
         if found_rank is not None:
             break
@@ -367,17 +371,18 @@ def run_query(
     if found_rank is not None and "expected_text" not in query:
         reached = True
     elif found_rank is not None:
-        message, text_offset = query.get("expected_message", 0), 0
+        read_arguments = {
+            "uid": expected,
+            "message": 0,
+            "offset": 0,
+            "limit": args.read_limit,
+            **handoff,
+        }
+        # Respect a smaller tool-supplied window while retaining the harness's read cap.
+        if isinstance(read_arguments["limit"], int):
+            read_arguments["limit"] = min(read_arguments["limit"], args.read_limit)
         while len(calls) < args.max_calls:
-            record = call(
-                library_mcp.READ_TOOL,
-                {
-                    "uid": expected,
-                    "message": message,
-                    "offset": text_offset,
-                    "limit": args.read_limit,
-                },
-            )
+            record = call(library_mcp.READ_TOOL, dict(read_arguments))
             if record["error"]:
                 break
             structured = record["_structured"]
@@ -385,11 +390,16 @@ def run_query(
                 reached = True
                 break
             if structured.get("next_offset") is not None:
-                text_offset = structured["next_offset"]
+                read_arguments.update(
+                    message=structured.get("message", read_arguments["message"]),
+                    offset=structured["next_offset"],
+                )
             elif structured.get("next_message") is not None:
-                message, text_offset = structured["next_message"], 0
+                read_arguments.update(message=structured["next_message"], offset=0)
             else:
                 break
+            # Around-query locators apply to the first window only; cursor continuation is exact.
+            read_arguments.pop("around_query", None)
     tokens = sum(item["est_tokens"] for item in calls)
     outcome = {
         "id": query["id"],

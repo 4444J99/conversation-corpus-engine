@@ -205,6 +205,7 @@ def test_every_enum_of_the_schema_is_enforced_by_the_tool(env) -> None:
     refused = {
         (SEARCH_TOOL, "wing"): {"query": "zebra", "wing": "NOPE"},
         (SEARCH_TOOL, "plan"): {"query": "zebra", "plan": "NOPE"},
+        (SEARCH_TOOL, "unit"): {"query": "zebra", "unit": "NOPE"},
         (SEARCH_TOOL, "depth"): {"query": "zebra", "depth": "L9"},
         (READ_TOOL, "sequence"): {"uid": env.uid, "sequence": "NOPE"},
         (READ_TOOL, "toc_mode"): {"uid": env.uid, "toc": True, "toc_mode": "NOPE"},

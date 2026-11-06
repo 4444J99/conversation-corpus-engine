@@ -142,7 +142,14 @@ def test_tool_definition_declares_plan_and_max_seconds():
 def test_default_response_keeps_every_existing_field_and_adds_the_planner_fields(mcp):
     result = mcp(SEARCH_TOOL, query="omega", limit=3)
     assert set(result) >= LEGACY_RESPONSE_KEYS
-    assert set(result) - LEGACY_RESPONSE_KEYS == {"plan", "partial", "ranked", "elapsed_s"}
+    assert set(result) - LEGACY_RESPONSE_KEYS == {
+        "plan",
+        "partial",
+        "ranked",
+        "elapsed_s",
+        "unit",
+        "total_unit",
+    }
     assert result["plan"] == "and" and result["partial"] is False and result["ranked"] is True
     assert isinstance(result["elapsed_s"], float) and result["elapsed_s"] >= 0
     for hit in result["hits"]:

@@ -26,8 +26,11 @@ from typing import Any
 from .archive_database import WORD_RE, fts_terms
 from .archive_model import Conversation, stable_uid
 from .library_blocks import split_blocks
+from .library_passages import PASSAGE_LIMIT, PASSAGE_SCHEMA_SQL, index_passages, verify_passages
 
-LIBRARY_SCHEMA = "cce.knowledge-library.v1"
+LIBRARY_SCHEMA = "cce.knowledge-library.v2"
+LEGACY_LIBRARY_SCHEMA = "cce.knowledge-library.v1"
+EVIDENCE_FINGERPRINT_SCHEMA = "cce.library-evidence-fingerprint.v2"
 MAX_PAGE = 200
 # Document records state their reason in ``body_reason`` only; other providers may instead
 # record coverage findings, so findings never explain a document.
@@ -36,6 +39,7 @@ DOCUMENT_PROVIDER = "documents"
 # Search planning. ``auto`` runs an unquoted multi-word query as an adjacent phrase, then as the
 # AND of its words, then as the OR of its words, and stops at the first plan that matches.
 SEARCH_PLANS = ("auto", "phrase", "and", "or")
+SEARCH_UNITS = ("auto", "passage", "conversation")
 CONCRETE_PLANS = SEARCH_PLANS[1:]
 # Totals are counted only up to this many matches, so a huge match set is never counted in full.
 DEFAULT_COUNT_CAP = 1000
@@ -82,6 +86,12 @@ def validate_plan(plan: Any) -> str:
     if not isinstance(plan, str) or plan not in SEARCH_PLANS:
         raise ValueError("plan must be one of: " + ", ".join(SEARCH_PLANS))
     return plan
+
+
+def validate_unit(unit: Any) -> str:
+    if not isinstance(unit, str) or unit not in SEARCH_UNITS:
+        raise ValueError("unit must be one of: " + ", ".join(SEARCH_UNITS))
+    return unit
 
 
 def validate_max_seconds(value: Any) -> float | None:
@@ -253,7 +263,23 @@ def _bounded_sql(method: Any) -> Any:
     return run
 
 
-SCHEMA_SQL = """
+def _search_snapshot(method: Any) -> Any:
+    @wraps(method)
+    def run(self: Library, *args: Any, **kwargs: Any) -> Any:
+        own = not self.connection.in_transaction
+        if own:
+            self.connection.execute("BEGIN")
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            if own and self.connection.in_transaction:
+                self.connection.execute("ROLLBACK")
+
+    return run
+
+
+SCHEMA_SQL = (
+    """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS objects (
     digest TEXT PRIMARY KEY, payload BLOB NOT NULL, raw_bytes INTEGER NOT NULL
@@ -300,6 +326,8 @@ CREATE TABLE IF NOT EXISTS relations (
     evidence TEXT NOT NULL, PRIMARY KEY(src, dst, kind)
 );
 """
+    + PASSAGE_SCHEMA_SQL
+)
 
 
 def canonical_json(value: Any) -> str:
@@ -308,6 +336,23 @@ def canonical_json(value: Any) -> str:
 
 def digest_json(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def candidate_evidence_fingerprint(library: Library, report: dict[str, Any]) -> str:
+    """Reproduce the declared publication fingerprint, including legacy resume receipts."""
+    evidence = {
+        "library": library.evidence_fingerprint(),
+        "sources": report["sources"],
+        "findings": report["findings"],
+        "manifest": report["source_manifest_hash"],
+        "resume_source": report.get("resume_source"),
+    }
+    schema = report.get("evidence_fingerprint_schema")
+    if schema == EVIDENCE_FINGERPRINT_SCHEMA:
+        evidence["library_schema"] = library.schema
+    elif schema is not None:
+        raise ValueError("unsupported library evidence fingerprint schema")
+    return digest_json(evidence)
 
 
 def _next_version(previous: str | None, change: str) -> str:
@@ -356,13 +401,20 @@ class Library:
         self.connection.execute("PRAGMA cache_size=-32768")
         self._owned_sql_handler: tuple[Any, int] | None = None
         version = self.connection.execute("SELECT value FROM meta WHERE key='schema'").fetchone()
-        if version is None or version[0] != LIBRARY_SCHEMA:
+        if version is None or version[0] not in {LIBRARY_SCHEMA, LEGACY_LIBRARY_SCHEMA}:
             self.connection.close()
             raise ValueError("unsupported knowledge library schema")
+        self.schema = version[0]
 
     @classmethod
     def create(
-        cls, path: Path, *, previous: Path | None = None, compact_previous: bool = False
+        cls,
+        path: Path,
+        *,
+        previous: Path | None = None,
+        compact_previous: bool = False,
+        max_bytes: int | None = None,
+        check_callback: Any = None,
     ) -> Library:
         """Create a new candidate, optionally inheriting the accepted immutable generation.
 
@@ -383,12 +435,43 @@ class Library:
                         original.connection.execute("VACUUM main INTO ?", (str(path),))
                     else:
                         original.connection.backup(connection)
+            if max_bytes is not None:
+                page_size = connection.execute("PRAGMA page_size").fetchone()[0]
+                connection.execute(f"PRAGMA max_page_count={max(1, max_bytes // page_size)}")
             connection.executescript(SCHEMA_SQL)
             connection.execute("INSERT OR IGNORE INTO meta VALUES ('schema', ?)", (LIBRARY_SCHEMA,))
             connection.commit()
         finally:
             connection.close()
-        return cls(path, writable=True)
+        candidate = cls(path, writable=True)
+        try:
+            if max_bytes is not None:
+                page_size = candidate.connection.execute("PRAGMA page_size").fetchone()[0]
+                candidate.connection.execute(
+                    f"PRAGMA max_page_count={max(1, max_bytes // page_size)}"
+                )
+            if candidate.schema == LEGACY_LIBRARY_SCHEMA or compact_previous:
+                # This is the new copy, never the published source. VACUUM may renumber block
+                # rows, so its derived index is realigned even when the source was already v2.
+                candidate.migrate_passages(check_callback=check_callback)
+            return candidate
+        except BaseException:
+            candidate.close()
+            raise
+
+    @_bounded_sql
+    def migrate_passages(self, *, check_callback: Any = None) -> None:
+        """Upgrade a writable candidate from existing blocks, without importing source objects."""
+        self._write()
+        with self.connection:
+            self.connection.execute("SAVEPOINT passage_migration")
+            for statement in PASSAGE_SCHEMA_SQL.split(";"):
+                if statement.strip():
+                    self.connection.execute(statement)
+            index_passages(self.connection, check_callback=check_callback)
+            self.connection.execute("UPDATE meta SET value=? WHERE key='schema'", (LIBRARY_SCHEMA,))
+            self.connection.execute("RELEASE SAVEPOINT passage_migration")
+        self.schema = LIBRARY_SCHEMA
 
     def __enter__(self) -> Library:
         return self
@@ -736,6 +819,10 @@ class Library:
                     "DELETE FROM blocks WHERE NOT EXISTS "
                     "(SELECT 1 FROM occurrences WHERE occurrences.digest=blocks.digest)"
                 )
+            if self.schema == LIBRARY_SCHEMA:
+                index_passages(
+                    self.connection, incremental=uids is not None, check_callback=check_callback
+                )
             self.connection.execute("RELEASE SAVEPOINT block_reindex")
         return self.status(check_callback=check_callback)
 
@@ -776,6 +863,7 @@ class Library:
             composed, instructions=min(SEARCH_PROGRESS_INSTRUCTIONS, outer_instructions)
         )
 
+    @_search_snapshot
     def search(
         self,
         query: str,
@@ -787,6 +875,7 @@ class Library:
         providers: list[str] | None = None,
         kinds: list[str] | None = None,
         plan: str = "auto",
+        unit: str = "conversation",
         max_seconds: float | None = None,
         count_cap: int | None = DEFAULT_COUNT_CAP,
     ) -> dict[str, Any]:
@@ -803,17 +892,42 @@ class Library:
         index order (``ranked`` false, ``partial`` true). ``count_cap`` stops counting matches
         beyond that many (``total_exact`` false, ``total_label`` ``"<cap>+"``); ``None`` counts
         them all. Hits and their order do not depend on the cap.
+
+        ``unit="conversation"`` preserves record retrieval. ``passage`` ranks distinct eligible
+        prose blocks and returns original occurrence locators. ``auto`` prefers passages within
+        each query plan for at most three words or a quoted phrase. ``total`` always counts
+        conversations; passage results also expose ``unit_total`` for block pagination.
         """
         if not bounded_int(limit, 1, MAX_PAGE):
             raise ValueError(f"limit must be an integer from 1 to {MAX_PAGE}")
         if not bounded_int(offset, 0, 1000000000):
             raise ValueError("offset must be an integer from 0 to 1000000000")
         plan = validate_plan(plan)
+        unit = validate_unit(unit)
         seconds = validate_max_seconds(max_seconds)
         cap = validate_count_cap(count_cap)
         started = _clock()
         deadline = None if seconds is None else started + seconds
         steps, terms = _plan_steps(query, plan)
+        selected_unit = (
+            "passage"
+            if unit == "passage" or (unit == "auto" and (terms.phrases or len(terms.sequence) <= 3))
+            else "conversation"
+        )
+        if self.schema == LEGACY_LIBRARY_SCHEMA:
+            if unit == "passage":
+                raise ValueError(
+                    "passage search needs a v2 library; build a new candidate from this store"
+                )
+            selected_unit = "conversation"
+        if unit == "auto" and selected_unit == "passage":
+            # Preserve plan precision: a conversation phrase/AND match is stronger than a
+            # passage OR match. Unit preference applies within each concrete query plan.
+            steps = [step for step in steps for _ in range(2)]
+            step_units = ["passage", "conversation"] * (len(steps) // 2)
+        else:
+            step_units = [selected_unit] * len(steps)
+        conversation_totals: tuple[int, bool] | None = None
 
         def finish(
             name: str,
@@ -828,6 +942,8 @@ class Library:
             partial = expired_in is not None
             result: dict[str, Any] = {
                 "query": query,
+                "unit": selected_unit,
+                "total_unit": "conversation",
                 "total": total,
                 "offset": offset,
                 "limit": limit,
@@ -840,6 +956,17 @@ class Library:
                 "ranked": not partial,
                 "elapsed_s": round(_clock() - started, 3),
             }
+            if selected_unit == "passage":
+                result.update(unit_total=total, unit_total_exact=exact)
+                conversations, conversations_exact = conversation_totals or (
+                    len({hit["uid"] for hit in hits}),
+                    not steps,
+                )
+                result.update(
+                    total=conversations,
+                    total_exact=conversations_exact,
+                    total_label=str(conversations) if conversations_exact else f"{conversations}+",
+                )
             notices = []
             if terms.lost(name):
                 result["terms_truncated"] = True
@@ -868,7 +995,20 @@ class Library:
                 clauses.append(f"r.{column} IN ({','.join('?' for _ in values)})")
                 filters.extend(values)
 
-        def source(match: str) -> tuple[str, list[Any]]:
+        def source(match: str, which: str | None = None) -> tuple[str, list[Any]]:
+            if (which or selected_unit) == "passage":
+                # Select one deterministic occurrence after applying the record facets. The
+                # FTS row is the deduplicated block, so repeated copies do not consume a page.
+                filtered = " AND " + " AND ".join(clauses) if clauses else ""
+                return (
+                    "FROM passage_fts JOIN blocks b ON b.rowid=passage_fts.rowid "
+                    "JOIN occurrences o ON o.rowid=(SELECT o2.rowid FROM occurrences o2 "
+                    "JOIN records r ON r.uid=o2.uid WHERE o2.digest=b.digest"
+                    + filtered
+                    + " ORDER BY o2.uid,o2.message_index,o2.block_index LIMIT 1) "
+                    "JOIN records r ON r.uid=o.uid WHERE passage_fts MATCH ?",
+                    [*filters, match],
+                )
             where = " AND ".join(["record_fts MATCH ?", *clauses])
             # Joined on the row number, never on the stored ``uid`` column: reading that column
             # loads the whole stored conversation body of every match (megabytes each), which
@@ -883,8 +1023,8 @@ class Library:
             if deadline is not None and _clock() >= deadline:
                 raise _BudgetExpired
 
-        def count(match: str) -> tuple[int, bool]:
-            text, params = source(match)
+        def count(match: str, which: str | None = None) -> tuple[int, bool]:
+            text, params = source(match, which)
             if cap is None:
                 return self.connection.execute("SELECT COUNT(*) " + text, params).fetchone()[
                     0
@@ -897,9 +1037,18 @@ class Library:
         def page(match: str, order: str) -> Any:
             # One row beyond the page says whether another page follows, whatever the total says.
             text, params = source(match)
+            table = "passage_fts" if selected_unit == "passage" else "record_fts"
+            extra = (
+                "o.message_index AS passage_message,o.start AS passage_start,"
+                "o.end AS passage_end,b.digest AS passage_digest,NULL AS score,"
+                if selected_unit == "passage"
+                else ""
+            )
             return self.connection.execute(
                 "SELECT r.uid,r.title,r.provider,r.kind,r.wing,r.lane,r.current_version AS version,"
-                "r.body_status,r.message_count,r.source_ref,snippet(record_fts,-1,'[',']','...',28) AS excerpt "
+                "r.body_status,r.message_count,r.source_ref,"
+                + extra
+                + f"snippet({table},-1,'[',']','...',28) AS excerpt "
                 + text
                 + order
                 + " LIMIT ? OFFSET ?",
@@ -914,6 +1063,10 @@ class Library:
             read one snapshot: a writer that commits between two separate statements would
             otherwise drop a ranked row from the page."""
             text, params = source(match)
+            table = "passage_fts" if selected_unit == "passage" else "record_fts"
+            rank = (
+                "bm25(passage_fts,0,1)" if selected_unit == "passage" else "bm25(record_fts,0,5,1)"
+            )
             own_snapshot = not self.connection.in_transaction
             if own_snapshot:
                 self.connection.execute("BEGIN")
@@ -921,24 +1074,33 @@ class Library:
                 keys = [
                     row[0]
                     for row in self.connection.execute(
-                        "SELECT record_fts.rowid "
+                        f"SELECT {table}.rowid "
                         + text
-                        + " ORDER BY bm25(record_fts,0,5,1),r.uid LIMIT ? OFFSET ?",
+                        + f" ORDER BY {rank},r.uid,{table}.rowid LIMIT ? OFFSET ?",
                         [*params, limit + 1, offset],
                     )
                 ]
                 if not keys:
                     return []
                 marks = ",".join("?" for _ in keys)
+                extra = (
+                    "o.message_index AS passage_message,o.start AS passage_start,"
+                    "o.end AS passage_end,b.digest AS passage_digest,"
+                    f"-{rank} AS score,"
+                    if selected_unit == "passage"
+                    else ""
+                )
                 by_key = {
                     row["key"]: row
                     for row in self.connection.execute(
-                        "SELECT record_fts.rowid AS key,r.uid,r.title,r.provider,r.kind,r.wing,"
+                        f"SELECT {table}.rowid AS key,r.uid,r.title,r.provider,r.kind,r.wing,"
                         "r.lane,r.current_version AS version,r.body_status,r.message_count,"
-                        "r.source_ref,snippet(record_fts,-1,'[',']','...',28) AS excerpt "
-                        "FROM record_fts JOIN records r ON r.rowid=record_fts.rowid "
-                        f"WHERE record_fts MATCH ? AND record_fts.rowid IN ({marks})",
-                        [match, *keys],
+                        "r.source_ref,"
+                        + extra
+                        + f"snippet({table},-1,'[',']','...',28) AS excerpt "
+                        + text
+                        + f" AND {table}.rowid IN ({marks})",
+                        [*params, *keys],
                     )
                 }
             finally:
@@ -957,6 +1119,23 @@ class Library:
                     hit[key] = hit[key][:128]
                 hit["excerpt"] = hit["excerpt"][:360]
                 hit["path"] = f"vault/records/{hit['uid']}.md"
+                if selected_unit == "passage":
+                    message, start, end, digest = (
+                        hit.pop("passage_" + key) for key in ("message", "start", "end", "digest")
+                    )
+                    hit["passage"] = {
+                        "digest": digest,
+                        "message": message,
+                        "start": start,
+                        "end": end,
+                    }
+                    hit["read"] = {
+                        "uid": hit["uid"],
+                        "version": hit["version"],
+                        "message": message,
+                        "offset": start,
+                        "limit": min(PASSAGE_LIMIT, end - start),
+                    }
                 hits.append(hit)
             return hits
 
@@ -970,7 +1149,8 @@ class Library:
             rows: list[sqlite3.Row] = []
             try:
                 with self._budget_scope(grace_deadline()):
-                    rows.extend(page(chosen, " ORDER BY record_fts.rowid"))
+                    table = "passage_fts" if selected_unit == "passage" else "record_fts"
+                    rows.extend(page(chosen, f" ORDER BY {table}.rowid"))
             except _BudgetExpired:
                 return rows, True
             return rows, False
@@ -1010,6 +1190,7 @@ class Library:
         try:
             while index < len(steps):
                 name, match = steps[index]
+                selected_unit = step_units[index]
                 check()
                 with self._budget_scope(deadline):
                     total, exact = count(match)
@@ -1021,6 +1202,11 @@ class Library:
                 check()
                 with self._budget_scope(deadline):
                     rows = ranked_page(match)
+            if selected_unit == "passage":
+                index = min(index, len(steps) - 1)
+                check()
+                with self._budget_scope(deadline):
+                    conversation_totals = count(match, "conversation")
         except _BudgetExpired:
             expired_in = steps[index][0]
             if total:
@@ -1029,17 +1215,20 @@ class Library:
                 return partial_page(name, expired_in, unranked_rows, cut, total)
             # The budget ran out before this plan was known to be empty, which says nothing about
             # the plans after it: take the first plan that a short probe shows to match.
-            unproven: str | None = None
-            for later_name, later_match in steps[index:]:
+            unproven: tuple[str, str] | None = None
+            for later_index in range(index, len(steps)):
+                later_name, later_match = steps[later_index]
+                selected_unit = step_units[later_index]
                 found = probe(later_match)
                 if found:
                     unranked_rows, cut = unranked(later_match)
                     return partial_page(later_name, expired_in, unranked_rows, cut, None)
                 if found is None and unproven is None:
-                    unproven = later_name
+                    unproven = (later_name, selected_unit)
             if unproven is not None:
+                unproven_name, selected_unit = unproven
                 return finish(
-                    unproven,
+                    unproven_name,
                     offset,
                     False,
                     [],
@@ -1048,7 +1237,14 @@ class Library:
                     tail=_UNPROVEN_TAIL,
                 )
             # Every plan finished its probe and found nothing: the empty answer is complete.
-            return finish(steps[-1][0], 0, True, [], None)
+            return finish(
+                steps[-1][0],
+                0,
+                True,
+                [],
+                None,
+                expired_in=expired_in if selected_unit == "passage" else None,
+            )
         hits = shape(rows)
         return finish(name, total, exact, hits, offset + len(hits) if len(rows) > limit else None)
 
@@ -1072,7 +1268,7 @@ class Library:
             "JOIN blocks b ON b.digest=repeated.digest WHERE b.eligible=1"
         ).fetchone()
         counts.update(
-            schema=LIBRARY_SCHEMA,
+            schema=self.schema,
             repeated_blocks=repeats[0],
             reference_occurrences=repeats[1],
             repeated_characters=repeats[2],
@@ -1168,6 +1364,12 @@ class Library:
             "WHERE f.uid IS NOT r.uid LIMIT 1"
         ).fetchone():
             problems.append("search identity is not aligned with its record row")
+        if self.schema == LIBRARY_SCHEMA:
+            problems.extend(
+                verify_passages(
+                    self.connection, full=full, record=self.record, check_callback=check_callback
+                )
+            )
         if full:
             for row in self.connection.execute("SELECT digest,payload,raw_bytes FROM objects"):
                 if check_callback:
