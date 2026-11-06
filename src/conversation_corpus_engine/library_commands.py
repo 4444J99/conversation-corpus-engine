@@ -37,6 +37,8 @@ from .library_store import (
 )
 from .library_vault import VAULT_PROFILES
 from .library_vault_gate import describe_findings, measure_vault
+from .library_zettel_files import authorize_destination as authorize_zettel_destination
+from .library_zettel_notes import export_zettel_notes
 from .paths import default_project_root
 from .persona_extract import extract_persona_lexicon
 
@@ -676,13 +678,23 @@ def add_library_parser(subparsers: Any) -> Any:
     )
     common(zettels)
     zettels.add_argument(
-        "--input", type=Path, required=True, help="Private reviewed-Zettels JSON envelope"
+        "--input",
+        type=Path,
+        required=True,
+        help="Private reviewed-Zettels JSON envelope; obsidian-md also accepts explicit agent drafts",
     )
     zettels.add_argument(
         "--format",
-        choices=("json", "atoms-jsonl"),
+        choices=("json", "atoms-jsonl", "obsidian-md"),
         default="json",
-        help="Reviewed envelope or explicit sealed-archive knowledge atoms",
+        help="Reviewed envelope, explicit sealed-archive knowledge atoms, or one small "
+        "Wiki Standard v1 note per idea (obsidian-md, needs --out)",
+    )
+    zettels.add_argument(
+        "--out",
+        type=Path,
+        help="obsidian-md only: private notes directory, outside the library store and "
+        "outside every Git work tree or ignored by it",
     )
     export = sub.add_parser(
         "export", help="Write the private reading export, optionally with reviewed Zettel pages"
@@ -1022,6 +1034,13 @@ def handle_library(args: argparse.Namespace) -> int:
             # The export is the library's text as plaintext (all of it, or a card per record):
             # authorise where it lands before the library or the reviewed envelope is read.
             require_git_private(args.out)
+        if args.action == "zettels":
+            if (args.format == "obsidian-md") != (args.out is not None):
+                raise ValueError("--out goes with --format obsidian-md, and only with it")
+            if args.out is not None:
+                # The notes quote the library's text: authorise where they land before the
+                # library or the reviewed envelope is read.
+                authorize_zettel_destination(args.out)
         store = configured_store(args.store_root)
         if args.action == "build":
             manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
@@ -1070,8 +1089,13 @@ def handle_library(args: argparse.Namespace) -> int:
                     )
                 elif args.action == "zettels":
                     envelope = _load_zettel_envelope(args.input)
-                    exporter = zettel_atoms if args.format == "atoms-jsonl" else export_zettels
-                    result = exporter(library, envelope.get("zettels"))
+                    if args.format == "obsidian-md":
+                        result = export_zettel_notes(
+                            library, envelope.get("zettels"), args.out, store_root=store
+                        )
+                    else:
+                        exporter = zettel_atoms if args.format == "atoms-jsonl" else export_zettels
+                        result = exporter(library, envelope.get("zettels"))
                 elif args.action == "profile":
                     annotations = json.loads(args.annotations.read_text(encoding="utf-8"))
                     result = extract_persona_lexicon(

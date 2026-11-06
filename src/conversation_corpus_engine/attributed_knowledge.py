@@ -153,11 +153,15 @@ def _source_evidence(library: Library, entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def export_zettels(library: Library, zettels: list[dict[str, Any]]) -> dict[str, Any]:
+def export_zettels(
+    library: Library, zettels: list[dict[str, Any]], *, allow_agent_drafts: bool = False
+) -> dict[str, Any]:
     """Validate and export reviewed semantic units without minting or changing IDs.
 
     Review and authorship are supplied assertions, not automatic independent proof.
     Relationship targets remain caller IDs and may refer to units in another export.
+    The Obsidian note emitter may explicitly accept digest-bound agent drafts;
+    reviewed JSON/atoms and other existing callers retain their reviewed-only contract.
     """
     if not isinstance(zettels, list):
         raise ValueError("zettels must be a list")
@@ -172,11 +176,19 @@ def export_zettels(library: Library, zettels: list[dict[str, Any]]) -> dict[str,
         title = require_text(zettel.get("title"), "Zettel title")
         body = require_text(zettel.get("body"), "Zettel body")
         review = zettel.get("review")
-        if not isinstance(review, dict) or review.get("status") != "reviewed":
+        explicit_draft = (isinstance(review, dict) and review.get("status") == "draft") or (
+            review is None
+            and zettel.get("authorship") == "agent"
+            and zettel.get("status") == "draft"
+        )
+        draft = allow_agent_drafts and explicit_draft
+        if not draft and (not isinstance(review, dict) or review.get("status") != "reviewed"):
             raise ValueError("only explicitly reviewed semantic Zettels can be exported")
-        require_text(review.get("reviewer"), "Zettel reviewer")
-        evidence = review.get("evidence")
-        if not isinstance(evidence, list) or not evidence:
+        review = copy.deepcopy(review) if isinstance(review, dict) else {"status": "draft"}
+        if not draft or review.get("reviewer") is not None:
+            require_text(review.get("reviewer"), "Zettel reviewer")
+        evidence = review.get("evidence", [] if draft else None)
+        if not isinstance(evidence, list) or (not evidence and not draft):
             raise ValueError("Zettel review needs evidence")
         for value in evidence:
             require_text(value, "Zettel review evidence")
@@ -193,14 +205,22 @@ def export_zettels(library: Library, zettels: list[dict[str, Any]]) -> dict[str,
             raise ValueError("Zettel needs at least one exact source span")
         if not isinstance(zettel.get("attribution"), dict):
             raise ValueError("Zettel body needs explicit digest-bound attribution")
+        body_attribution = attributed_spans(body, zettel["attribution"])
+        if draft and not all(
+            span["author"] == "agent" and span["assertion_status"] == "asserted"
+            for span in body_attribution
+        ):
+            raise ValueError("a draft needs complete digest-bound asserted agent attribution")
+        review.setdefault("evidence", evidence)
         result.append(
             {
                 **copy.deepcopy(zettel),
                 "id": identity,
                 "title": title,
                 "body": body,
+                "review": review,
                 "relationships": copy.deepcopy(relationships),
-                "body_attribution": attributed_spans(body, zettel["attribution"]),
+                "body_attribution": body_attribution,
                 "title_spans": attributed_spans(title, zettel.get("title_attribution")),
                 "sources": [_source_evidence(library, entry) for entry in sources],
             }
