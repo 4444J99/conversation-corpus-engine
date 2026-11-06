@@ -66,6 +66,7 @@ STATUS_VALUES = ("seed", "draft", "stable", "superseded", "archived")
 _UNSAFE_TITLE = re.compile(r'[/\\:*?"<>|#^\[\]]')
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
 _QUOTE_FORBIDDEN = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f  ]")
+_QUOTE_LIST_OPEN = re.compile(r"(?:[0-9]{1,9}[.)]|[-+])(?:[ \t]|$)")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _TUPLE = re.compile(
     r"cce:library-[0-9a-f]{64}/[a-z0-9][a-z0-9-]*@[^\s#]+#[ma]\d+:\d+-\d+ "
@@ -169,12 +170,17 @@ def quote_block(text: str) -> str:
     """The quote as a blockquote: inert Markdown, one `> ` line per source line, no loss."""
     lines = []
     for line in text.split("\n"):
-        escaped = inert_line(line)
+        escaped = inert_line(line).replace("~", "&#126;")
         leading = len(escaped) - len(escaped.lstrip(" \t"))
         # Entities begin a paragraph, not an indented code block (which would show the
         # punctuation entities literally). Decoding them restores every space and tab.
         prefix = "".join(f"&#{ord(char)};" for char in escaped[:leading])
-        lines.append("> " + prefix + escaped[leading:])
+        rest = escaped[leading:]
+        # CommonMark consumes list markers and can renumber the quoted words. Escape
+        # the opener; the shared helper already handles star markers and other syntax.
+        if _QUOTE_LIST_OPEN.match(rest):
+            rest = f"&#{ord(rest[0])};" + rest[1:]
+        lines.append("> " + prefix + rest)
     return "\n".join(lines)
 
 

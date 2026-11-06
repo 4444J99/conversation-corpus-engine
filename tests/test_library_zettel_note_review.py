@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from html.parser import HTMLParser
 
 import pytest
 from markdown_it import MarkdownIt
@@ -301,3 +302,88 @@ def test_short_display_collision_passes_distinct_full_identity_to_the_writer(
     notes.write_notes([second], tmp_path / "notes")
     assert plans[0][first.filename]["caller_digest"] == first.caller_digest
     assert plans[1][second.filename]["caller_digest"] == second.caller_digest
+
+
+class QuoteRendering(HTMLParser):
+    """Inspect the text a CommonMark renderer actually puts in paragraph elements."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tags = []
+        self.paragraphs = []
+        self.current = None
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.append(tag)
+        if tag == "p":
+            self.current = []
+
+    def handle_endtag(self, tag):
+        if tag == "p" and self.current is not None:
+            self.paragraphs.append("".join(self.current))
+            self.current = None
+
+    def handle_data(self, data):
+        if self.current is not None:
+            self.current.append(data)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "3. Keep original\n9. Keep number",
+        "4) Keep parenthesis\n7) Keep suffix",
+        "- Keep hyphen\n+ Keep plus\n* Keep star",
+        "1. First number\n\n9. Separated number\n\n3) Changed marker",
+        "0. Keep zero\n999999999. Keep nine digits",
+        "3.\n9)\n-\n+",
+        "3.\tKeep tab\n9.\tKeep later tab",
+        "   3. Keep leading spaces\n\n\t+ Keep leading tab",
+        "Earlier paragraph\n+ Keep continuation marker",
+        "* Keep already escaped star\n- Keep later hyphen",
+        "~~~\n[example]\n~~~",
+        "~~~~python\nprint('[example]')\n~~~~",
+        "    ~~~\n    [example]\n    ~~~",
+        "~~literal tildes~~ and a lone ~",
+        "٣. Unicode digit stays literal\nWord 3. and plus+ stay literal",
+        "-without whitespace and +without whitespace stay literal",
+        "1000000000. Ten digits stay literal",
+    ],
+)
+def test_quote_markers_render_as_exact_text_without_lists_or_fences(text):
+    block = notes.quote_block(text)
+    rendered = QuoteRendering()
+    rendered.feed(MarkdownIt("commonmark").render(block))
+    rendered.close()
+    assert set(rendered.tags) <= {"blockquote", "p"}
+    assert "\n\n".join(rendered.paragraphs) == text
+    assert notes.recover_quote(block) == text
+
+
+def test_quote_tilde_runs_stay_literal_when_strikethrough_is_enabled():
+    text = "~~literal tildes~~ and a lone ~"
+    block = notes.quote_block(text)
+    rendered = QuoteRendering()
+    rendered.feed(MarkdownIt("commonmark").enable("strikethrough").render(block))
+    rendered.close()
+    assert set(rendered.tags) <= {"blockquote", "p"}
+    assert rendered.paragraphs == [text]
+    assert notes.recover_quote(block) == text
+
+
+@pytest.mark.parametrize("control", ["\r", "\x00", "\x0b", "\x1f", "\x7f", "\u2028", "\u2029"])
+def test_quote_marker_controls_are_refused_before_any_output(world, tmp_path, control):
+    world.put(
+        Conversation(
+            provider="chatgpt",
+            source_id="note-review",
+            title="Synthetic source",
+            messages=[
+                Message(role="assistant", id="source-message", text=f"3. Keep{control}9. Later")
+            ],
+        )
+    )
+    destination = tmp_path / "notes"
+    with pytest.raises(ValueError, match="control|line-separator"):
+        notes.export_zettel_notes(world, [idea(world)], destination, store_root=tmp_path / "store")
+    assert not destination.exists()
