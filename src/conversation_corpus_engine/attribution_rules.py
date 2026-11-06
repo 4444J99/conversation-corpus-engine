@@ -32,7 +32,7 @@ import itertools
 import json
 import os
 import re
-from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -143,6 +143,9 @@ class RecordInfo:
     authored_family: bool = False
     # Why the record as a whole is machine-made ('' when nothing says so).
     agent_origin: str = ""
+    # An AI-authorship marker found anywhere in a note or document of the person's own library:
+    # section boundaries cannot be proven, so none of the record can be attributed to the owner.
+    ai_marker: str = ""
 
 
 def record_info(payload: Mapping[str, Any]) -> RecordInfo:
@@ -168,6 +171,14 @@ def record_info(payload: Mapping[str, Any]) -> RecordInfo:
         )
     if not origin and kind in DOCUMENT_KINDS:
         origin = _path_reason(provenance)
+    ai_marker = ""
+    if kind in DOCUMENT_KINDS:
+        for body in _record_texts(payload, extra):
+            if not origin:
+                marker = _text_marker(body)
+                origin = f"text:{marker}" if marker else ""
+            if authored and kind in NOTE_KINDS and not ai_marker:
+                ai_marker = _ai_marker(body)
     return RecordInfo(
         provider=provider,
         kind=kind,
@@ -175,7 +186,18 @@ def record_info(payload: Mapping[str, Any]) -> RecordInfo:
         session_kind=str(extra.get("session_kind") or ""),
         authored_family=authored,
         agent_origin=origin,
+        ai_marker=ai_marker,
     )
+
+
+def _record_texts(payload: Mapping[str, Any], extra: Mapping[str, Any]) -> Iterator[str]:
+    """The text of every message of a record, in both sequences."""
+    for messages in (payload.get("messages"), extra.get("alternate_messages")):
+        if isinstance(messages, list):
+            for item in messages:
+                body = item.get("text") if isinstance(item, Mapping) else None
+                if isinstance(body, str):
+                    yield body
 
 
 @dataclass(frozen=True)
@@ -314,11 +336,52 @@ def _frontmatter_marker(text: str) -> str:
 
 
 def _text_marker(text: str) -> str:
-    for window in (text[:4000], text[-2000:]):
-        for name, pattern in _TEXT_MARKERS:
-            if pattern.search(window):
-                return name
+    """A generated-by footer, co-author line or skill frontmatter anywhere in the text."""
+    for name, pattern in _TEXT_MARKERS:
+        if pattern.search(text):
+            return name
     return _frontmatter_marker(text)
+
+
+_AGENT_NOUN = (
+    r"(?:an?\s+)?(?:ai|a\.i\.|llm|large\s+language\s+model|language\s+model|chat\s?bot"
+    r"|chatgpt|gpt[-\w.]*|claude|gemini|copilot|codex|openai|anthropic|assistant|bard|grok"
+    r"|perplexity|mistral|deepseek)"
+)
+_AI_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "ai-authorship",
+        re.compile(
+            r"\b(?:generated|written|drafted|composed|authored|created|produced|summari[sz]ed"
+            r"|translated|rewritten|edited|suggested|answered)\s+(?:by|using|with|via)\s+"
+            rf"(?:the\s+help\s+of\s+)?{_AGENT_NOUN}\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "with-help-of-ai",
+        re.compile(
+            rf"\bwith\s+(?:the\s+)?(?:help|assistance|aid)\s+(?:of|from)\s+{_AGENT_NOUN}\b",
+            re.IGNORECASE,
+        ),
+    ),
+    ("as-an-ai", re.compile(r"\bas\s+an\s+ai\b", re.IGNORECASE)),
+    (
+        "ai-generated",
+        re.compile(
+            r"\b(?:ai|a\.i\.|llm|machine)[-\s]+(?:generated|written|authored|produced|assisted)\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _ai_marker(text: str) -> str:
+    """The name of an AI-authorship statement anywhere in the text, else ''."""
+    for name, pattern in _AI_MARKERS:
+        if pattern.search(text):
+            return name
+    return _text_marker(text)
 
 
 def rule_document_origin(context: MessageContext) -> list[Claim]:
@@ -784,15 +847,70 @@ def rule_boilerplate(context: MessageContext) -> list[Claim]:
 # --- ambiguous text: unknown, never owner -----------------------------------------------------
 
 
+def _owns_notes(record: RecordInfo) -> bool:
+    return record.authored_family and record.kind in NOTE_KINDS
+
+
 def rule_ambiguous(context: MessageContext) -> list[Claim]:
-    """Text whose authorship cannot be told from its shape. A paragraph with an odd number of
-    ASCII double quotes cannot be paired into quotations, so none of it is attributed. Every
-    stronger rule has already taken its own characters by the time this one runs."""
+    """Text whose authorship cannot be told from its shape or its record. A paragraph with an odd
+    number of ASCII double quotes cannot be paired into quotations, and a note or document of the
+    person's own library that states an AI had a hand in it anywhere cannot be split into the
+    person's sections and the machine's: none of it is attributed. Every stronger rule has
+    already taken its own characters by the time this one runs."""
     text = context.text
+    marker = ""
+    if _owns_notes(context.record):
+        marker = context.record.ai_marker or _ai_marker(text)
+    if marker:
+        return [(0, len(text), f"ai-marker:{marker}")]
     claims: list[Claim] = []
     for start, end in _paragraphs(_lines(text)):
         if text.count('"', start, end) % 2:
             claims.append((start, end, "odd-ascii-quotes"))
+    return claims
+
+
+# --- pasted blocks: emails, forwards and tables ------------------------------------------------
+
+_MAIL_HEADER = re.compile(r"^(?:From|To|Cc|Bcc|Subject|Date|Sent|Reply-To):[ \t]*\S", re.IGNORECASE)
+_MAIL_MARKERS = (
+    re.compile(r"^-{2,}\s*Original Message\s*-{2,}\s*$", re.IGNORECASE),
+    re.compile(r"^-{2,}\s*Forwarded message\s*-{2,}\s*$", re.IGNORECASE),
+    re.compile(r"^Begin forwarded message:?\s*$", re.IGNORECASE),
+    re.compile(r"^On .{5,200} wrote:\s*$", re.IGNORECASE),
+)
+_TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$")
+
+
+def rule_pasted_block(context: MessageContext) -> list[Claim]:
+    """A pasted email or forward and a markdown table are third-party text. Where an email starts
+    its extent cannot be proven, so it runs to the end of the message."""
+    lines = _lines(context.text)
+    claims: list[Claim] = []
+    for index, (start, _, content) in enumerate(lines):
+        marker = any(pattern.match(content) for pattern in _MAIL_MARKERS)
+        header_run = (
+            _MAIL_HEADER.match(content)
+            and index + 1 < len(lines)
+            and _MAIL_HEADER.match(lines[index + 1][2])
+            and (index == 0 or not _MAIL_HEADER.match(lines[index - 1][2]))
+        )
+        if marker or header_run:
+            claims.append((start, len(context.text), "email" if header_run else "forward"))
+            break
+    index = 0
+    while index < len(lines):
+        if "|" not in lines[index][2]:
+            index += 1
+            continue
+        stop = index
+        while stop < len(lines) and "|" in lines[stop][2]:
+            stop += 1
+        if stop - index >= 2 and any(
+            _TABLE_SEPARATOR.match(lines[i][2]) for i in range(index, stop)
+        ):
+            claims.append((lines[index][0], lines[stop - 1][1], "markdown-table"))
+        index = stop
     return claims
 
 
@@ -812,6 +930,8 @@ def rule_note_owner(context: MessageContext) -> list[Claim]:
         or not record.authored_family
         or record.kind not in NOTE_KINDS
         or marks_agent_origin(context.meta)
+        or record.ai_marker
+        or _ai_marker(context.text)
     ):
         return []
     return [(0, len(context.text), f"family={record.provider}")]
@@ -862,6 +982,12 @@ RULES: tuple[Rule, ...] = (
         rule_log_trace,
     ),
     Rule(
+        "pasted_block",
+        THIRD_PARTY,
+        "a pasted email or forward, or a markdown table",
+        rule_pasted_block,
+    ),
+    Rule(
         "boilerplate",
         THIRD_PARTY,
         "later occurrences of long text that repeats verbatim across the slice",
@@ -870,7 +996,7 @@ RULES: tuple[Rule, ...] = (
     Rule(
         "ambiguous",
         UNKNOWN,
-        "text whose authorship cannot be told (unpaired quotes); never owner",
+        "text whose authorship cannot be told (unpaired quotes, an AI-marked note); never owner",
         rule_ambiguous,
     ),
     Rule("typed_prefix", OWNER, "the characters the person typed", rule_typed_prefix),

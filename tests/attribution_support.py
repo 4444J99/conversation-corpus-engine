@@ -22,6 +22,7 @@ CODE_LOG_TURN = (
     "```\nx = 1\n```\n\nWhat should I change?"
 )
 ODD_QUOTE_TURN = 'She measured 5" by 6 and wrote it down.'
+TABLE_TURN = "| Name | Cost |\n|---|---|\n| Rent | 1200 |"
 CLI_TURN = "Rename the parser module.\n\nHarness appended context nobody typed."
 CLI_TYPED = len("Rename the parser module.")
 NOTE_TURN = "My thoughts.\n\n> pasted from a website\n\nMore thoughts."
@@ -67,6 +68,7 @@ def conversations(
                 typed("m2", QUOTE_TURN),
                 typed("m3", CODE_LOG_TURN),
                 typed("m4", ODD_QUOTE_TURN),
+                typed("m5", TABLE_TURN),
             ],
             alternate_messages=[
                 {
