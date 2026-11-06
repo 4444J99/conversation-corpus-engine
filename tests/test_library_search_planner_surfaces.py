@@ -134,6 +134,7 @@ def test_tool_definition_declares_plan_and_max_seconds():
     assert "phrase" in properties["plan"]["description"]
     assert "phrase" in properties["query"]["description"]
     assert "1000+" in definition["description"]
+    assert "lower bound" in definition["description"] and "N+" in definition["description"]
     for key in ("pn", "pt", "rk", "es"):
         assert key in properties["compact"]["description"]
 
@@ -341,6 +342,7 @@ def test_cli_help_documents_the_plan_order_the_budget_and_the_cost_of_or(capsys)
     assert "phrase" in text and "AND" in text and "OR" in text
     assert "15" in text and "600" in text and "index order" in text
     assert "slow" in text and "quote a phrase" in text
+    assert "lower bound" in text and "1000+" in text
 
 
 def run_search(tmp_path, capsys, *extra):

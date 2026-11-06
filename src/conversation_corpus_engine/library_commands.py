@@ -464,7 +464,8 @@ def add_library_parser(subparsers: Any) -> None:
             'matches; the response names it in `plan`. A single word or a "quoted phrase" is '
             "searched as written. OR on a large library is slow, so quote a phrase or add "
             "terms for a faster, more precise search. The match count is exact up to 1000 and "
-            "then reads 1000+. The call is bounded by --max-seconds: when it runs out, ranking "
+            "then reads 1000+ (a count cut short by the budget is a lower bound, N+). The call is "
+            "bounded by --max-seconds: when it runs out, ranking "
             "is abandoned and a partial page is returned in index order (`partial` true, "
             "`ranked` false)."
         ),
