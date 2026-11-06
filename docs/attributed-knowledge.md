@@ -367,10 +367,23 @@ Limits, stated plainly:
 
 - An idea the owner wrote that is not made of quotes cannot be verified by the exporter, so it
   degrades to `generated`. Quote the owner's own words to have them credited.
-- The derivation runs live over the whole library on every export: one full census pass,
-  bounded by an optional wall-clock `deadline_seconds` (default 900; the Python API
-  `build_notes`/`export_zettel_notes` takes it). A pass that misses the deadline credits nothing.
+- The derivation runs live on every export, per quoted conversation: each quoted conversation is
+  read once by its uid and attributed with the per-message rules (agent family, document origin,
+  injected wrappers, typed remainder, code, quote, log trace, pasted block, third-party origin,
+  typed prefix, note owner) plus the assistant-echo check over that conversation's own earlier
+  assistant turns. The cost is proportional to the quoted conversations, not to the library.
+  Bounds: one wall-clock `deadline_seconds` for the whole export (default 900), a
+  per-conversation cap of 2 MiB of message text and 50,000 messages, and a per-quote message cap of
+  1 MiB; a quote over any budget is `unknown` with a reason, and a quote the deadline cut off is
+  `unknown`. The Python API `build_notes`/`export_zettel_notes` takes `deadline_seconds`.
   The library keeps no stored annotations to read back instead.
+- The library-wide repeat census (the boilerplate rule that re-labels long verbatim-repeated
+  templates as third party) is **not** run by default; `authorship_note` says "per-conversation
+  derivation; library-wide repeat census not used". It is an explicit opt-in, API only
+  (`repeat_census=True` on `build_notes`/`export_zettel_notes`/`derive_quote_authors`; there is no
+  command-line flag), and costs one full pass over the whole library (the same pass as
+  `cce library attribute`, which can run for many minutes on a large library; the conversation
+  budgets do not apply to it). The note then says "library-wide repeat census used".
 - The rules are heuristics with a published precision gate that is not met; a derived `owner` can
   be wrong in the cases the rules section lists.
 
