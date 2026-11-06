@@ -5,12 +5,14 @@ import argparse
 import json
 import re
 import shutil
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .answering import slugify, tokenize, write_json, write_markdown
+from .corpus_store import git_visible_refusal
 from .sharded_collection import (
     collection_storage_path,
     merge_entity_records,
@@ -689,6 +691,11 @@ def import_markdown_document_corpus(
 
 def main() -> int:
     args = parse_args()
+    # The corpus is the documents' text as plaintext, and --output-root defaults to the working
+    # directory: refuse a folder Git can see before anything is read.
+    if (refusal := git_visible_refusal(args.output_root)) is not None:
+        print(f"output refused: {refusal}", file=sys.stderr)
+        return 2
     result = import_markdown_document_corpus(
         args.input_path,
         args.output_root,

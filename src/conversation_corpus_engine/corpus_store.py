@@ -422,6 +422,20 @@ def require_git_private(directory: Path) -> Path:
     return resolved
 
 
+def git_visible_refusal(directory: Path) -> str | None:
+    """Why private text may not be written to `directory`, or None when it may.
+
+    For a command line that answers with a message and an exit status instead of an exception:
+    `require_git_private`, with its `CorpusStoreError` (a Git-visible directory, or a git that could
+    not be asked) returned as the message.
+    """
+    try:
+        require_git_private(directory)
+    except CorpusStoreError as exc:
+        return str(exc)
+    return None
+
+
 def _resolve_existing_store_root(root: Path) -> Path:
     lexical_root = _absolute_path(root)
     if lexical_root.is_symlink():
