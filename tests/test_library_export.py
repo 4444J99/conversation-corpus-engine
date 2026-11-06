@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import html
 import json
 import sys
 import zipfile
@@ -352,3 +353,17 @@ def test_plain_is_idempotent() -> None:
     once = _plain(title)
     assert "&&#35;" not in once
     assert _plain(once) == once
+
+
+def test_plain_shows_the_character_a_literal_entity_names() -> None:
+    # Escaping is idempotent because an entity already present passes through unchanged. The
+    # price is stated in docs/knowledge-library.md: a source title that literally contains an
+    # entity is not told apart from an escaped character, so the reader sees the character the
+    # entity names ("Q&A", "see [1]"), not the entity text the title spelled out.
+    assert _plain("Q&amp;A") == "Q&amp;A"
+    assert html.unescape(_plain("Q&amp;A")) == "Q&A"
+    assert html.unescape(_plain("see &#91;1&#93;")) == "see [1]"
+    assert _plain("see [1]") == _plain("see &#91;1&#93;")
+    # Only the entities the escaper itself writes, or a reader already sees as inert text, pass
+    # through; an incomplete or unknown one is escaped like any other ampersand.
+    assert _plain("AT&T; &copy; &#;") == "AT&amp;T; &amp;copy; &amp;&#35;;"
