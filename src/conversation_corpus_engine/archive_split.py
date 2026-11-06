@@ -11,6 +11,7 @@ parts. `rejoin` puts the original text back byte for byte, which is the proof te
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -20,6 +21,11 @@ MIN_CHUNK_BYTES = 512
 # Room kept inside a chunk for the synthetic lines that close and reopen a fence.
 FENCE_SLACK = 256
 MAX_FENCE_MARKER = 100
+# The opener indentation a container-aware synthetic fence line repeats: one to three plain
+# spaces, CommonMark's own limit for a fence relative to its container. Four columns or more is
+# indented code, a tab or other whitespace is not indentation to CommonMark at all, and the flat
+# `FenceTracker` reads all of them as openers; the column-0 lines stay for those.
+_FENCE_INDENT = re.compile(r" {1,3}")
 # A first guess at how much of a block budget a piece of raw text may use; the rest is left for
 # the label, the quoting and the escaping a renderer adds. `fit_blocks` halves it until it fits.
 FIRST_GUESS = 0.7
@@ -78,8 +84,20 @@ def _split_long_line(line: str, limit: int) -> list[str]:
     return pieces
 
 
-def split_text(text: str, max_bytes: int) -> list[Chunk]:
-    """Split `text` into chunks whose rendered text is at most `max_bytes` UTF-8 bytes each."""
+def split_text(text: str, max_bytes: int, *, container_fences: bool = False) -> list[Chunk]:
+    """Split `text` into chunks whose rendered text is at most `max_bytes` UTF-8 bytes each.
+
+    With `container_fences` (CommonMark output) a fence whose opener is indented one to three
+    plain spaces is closed and reopened at that indentation. Inside a list item a column-0 closer
+    would leave the item, which ends the fence, and then open a new top-level fence that swallows
+    everything after the cut, the next-part link included.
+
+    Every other opener keeps the column-0 lines, which is also the default and what the simple
+    `FenceTracker` renderers (`render_markdown_html`) read correctly: no indent, four columns or
+    more, tabs and other whitespace. The flat tracker reads those as openers where CommonMark may
+    not, and an indented closer can then leave a real fence open that the column-0 one closes.
+    Fences inside a blockquote, or on a list marker's own line, are not tracked either way.
+    """
     if max_bytes < MIN_CHUNK_BYTES:
         raise ValueError(f"max_bytes must be at least {MIN_CHUNK_BYTES}, got {max_bytes}")
     if utf8_size(text) <= max_bytes:
@@ -91,10 +109,13 @@ def split_text(text: str, max_bytes: int) -> list[Chunk]:
     prefix = ""
     continues = False
     tracker = FenceTracker()
+    indent = ""  # the open fence's opener indentation, when it is one to three plain spaces
 
     def cut(mid_line: bool) -> None:
         nonlocal current, used, prefix, continues
         opener = tracker.opener if 0 < len(tracker.opener) <= MAX_FENCE_MARKER else ""
+        if opener and container_fences:
+            opener = indent + opener
         chunks.append(
             Chunk("\n".join(current), prefix=prefix, suffix=opener, continues_line=continues)
         )
@@ -111,8 +132,9 @@ def split_text(text: str, max_bytes: int) -> list[Chunk]:
                 cut(mid_line=index > 0)
             current.append(piece)
             used += piece_size
-            if index == 0:
-                tracker.feed(line)
+            if index == 0 and tracker.feed(line) == "open":
+                leading = line[: len(line) - len(line.lstrip())]
+                indent = leading if _FENCE_INDENT.fullmatch(leading) else ""
     if current or not chunks:
         chunks.append(Chunk("\n".join(current), prefix=prefix, continues_line=continues))
     return chunks

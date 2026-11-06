@@ -3,6 +3,15 @@
 The digests below were captured from the unmodified exporter before any vault-profile change.
 Every file counts, including ``agent-entry.md`` and ``notion-import.zip``; the interpreter path
 that ``agent-entry.md`` embeds is pinned so the digest does not depend on the host.
+
+One deliberate recapture: the default-layout digest was taken again when the title escaper became
+idempotent (``plain`` in ``library_note_text``). The earlier escaper replaced ``[`` with ``&#91;``
+and then escaped the ``#`` inside that entity, so a title or a metadata value with a Markdown
+special rendered as literal entity text (``metadata&&#35;95;only``). The fixture below has two
+such values; ``test_special_characters_are_escaped_once_in_the_legacy_layout`` pins the exact
+new bytes. Every differing line is a doubled escape (``&&#NN;``) becoming a single one
+(``&#NN;``), in the two record notes, the seven hub pages that list them and the Notion ZIP that
+embeds the same notes; no other byte of the layout changed.
 """
 
 from __future__ import annotations
@@ -26,7 +35,7 @@ REPEATED = (
     "original wording to remain a meaningful passage across independent records and source "
     "observations."
 )
-DEFAULT_TREE_DIGEST = "89603518b58885aece770e9ac002fc43d89daf90cd1c0513c1b88ddf5d29b905"
+DEFAULT_TREE_DIGEST = "824763f4861ff8ae3ead6708d567412ef63a3100c7a293f0aa083c3c863fc437"
 ZETTEL_TREE_DIGEST = "954bb334bc1ea9f8e7798b0330fe420b36e89aac7fbfd68de379c5663c796536"
 
 
@@ -107,6 +116,18 @@ def test_default_export_is_byte_identical_to_the_legacy_layout(tmp_path: Path) -
         assert manifest["schema"] == "cce.library-export.v1"
         assert "profile" not in manifest
         assert (destination / "vault" / "blocks").is_dir()
+
+
+def test_special_characters_are_escaped_once_in_the_legacy_layout(tmp_path: Path) -> None:
+    with layout_library(tmp_path) as library:
+        destination = tmp_path / "export"
+        export_library(library, destination)
+        child = (destination / "vault" / "records" / "chatgpt-child.md").read_text()
+        formula = (destination / "vault" / "records" / "documents-formula.md").read_text()
+        assert child.startswith("# &lt;script&gt;bad&lt;/script&gt; &#91;&#91;injected&#93;&#93;\n")
+        assert "- Body coverage: metadata&#95;only\n" in formula
+        for note in destination.rglob("*.md"):
+            assert "&&#" not in note.read_text(), note.name
 
 
 def test_default_export_with_reviewed_zettels_is_byte_identical(tmp_path: Path) -> None:

@@ -30,6 +30,7 @@ def build(packer, tmp_path, files, **kwargs):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(content)
     output = tmp_path / "derived"
+    kwargs.setdefault("source_generation", "test-generation")
     result = packer.package(
         source,
         output,
@@ -114,12 +115,12 @@ def test_refuses_existing_or_nested_output_and_symlink(packer, tmp_path):
     existing = tmp_path / "existing"
     existing.mkdir()
     with pytest.raises(ValueError, match="exist"):
-        packer.package(source, existing)
+        packer.package(source, existing, source_generation="test-generation")
     with pytest.raises(ValueError, match="inside|overlap"):
-        packer.package(source, source / "nested")
+        packer.package(source, source / "nested", source_generation="test-generation")
     source.joinpath("link.md").symlink_to(source / "Home.md")
     with pytest.raises(ValueError, match="symlink"):
-        packer.package(source, tmp_path / "new")
+        packer.package(source, tmp_path / "new", source_generation="test-generation")
 
 
 def test_invalid_utf8_and_output_budget_do_not_claim_success(packer, tmp_path):
@@ -127,10 +128,12 @@ def test_invalid_utf8_and_output_budget_do_not_claim_success(packer, tmp_path):
     source.mkdir()
     source.joinpath("bad.md").write_bytes(b"\xff")
     with pytest.raises(UnicodeError):
-        packer.package(source, tmp_path / "invalid")
+        packer.package(source, tmp_path / "invalid", source_generation="test-generation")
     source.joinpath("bad.md").write_bytes(b"x" * 10000)
     with pytest.raises(ValueError, match="budget"):
-        packer.package(source, tmp_path / "tiny", max_output_bytes=1024)
+        packer.package(
+            source, tmp_path / "tiny", max_output_bytes=1024, source_generation="test-generation"
+        )
     assert not (tmp_path / "tiny/.cce-package/manifest.json").exists()
 
 
@@ -169,7 +172,7 @@ def test_failed_tiny_budget_never_writes_more_than_the_cap(packer, tmp_path):
     source.joinpath("Home.md").write_text("# Home\n")
     output = tmp_path / "tiny"
     with pytest.raises(ValueError, match="budget"):
-        packer.package(source, output, max_output_bytes=1)
+        packer.package(source, output, max_output_bytes=1, source_generation="test-generation")
     assert sum(path.stat().st_size for path in output.rglob("*") if path.is_file()) <= 1
 
 
@@ -190,7 +193,9 @@ def test_configurable_source_cap_rejects_before_reading(packer, tmp_path):
     source.mkdir()
     source.joinpath("large.md").write_bytes(b"a" * 100)
     with pytest.raises(ValueError, match="source.*byte"):
-        packer.package(source, tmp_path / "bounded", max_source_bytes=50)
+        packer.package(
+            source, tmp_path / "bounded", max_source_bytes=50, source_generation="test-generation"
+        )
 
 
 def test_quoted_fences_and_indented_code_remain_literal(packer, tmp_path):
@@ -216,7 +221,13 @@ def test_navigation_growth_obeys_the_output_cap_before_sqlite_writes(packer, tmp
     )
     output = tmp_path / "bounded"
     with pytest.raises((ValueError, sqlite3.DatabaseError)):
-        packer.package(source, output, max_note_bytes=4096, max_output_bytes=16384)
+        packer.package(
+            source,
+            output,
+            max_note_bytes=4096,
+            max_output_bytes=16384,
+            source_generation="test-generation",
+        )
     actual = sum(path.stat().st_size for path in output.rglob("*") if path.is_file())
     assert actual <= 16384
     assert not output.joinpath(".cce-package/manifest.json").exists()
@@ -240,7 +251,7 @@ def test_refuses_output_anywhere_inside_canonical_generation(packer, tmp_path):
     source.mkdir(parents=True)
     source.joinpath("Home.md").write_text("# Home\n")
     with pytest.raises(ValueError, match="canonical generation"):
-        packer.package(source, generation / "derived")
+        packer.package(source, generation / "derived", source_generation="test-generation")
 
 
 def test_refuses_output_inside_a_different_canonical_generation(packer, tmp_path):
@@ -251,7 +262,7 @@ def test_refuses_output_inside_a_different_canonical_generation(packer, tmp_path
     other = generations / "generation-other"
     other.mkdir()
     with pytest.raises(ValueError, match="canonical generation"):
-        packer.package(source, other / "derived")
+        packer.package(source, other / "derived", source_generation="test-generation")
 
 
 @pytest.mark.parametrize("ticks", ["`", "``", "```"])
@@ -361,7 +372,16 @@ def test_cli_refuses_a_git_visible_output_before_reading_the_source(
     monkeypatch.setattr(packer.os, "umask", lambda mask: 0)
     visible = work_tree / "visible"
     monkeypatch.setattr(
-        sys, "argv", ["package-obsidian-vault", str(source), "--output", str(visible)]
+        sys,
+        "argv",
+        [
+            "package-obsidian-vault",
+            str(source),
+            "--output",
+            str(visible),
+            "--source-generation",
+            "test-generation",
+        ],
     )
     with pytest.raises(SystemExit) as refused:
         packer.main()
@@ -384,8 +404,518 @@ def test_cli_hands_an_output_git_ignores_to_the_packager(packer, tmp_path, monke
     monkeypatch.setattr(packer.os, "nice", lambda increment: 0)
     monkeypatch.setattr(packer.os, "umask", lambda mask: 0)
     monkeypatch.setattr(
-        sys, "argv", ["package-obsidian-vault", str(source), "--output", str(work_tree / "ignored")]
+        sys,
+        "argv",
+        [
+            "package-obsidian-vault",
+            str(source),
+            "--output",
+            str(work_tree / "ignored"),
+            "--source-generation",
+            "test-generation",
+        ],
     )
     packer.main()
     assert received["output"] == work_tree / "ignored" and received["source"] == source
+    assert received["source_generation"] == "test-generation"
     assert json.loads(capsys.readouterr().out) == {"complete": True}
+
+
+def test_manifest_names_source_generation(packer, tmp_path):
+    _, output, result = build(
+        packer, tmp_path, {"Home.md": b"# Home\n"}, source_generation="20261027"
+    )
+    assert result["source_generation"] == "20261027"
+    receipt = json.loads(output.joinpath(".cce-package/manifest.json").read_text())
+    assert receipt["source_generation"] == "20261027"
+    assert packer.verify_package(output)["status"] == "verified"
+
+
+def test_missing_source_generation_is_refused(packer, tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    source.joinpath("Home.md").write_text("# Home\n")
+    with pytest.raises(TypeError):
+        packer.package(source, tmp_path / "derived")
+
+
+def test_agent_entry_outbound_links_rebase_into_vault(packer, tmp_path):
+    generation = tmp_path / "generation"
+    source = generation / "vault"
+    source.mkdir(parents=True)
+    source.joinpath("Home.md").write_text("# Home\n")
+    big = b"# Big\n\n## Message 2\n\n" + b"body\n" * 1500
+    source.joinpath("big.md").write_bytes(big)
+    agent = generation / "agent-entry.md"
+    agent.write_text("[Home](vault/Home.md)\n[Big](vault/big.md#message-2)\n[Outside](other.md)\n")
+    output = tmp_path / "derived"
+    packer.package(
+        source,
+        output,
+        agent_entry=agent,
+        source_generation="test-generation",
+        max_note_bytes=4096,
+        max_output_bytes=10_000_000,
+        max_seconds=30,
+    )
+    entry = output.joinpath("agent-entry.md").read_text()
+    assert "[Home](Home.md)" in entry
+    assert "big.__part" in entry and "#message-2" in entry
+    assert "[Outside](other.md)" in entry
+    assert b"".join(packer.reconstruct(output, "agent-entry.md")) == agent.read_bytes()
+
+
+def test_open_fence_note_fails_closed_but_split_wrapper_closes(packer, tmp_path):
+    with pytest.raises(ValueError, match="fence"):
+        build(packer, tmp_path, {"note.md": b"# Note\n\n```\ncode\n"})
+    split_base = tmp_path / "split"
+    split_base.mkdir()
+    raw = b"# Note\n\n" + b"body\n" * 1500 + b"```python\n" + b"code\n" * 300
+    _, output, _ = build(packer, split_base, {"note.md": raw})
+    for path in output.glob("note.__part*.md"):
+        assert packer.fence_state(path.read_text()) is None
+    assert b"".join(packer.reconstruct(output, "note.md")) == raw
+
+
+def test_container_fences_are_tracked(packer):
+    # PR #115 review corrections: a fence opened on a list item's own line
+    # used to be missed, so its closing fence was misread as an opener
+    # (a closed note failed, an unclosed one passed).
+    assert packer.fence_state("- ```python\n  print(1)\n  ```\n") is None
+    assert packer.fence_state("- ```python\n  print(1)\n") is not None
+    # A fence on a list continuation line is measured from the item's
+    # content indent, so 4 spaces inside a "- " item is a fence, while
+    # 6 spaces (indented code past the content) is not.
+    assert packer.fence_state("- item\n\n    ```\n    code\n") is not None
+    assert packer.fence_state("- item\n\n    ```\n    code\n    ```\n") is None
+    assert packer.fence_state("- item\n\n      ```\n      code\n") is None
+    # Fence markers inside a raw <pre> block are HTML content, not fences.
+    assert packer.fence_state("<pre>\n```\n</pre>\n") is None
+    assert packer.fence_state("<pre>\n```\n</pre>\n\n```\ncode\n") is not None
+    # Round-2 review corrections: a quoted list fence keeps its quote
+    # depth through content and closing lines, and a <pre> block closed
+    # on its opening line (or by its closing tag) does not swallow the
+    # fences that follow it.
+    assert packer.fence_state("> - ```python\n>   print(1)\n>   ```\n") is None
+    assert packer.fence_state("> - item\n>\n>     ```\n>     code\n>     ```\n") is None
+    assert packer.fence_state("> ```\n> code\n> ```\n") is None
+    # Round-5 review correction: a fence inside a list item ends when a
+    # later line leaves the item, exactly as the pinned CommonMark
+    # parser reads it. A column-zero content line is therefore not
+    # fence content: the item (and its fence) end there, the trailing
+    # fence opens a new block, and the note ends inside it.
+    assert packer.fence_state("- ```\ncode\n```\n") is not None
+    # Round-6 review corrections (4455440484): the same holds for a
+    # fence line itself: a column-zero fence after a list fence ends
+    # the item and opens a new fence, while a sibling item with a
+    # different fence marker opens and closes its own fence.
+    assert packer.fence_state("- ```\n```\n") is not None
+    assert packer.fence_state("- ```\n  code\n- ~~~\n  code\n  ~~~\n") is None
+    assert packer.fence_state("<pre>\n</pre>\n```python\ncode\n") is not None
+    assert packer.fence_state("<pre>```</pre>\n") is None
+
+
+def test_list_item_fence_note_packages(packer, tmp_path):
+    _, output, _ = build(
+        packer, tmp_path, {"note.md": b"# Note\n\n- ```python\n  print(1)\n  ```\n"}
+    )
+    assert packer.verify_package(output)["status"] == "verified"
+
+
+def test_comment_and_container_fences_share_one_tracker(packer, tmp_path):
+    # PR #115 round-3 review corrections: validation and rewriting shared
+    # only a plain fence tracker, so they disagreed. A fence-looking line
+    # inside an HTML comment is comment text, not a fence, and a real fence
+    # after the comment still opens one.
+    assert packer.fence_state("<!--\n```python\nexample\n-->\n") is None
+    assert packer.fence_state("<!-- note -->\n```\ncode\n") is not None
+    assert packer.fence_state("<!--\n```\n-->\n```python\ncode\n") is not None
+    assert packer.fence_state("- <!--\n  ```\n  -->\n") is None
+    # A commented fence must not fail packaging.
+    (tmp_path / "comment").mkdir()
+    _, output, _ = build(
+        packer,
+        tmp_path / "comment",
+        {
+            "Home.md": b"# Home\n\n<!--\n```python\nexample\n-->\n\n[Other](other.md)\n",
+            "other.md": b"# Other\n",
+        },
+    )
+    assert packer.verify_package(output)["status"] == "verified"
+    # A link after a list-contained fence is rewritten by the same tracker
+    # that validates it: the 4-space-indented closing delimiter closes the
+    # fence for rewriting too, instead of stranding the link as code.
+    large = b"# Record\n\n## Message 1\n\n" + b"body\n" * 1400
+    large += b"\n## Message 2\n\nLast message.\n"
+    (tmp_path / "listfence").mkdir()
+    _, output, _ = build(
+        packer,
+        tmp_path / "listfence",
+        {
+            "records/a.md": large,
+            "blocks/b.md": (
+                b"-   ```python\n    code\n    ```\n\n[Second](../records/a.md#message-2)\n"
+            ),
+        },
+    )
+    backlink = output.joinpath("blocks/b.md").read_text()
+    assert "a.__part" in backlink and "#message-2" in backlink
+    target = backlink.split("](", 1)[1].split(")", 1)[0].split("#", 1)[0]
+    assert "## Message 2" in (output / "blocks" / target).read_text()
+    # A link after a <pre> block is rewritten too: rewrite used to treat
+    # the fence-looking line inside <pre> as an opener and skip the rest.
+    (tmp_path / "pre").mkdir()
+    _, output, _ = build(
+        packer,
+        tmp_path / "pre",
+        {
+            "records/a.md": large,
+            "blocks/c.md": (b"<pre>\n```\n</pre>\n\n[Second](../records/a.md#message-2)\n"),
+        },
+    )
+    backlink = output.joinpath("blocks/c.md").read_text()
+    assert "a.__part" in backlink and "#message-2" in backlink
+
+
+def test_verifier_rejects_package_ending_in_open_fence(packer, tmp_path):
+    _, output, _ = build(packer, tmp_path, {"Home.md": b"# Home\n"})
+    home = output / "Home.md"
+    home.write_bytes(home.read_bytes() + b"```\n")
+    with pytest.raises(ValueError, match="fence"):
+        packer.verify_package(output)
+
+
+def test_round4_raw_html_blocks_end_at_closing_tag_not_blank_line(packer):
+    # PR #115 round-4 review corrections: type-1 raw HTML blocks end
+    # only at their matching closing tag. A blank line inside <pre>
+    # used to end the block, so a fence after it falsely opened one.
+    assert packer.fence_state("<pre>\n\n```\n</pre>\n") is None
+    assert packer.fence_state("<pre>\n\n```\n</pre>\n\n```\ncode\n") is not None
+    for tag in ("script", "style", "textarea"):
+        assert packer.fence_state(f"<{tag}>\n```\n</{tag}>\n") is None
+        assert packer.fence_state(f"<{tag}>x</{tag}>\n```\ncode\n") is not None
+
+
+def test_round4_literal_block_ends_at_list_item_boundary(packer, tmp_path):
+    # PR #115 round-4 review corrections: a literal block opened inside
+    # a list item must not swallow the top-level content that follows
+    # the item. A link after the item is rewritten, not left literal.
+    large = b"# Record\n\n## Message 1\n\n" + b"body\n" * 1400
+    large += b"\n## Message 2\n\nLast message.\n"
+    _, output, _ = build(
+        packer,
+        tmp_path,
+        {
+            "records/a.md": large,
+            "blocks/b.md": (
+                b"- item\n    <!--\n    comment\n\n[Second](../records/a.md#message-2)\n"
+            ),
+        },
+    )
+    backlink = output.joinpath("blocks/b.md").read_text()
+    assert "a.__part" in backlink and "#message-2" in backlink
+    assert packer.verify_package(output)["status"] == "verified"
+
+
+def test_round4_split_list_fence_rewrites_following_link(packer, tmp_path):
+    # PR #115 round-4 review corrections: a list-contained fence that
+    # crosses a part boundary used to strand the link after it, because
+    # the next segment lost the list content indent and never closed
+    # the fence. The part header now reopens the fence with its list
+    # prefix, so the closing line closes it and the link is rewritten.
+    large = b"# Record\n\n## Message 1\n\n" + b"body\n" * 1400
+    large += b"\n## Message 2\n\nLast message.\n"
+    note = (
+        b"-   ```python\n"
+        + b"    code\n" * 300
+        + b"    ```\n\n[Second](../records/a.md#message-2)\n"
+    )
+    _, output, _ = build(
+        packer,
+        tmp_path,
+        {"records/a.md": large, "blocks/b.md": note},
+    )
+    parts = sorted(output.glob("blocks/b.__part*.md"))
+    assert len(parts) == 2
+    assert "a.__part" in parts[1].read_text() and "#message-2" in parts[1].read_text()
+    assert packer.verify_package(output)["status"] == "verified"
+    assert b"".join(packer.reconstruct(output, "blocks/b.md")) == note
+
+
+def test_round5_review_corrections(packer, tmp_path):
+    # PR #115 round-5 review corrections (bot round on 71ac0fc1).
+    # 4454058551: a fence opened by a list item's blockquoted line
+    # ("- > ```") was missed, so its closer was misread as an opener.
+    assert packer.fence_state("- > ```python\n  > code\n  > ```\n") is None
+    # 4454058563: a list-contained fence ends when a later non-fence
+    # line leaves the item (blank line plus unindented paragraph, or a
+    # sibling item); this also closes the deferred 4452002015 case.
+    assert packer.fence_state("- ```python\n  code\n\nOutside\n") is None
+    assert packer.fence_state("- ```python\n  code\n- next\n") is None
+    assert packer.fence_state("- ```python\n  code\n") is not None
+    # Both notes package and verify: neither fails closed any more.
+    (tmp_path / "quoted").mkdir()
+    _, output, _ = build(
+        packer,
+        tmp_path / "quoted",
+        {"note.md": b"# Note\n\n- > ```python\n  > code\n  > ```\n"},
+    )
+    assert packer.verify_package(output)["status"] == "verified"
+    (tmp_path / "exited").mkdir()
+    _, output, _ = build(
+        packer,
+        tmp_path / "exited",
+        {"note.md": b"# Note\n\n- ```python\n  code\n\nOutside\n"},
+    )
+    assert packer.verify_package(output)["status"] == "verified"
+    # 4454102219: fragmentless links in an ordinary note are never
+    # rewritten, so they budget no encoding growth; the agent entry's
+    # own links keep the existing rebase bound.
+    assert packer.navigation_growth("[A](other.md)\n[B](vault/café.md)\n", "notes/a.md") == 0
+    assert packer.navigation_growth("[Home](vault/café.md)\n", "agent-entry.md") == 4
+    # 4454102229: a split list fence's closing footer sits at the
+    # item's content indent, so the rendered part parses as one fence
+    # block instead of ending inside a newly opened one.
+    segment = {"before": "```", "after": "```", "fence_prefix_before": "-   "}
+    rendered, _ = packer.render_part(b"    code\n", "blocks/b.md", 1, 2, segment)
+    assert "    ```" in rendered.decode().splitlines()
+    fences = [
+        token
+        for token in MarkdownIt("commonmark", {"html": True}).parse(rendered.decode())
+        if token.type == "fence"
+    ]
+    assert len(fences) == 1
+    # A plain fence keeps its column-zero closer.
+    segment = {"before": "```", "after": "```", "fence_prefix_before": ""}
+    rendered, _ = packer.render_part(b"code\n", "b.md", 1, 2, segment)
+    assert rendered.decode().splitlines()[-1] == "```"
+
+
+def test_round6_review_corrections(packer, tmp_path):
+    # PR #115 round-6 review corrections (bot round on bd0dcf14).
+    # 4455440450: a fence opened in a list item inside a blockquote
+    # ("- > 10. ```") closes at the nested item's content indent: a
+    # closer six spaces after ">" sits at column 8, the nested
+    # content indent, not four spaces past the outer item's indent.
+    assert packer.fence_state("- > 10. ```python\n>       code\n>       ```\n") is None
+    # 4455440469: a blockquote starting outside the list item ends
+    # the item (and its fence); a quoted continuation indented into
+    # the item does not.
+    assert packer.fence_state("- ```\n> outside\n") is None
+    assert packer.fence_state("- ```\n  > inside\n") is not None
+    # 4455353064: a split part whose segment opens a list fence
+    # inside itself must close it with a footer at the fence's own
+    # column (4 for "-   ```"), not column zero: the pinned parser
+    # reads the part as exactly one fence block, and the note
+    # packages, verifies, and reconstructs exactly.
+    raw = b"-   ```python\n" + b"    code\n" * 300 + b"    ```\n"
+    segments = packer.ranges(raw, 2048, relative="blocks/b.md", maximum=4096)
+    assert len(segments) >= 2
+    rendered, _ = packer.render_part(
+        raw[segments[0]["start"] : segments[0]["end"]],
+        "blocks/b.md",
+        1,
+        len(segments),
+        segments[0],
+    )
+    assert rendered.decode().splitlines()[-1] == "    ```"
+    fences = [
+        token
+        for token in MarkdownIt("commonmark", {"html": True}).parse(rendered.decode())
+        if token.type == "fence"
+    ]
+    assert len(fences) == 1
+    _, output, _ = build(packer, tmp_path, {"blocks/b.md": raw})
+    assert packer.verify_package(output)["status"] == "verified"
+    assert b"".join(packer.reconstruct(output, "blocks/b.md")) == raw
+    # 4455440504 / 4455440510: navigation growth with vault context
+    # budgets an agent entry's rebase prefix (each "[a](b)" link in
+    # an entry inside "agents/" gains 7 bytes) and charges an
+    # escaping link only when it actually lands on the agent entry.
+    vault = tmp_path / "vault6"
+    agent = vault / "agents" / "entry.md"
+    assert (
+        packer.navigation_growth(
+            "[a](b)\n" * 330, "agent-entry.md", source=vault, agent_entry=agent
+        )
+        == 330 * 7
+    )
+    assert (
+        packer.navigation_growth("[a](../other.md)\n", "a.md", source=vault, agent_entry=agent) == 0
+    )
+    assert (
+        packer.navigation_growth("[e](entry.md)\n", "agents/x.md", source=vault, agent_entry=agent)
+        == 9
+    )
+    # Without vault context the old bounds are unchanged.
+    assert packer.navigation_growth("[a](../other.md)\n", "a.md") == 3
+    # 4455440504 end to end: the 330-link single-line entry (1980
+    # bytes of links) used to abort with "rewritten Markdown exceeds
+    # note byte limit" because its growth budgeted zero; with the
+    # rebase budgeted it splits and verifies instead.
+    (tmp_path / "vault6src" / "agents").mkdir(parents=True)
+    entry = tmp_path / "vault6src" / "agents" / "entry.md"
+    entry.write_bytes(b"# Entry\n\n" + b"[a](b)" * 330 + b"\n")
+    output6 = tmp_path / "derived6"
+    packer.package(
+        tmp_path / "vault6src",
+        output6,
+        agent_entry=entry,
+        source_generation="test-generation",
+        max_note_bytes=4096,
+        max_output_bytes=10_000_000,
+        max_seconds=30,
+    )
+    assert packer.verify_package(output6)["status"] == "verified"
+    assert b"".join(packer.reconstruct(output6, "agent-entry.md")) == entry.read_bytes()
+
+
+def test_round7_review_corrections(packer, tmp_path):
+    # PR #115 round-7 review correction (bot round on a25f9b8e).
+    # 4456828117: a fence inside alternating list and blockquote
+    # containers ("- > 10000. ```") spans split parts, but the part
+    # header rebuilt only the outer list prefix ("> - ```"), whose
+    # shallow content indent leaves the column-11 footer and the
+    # source's own closing lines unable to close it, so each later
+    # part ended inside an open fence and packaging failed closed.
+    # ranges now carries the fence's original opener prefix, and
+    # render_part reopens with it whole, so every part parses as
+    # exactly one closed fence block and the note packages,
+    # verifies, and reconstructs exactly.
+    raw = b"- > 10000. ```python\n" + b"  >        code\n" * 300 + b"  >        ```\n"
+    segments = packer.ranges(raw, 2048, relative="blocks/b.md", maximum=4096)
+    assert len(segments) == 3
+    for number, segment in enumerate(segments, 1):
+        rendered, _ = packer.render_part(
+            raw[segment["start"] : segment["end"]],
+            "blocks/b.md",
+            number,
+            len(segments),
+            segment,
+        )
+        assert packer.fence_state(rendered.decode()) is None
+        fences = [
+            token
+            for token in MarkdownIt("commonmark", {"html": True}).parse(rendered.decode())
+            if token.type == "fence"
+        ]
+        assert len(fences) == 1
+    assert segments[1]["fence_opener_before"] == "- > 10000. "
+    _, output, _ = build(packer, tmp_path, {"blocks/b.md": raw})
+    assert packer.verify_package(output)["status"] == "verified"
+    assert b"".join(packer.reconstruct(output, "blocks/b.md")) == raw
+
+
+def test_round8_review_corrections(packer, tmp_path):
+    # PR #115 round-8 review corrections (bot round on 80909fa5).
+    # 4458223689: a raw HTML block inside a list item's blockquote
+    # ("- > <pre>") was missed because stripping only the outer list
+    # marker left the blockquote prefix in front of the tag, so its
+    # literal backticks opened a fence and packaging failed closed.
+    # The tracker now strips alternating containers before detecting
+    # literal HTML, so the block parses closed, packages, verifies,
+    # and reconstructs exactly.
+    raw = b"- > <pre>\n  > ```python\n  > example\n  > </pre>\n"
+    assert packer.fence_state(raw.decode()) is None
+    _, output, _ = build(packer, tmp_path, {"note.md": raw})
+    assert packer.verify_package(output)["status"] == "verified"
+    assert b"".join(packer.reconstruct(output, "note.md")) == raw
+    # 4458223679: navigation_growth budgeted fragment-bearing links
+    # in the agent-entry note with only the fixed 32-byte part-name
+    # allowance, ignoring the rebase prefix, so an entry under a
+    # 200-character directory was estimated at 1470 bytes but
+    # rewritten to 6540 and packaging aborted instead of splitting.
+    # The bound now includes the rebased prefix, covers the actual
+    # rewritten growth, and ranges splits the entry under a 4096
+    # byte limit instead of accepting it whole.
+    directory = "d" * 200
+    generation = tmp_path / "generation"
+    source = generation / "vault"
+    (source / directory).mkdir(parents=True)
+    agent = source / directory / "entry.md"
+    lines = "[a](b#message-1)\n" * 30
+    agent.write_text(lines)
+    assert len(lines.encode()) == 510
+    growth = packer.navigation_growth(lines, "agent-entry.md", source=source, agent_entry=agent)
+    rewritten = packer.rewritten_target(
+        "b#message-1",
+        "agent-entry.md",
+        {},
+        None,
+        source=source,
+        agent_entry=agent,
+    )
+    actual = (len(rewritten.encode()) - len(b"b#message-1")) * 30
+    assert actual == 6030
+    assert growth >= actual
+    segments = packer.ranges(
+        lines.encode(),
+        4096,
+        relative="agent-entry.md",
+        maximum=4096,
+        source=source,
+        agent_entry=agent,
+    )
+    assert len(segments) >= 2
+
+
+def test_round4_agent_entry_unicode_links_budget_percent_encoding(packer, tmp_path):
+    # PR #115 round-4 review corrections: navigation growth skipped
+    # links without a fragment, so an agent entry whose unicode links
+    # expand under percent-encoding was never split and aborted with
+    # "rewritten Markdown exceeds note byte limit" instead.
+    filename = "文" * 70 + ".md"
+    generation = tmp_path / "generation"
+    source = generation / "vault"
+    source.mkdir(parents=True)
+    source.joinpath("Home.md").write_text("# Home\n")
+    source.joinpath(filename).write_text("# F\n")
+    agent = generation / "agent-entry.md"
+    agent.write_text("".join(f"[Home](vault/{filename})\n" for _ in range(8)))
+    assert len(agent.read_bytes()) == 1824
+    output = tmp_path / "derived"
+    packer.package(
+        source,
+        output,
+        agent_entry=agent,
+        source_generation="test-generation",
+        max_note_bytes=4096,
+        max_output_bytes=10_000_000,
+        max_seconds=30,
+    )
+    assert packer.verify_package(output)["status"] == "verified"
+    assert b"".join(packer.reconstruct(output, "agent-entry.md")) == agent.read_bytes()
+
+
+def test_round9_review_corrections(packer, tmp_path):
+    # PR #115 round-9 review corrections (bot round on 593858b2).
+    # 4459507294: a tab after a list marker's space ("- \t```python")
+    # was left in front of the fence marker, so the opener was missed,
+    # the closing delimiter was misread as a new opener, and packaging
+    # failed closed. Marker stripping now expands separator tabs to
+    # tab stops (content indent 4), so the note parses closed,
+    # packages, verifies, and reconstructs exactly; the pinned
+    # CommonMark parser agrees it holds exactly one fence.
+    raw = b"- \t```python\n    print(1)\n    ```\n"
+    assert packer.fence_state(raw.decode()) is None
+    fences = [
+        token for token in MarkdownIt("commonmark").parse(raw.decode()) if token.type == "fence"
+    ]
+    assert len(fences) == 1
+    # An ordered marker with the same tab separator, and a tab-opened
+    # fence long enough to split: the split footer must sit at the
+    # content indent (4), not at the tab-counted column (3), or it
+    # falls outside the item and opens a new fence in the part
+    # instead of closing the carried one.
+    ordered = b"1. \t```python\n    print(1)\n    ```\n"
+    assert packer.fence_state(ordered.decode()) is None
+    long = b"- \t```python\n" + b"    x = 1\n" * 500 + b"    ```\n"
+    assert packer.fence_state(long.decode()) is None
+    _, output, _ = build(packer, tmp_path, {"note.md": raw, "ordered.md": ordered, "long.md": long})
+    assert packer.verify_package(output)["status"] == "verified"
+    for relative, original in (
+        ("note.md", raw),
+        ("ordered.md", ordered),
+        ("long.md", long),
+    ):
+        assert b"".join(packer.reconstruct(output, relative)) == original

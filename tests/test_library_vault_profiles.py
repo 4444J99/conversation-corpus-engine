@@ -439,3 +439,26 @@ def test_an_index_path_that_names_no_file_fails_verification(tmp_path: Path) -> 
         index.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
         problems = verify_export(destination)
         assert problems
+
+
+@pytest.mark.parametrize("profile", ["cards", "full"])
+def test_a_title_and_metadata_with_markdown_specials_are_escaped_once_in_every_note(
+    tmp_path: Path, profile: str
+) -> None:
+    with Library.create(tmp_path / "library.sqlite") as library:
+        library.put(
+            Conversation(
+                provider="chatgpt",
+                source_id="specials",
+                title="Plan [draft] C# notes_v2",
+                messages=[Message(role="user", text="Body.", id="m0")],
+                extra={"wing": "ai", "lane": "conversations", "body_status": "metadata_only"},
+            )
+        )
+        export_library(library, tmp_path / "export", vault_profile=profile)
+    text = "".join(
+        path.read_text(encoding="utf-8") for path in notes_under(tmp_path / "export" / "vault")
+    )
+    assert "Plan &#91;draft&#93; C&#35; notes&#95;v2" in text
+    assert "metadata&#95;only" in text
+    assert "&&#" not in text
