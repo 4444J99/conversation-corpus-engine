@@ -378,7 +378,7 @@ def require_git_private(directory: Path) -> Path:
     """
     resolved = _absolute_path(directory).resolve(strict=False)
     probe = resolved
-    while not probe.exists():
+    while not probe.is_dir():  # git can be asked from a directory only: a file's folder will do
         probe = probe.parent
     git_root = _git_root(probe)
     if git_root is None:

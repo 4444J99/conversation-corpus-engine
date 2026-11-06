@@ -17,6 +17,7 @@ import pytest
 from conversation_corpus_engine import cli, corpus_store
 from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.corpus_store import CorpusStoreError, require_git_private
+from conversation_corpus_engine.library_cards import export_cards
 from conversation_corpus_engine.library_export import export_library
 from conversation_corpus_engine.library_store import Library
 
@@ -188,6 +189,36 @@ def test_a_library_export_is_refused_where_only_dotfiles_or_the_probe_are_ignore
         text=True,
     ).stdout
     assert "SYNTHETIC" not in status and status.strip() in ("", "?? .gitignore")
+
+
+def test_a_path_that_is_a_file_is_judged_by_where_it_sits_not_refused_for_being_one(
+    tmp_path,
+) -> None:
+    """git cannot be asked from inside a file; the folder it sits in answers. The caller that
+    wanted a directory then fails on its own terms (FileExistsError), not with a git error."""
+    outside = tmp_path / "plain-file"
+    outside.write_text("x", encoding="utf-8")
+    assert require_git_private(outside) == outside.resolve()
+    repo = make_repo(tmp_path, gitignore="")
+    inside = repo / "visible.txt"
+    inside.write_text("x", encoding="utf-8")
+    with pytest.raises(CorpusStoreError, match="Git-visible"):
+        require_git_private(inside)
+
+
+def test_export_cards_guards_its_own_destination_not_only_the_command_line(tmp_path) -> None:
+    """`export_library` refuses a Git-visible folder itself; a caller of `export_cards` (a script,
+    a test, another command) gets the same refusal and nothing is created."""
+    database = private_library(tmp_path)
+    repo = make_repo(tmp_path, gitignore=".*\n")  # only dotfiles ignored
+    target = repo / "cards"
+    with Library(database) as library, pytest.raises(CorpusStoreError, match="Git-visible"):
+        export_cards(library, target)
+    assert not target.exists(), "nothing was written"
+    private = tmp_path / "plain" / "cards"
+    with Library(database) as library:
+        assert export_cards(library, private)["cards"] == 1
+    assert (private / ".cce-cards-vault").is_file()
 
 
 # --- what Git is told, and what it may not be taken to mean --------------------------------------

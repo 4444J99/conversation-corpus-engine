@@ -27,6 +27,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .corpus_store import require_git_private
 from .library_export import _absolute, _no_symlinks, _safe_relative
 from .library_note_text import WINGS, check, safe_uid
 from .library_store import Library
@@ -203,8 +204,14 @@ def export_cards(
     caps: VaultCaps | None = None,
     check_callback: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
-    """Write (or refresh) the card vault in ``out`` and return what was done."""
+    """Write (or refresh) the card vault in ``out`` and return what was done.
+
+    The cards are the library's text as plaintext, so ``out`` must be somewhere Git cannot see
+    (``corpus_store.require_git_private``); that is checked here, before anything is read or
+    written, and not only by the command line, so every caller gets it.
+    """
     caps = caps or DEFAULT_CAPS
+    require_git_private(out)
     out = _absolute(Path(out))
     _no_symlinks(out)
     _refuse_library_store(out, store_root)
