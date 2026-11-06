@@ -65,6 +65,7 @@ from .attribution_rules import (
     read_ledger,
     record_info,
     review_statistics,
+    stratum_of,
     to_annotation,
     utc_stamp,
 )
@@ -102,6 +103,8 @@ class ScanStats:
     records_scanned: int = 0
     messages: int = 0
     unreferenceable: int = 0
+    # Messages whose text cannot be encoded (a lone surrogate): counted, treated as unknown.
+    unreadable: int = 0
     limited: bool = False
     deadline_reached: bool = False
 
@@ -121,11 +124,20 @@ class ScannedMessage:
     # False when the id is empty or not unique in its sequence: no exact reference can name it.
     referenceable: bool
     text: str
+    unreadable: bool
     role: str
     channel: str
     typed_chars: Any
     meta: Mapping[str, Any]
     record: RecordInfo
+
+
+def _unencodable(text: str) -> bool:
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
 
 
 def iter_messages(
@@ -177,6 +189,7 @@ def iter_messages(
                     and bool(message_id)
                     and ids[message_id] == 1,
                     text=text,
+                    unreadable=not text.isascii() and _unencodable(text),
                     role=str(item.get("role") or ""),
                     channel=str(item.get("channel") or ""),
                     typed_chars=item.get("typed_chars"),
@@ -197,7 +210,8 @@ def build_census(
     for message in iter_messages(
         library, ScanStats(), limit_records=limit_records, deadline=deadline
     ):
-        census.observe(message.text)
+        if not message.unreadable:
+            census.observe(message.text)
     return census
 
 
@@ -217,6 +231,19 @@ class Tally:
         self.covered_characters = 0
         self.problems: Counter[str] = Counter()
         self.unattributed_whitespace = 0
+        self.unreadable_messages = 0
+
+    def add_unreadable(self, text: str) -> None:
+        """A message that cannot be encoded has no digest and no spans: all of it is unknown."""
+        length = len(text)
+        self.messages += 1
+        self.total_characters += length
+        self.covered_characters += length
+        self.spans[UNATTRIBUTED] += 1
+        self.characters[UNATTRIBUTED] += length
+        self.stratum_spans[(UNATTRIBUTED, stratum_of(length))] += 1
+        self.stratum_characters[(UNATTRIBUTED, stratum_of(length))] += length
+        self.unreadable_messages += 1
 
     def add(self, text: str, spans: list[AttributedSpan]) -> None:
         self.messages += 1
@@ -249,6 +276,10 @@ def scan(
             library, stats, limit_records=limit_records, deadline=deadline
         ):
             stats.messages += 1
+            if message.unreadable:
+                stats.unreadable += 1
+                tally.add_unreadable(message.text)
+                continue
             if (message.uid, message.sequence) != echo_key:
                 echo, echo_key = AssistantEcho(), (message.uid, message.sequence)
             role = message.role.strip().lower()
@@ -346,6 +377,7 @@ def build_report(
             "deadline_reached": stats.deadline_reached,
             "complete": stats.complete,
             "unreferenceable_messages": stats.unreferenceable,
+            "unreadable_messages": stats.unreadable,
             "repeat_min_chars": min_chars,
             "repeat_min_occurrences": min_occurrences,
         },
@@ -419,6 +451,11 @@ def render_report(report: dict[str, Any]) -> str:
                     f"{item['reviewed']:>10}{precision:>11}{'yes' if item['eligible'] else 'no':>10}"
                 )
             lines.append(f"{row['rule']:<18}{row['author']:<13}{name:>8}{cells}")
+    if scan_info["unreadable_messages"]:
+        lines.append(
+            f"{scan_info['unreadable_messages']} message(s) could not be encoded and are counted "
+            "as unknown"
+        )
     lines.append("")
     lines.append(
         "largest categories: "
@@ -910,6 +947,7 @@ def _apply(args: argparse.Namespace) -> int:
         "limited": stats.limited,
         "deadline_reached": stats.deadline_reached,
         "unreferenceable_messages": stats.unreferenceable,
+        "unreadable_messages": stats.unreadable,
         "messages_without_annotation": counts["messages_without_annotation"],
         "owner_spans": counts["owner_spans"],
         "profile_eligible_spans": counts["profile_eligible_spans"],

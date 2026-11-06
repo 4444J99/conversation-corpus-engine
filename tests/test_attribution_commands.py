@@ -6,9 +6,11 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import stat
 import subprocess
 import sys
+import zlib
 from collections import Counter
 from pathlib import Path
 
@@ -863,6 +865,84 @@ def test_review_record_stamps_the_current_utc_time_only_when_none_is_given(
     recorded = json.loads(ledger.read_text(encoding="utf-8"))
     assert recorded["verdict"] == "yes" and recorded["reviewer"] == "rob"
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", recorded["reviewed_at"])
+
+
+# --- messages that cannot be encoded -----------------------------------------------------------
+
+
+def poison_one_message(database: Path, uid_suffix: str, message: int, text: str) -> None:
+    """Rewrite one stored message with `text`, written the way an ensure_ascii writer would, so
+    it reads back with a lone surrogate (the library's own writer cannot store one)."""
+    connection = sqlite3.connect(database)
+    try:
+        uid = next(
+            row[0]
+            for row in connection.execute("SELECT uid FROM records")
+            if row[0].endswith(uid_suffix)
+        )
+        digest = connection.execute(
+            "SELECT current_digest FROM records WHERE uid=?", (uid,)
+        ).fetchone()[0]
+        payload = json.loads(
+            zlib.decompress(
+                connection.execute(
+                    "SELECT payload FROM objects WHERE digest=?", (digest,)
+                ).fetchone()[0]
+            )
+        )
+        payload["messages"][message]["text"] = text
+        packed = zlib.compress(json.dumps(payload, ensure_ascii=True).encode("ascii"))
+        connection.execute("UPDATE objects SET payload=? WHERE digest=?", (packed, digest))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_a_message_with_a_lone_surrogate_is_counted_and_never_aborts_a_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store")
+    poison_one_message(library, "owner-chat", 0, "before \ud800 after")
+    with Library(library) as handle:
+        assert (
+            "\ud800"
+            in handle.record(
+                next(r["uid"] for r in handle.rows() if r["uid"].endswith("owner-chat"))
+            )["messages"][0]["text"]
+        )
+    report = report_of(capsys, library)
+    assert report["scan"]["unreadable_messages"] == 1
+    assert report["partition"]["ok"] is True
+    code, text_report, _ = run_cli(capsys, "--report", "--library", library)
+    assert code == 0 and "could not be encoded" in text_report
+    unattributed = next(r for r in report["rules"] if r["rule"] == "unattributed")
+    assert unattributed["characters"] >= len("before \ud800 after")
+    out = tmp_path / "a.json"
+    entries, result = apply_entries(capsys, library, out, "--owner-id", "rob")
+    assert result["unreadable_messages"] == 1 and entries
+    assert not any(
+        entry["source"]["uid"].endswith("owner-chat")
+        and entry["source"]["sequence"] == "main"
+        and entry["source"]["message"] == 0
+        for entry in entries
+    )
+    sample = tmp_path / "s.jsonl"
+    assert run_cli(capsys, "review-sample", "--library", library, "--out", sample)[0] == 0
+    assert "ud800" not in sample.read_text(encoding="utf-8")
+
+
+def test_the_census_skips_unencodable_messages_instead_of_failing(tmp_path: Path) -> None:
+    library = build_library(tmp_path / "store")
+    poison_one_message(library, "owner-chat", 0, "before \ud800 after " + "x" * 300)
+    with Library(library) as handle:
+        census = build_census(
+            handle,
+            limit_records=None,
+            min_chars=200,
+            min_occurrences=3,
+            deadline=Deadline(60.0),
+        )
+    assert census.later_occurrences("fine words") == ()
 
 
 # --- where the writers may write --------------------------------------------------------------
