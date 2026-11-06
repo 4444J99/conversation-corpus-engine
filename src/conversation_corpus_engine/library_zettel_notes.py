@@ -20,7 +20,7 @@ import json
 import re
 import unicodedata
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -213,7 +213,20 @@ def made_of_quotes(item: dict[str, Any]) -> bool:
     return bool(quoted) and _flat(item["body"]) == quoted and _flat(item["title"]) in quoted
 
 
-def note_authorship(item: dict[str, Any], quotes: Sequence[QuoteAuthorship]) -> Authorship:
+CENSUS_NOT_USED = "per-conversation derivation; library-wide repeat census not used"
+CENSUS_USED = "library-wide repeat census used (opt-in, full-library derivation)"
+
+
+def note_authorship(
+    item: dict[str, Any], quotes: Sequence[QuoteAuthorship], *, repeat_census: bool = False
+) -> Authorship:
+    """`_note_authorship`, with the note saying whether the library-wide repeat census was used."""
+    authorship = _note_authorship(item, quotes)
+    census = CENSUS_USED if repeat_census else CENSUS_NOT_USED
+    return replace(authorship, note=f"{authorship.note}; {census}")
+
+
+def _note_authorship(item: dict[str, Any], quotes: Sequence[QuoteAuthorship]) -> Authorship:
     """The Wiki Standard `authorship` value, `author` and basis of a validated Zettel.
 
     `quotes` holds the class the authorship engine derived for each source span, in order. Nobody
@@ -318,11 +331,12 @@ def _render(
     targets: dict[str, str],
     library_id: str,
     quotes: Sequence[QuoteAuthorship],
+    repeat_census: bool = False,
 ) -> Note:
     caller_id = item["id"]
     created = _day(item.get("created"), "created")
     updated = _day(item.get("updated") or created, "updated")
-    authorship = note_authorship(item, quotes)
+    authorship = note_authorship(item, quotes, repeat_census=repeat_census)
     label, author = authorship.label, authorship.author
     summary = _summary(item["body"])
     links: list[str] = []
@@ -552,12 +566,15 @@ def build_notes(
     zettels: list[dict[str, Any]],
     *,
     deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
+    repeat_census: bool = False,
 ) -> list[Note]:
     """Validate the whole envelope against the library, then render every note or none.
 
     Authorship is derived (see `note_authorship`); no owner identity is taken. The derivation
-    costs one full census pass over the library per export, within `deadline_seconds`; a quote it
-    could not derive in time is `unknown` and the note is never `human`.
+    reads only each quoted conversation (cost per quoted conversation, within `deadline_seconds`
+    for the whole export); a quote it could not derive in time is `unknown` and the note is never
+    `human`. `repeat_census=True` opts in to the library-wide repeat census: a full pass over the
+    whole library.
     Raises `ValueError` listing every refusal; nothing is returned partially.
     """
     if isinstance(deadline_seconds, bool) or not (
@@ -617,12 +634,15 @@ def build_notes(
                 library,
                 [source["source"] for item, _, _ in prepared for source in item["sources"]],
                 deadline_seconds=deadline_seconds,
+                repeat_census=repeat_census,
             )
         )
         for item, identity, title in prepared:
             quotes = [next(derived) for _ in item["sources"]]
             try:
-                notes.append(_render(item, identity, title, targets, library_id, quotes))
+                notes.append(
+                    _render(item, identity, title, targets, library_id, quotes, repeat_census)
+                )
             except ValueError as error:
                 problems.append(f"{item['id']}: {error}")
     if problems:
@@ -691,6 +711,7 @@ def export_zettel_notes(
     *,
     store_root: Path,
     deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
+    repeat_census: bool = False,
 ) -> dict[str, Any]:
     """Validate, render and write the notes; the destination may not overlap the library store.
 
@@ -700,5 +721,7 @@ def export_zettel_notes(
     store = _absolute(store_root).resolve(strict=False)
     if target == store or store in target.parents or target in store.parents:
         raise ValueError("the notes directory must be outside the library store")
-    notes = build_notes(library, zettels, deadline_seconds=deadline_seconds)
+    notes = build_notes(
+        library, zettels, deadline_seconds=deadline_seconds, repeat_census=repeat_census
+    )
     return write_notes(notes, destination)
