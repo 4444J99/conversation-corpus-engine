@@ -86,6 +86,7 @@ from .corpus_store import CorpusStoreError, require_git_private
 from .library_build import DIRECTORY, current_generation
 from .library_commands import STORE_ENV, configured_store, open_library
 from .library_store import Library
+from .origin_hints import OriginHints, load_origin_hints
 
 DEFAULT_DEADLINE_SECONDS = 900.0
 LARGEST_CATEGORIES = 5
@@ -156,10 +157,16 @@ def _unencodable(text: str) -> bool:
 
 
 def iter_messages(
-    library: Library, stats: ScanStats, *, limit_records: int | None, deadline: Deadline
+    library: Library,
+    stats: ScanStats,
+    *,
+    limit_records: int | None,
+    deadline: Deadline,
+    origin_hints: OriginHints | None = None,
 ) -> Iterator[ScannedMessage]:
     """Every nonempty message of the current revision of each record, in uid order: main
-    sequence first, then the alternate sequence, each by message index."""
+    sequence first, then the alternate sequence, each by message index. Git-history origin hints,
+    when given, shape each record's `RecordInfo` (see `record_info`)."""
     stats.records_total = int(
         library.connection.execute("SELECT COUNT(*) FROM records").fetchone()[0]
     )
@@ -171,7 +178,7 @@ def iter_messages(
         deadline.check()
         payload = library.record(row["uid"])
         stats.records_scanned += 1
-        info = record_info(payload)
+        info = record_info(payload, origin_hints)
         extra = payload.get("extra") if isinstance(payload.get("extra"), dict) else {}
         for sequence, messages in (
             ("main", payload.get("messages")),
@@ -282,6 +289,7 @@ def scan(
     limit_records: int | None,
     deadline: Deadline,
     visit: Callable[[ScannedMessage, list[AttributedSpan]], None] | None = None,
+    origin_hints: OriginHints | None = None,
 ) -> tuple[ScanStats, Tally]:
     """Attribute every message of the slice; a deadline during this pass ends it, flagged.
 
@@ -323,7 +331,11 @@ def scan(
 
     try:
         for message in iter_messages(
-            library, stats, limit_records=limit_records, deadline=deadline
+            library,
+            stats,
+            limit_records=limit_records,
+            deadline=deadline,
+            origin_hints=origin_hints,
         ):
             if (message.uid, message.sequence) != echo_key:
                 release()
@@ -745,6 +757,17 @@ def message_entry(
 # --- arguments -------------------------------------------------------------------------------
 
 
+ORIGIN_HINTS_HELP = (
+    "A cce.origin-hints.v1 JSONL file from scripts/git_origin_hints.py (git history of the "
+    "repositories documents came from). Only document-kind records are affected, and only to "
+    "remove owner credit: an agent hint makes the document the agent's, a mixed or ambiguous "
+    "hint makes it unknown, a human hint or no hint changes nothing and never grants owner "
+    "credit. Git cannot see renames, human squashes of agent text, humans committing agent "
+    "output, pre-git text or rewritten history. A malformed row refuses the run. A sample "
+    "drawn with hints must be recorded with the same file"
+)
+
+
 def _positive_int(value: str) -> int:
     try:
         number = int(value)
@@ -823,6 +846,12 @@ def _scan_arguments(parser: argparse.ArgumentParser, *, nested: bool) -> None:
             "The owner identity: the author_id of owner spans, and the only reviewer whose "
             "ledger rows count toward the gate"
         ),
+    )
+    parser.add_argument(
+        "--origin-hints",
+        type=Path,
+        default=default(None),
+        help=ORIGIN_HINTS_HELP,
     )
     parser.add_argument(
         "--json",
@@ -904,6 +933,12 @@ def add_attribute_parser(library_actions: Any) -> None:
     )
     record.add_argument(
         "--reviewed-at", help="UTC time like 2026-01-02T03:04:05Z (default: the current time)"
+    )
+    record.add_argument(
+        "--origin-hints",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="The origin hints the sample was drawn with, if any (same file)",
     )
     record.add_argument(
         "--deadline-seconds",
@@ -1013,6 +1048,21 @@ def _identity(value: str, flag: str) -> str:
     return value
 
 
+def _origin_hints(args: argparse.Namespace) -> OriginHints | None:
+    """The hints file named by --origin-hints. A file with any malformed row is refused: a row
+    that could not be read would give owner credit back."""
+    path = getattr(args, "origin_hints", None)
+    if path is None:
+        return None
+    hints = load_origin_hints(path.expanduser())
+    hints.refuse_findings()
+    return hints
+
+
+def _hints_summary(hints: OriginHints | None) -> dict[str, Any]:
+    return {} if hints is None else {"origin_hints": {"rows": hints.rows}}
+
+
 def _owner(args: argparse.Namespace) -> str | None:
     owner = args.owner_id
     return None if owner is None else _identity(owner, "--owner-id")
@@ -1033,7 +1083,7 @@ def _emit(payload: dict[str, Any], text: str, as_json: bool) -> None:
 
 
 def _report(args: argparse.Namespace) -> int:
-    view, owner = _ledger_view(args), _owner(args)
+    view, owner, hints = _ledger_view(args), _owner(args), _origin_hints(args)
     recorder = MatchRecorder(view.wanted)
     deadline = Deadline(args.deadline_seconds)
     library, _ = _open_target(args)
@@ -1045,6 +1095,7 @@ def _report(args: argparse.Namespace) -> int:
             limit_records=args.limit_records,
             deadline=deadline,
             visit=recorder.visit if view.wanted else None,
+            origin_hints=hints,
         )
     summary = review_statistics(view.rows, matched=recorder.matched, owner=owner)
     report = build_report(
@@ -1056,6 +1107,7 @@ def _report(args: argparse.Namespace) -> int:
         min_chars=args.repeat_min_chars,
         min_occurrences=args.repeat_min_occurrences,
     )
+    report.update(_hints_summary(hints))
     _emit(report, render_report(report), args.json)
     if stats.deadline_reached:
         print("attribute: wall deadline reached; the report is partial", file=sys.stderr)
@@ -1064,7 +1116,7 @@ def _report(args: argparse.Namespace) -> int:
 
 
 def _apply(args: argparse.Namespace) -> int:
-    view, owner = _ledger_view(args), _owner(args)
+    view, owner, hints = _ledger_view(args), _owner(args), _origin_hints(args)
     deadline = Deadline(args.deadline_seconds)
     library, database = _open_target(args)
     with library:
@@ -1079,6 +1131,7 @@ def _apply(args: argparse.Namespace) -> int:
                 limit_records=args.limit_records,
                 deadline=deadline,
                 visit=recorder.visit,
+                origin_hints=hints,
             )
             if gate_stats.deadline_reached:
                 raise DeadlineReached(
@@ -1118,7 +1171,12 @@ def _apply(args: argparse.Namespace) -> int:
 
         try:
             stats, tally = scan(
-                library, census, limit_records=args.limit_records, deadline=deadline, visit=visit
+                library,
+                census,
+                limit_records=args.limit_records,
+                deadline=deadline,
+                visit=visit,
+                origin_hints=hints,
             )
             written = writer.commit(partial=not stats.complete)
         except BaseException:
@@ -1154,7 +1212,7 @@ def _apply(args: argparse.Namespace) -> int:
         "non_owner_rows": summary.non_owner_rows,
         "quarantined_rows": summary.quarantined_rows + view.malformed,
         "superseded_rows": summary.superseded_rows,
-    }
+    } | _hints_summary(hints)
     text = (
         f"wrote {writer.count} annotations for {tally.messages} messages to {written}"
         f" ({counts['owner_spans']} owner spans, {counts['profile_eligible_spans']} profile-eligible"
@@ -1206,6 +1264,7 @@ def _review_sample(args: argparse.Namespace) -> int:
             "owner's reviews count toward the gate"
         )
     view = _ledger_view(args)
+    hints = _origin_hints(args)
     exclude, exclude_texts = _reviewed_by_owner(view.rows, owner)
     deadline = Deadline(args.deadline_seconds)
     library, database = _open_target(args)
@@ -1227,6 +1286,7 @@ def _review_sample(args: argparse.Namespace) -> int:
             visit=lambda message, spans: [
                 sampler.offer(span, message.text[span.start : span.end]) for span in spans
             ],
+            origin_hints=hints,
         )
     partial = not stats.complete
     rows = sampler.rows(partial=partial)
@@ -1249,7 +1309,7 @@ def _review_sample(args: argparse.Namespace) -> int:
         "per_stratum": header["drawn"],
         "complete": stats.complete,
         "partial": partial,
-    }
+    } | _hints_summary(hints)
     if out is None:
         sys.stdout.write(payload)
         print(json.dumps(summary, sort_keys=True), file=sys.stderr)
@@ -1356,6 +1416,7 @@ def _check_the_draw(
     rows: list[dict[str, Any]],
     existing: list[dict[str, Any]],
     seconds: float,
+    origin_hints: OriginHints | None = None,
 ) -> None:
     """Draw again, from the library as it is now and the ledger as it stands, with the header's
     own settings, and refuse the sample unless its rows are exactly that draw (the same span ids
@@ -1386,6 +1447,7 @@ def _check_the_draw(
             visit=lambda message, spans: [
                 sampler.offer(span, message.text[span.start : span.end]) for span in spans
             ],
+            origin_hints=origin_hints,
         )
     if stats.deadline_reached:
         raise DeadlineReached(
@@ -1398,7 +1460,8 @@ def _check_the_draw(
         raise ValueError(
             "this sample is not the draw the rules give for this library and this ledger: "
             f"{_why_not_the_draw(shown, drawn)}. A sample must be exactly what `review-sample` "
-            "draws, in the same order; draw it again and answer all of it"
+            "draws, in the same order; draw it again and answer all of it (a sample drawn with "
+            "--origin-hints is recorded with the same --origin-hints file)"
         )
 
 
@@ -1412,6 +1475,7 @@ def _review_record(args: argparse.Namespace) -> int:
                 f"--ledger is the same file as {flag}: the ledger is append-only and must be a "
                 f"file of its own, or the verdicts would be written into the {flag[2:]} file"
             )
+    hints = _origin_hints(args)
     database = _database_path(args)
     ledger = check_ledger_path(args.ledger, library_roots(args, database))
     sample = parse_sample(args.sample.read_text(encoding="utf-8").split("\n"))
@@ -1469,7 +1533,7 @@ def _review_record(args: argparse.Namespace) -> int:
         if state not in checked:
             # While the ledger is locked (a ledger that does not exist yet has nothing to lock,
             # and is checked before it is created, then again if it changed meanwhile).
-            _check_the_draw(database, header, sample.rows, existing, args.deadline_seconds)
+            _check_the_draw(database, header, sample.rows, existing, args.deadline_seconds, hints)
             checked.add(state)
 
     appended = append_rows(ledger, rows, precondition=drawn_against_this_ledger)
