@@ -32,6 +32,7 @@ import itertools
 import json
 import os
 import re
+import unicodedata
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -1171,15 +1172,32 @@ def _subtract(free: list[Range], pieces: list[Claim]) -> list[Range]:
     return result
 
 
+# Characters that show nothing: spaces, line breaks, control characters and the zero-width and
+# other format characters (U+200B, U+FEFF, U+2060, ...). Text made only of these is nobody's.
+_BLANK_CATEGORIES = frozenset({"Cf", "Zs", "Zl", "Zp", "Cc"})
+
+
+def is_blank(char: str) -> bool:
+    return char.isspace() or unicodedata.category(char) in _BLANK_CATEGORIES
+
+
+def blank_text(text: str) -> bool:
+    return all(is_blank(char) for char in text)
+
+
 def _trimmed(text: str, pieces: list[Claim]) -> list[Claim]:
-    """An owner span never starts or ends with whitespace, and is never only whitespace."""
+    """An owner span never starts or ends with a blank character (see `is_blank`) and is never
+    only blank characters."""
     result: list[Claim] = []
     for start, end, detail in pieces:
-        segment = text[start:end]
-        lead = len(segment) - len(segment.lstrip())
-        trail = len(segment) - len(segment.rstrip())
-        if lead + trail < len(segment):
-            result.append((start + lead, end - trail, detail))
+        first, last = start, end
+        while first < last and is_blank(text[first]):
+            first += 1
+        if first == last:
+            continue
+        while is_blank(text[last - 1]):
+            last -= 1
+        result.append((first, last, detail))
     return result
 
 
@@ -1662,7 +1680,7 @@ class ReviewSampler:
 
     def offer(self, span: AttributedSpan, text: str) -> None:
         """Consider one span; `text` is exactly the span's own characters."""
-        if span.rule not in RULE_BY_ID or span.author == UNKNOWN or not text.strip():
+        if span.rule not in RULE_BY_ID or span.author == UNKNOWN or blank_text(text):
             return
         identifier = span.span_id
         if identifier in self.exclude:

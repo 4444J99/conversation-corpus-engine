@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import time
+import unicodedata
 
 import pytest
 
@@ -517,6 +518,26 @@ def test_owner_spans_never_start_or_end_with_whitespace() -> None:
     ]
     blank = "   \n\n  "
     assert view(blank, run(blank)) == [("unattributed", "unknown", blank)]
+
+
+@pytest.mark.parametrize(
+    "invisible",
+    ["\u200b\u200b", "\ufeff", "\u200d\u2060", "\u3000\u00a0", " \u200b ", "\u200e\u200f"],
+)
+def test_a_span_of_only_zero_width_or_format_characters_is_never_owner(invisible: str) -> None:
+    assert view(invisible, run(invisible)) == [("unattributed", "unknown", invisible)]
+
+
+def test_owner_spans_trim_zero_width_and_format_characters_at_their_edges() -> None:
+    text = "\u200b hello world \u200b\ufeff"
+    assert view(text, run(text)) == [
+        ("unattributed", "unknown", "\u200b "),
+        ("typed_prefix", "owner", "hello world"),
+        ("unattributed", "unknown", " \u200b\ufeff"),
+    ]
+    assert [t for _, a, t in view("\ufeffHello", run("\ufeffHello")) if a == "owner"] == ["Hello"]
+    inside = "zero\u200bwidth"
+    assert [t for _, a, t in view(inside, run(inside)) if a == "owner"] == [inside]
 
 
 def test_agent_family_rule_function_directly() -> None:
@@ -1209,6 +1230,8 @@ def block(rng: random.Random) -> str:
         ),
         lambda: "\n".join(f"ERROR: {prose(rng)}" for _ in range(rng.randint(1, 4))),
         lambda: " " * rng.randint(1, 4),
+        lambda: "\u200b" * rng.randint(1, 3),
+        lambda: " \u200b\ufeff ",
         lambda: "a < b > c",
         lambda: "\t" + body,
         lambda: f"<pasted_content>{body}</pasted_content>",
@@ -1219,6 +1242,10 @@ def block(rng: random.Random) -> str:
         lambda: f"> {body}\n{prose(rng)}",
     ]
     return rng.choice(makers)()
+
+
+def blank(char: str) -> bool:
+    return char.isspace() or unicodedata.category(char) in {"Cf", "Zs", "Zl", "Zp", "Cc"}
 
 
 def check_partition(context: MessageContext, spans: list[AttributedSpan]) -> None:
@@ -1248,8 +1275,8 @@ def check_partition(context: MessageContext, spans: list[AttributedSpan]) -> Non
             assert span.rule in {"typed_prefix", "note_owner"}
             assert not chars & non_owner
             assert chars <= raw[span.rule]
-            assert text[span.start].strip()
-            assert text[span.end - 1].strip()
+            assert not blank(text[span.start])
+            assert not blank(text[span.end - 1])
         if span.rule == "unattributed":
             assert span.author == "unknown"
             assert not chars & non_owner
@@ -1259,7 +1286,7 @@ def check_partition(context: MessageContext, spans: list[AttributedSpan]) -> Non
         claimed = index in non_owner or index in owner_raw
         if not claimed:
             assert owner_of[index].rule == "unattributed"
-        elif index not in non_owner and text[index].strip():
+        elif index not in non_owner and not blank(text[index]):
             assert owner_of[index].author == "owner"
 
 

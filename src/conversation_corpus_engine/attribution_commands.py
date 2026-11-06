@@ -58,6 +58,7 @@ from .attribution_rules import (
     ReviewSummary,
     append_ledger,
     attribute_message,
+    blank_text,
     eligible_strata,
     ledger_row,
     partition_problems,
@@ -226,7 +227,7 @@ class Tally:
             self.stratum_spans[(span.rule, span.stratum)] += 1
             self.stratum_characters[(span.rule, span.stratum)] += span.end - span.start
             self.covered_characters += span.end - span.start
-            if span.rule == UNATTRIBUTED and not text[span.start : span.end].strip():
+            if span.rule == UNATTRIBUTED and blank_text(text[span.start : span.end]):
                 self.unattributed_whitespace += span.end - span.start
         for name, count in partition_problems(text, spans, text_digest(text)).items():
             self.problems[name] += count
