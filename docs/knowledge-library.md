@@ -145,7 +145,7 @@ A capture tool that fetches saved web pages writes *shards*: JSONL files with on
 
 **Search.** A hit of a web capture carries `capture`: `url` (the requested URL), `final_url`, `captured_at`, `content_digest` and `http_status`, beside the usual fields; hits of other providers are unchanged. `cce library read UID` shows the full provenance.
 
-**Authorship.** A page is another party's text. The authorship engine labels every character of a record from the `webcapture` family `third_party` through its own first rule, whatever the role, channel or typed count says and whatever the URL or text looks like; it can never be `owner`. See [attributed knowledge](attributed-knowledge.md#rule-precedence).
+**Authorship.** A page is another party's text. The authorship engine labels every character of a record whose provider is `webcapture` (compared stripped and case-folded) `third_party` through its own first rule, whatever the role, channel or typed count says, whatever the record's kind or wing is, whichever intake brought it in, and whatever the URL or text looks like; it can never be `owner`. See [attributed knowledge](attributed-knowledge.md#rule-precedence).
 
 **Duplicates, failures and refusals.**
 

@@ -132,10 +132,43 @@ def test_only_the_third_party_family_marks_a_record_third_party() -> None:
     assert record_info(page).third_party_origin == "family:webcapture"
     for other in (
         {"provider": "chatgpt", "kind": "page", "extra": {"wing": "ai"}},
-        {"provider": "webcapture", "kind": "chat", "extra": {"wing": "ai"}},
+        {"provider": "webcaptures", "kind": "page", "extra": {"wing": "ai"}},
         {"provider": "documents", "kind": "document", "extra": {"wing": "authored"}},
+        {"provider": "", "kind": "page", "extra": {"wing": "ai"}},
     ):
         assert record_info(other).third_party_origin == ""
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"provider": "webcapture", "kind": "chat", "extra": {"wing": "ai"}},
+        {"provider": "webcapture", "kind": "page", "extra": {"wing": "authored"}},
+        {"provider": "webcapture", "kind": "note", "extra": {"wing": "authored"}},
+        {"provider": "webcapture"},
+        {"provider": "WebCapture", "kind": "page", "extra": {"wing": "ai"}},
+        {"provider": " webcapture\n", "kind": "chat", "extra": {"wing": "authored"}},
+        {"provider": "WEBCAPTURE", "kind": "", "extra": None},
+    ],
+)
+def test_the_provider_alone_marks_a_webcapture_record_third_party(payload) -> None:
+    info = record_info(payload)
+    assert info.third_party_origin == "family:webcapture"
+    text = "I typed this myself."
+    for role, channel, typed in (
+        ("user", "typed", len(text)),
+        ("assistant", "reply", 0),
+        ("tool", "tool", 0),
+        ("system", "project", 3),
+    ):
+        spans = run(text, role=role, channel=channel, typed=typed, record=info)
+        assert view(text, spans) == [("third_party_origin", "third_party", text)]
+
+
+def test_a_record_info_built_by_hand_with_only_the_provider_is_still_third_party() -> None:
+    text = "I typed this myself."
+    spans = run(text, record=RecordInfo(provider="webcapture"))
+    assert view(text, spans) == [("third_party_origin", "third_party", text)]
 
 
 def test_unclaimed_text_is_unknown_never_owner() -> None:

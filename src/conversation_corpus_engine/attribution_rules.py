@@ -159,6 +159,23 @@ class RecordInfo:
     third_party_origin: str = ""
 
 
+def third_party_origin_of(provider: Any) -> str:
+    """`family:<name>` when the provider is one of a third-party family, else ''.
+
+    The provider alone decides: the record's kind, wing, role and channel play no part, so a
+    record of that provider arriving through any intake cannot be credited to the owner. The
+    word is compared stripped and case-folded."""
+    word = str(provider or "").strip().casefold()
+    return next(
+        (
+            f"family:{family.name}"
+            for family in FAMILIES
+            if family.third_party and word == family.library_provider
+        ),
+        "",
+    )
+
+
 def record_info(payload: Mapping[str, Any]) -> RecordInfo:
     """Derive the rule inputs from a library record payload (a `Conversation.to_dict()`)."""
     extra = payload.get("extra") if isinstance(payload.get("extra"), Mapping) else {}
@@ -190,14 +207,7 @@ def record_info(payload: Mapping[str, Any]) -> RecordInfo:
                 origin = f"text:{marker}" if marker else ""
             if authored and kind in NOTE_KINDS and not ai_marker:
                 ai_marker = _ai_marker(body)
-    third_party = next(
-        (
-            f"family:{family.name}"
-            for family in FAMILIES
-            if family.third_party and family.selects(row)
-        ),
-        "",
-    )
+    third_party = third_party_origin_of(provider)
     return RecordInfo(
         provider=provider,
         kind=kind,
@@ -286,7 +296,7 @@ def rule_third_party_origin(context: MessageContext) -> list[Claim]:
     party's text, whatever its role, channel or typed count says and whatever its URL or body
     looks like. It runs before every other rule so that no later rule, owner or agent, can take a
     character of it."""
-    origin = context.record.third_party_origin
+    origin = context.record.third_party_origin or third_party_origin_of(context.record.provider)
     return [(0, len(context.text), f"origin={origin}")] if origin else []
 
 
