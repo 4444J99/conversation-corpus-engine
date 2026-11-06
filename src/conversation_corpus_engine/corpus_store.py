@@ -75,6 +75,29 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
     return True
 
 
+# Variables that tell git where a repository is, or hide it. Left in, GIT_DIR=/nonexistent makes git
+# answer "not a git repository" for every directory, which the guards would read as "outside every
+# work tree". Configuration variables (GIT_CONFIG_GLOBAL and the like) are kept: they are how a
+# developer's own ignore rules reach git, and the guards are meant to honour them.
+GIT_LOCATION_VARIABLES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_NAMESPACE",
+)
+
+
+def _git_environment() -> dict[str, str]:
+    environment = {
+        name: value for name, value in os.environ.items() if name not in GIT_LOCATION_VARIABLES
+    }
+    environment["LC_ALL"] = "C"  # git's messages are matched by text below
+    return environment
+
+
 def _run_git(cwd: Path, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", str(cwd), *args],
@@ -82,16 +105,26 @@ def _run_git(cwd: Path, *args: str, stdin: str | None = None) -> subprocess.Comp
         capture_output=True,
         text=True,
         input=stdin,
-        env={**os.environ, "LC_ALL": "C"},  # git's messages are matched by text below
+        env=_git_environment(),
     )
+
+
+def _enclosing_dot_git(path: Path) -> Path | None:
+    """The nearest `.git` (a directory, or the file of a linked work tree) at or above `path`."""
+    for candidate in (path, *path.parents):
+        marker = candidate / ".git"
+        if marker.exists() or marker.is_symlink():
+            return marker
+    return None
 
 
 def _git_root(path: Path) -> Path | None:
     """The work tree `path` sits in, or None when it sits in none.
 
-    None means exactly one thing: git said this is not a repository. Any other failure (no git
-    binary, a permission error, an ownership refusal) is raised, because treating it as "outside
-    every work tree" would let private text land somewhere Git can see.
+    None means exactly one thing: git said this is not a repository, and no `.git` exists at or
+    above `path` to contradict it (git says the same of a damaged `.git`). Any other failure (no
+    git binary, a permission error, an ownership refusal) is raised, because treating it as
+    "outside every work tree" would let private text land somewhere Git can see.
     """
     try:
         result = _run_git(path, "rev-parse", "--show-toplevel")
@@ -99,6 +132,12 @@ def _git_root(path: Path) -> Path | None:
         raise CorpusStoreError(f"Could not run git to inspect {path}: {exc}") from exc
     if result.returncode != 0:
         if result.returncode == NOT_A_REPOSITORY_EXIT and NOT_A_REPOSITORY in result.stderr:
+            marker = _enclosing_dot_git(path)
+            if marker is not None:
+                raise CorpusStoreError(
+                    f"git could not inspect {path}: it says this is not a repository, but "
+                    f"{marker} exists, so the answer cannot be trusted"
+                )
             return None
         raise CorpusStoreError(
             f"git could not inspect {path} (exit {result.returncode}): "
@@ -251,6 +290,10 @@ def require_git_private(directory: Path) -> Path:
     `.git/info/exclude`, the global excludes file, negations) and nothing is created to find out.
     The directory may not exist yet. Symlinks are followed first, so the answer is for where the
     text would really land.
+
+    Git runs without the variables that relocate or hide a repository (`GIT_LOCATION_VARIABLES`),
+    and its "not a git repository" counts as "outside every work tree" only when no `.git` exists
+    at or above the path. Any other failure to run or understand git is an error, never a pass.
     """
     resolved = _absolute_path(directory).resolve(strict=False)
     probe = resolved
