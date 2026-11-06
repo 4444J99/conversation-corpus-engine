@@ -40,9 +40,15 @@ from .library_note_text import (
     facet_stem,
     inert_lines,
     plain,
+    safe_uid,
 )
 from .library_store import Library, canonical_json
-from .library_vault_gate import DEFAULT_CAPS, VaultCaps
+from .library_vault_gate import (
+    DEFAULT_CAPS,
+    VaultCaps,
+    hard_cap_problems,
+    measure_planned,
+)
 
 PROFILE_NONE = "none"
 PROFILE_CARDS = "cards"
@@ -62,6 +68,8 @@ FACET_CHARS = 80
 EXCERPT_CHARS = 400
 SOURCE_CHARS = 300
 URI_CHARS = 1024
+# A record's header lists this many parents; the rest are counted, not listed.
+MAX_PARENTS = 20
 # Page paths are measured as if two bucket folders deep, the deepest the plan can need here.
 NOMINAL_FOLDERS = "bucket-all-b000/bucket-all-b000"
 
@@ -322,12 +330,31 @@ def _nav(paths: list[str], index: int) -> str:
     return " - ".join(pieces)
 
 
+def _parent_links(
+    library: Library, uid: str, record_path: dict[str, str]
+) -> tuple[list[tuple[str, str | None]], int]:
+    """The first MAX_PARENTS parents of a record (with their note, if in the vault) and the rest."""
+    connection = library.connection
+    total = connection.execute(
+        "SELECT COUNT(*) FROM relations WHERE src=? AND kind='parent'", (uid,)
+    ).fetchone()[0]
+    shown = [
+        (safe_uid(relation["dst"]), record_path.get(relation["dst"]))
+        for relation in connection.execute(
+            "SELECT dst FROM relations WHERE src=? AND kind='parent' ORDER BY dst LIMIT ?",
+            (uid, MAX_PARENTS),
+        )
+    ]
+    return shown, total - len(shown)
+
+
 def _record_texts(
     row: dict[str, Any],
     bodies: list[str],
     paths: list[str],
     *,
     parents: list[tuple[str, str | None]],
+    more_parents: int,
     hub_path: dict[str, str],
     home_path: str,
     entry_doc: str | None,
@@ -346,6 +373,11 @@ def _record_texts(
                     head.append(f"- Parent record: {parent} (not present in this vault)\n")
                 else:
                     head.append(f"- [Parent record: {parent}]({_href(here, parent_path)})\n")
+            if more_parents:
+                head.append(
+                    f"- {more_parents} more parent records are not listed here; "
+                    "the library database and graph.jsonl hold every relation\n"
+                )
             reader = (
                 f"[agent entry]({_href(here, entry_doc)})"
                 if entry_doc
@@ -424,7 +456,11 @@ def _recency(row: dict[str, Any]) -> str:
 
 @dataclass
 class VaultPlan:
-    """A vault ready to render: its note paths and counts are known, nothing is written."""
+    """A vault fully rendered in memory and already measured; nothing is written.
+
+    Every note exists as text, so the planning pass measures the real notes, folders and hub pages
+    against all of the hard caps and refuses before a single file is written.
+    """
 
     profile: str
     paths: dict[str, str | None]
@@ -435,18 +471,37 @@ class VaultPlan:
     notes: int
     limit_notes: int | None
     caps: VaultCaps
-    render: Callable[[], Iterator[tuple[str, str]]]
+    files: list[tuple[str, str]]
+    gate: dict[str, Any]
 
     def write(self, emit: Callable[[str, str], None]) -> dict[str, int]:
-        """Hand every note to ``emit``, enforcing the hard caps on what is actually produced."""
+        """Hand every note to ``emit``; the caps are re-checked on what is actually produced."""
         notes = size = 0
-        for path, text in self.render():
+        for path, text in self.files:
             notes += 1
             size += utf8_size(text)
             if notes > self.caps.vault_notes_fail or size > self.caps.vault_bytes_fail:
                 raise _refusal(self.profile, f"{notes} notes and {size} bytes so far", self.caps)
             emit(path, text)
         return {"notes": notes, "bytes": size}
+
+
+def _gate_planned(
+    profile: str, files: list[tuple[str, str]], prefix: str, caps: VaultCaps
+) -> dict[str, Any]:
+    """Measure the rendered notes against every hard cap; raise before anything is written."""
+    report = measure_planned(dict(files), caps, root=prefix)
+    if not report["ok"]:
+        advice = (
+            "Rebuild with --vault-profile cards for a capped card vault, or --vault-profile none"
+            if profile == PROFILE_FULL
+            else "Lower --limit-notes, or use --vault-profile none"
+        )
+        raise VaultRefused(
+            f"the {profile} vault would break its hard caps ({'; '.join(hard_cap_problems(report))}). "
+            f"Nothing was written. {advice}"
+        )
+    return report
 
 
 def _home(
@@ -514,38 +569,30 @@ def _plan_full(
         raise _refusal(PROFILE_FULL, f"{notes} notes", caps)
     home_path = prefix + "Home.md"
     groups = {key: len(members) for key, members in _facet_groups(rows).items()}
-    known = set(record_path)
-
-    def render() -> Iterator[tuple[str, str]]:
-        for row in rows:
-            uid = row["uid"]
-            check(check_callback)
-            parts = bodies.pop(uid)
-            paths = [
-                record_path[uid],
-                *(part_path[f"{uid}-p{n:03d}"] for n in range(2, len(parts) + 1)),
-            ]
-            parents = [
-                (
-                    relation["dst"],
-                    record_path.get(relation["dst"]) if relation["dst"] in known else None,
-                )
-                for relation in library.connection.execute(
-                    "SELECT dst FROM relations WHERE src=? AND kind='parent' ORDER BY dst", (uid,)
-                )
-            ]
-            texts = _record_texts(
-                row,
-                parts,
-                paths,
-                parents=parents,
-                hub_path=hub_path,
-                home_path=home_path,
-                entry_doc=entry_doc,
-            )
-            yield from zip(paths, texts, strict=True)
-        yield from _hub_notes(hubs, hub_path, home_path)
-        yield (
+    files: list[tuple[str, str]] = []
+    for row in rows:
+        uid = row["uid"]
+        check(check_callback)
+        parts = bodies.pop(uid)
+        paths = [
+            record_path[uid],
+            *(part_path[f"{uid}-p{n:03d}"] for n in range(2, len(parts) + 1)),
+        ]
+        parents, more_parents = _parent_links(library, uid, record_path)
+        texts = _record_texts(
+            row,
+            parts,
+            paths,
+            parents=parents,
+            more_parents=more_parents,
+            hub_path=hub_path,
+            home_path=home_path,
+            entry_doc=entry_doc,
+        )
+        files.extend(zip(paths, texts, strict=True))
+    files.extend(_hub_notes(hubs, hub_path, home_path))
+    files.append(
+        (
             home_path,
             _home(
                 [
@@ -562,7 +609,8 @@ def _plan_full(
                 "inert Markdown evidence; generated navigation links are separate.",
             ),
         )
-
+    )
+    gate = _gate_planned(PROFILE_FULL, files, prefix, caps)
     return VaultPlan(
         PROFILE_FULL,
         {row["uid"]: record_path[row["uid"]] for row in rows},
@@ -570,10 +618,11 @@ def _plan_full(
         None,
         False,
         0,
-        notes,
+        len(files),
         None,
         caps,
-        render,
+        files,
+        gate,
     )
 
 
@@ -625,7 +674,6 @@ def _plan_cards(
     card_path = _placed([row["uid"] for row in chosen], prefix, "cards", caps)
     hubs = _hubs(chosen, lambda row: card_path[row["uid"]], caps)
     hub_path = _hub_paths(hubs, prefix, caps)
-    notes = count + _page_count(hubs) + 1
     omitted = len(rows) - count
     home_path = prefix + "Home.md"
     groups = {key: len(members) for key, members in _facet_groups(chosen).items()}
@@ -649,11 +697,12 @@ def _plan_cards(
         'cce library read UID --store-root "$STORE" --message 0 --offset 0 --limit 12000\n```\n\n'
     )
 
-    def render() -> Iterator[tuple[str, str]]:
-        for row in chosen:
-            check(check_callback)
-            uid = row["uid"]
-            yield (
+    files: list[tuple[str, str]] = []
+    for row in chosen:
+        check(check_callback)
+        uid = row["uid"]
+        files.append(
+            (
                 card_path[uid],
                 _card_text(
                     row,
@@ -664,8 +713,10 @@ def _plan_cards(
                     entry_doc=entry_doc,
                 ),
             )
-        yield from _hub_notes(hubs, hub_path, home_path)
-        yield (
+        )
+    files.extend(_hub_notes(hubs, hub_path, home_path))
+    files.append(
+        (
             home_path,
             _home(
                 [status, commands],
@@ -677,7 +728,8 @@ def _plan_cards(
                 "separate.",
             ),
         )
-
+    )
+    gate = _gate_planned(PROFILE_CARDS, files, prefix, caps)
     return VaultPlan(
         PROFILE_CARDS,
         {row["uid"]: card_path.get(row["uid"]) for row in rows},
@@ -685,10 +737,11 @@ def _plan_cards(
         count,
         bool(omitted),
         omitted,
-        notes,
+        len(files),
         limit,
         caps,
-        render,
+        files,
+        gate,
     )
 
 
@@ -720,7 +773,8 @@ def plan_vault(
             0,
             None,
             caps,
-            lambda: iter(()),
+            [],
+            measure_planned({}, caps, root=prefix),
         )
     if profile == PROFILE_FULL:
         if limit_notes is not None:

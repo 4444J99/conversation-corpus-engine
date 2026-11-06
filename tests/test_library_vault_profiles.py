@@ -212,6 +212,77 @@ def test_full_refuses_before_writing_when_the_bytes_would_pass_the_hard_cap(
         assert not destination.exists()
 
 
+def test_full_refuses_before_writing_when_a_note_would_pass_the_hard_cap(tmp_path: Path) -> None:
+    caps = VaultCaps(note_target=1024, note_warn=2048, note_fail=2048)
+    with Library.create(tmp_path / "library.sqlite") as library:
+        library.put(
+            Conversation(
+                provider="chatgpt",
+                source_id="heavy",
+                title="[" * 150,  # each bracket escapes to five bytes in the header
+                messages=[Message(role="user", text=sentinel_lines("H", 60))],
+                extra={"wing": "ai", "lane": "conversations"},
+            )
+        )
+        destination = tmp_path / "export"
+        with pytest.raises(ValueError, match="note_size") as raised:
+            export_library(library, destination, vault_profile="full", caps=caps)
+        assert "hard cap" in str(raised.value) and "--vault-profile cards" in str(raised.value)
+        assert not destination.exists()
+
+
+def test_full_refuses_before_writing_when_a_folder_would_pass_the_hard_cap(
+    tmp_path: Path,
+) -> None:
+    caps = VaultCaps(folder_warn=2, folder_fail=2)
+    with synthetic_library(tmp_path, 5) as library:
+        destination = tmp_path / "export"
+        with pytest.raises(ValueError, match="folder_entries"):
+            export_library(library, destination, vault_profile="full", caps=caps)
+        assert not destination.exists()
+
+
+def test_cards_refuse_before_writing_when_a_card_would_pass_the_hard_cap(tmp_path: Path) -> None:
+    caps = VaultCaps(note_target=1024, note_warn=2048, note_fail=2048)
+    with Library.create(tmp_path / "library.sqlite") as library:
+        library.put(
+            Conversation(
+                provider="chatgpt",
+                source_id="brackets",
+                title="Escapes grow",
+                messages=[Message(role="user", text="[" * 1000)],
+                extra={"wing": "ai", "lane": "conversations"},
+            )
+        )
+        destination = tmp_path / "export"
+        with pytest.raises(ValueError, match="note_size"):
+            export_library(library, destination, vault_profile="cards", caps=caps)
+        assert not destination.exists()
+
+
+def add_parents(library: Library, uid: str, count: int) -> None:
+    library.connection.executemany(
+        "INSERT INTO relations VALUES (?,?,?,?)",
+        [(uid, f"chatgpt-parent{n:05d}", "parent", "{}") for n in range(count)],
+    )
+    library.connection.commit()
+
+
+def test_a_record_with_thousands_of_parents_keeps_its_first_part_small(tmp_path: Path) -> None:
+    with synthetic_library(tmp_path, 3) as library:
+        uid = next(iter(library.rows()))["uid"]
+        add_parents(library, uid, 5000)
+        destination = tmp_path / "export"
+        export_library(library, destination, vault_profile="full")
+        row = next(r for r in index_of(destination) if r["uid"] == uid)
+        first = (destination / row["path"]).read_text(encoding="utf-8")
+        assert len(first.encode()) < 16 * KIB
+        assert first.count("Parent record") <= 21  # a bounded list plus the statement
+        assert "4980 more parent records" in first
+        assert measure_vault(destination / "vault")["clean"]
+        assert verify_export(destination) == []
+
+
 def test_cards_write_one_small_card_per_record_and_never_copy_the_body(tmp_path: Path) -> None:
     with synthetic_library(tmp_path, 30, lines=lambda number: 800) as library:
         destination = tmp_path / "export"
