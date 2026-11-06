@@ -30,6 +30,7 @@ from conversation_corpus_engine.attribution_rules import (
     RULES_VERSION,
     SAMPLE_PER_STRATUM,
     SAMPLE_SCHEMA,
+    SAMPLE_SEED,
     STRATA,
     AttributedSpan,
     RecordInfo,
@@ -42,6 +43,7 @@ from conversation_corpus_engine.attribution_rules import (
     eligible_strata,
     parse_ledger,
     parse_sample,
+    preview_only_reasons,
     read_ledger,
     review_excerpt,
     review_statistics,
@@ -963,6 +965,35 @@ def test_a_sample_document_round_trips_and_its_digest_ignores_the_answers() -> N
     assert sample_digest(answered) == header["sample_digest"]
     assert parse_sample(sample_text(header, answered).splitlines()).rows == answered
     assert sample_digest(rows) != sample_digest(rows[:-1])
+
+
+def test_a_sample_is_recordable_only_when_it_is_the_default_draw_over_the_whole_library() -> None:
+    header, rows = drawn_sample()
+    assert header["seed"] == SAMPLE_SEED and header["partial"] is False
+    assert (header["repeat_min_chars"], header["repeat_min_occurrences"]) == (200, 3)
+    assert preview_only_reasons(header) == []
+    assert preview_only_reasons({**header, "partial": True}) == [
+        "it covers only part of the library (a record limit or the deadline cut the scan)"
+    ]
+    assert "another seed" in preview_only_reasons({**header, "seed": "s1"})[0]
+    assert "repeat-census" in preview_only_reasons({**header, "repeat_min_chars": 100})[0]
+    assert "repeat-census" in preview_only_reasons({**header, "repeat_min_occurrences": 5})[0]
+    assert len(preview_only_reasons({**header, "seed": "s", "partial": True})) == 2
+    odd = sample_header(
+        rows,
+        library="f" * 64,
+        owner_id=OWNER_ID,
+        seed="s",
+        per_stratum=5,
+        partial=False,
+        repeat_min_chars=50,
+        repeat_min_occurrences=2,
+    )
+    assert (odd["repeat_min_chars"], odd["repeat_min_occurrences"]) == (50, 2)
+    for key in ("repeat_min_chars", "repeat_min_occurrences"):
+        bad = {**header, key: 0}
+        with pytest.raises(ValueError, match=key):
+            parse_sample(sample_lines(bad, rows))
 
 
 def sample_lines(header: dict, rows: list[dict]) -> list[str]:

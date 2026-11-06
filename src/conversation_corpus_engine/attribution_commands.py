@@ -68,6 +68,7 @@ from .attribution_rules import (
     load_json_line,
     parse_sample,
     partition_problems,
+    preview_only_reasons,
     read_ledger,
     record_info,
     review_statistics,
@@ -1166,6 +1167,8 @@ def _review_sample(args: argparse.Namespace) -> int:
         seed=args.seed,
         per_stratum=args.per_stratum,
         partial=partial,
+        repeat_min_chars=args.repeat_min_chars,
+        repeat_min_occurrences=args.repeat_min_occurrences,
     )
     payload = sample_text(header, rows)
     summary = {
@@ -1245,6 +1248,12 @@ def _review_record(args: argparse.Namespace) -> int:
     ledger = check_ledger_path(args.ledger, library_roots(args, database))
     sample = parse_sample(args.sample.read_text(encoding="utf-8").split("\n"))
     header = sample.header
+    preview = preview_only_reasons(header)
+    if preview:
+        raise ValueError(
+            f"this sample cannot be recorded: {'; '.join(preview)}. It is a preview; draw the "
+            "sample again with the default seed and repeat-census settings over the whole library"
+        )
     if reviewer != header["owner_id"]:
         raise ValueError(
             "this sample was drawn for another owner identity; only that owner can record it"

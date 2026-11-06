@@ -1291,6 +1291,68 @@ def test_a_row_counts_only_if_the_scans_span_has_the_text_it_answered(
     assert result["text_mismatch_rows"] == 1 and result["eligible_strata"] == []
 
 
+@pytest.mark.parametrize(
+    ("extra", "reason"),
+    [
+        (("--seed", "another-seed"), "another seed"),
+        (("--limit-records", "2"), "only part of the library"),
+        (("--repeat-min-chars", "100"), "repeat-census"),
+        (("--repeat-min-occurrences", "5"), "repeat-census"),
+    ],
+)
+def test_only_the_default_draw_over_the_whole_library_can_be_recorded(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], extra: tuple[str, ...], reason: str
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=5)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    code, _, err = run_cli(
+        capsys,
+        "review-sample",
+        "--owner-id",
+        "rob",
+        "--library",
+        library,
+        "--out",
+        sample,
+        *extra,
+    )
+    assert code == 0, err
+    preview = sample if sample.exists() else sample.with_name("s.jsonl.partial")
+    answers.write_text("", encoding="utf-8")
+    code, _, err = record_answers(capsys, library, ledger, preview, answers)
+    assert code == 2 and "cannot be recorded" in err and reason in err, err
+    assert not ledger.exists()
+
+
+def test_a_bigger_or_smaller_batch_of_the_default_draw_can_still_be_recorded(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=30)
+    ledger = tmp_path / "l.jsonl"
+    seen: set[str] = set()
+    for number, size in enumerate(("3", "7")):
+        sample, answers = tmp_path / f"s{number}.jsonl", tmp_path / f"a{number}.jsonl"
+        extra = ("--ledger", ledger) if ledger.exists() else ()
+        run_cli(
+            capsys,
+            "review-sample",
+            "--owner-id",
+            "rob",
+            "--library",
+            library,
+            *extra,
+            "--per-stratum",
+            size,
+            "--out",
+            sample,
+        )
+        ids = {row["span_id"] for row in sample_rows(sample)}
+        assert ids and seen.isdisjoint(ids)
+        seen |= ids
+        answers.write_text("", encoding="utf-8")
+        assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
+
+
 def test_review_record_needs_the_sample_it_answers(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

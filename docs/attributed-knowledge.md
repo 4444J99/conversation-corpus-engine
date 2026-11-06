@@ -493,9 +493,18 @@ can append rows with real span ids and the owner's name, and the gate cannot tel
 owner's own; the sample digest and the library fingerprint are integrity checks that anyone can
 recompute, not authentication. The gate protects against mistakes, omission and fabrication
 (made-up ids, a rule or text edited in a row, an edited sample, a reviewer that is not the owner,
-blank rows dropped), not against an adversary holding the owner's permissions. Nor can it know a
-sample that was drawn and never recorded: a different `--seed` draws a different sample, so
-record every sample you draw.
+blank rows dropped, samples chosen among many draws), not against an adversary holding the
+owner's permissions.
+
+**No choosing among draws.** If any sample could be recorded, the rows to answer could be chosen
+by drawing under many seeds, record limits or census settings and recording only the good-looking
+draws. So only the default draw over the whole library can be recorded: `review-record` refuses a
+sample whose header says `partial: true` (a `--limit-records` or deadline slice), a `seed` other
+than the default, or `repeat_min_chars` / `repeat_min_occurrences` other than the defaults (200 and
+3). The draw is then fixed by the library, the ledger and the owner, and skipping a recording
+only brings the same rows back. `--seed`, `--limit-records`, `--deadline-seconds` and the
+`--repeat-min-*` options remain for previewing a sample. The batch size (`--per-stratum`) is
+free: a smaller batch is a prefix of a larger one.
 
 The ledger is append-only JSONL, one object per line with exactly these keys: `schema`
 (`cce.attribution-review-ledger.v3`), `rules_version`, `span_id`, `rule`, `stratum` (`S`, `M` or
@@ -528,7 +537,8 @@ the span text, the SHA-256 of the full span text, the rule and its description, 
 class and the stratum, nothing about the record. The first line of the file is a **header**:
 the row count, a SHA-256 digest over the rows (answers left out), the library fingerprint (a digest
 of every record's uid, version and revision digest), the owner the sample was drawn for, the seed,
-and the number of rows drawn per `rule:stratum`. Passing `--ledger` leaves out only the spans the
+the repeat-census settings, whether the scan was cut short (`partial`) and the number of rows drawn
+per `rule:stratum`. Passing `--ledger` leaves out only the spans the
 owner (`--owner-id`) already reviewed: a current row of that identity whose rule, stratum and text
 hash match the span in this scan. Rows of other reviewers, rows of other versions and rows naming
 spans that are not in the scan hide nothing. Without `--out` the sample goes to standard

@@ -2211,6 +2211,8 @@ _SAMPLE_HEADER_KEYS = frozenset(
         "seed",
         "per_stratum",
         "partial",
+        "repeat_min_chars",
+        "repeat_min_occurrences",
         "drawn",
     }
 )
@@ -2248,9 +2250,12 @@ def sample_header(
     seed: str,
     per_stratum: int,
     partial: bool,
+    repeat_min_chars: int = DEFAULT_REPEAT_MIN_CHARS,
+    repeat_min_occurrences: int = DEFAULT_REPEAT_MIN_OCCURRENCES,
 ) -> dict[str, Any]:
     """The first line of a sample file: it counts and digests the rows and names the library
-    (its fingerprint) and the owner the sample was drawn for."""
+    (its fingerprint), the owner the sample was drawn for, and the settings that decide which
+    spans exist and in what order they are drawn (seed, repeat census)."""
     return {
         "schema": SAMPLE_HEADER_SCHEMA,
         "rules_version": RULES_VERSION,
@@ -2261,8 +2266,31 @@ def sample_header(
         "seed": seed,
         "per_stratum": per_stratum,
         "partial": partial,
+        "repeat_min_chars": repeat_min_chars,
+        "repeat_min_occurrences": repeat_min_occurrences,
         "drawn": drawn_counts(rows),
     }
+
+
+def preview_only_reasons(header: Mapping[str, Any]) -> list[str]:
+    """Why a sample may be looked at but not recorded, else an empty list. Only the default draw
+    over the whole library can be recorded: its rows are fixed by the library, the ledger and the
+    owner, so skipping a recording only brings the same rows back. A sample drawn with another
+    seed, over part of the library or with other repeat-census settings is a different draw, and
+    choosing among such draws would be choosing the rows to answer."""
+    reasons = []
+    if header["partial"]:
+        reasons.append(
+            "it covers only part of the library (a record limit or the deadline cut the scan)"
+        )
+    if header["seed"] != SAMPLE_SEED:
+        reasons.append(f"it was drawn with another seed ({header['seed']!r})")
+    if (header["repeat_min_chars"], header["repeat_min_occurrences"]) != (
+        DEFAULT_REPEAT_MIN_CHARS,
+        DEFAULT_REPEAT_MIN_OCCURRENCES,
+    ):
+        reasons.append("it was drawn with other repeat-census settings")
+    return reasons
 
 
 def sample_text(header: Mapping[str, Any], rows: Iterable[Mapping[str, Any]]) -> str:
@@ -2357,6 +2385,9 @@ def parse_sample(lines: Iterable[str]) -> ReviewSample:
     for key in ("library", "owner_id"):
         if not isinstance(header[key], str) or not header[key].strip():
             problems.append(f"the header needs a {key}")
+    for key in ("repeat_min_chars", "repeat_min_occurrences"):
+        if isinstance(header[key], bool) or not isinstance(header[key], int) or header[key] < 1:
+            problems.append(f"the header needs a positive {key}")
     if problems:
         raise ValueError(f"sample was altered or is not a sample: {'; '.join(problems)}")
     return ReviewSample(header=dict(header), rows=rows)
