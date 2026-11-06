@@ -116,6 +116,8 @@ import ZIP. Library builds now emit a stable progress event at the start of ever
 (including previously silent fingerprint, verify, and artifact stages) with elapsed_seconds,
 and byte-limit failures include measured numbers for sizing retries. See [docs/knowledge-library.md](docs/knowledge-library.md).
 
+`cce library attribute` labels who wrote each span of each message (owner, agent, third party or unknown) with deterministic rules, and nothing is profile-eligible until the owner has reviewed a sample and the precision gate is met; see [docs/attributed-knowledge.md](docs/attributed-knowledge.md).
+
 Example:
 
 ```bash

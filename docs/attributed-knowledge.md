@@ -429,7 +429,29 @@ percent of the cases (0 percent when the same pieces are consecutive turns). Pas
 beyond the indexed head are not recognised either. The length strata and the owner's review stay
 as defence in depth for what slips through: a paste that was not carved and is typed as one turn
 is a `typed_prefix` span that the owner is shown in a sample and rejects, and one rejection
-rejects the text everywhere. Only the first 400,000 match-form characters of an assistant turn are
+rejects the text everywhere.
+
+More limits, stated with what was measured (300 generated cases each):
+
+- **A mosaic spread over several paragraphs.** Fragments stack only inside one paragraph. Eight
+  paragraphs of two verbatim fragments of 40 to 46 characters each, one blank line between the
+  paragraphs, are carved in 0 of 300 cases: every paragraph is under the 100-character total.
+  The owner's review is the remaining defence.
+- **Repeated owner phrases.** The fragment rule can carve genuine owner text. A stock phrase of 32
+  to 37 characters that the assistant once restated, and that the owner then uses three or more
+  times in one paragraph, makes the paragraph carve whole: 255 of 300 at three uses, 300 of 300 at
+  four. That costs recall only.
+- **Strata use raw length, text identity the visible form.** A stratum is decided on the raw
+  character length of a span, while "the same text" is its visible form. Variants padded with
+  invisible characters can therefore fall on either side of 240 or 2000 characters, and one text
+  may be shown once per stratum and counted once in each.
+- **Format characters depend on the interpreter.** Which characters are deleted as format (Cf) or
+  control (Cc) characters comes from the Unicode data of the Python that runs the command, so a
+  newer interpreter can treat a recently added character differently. A row's key is recomputed
+  from the scan for every span the scan finds, so this changes what counts as the same text, not
+  what a row binds to.
+
+Only the first 400,000 match-form characters of an assistant turn are
 indexed, at most 400,000 characters of assistant text are indexed per conversation (the oldest
 turns go first, the newest included in the count), and each indexed turn is kept as an array of
 64-bit window hashes and its normalized head, never its full text.

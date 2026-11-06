@@ -779,7 +779,12 @@ def _scan_arguments(parser: argparse.ArgumentParser, *, nested: bool) -> None:
         help="A library.sqlite file, a generation folder or a store folder (default: the store)",
     )
     parser.add_argument(
-        "--store-root", "--corpus-store-root", dest="store_root", type=Path, default=default(None)
+        "--store-root",
+        "--corpus-store-root",
+        dest="store_root",
+        type=Path,
+        default=default(None),
+        help="The library store folder (alias --corpus-store-root; default: the configured store)",
     )
     parser.add_argument(
         "--limit-records",
@@ -859,7 +864,11 @@ def add_attribute_parser(library_actions: Any) -> None:
         default=SAMPLE_PER_STRATUM,
         help="Spans drawn for each rule and length stratum (S, M, L)",
     )
-    sample.add_argument("--seed", default=SAMPLE_SEED)
+    sample.add_argument(
+        "--seed",
+        default=SAMPLE_SEED,
+        help="Draw seed; only the default seed gives a sample that review-record accepts",
+    )
     sample.add_argument("--out", type=Path, help="New JSONL file (default: standard output)")
     record = sub.add_parser(
         "review-record", help="Append the owner's verdicts on a sample to the review ledger"
@@ -876,13 +885,23 @@ def add_attribute_parser(library_actions: Any) -> None:
         dest="store_root",
         type=Path,
         default=argparse.SUPPRESS,
+        help="The library store folder (alias --corpus-store-root)",
     )
-    record.add_argument("--ledger", type=Path, required=True)
+    record.add_argument(
+        "--ledger",
+        type=Path,
+        required=True,
+        help="Append-only review ledger (JSONL); must be a file of its own, not the sample",
+    )
     record.add_argument(
         "--sample", type=Path, required=True, help="The review-sample file the answers belong to"
     )
     record.add_argument("--answers", type=Path, required=True, help="The sample, answered")
-    record.add_argument("--reviewer", required=True)
+    record.add_argument(
+        "--reviewer",
+        required=True,
+        help="The reviewer identity; it must be the owner the sample was drawn for",
+    )
     record.add_argument(
         "--reviewed-at", help="UTC time like 2026-01-02T03:04:05Z (default: the current time)"
     )
@@ -895,7 +914,12 @@ def add_attribute_parser(library_actions: Any) -> None:
             f"(default {DEFAULT_DEADLINE_SECONDS:g})"
         ),
     )
-    record.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    record.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Print JSON instead of text",
+    )
 
 
 # --- command handlers ------------------------------------------------------------------------
