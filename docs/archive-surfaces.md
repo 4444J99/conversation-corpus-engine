@@ -501,7 +501,10 @@ moves an existing conversation page URL.
   added, changed and removed (continued on linked pages past the cap) above a table of the last
   20 generations, and each conversation page ends with a *History* section: its newest 8
   revisions, linking to their row on that page while the generation is still in the table.
-  Nothing is derived by diffing pages.
+  Nothing is derived by diffing pages. The ledger row is written before the digest file, so an
+  ingest that dies between the two is completed by running it again on the same sources (the
+  row is not recorded twice and its changes are not lost), and a lost digest file is rewritten
+  by an ingest of unchanged sources without adding a generation.
 
 `cce archive verify` (and the verify that closes `build`) reports a `wiki` block (pages,
 messages and messages anchored, pages with a table of contents, backlink and history pages,

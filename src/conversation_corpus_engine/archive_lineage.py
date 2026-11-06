@@ -63,8 +63,17 @@ def record_generation(
     provider that has no digests yet (a store that predates the lineage, merged one provider at
     a time) is digested from the shards it already holds, through `digest_store(provider)`, so
     its conversations are part of this generation's baseline and not "added" by the next one.
-    Nothing is written when the sources are unchanged (same fingerprint, no uid differs).
+    Nothing is recorded when the sources are unchanged (same fingerprint, no uid differs).
+
+    The ledger row is written before the digest file, because the next ingest diffs against the
+    digests: written the other way round, a crash between the two would leave a baseline that
+    already holds this generation's changes and no row to say what they were. Written in this
+    order, a crash leaves the row and a baseline one generation behind, and rerunning the same
+    sources finds that its changes are the last row's and records nothing twice; a baseline that
+    is simply gone is rewritten the same way, since sources whose fingerprint is the last row's
+    hold exactly what its generation held.
     """
+    baseline_present = paths.digests.is_file()
     previous = load_digests(paths)
     read_now = set(read)
     current: dict[str, dict[str, str]] = {}
@@ -93,8 +102,17 @@ def record_generation(
         "changed": changed,
         "removed": removed,
     }
-    if ledger and ledger[-1]["fingerprint"] == fingerprint and not (added or changed or removed):
-        record = None
+    if ledger and ledger[-1]["fingerprint"] == fingerprint:
+        last = ledger[-1]
+        interrupted = last["conversations"] == len(after) and (added, changed, removed) == (
+            last["added"],
+            last["changed"],
+            last["removed"],
+        )  # the last row is this very generation, whose baseline write did not complete
+        if not (added or changed or removed) or not baseline_present or interrupted:
+            record = None
+    if record is not None:
+        write_jsonl_atomic(paths.lineage, [*ledger, record])
     write_jsonl_atomic(
         paths.digests,
         (
@@ -103,8 +121,6 @@ def record_generation(
             for uid, digest in sorted(rows.items())
         ),
     )
-    if record is not None:
-        write_jsonl_atomic(paths.lineage, [*ledger, record])
     return record
 
 
