@@ -11,6 +11,7 @@ from conversation_corpus_engine.attribution import text_digest
 from conversation_corpus_engine.attribution_rules import (
     RULES,
     RULES_VERSION,
+    AssistantEcho,
     AttributedSpan,
     MessageContext,
     RecordInfo,
@@ -27,6 +28,7 @@ from conversation_corpus_engine.attribution_rules import (
     rule_inline_injection,
     rule_log_trace,
     rule_note_owner,
+    rule_pasted_back,
     rule_pasted_block,
     rule_quote,
     rule_typed_prefix,
@@ -47,6 +49,7 @@ def ctx(
     meta: dict | None = None,
     record: RecordInfo = CHAT,
     boilerplate: tuple = (),
+    pasted_back: tuple = (),
 ) -> MessageContext:
     return MessageContext(
         text=text,
@@ -56,6 +59,7 @@ def ctx(
         meta=meta or {},
         record=record,
         boilerplate=boilerplate,
+        pasted_back=pasted_back,
     )
 
 
@@ -69,6 +73,7 @@ def run(text: str, **kwargs) -> list[AttributedSpan]:
         meta=context.meta,
         record=context.record,
         boilerplate=context.boilerplate,
+        pasted_back=context.pasted_back,
     )
 
 
@@ -863,6 +868,83 @@ def test_boilerplate_rule_passes_the_census_ranges_through() -> None:
     assert rule_boilerplate(ctx("abcdefgh")) == []
 
 
+# --- pasted-back assistant text ---------------------------------------------------------------
+
+ANSWER = " ".join(
+    f"Sentence {i} of the assistant answer explains point {i * 3} about the parser."
+    for i in range(12)
+)
+
+
+def shared_with_answer(length: int, filler: int = 60) -> str:
+    """A 600+ character paragraph that shares exactly `length` characters with ANSWER."""
+    start = next(
+        i
+        for i in range(200, 400)
+        if ANSWER[i - 1] != " " and ANSWER[i] != " " and ANSWER[i + length] != " "
+    )
+    middle = ANSWER[start : start + length]
+    padding = " ".join(f"unrelated{i}" for i in range(filler))
+    return f"{padding} #{middle}# {padding}"
+
+
+def test_a_long_paragraph_pasted_back_from_an_earlier_assistant_turn_is_third_party() -> None:
+    assert len(ANSWER) >= 600
+    echo = AssistantEcho()
+    echo.add_assistant(ANSWER)
+    text = f"Please check this:\n\n{ANSWER}\n\nThanks."
+    start = text.index(ANSWER)
+    assert echo.pasted_back(text) == ((start, start + len(ANSWER)),)
+    spans = attribute_message(
+        text,
+        role="user",
+        channel="typed",
+        typed_chars=len(text),
+        record=CHAT,
+        pasted_back=echo.pasted_back(text),
+    )
+    assert [(s.rule, s.author, text[s.start : s.end]) for s in spans if s.author != "unknown"] == [
+        ("typed_prefix", "owner", "Please check this:"),
+        ("pasted_back", "third_party", ANSWER),
+        ("typed_prefix", "owner", "Thanks."),
+    ]
+    assert rule_pasted_back(ctx("abcdefgh", pasted_back=((0, 4), (6, 8)))) == [
+        (0, 4, "pasted-back"),
+        (6, 8, "pasted-back"),
+    ]
+    assert rule_pasted_back(ctx("abcdefgh")) == []
+
+
+def test_pasted_back_text_needs_600_characters_and_100_shared_characters() -> None:
+    echo = AssistantEcho()
+    echo.add_assistant(ANSWER)
+    assert echo.pasted_back(f"short:\n\n{ANSWER[:500]}") == ()
+    shared_99 = shared_with_answer(99)
+    shared_100 = shared_with_answer(100)
+    assert len(shared_99) >= 600 and len(shared_100) >= 600
+    assert echo.pasted_back(shared_99) == ()
+    assert echo.pasted_back(shared_100) == ((0, len(shared_100)),)
+    reflowed = ANSWER.replace(". ", ".\n")
+    assert echo.pasted_back(reflowed) == ((0, len(reflowed)),)
+
+
+def test_only_earlier_assistant_turns_of_the_same_conversation_count() -> None:
+    echo = AssistantEcho()
+    assert echo.pasted_back(ANSWER) == ()
+    echo.add_assistant(ANSWER)
+    assert echo.pasted_back(ANSWER) != ()
+    assert AssistantEcho().pasted_back(ANSWER) == ()
+
+
+def test_the_echo_remembers_a_bounded_amount_of_assistant_text() -> None:
+    echo = AssistantEcho(history_limit=1000)
+    echo.add_assistant(ANSWER)
+    echo.add_assistant(" ".join(f"Another unrelated reply sentence {i}." for i in range(30)))
+    assert echo.pasted_back(ANSWER) == ()
+    with pytest.raises(ValueError, match="positive"):
+        AssistantEcho(min_paragraph=0)
+
+
 # --- notes: agent sections, pasted emails and tables ------------------------------------------
 
 
@@ -1059,6 +1141,7 @@ def test_the_rule_table_has_one_documented_order() -> None:
         ("log_trace", "agent"),
         ("pasted_block", "third_party"),
         ("boilerplate", "third_party"),
+        ("pasted_back", "third_party"),
         ("ambiguous", "unknown"),
         ("typed_prefix", "owner"),
         ("note_owner", "owner"),

@@ -23,6 +23,11 @@ CODE_LOG_TURN = (
 )
 ODD_QUOTE_TURN = 'She measured 5" by 6 and wrote it down.'
 TABLE_TURN = "| Name | Cost |\n|---|---|\n| Rent | 1200 |"
+ECHO_ANSWER = " ".join(
+    f"Sentence {i} of the assistant answer explains point {i * 3} about the parser."
+    for i in range(12)
+)
+ECHO_QUESTION = "Can you double check this answer you gave earlier?"
 CLI_TURN = "Rename the parser module.\n\nHarness appended context nobody typed."
 CLI_TYPED = len("Rename the parser module.")
 NOTE_TURN = "My thoughts.\n\n> pasted from a website\n\nMore thoughts."
@@ -93,6 +98,18 @@ def conversations(
                 typed("c0", CLI_TURN, typed_chars=CLI_TYPED),
                 Message(role="tool", channel="tool", id="c1", text='{"tool": "result"}'),
                 typed("c2", "<system-reminder>Injected reminder.</system-reminder>\nthen words"),
+            ],
+            extra={"wing": "ai", "lane": "coding", "session_kind": "main"},
+        ),
+        Conversation(
+            provider="claudecode",
+            source_id="cli-echo",
+            title="CLI echo",
+            kind="session",
+            messages=[
+                typed("e0", "Review the repository."),
+                Message(role="assistant", channel="reply", id="e1", text=ECHO_ANSWER),
+                typed("e2", f"{ECHO_QUESTION}\n\n{ECHO_ANSWER}"),
             ],
             extra={"wing": "ai", "lane": "coding", "session_kind": "main"},
         ),

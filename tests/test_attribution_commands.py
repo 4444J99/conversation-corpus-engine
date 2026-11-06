@@ -10,7 +10,7 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
-from attribution_support import build_library
+from attribution_support import ECHO_ANSWER, ECHO_QUESTION, build_library
 
 from conversation_corpus_engine import attribution_commands
 from conversation_corpus_engine.attributed_knowledge import collect_owner_segments
@@ -176,7 +176,8 @@ def test_report_counts_the_boilerplate_copies_and_honours_thresholds(
     assert boilerplate_spans() == 3
     assert boilerplate_spans("--repeat-min-occurrences", "5") == 0
     assert boilerplate_spans("--repeat-min-chars", "100000") == 0
-    assert boilerplate_spans("--repeat-min-occurrences", "2") == 3
+    # With two occurrences enough, the answer pasted back into the CLI session repeats too.
+    assert boilerplate_spans("--repeat-min-occurrences", "2") == 4
 
 
 def test_report_accepts_a_generation_folder(
@@ -523,6 +524,31 @@ def test_a_hand_damaged_ledger_is_reported_not_fatal(
     assert report["profile_eligible"] == []
     code, _, err = run_cli(capsys, "--report", "--library", library, "--ledger", ledger)
     assert code == 0, err
+
+
+def test_an_answer_pasted_back_into_a_cli_session_is_not_owner_text(
+    library_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    report = report_of(capsys, library_path)
+    assert next(r for r in report["rules"] if r["rule"] == "pasted_back")["spans"] == 1
+    entries, _ = apply_entries(capsys, library_path, tmp_path / "echo.json", "--owner-id", "rob")
+    with Library(library_path) as library:
+        found = [
+            (entry, message_text(library, entry["source"]))
+            for entry in entries
+            if entry["source"]["uid"].endswith("cli-echo") and entry["source"]["message"] == 2
+        ]
+    ((entry, text),) = found
+    spans = attributed_spans(text, entry["attribution"])
+    owner = [span["text"] for span in spans if span["author"] == "owner"]
+    assert owner == [ECHO_QUESTION]
+    pasted = [
+        span
+        for span in spans
+        if span["evidence"] and span["evidence"][0].endswith(":rule:pasted_back")
+    ]
+    assert [span["text"] for span in pasted] == [ECHO_ANSWER]
+    assert pasted[0]["author"] == "third_party"
 
 
 def test_a_limited_scan_counts_only_the_spans_it_saw(

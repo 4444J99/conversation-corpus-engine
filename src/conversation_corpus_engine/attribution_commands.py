@@ -49,6 +49,7 @@ from .attribution_rules import (
     UNATTRIBUTED,
     UNKNOWN,
     VERDICTS,
+    AssistantEcho,
     AttributedSpan,
     RecordInfo,
     RepeatCensus,
@@ -239,11 +240,20 @@ def scan(
 ) -> tuple[ScanStats, Tally]:
     """Attribute every message of the slice; a deadline during this pass ends it, flagged."""
     stats, tally = ScanStats(), Tally()
+    echo, echo_key = AssistantEcho(), None
     try:
         for message in iter_messages(
             library, stats, limit_records=limit_records, deadline=deadline
         ):
             stats.messages += 1
+            if (message.uid, message.sequence) != echo_key:
+                echo, echo_key = AssistantEcho(), (message.uid, message.sequence)
+            role = message.role.strip().lower()
+            pasted: tuple[tuple[int, int], ...] = ()
+            if role in {"assistant", "model"}:
+                echo.add_assistant(message.text)
+            elif role == "user":
+                pasted = echo.pasted_back(message.text)
             spans = attribute_message(
                 message.text,
                 role=message.role,
@@ -252,6 +262,7 @@ def scan(
                 meta=message.meta,
                 record=message.record,
                 boilerplate=census.later_occurrences(message.text),
+                pasted_back=pasted,
             )
             tally.add(message.text, spans)
             if not message.referenceable:

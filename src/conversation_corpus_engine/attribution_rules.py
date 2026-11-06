@@ -212,6 +212,8 @@ class MessageContext:
     record: RecordInfo = field(default_factory=RecordInfo)
     # Character ranges the repeated-span census flagged as later occurrences (rule f).
     boilerplate: tuple[Range, ...] = ()
+    # Paragraphs that repeat text of an earlier assistant turn of the same conversation.
+    pasted_back: tuple[Range, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -844,6 +846,97 @@ def rule_boilerplate(context: MessageContext) -> list[Claim]:
     return [(start, end, "verbatim-repeat") for start, end in context.boilerplate]
 
 
+# --- pasted-back assistant text ---------------------------------------------------------------
+
+DEFAULT_ECHO_MIN_PARAGRAPH = 600
+DEFAULT_ECHO_MIN_SHARED = 100
+DEFAULT_ECHO_HISTORY = 400_000
+
+
+class AssistantEcho:
+    """Finds text a user turn pastes back from an earlier assistant turn of its conversation.
+
+    Feed the conversation's turns in order: `add_assistant` for each assistant reply and
+    `pasted_back` for each user turn. A paragraph of the user turn that is at least
+    `min_paragraph` characters long and shares at least `min_shared` characters (after
+    whitespace normalization) with an earlier assistant turn is returned as a range. Only the
+    most recent `history_limit` normalized characters of assistant text are remembered, and the
+    index is built only when a user turn has a paragraph long enough to need it.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_paragraph: int = DEFAULT_ECHO_MIN_PARAGRAPH,
+        min_shared: int = DEFAULT_ECHO_MIN_SHARED,
+        history_limit: int = DEFAULT_ECHO_HISTORY,
+    ) -> None:
+        for name, value in (
+            ("min_paragraph", min_paragraph),
+            ("min_shared", min_shared),
+            ("history_limit", history_limit),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        self.min_paragraph = min_paragraph
+        self.min_shared = min_shared
+        self.history_limit = history_limit
+        self._turns: list[str] = []
+        self._size = 0
+        self._index: set[int] | None = None
+
+    def add_assistant(self, text: str) -> None:
+        normalized = " ".join(text.split())
+        if len(normalized) < self.min_shared:
+            return
+        self._turns.append(normalized)
+        self._size += len(normalized)
+        while self._size > self.history_limit and len(self._turns) > 1:
+            self._size -= len(self._turns.pop(0))
+        self._index = None
+
+    def _windows(self) -> set[int]:
+        if self._index is None:
+            width = self.min_shared
+            self._index = {
+                hash(turn[i : i + width])
+                for turn in self._turns
+                for i in range(len(turn) - width + 1)
+            }
+        return self._index
+
+    def _shares(self, normalized: str) -> bool:
+        width = self.min_shared
+        if not self._turns or len(normalized) < width:
+            return False
+        index = self._windows()
+        for i in range(len(normalized) - width + 1):
+            window = normalized[i : i + width]
+            if hash(window) in index and any(window in turn for turn in self._turns):
+                return True
+        return False
+
+    def pasted_back(self, text: str) -> tuple[Range, ...]:
+        claimed: list[Range] = []
+        if not self._turns:
+            return ()
+        for start, end in _paragraphs(_lines(text)):
+            piece = text[start:end]
+            stripped = piece.strip()
+            if len(stripped) < self.min_paragraph:
+                continue
+            if self._shares(" ".join(stripped.split())):
+                lead = len(piece) - len(piece.lstrip())
+                claimed.append((start + lead, start + lead + len(stripped)))
+        return tuple(claimed)
+
+
+def rule_pasted_back(context: MessageContext) -> list[Claim]:
+    """A long paragraph a user turn pastes back from an earlier assistant turn was written by the
+    assistant, not by the person."""
+    return [(start, end, "pasted-back") for start, end in context.pasted_back]
+
+
 # --- ambiguous text: unknown, never owner -----------------------------------------------------
 
 
@@ -994,6 +1087,12 @@ RULES: tuple[Rule, ...] = (
         rule_boilerplate,
     ),
     Rule(
+        "pasted_back",
+        THIRD_PARTY,
+        "a long paragraph repeated from an earlier assistant turn of the same conversation",
+        rule_pasted_back,
+    ),
+    Rule(
         "ambiguous",
         UNKNOWN,
         "text whose authorship cannot be told (unpaired quotes, an AI-marked note); never owner",
@@ -1108,6 +1207,7 @@ def attribute_message(
     meta: Mapping[str, Any] | None = None,
     record: RecordInfo | None = None,
     boilerplate: Sequence[Range] = (),
+    pasted_back: Sequence[Range] = (),
 ) -> list[AttributedSpan]:
     """Partition one message into spans, first rule wins; leftovers are `unknown`."""
     if not isinstance(text, str):
@@ -1123,6 +1223,7 @@ def attribute_message(
         meta=meta if isinstance(meta, Mapping) else {},
         record=record or RecordInfo(),
         boilerplate=tuple(boilerplate),
+        pasted_back=tuple(pasted_back),
     )
     digest = text_digest(text)
     free: list[Range] = [(0, length)]
