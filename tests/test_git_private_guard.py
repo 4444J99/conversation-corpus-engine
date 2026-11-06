@@ -348,6 +348,43 @@ def test_library_export_cards_refuses_a_git_visible_output_before_touching_the_s
     assert not (repo / "cards").exists() and not missing_store.exists()
 
 
+# --- the environment the answer depends on (documented in "Where private text may be written") ---
+
+
+def test_git_config_global_devnull_does_not_hide_the_default_global_excludes_file(
+    tmp_path, monkeypatch
+) -> None:
+    """GIT_CONFIG_GLOBAL=/dev/null hides the config file, not `$XDG_CONFIG_HOME/git/ignore`, so a
+    developer's own excludes file still decides unless HOME and XDG_CONFIG_HOME are redirected."""
+    excludes = tmp_path / "xdg" / "git" / "ignore"
+    excludes.parent.mkdir(parents=True)
+    excludes.write_text("ignored/\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    repo = make_repo(tmp_path)
+    assert require_git_private(repo / "ignored") == (repo / "ignored")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "elsewhere"))
+    with pytest.raises(CorpusStoreError, match="Git-visible"):
+        require_git_private(repo / "ignored")
+
+
+@pytest.mark.parametrize("how", ["count", "parameters"])
+def test_process_scoped_git_config_is_passed_on_and_counts(tmp_path, monkeypatch, how) -> None:
+    """An excludes file set through GIT_CONFIG_COUNT/KEY/VALUE or GIT_CONFIG_PARAMETERS reaches
+    the git processes the guard starts, on purpose: it is how a caller's own rules are honoured."""
+    excludes = tmp_path / "scoped-ignore"
+    excludes.write_text("ignored/\n", encoding="utf-8")
+    repo = make_repo(tmp_path)
+    with pytest.raises(CorpusStoreError, match="Git-visible"):
+        require_git_private(repo / "ignored")
+    if how == "count":
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", "core.excludesFile")
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", str(excludes))
+    else:
+        monkeypatch.setenv("GIT_CONFIG_PARAMETERS", f"'core.excludesfile'='{excludes}'")
+    assert require_git_private(repo / "ignored") == (repo / "ignored")
+
+
 # --- spelling: on a case-insensitive volume the caller's case is not the disk's case -------------
 
 

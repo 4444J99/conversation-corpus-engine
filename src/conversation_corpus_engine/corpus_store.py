@@ -360,6 +360,15 @@ def require_git_private(directory: Path) -> Path:
     and its "not a git repository" counts as "outside every work tree" only when no `.git` exists
     at or above the path. Any other failure to run or understand git is an error, never a pass.
 
+    The answer is Git's, asked in the caller's environment, so it can differ between a developer's
+    shell and a clean one. `GIT_CONFIG_GLOBAL=/dev/null` hides the global config file but not the
+    default global excludes file (`$XDG_CONFIG_HOME/git/ignore`, else `~/.config/git/ignore`),
+    which is still read: isolating a run takes `HOME` and `XDG_CONFIG_HOME` as well. Process-scoped
+    configuration (`GIT_CONFIG_COUNT` with its `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`, and
+    `GIT_CONFIG_PARAMETERS`) is passed to git on purpose, so an excludes file set that way counts.
+    `git` is found on `PATH`: one that cannot run is an error, but a stand-in that answers
+    wrongly is not detected.
+
     This says whether the text would be visible to Git, not that it is secret. It does not stop
     `git add -f`, a hook or tool that bypasses ignore rules, or a backup or sync client; it does
     not look at a repository's tracked files outside the directory; and a directory that ignores
