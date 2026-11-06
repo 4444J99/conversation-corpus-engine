@@ -1256,6 +1256,28 @@ def test_one_paragraph_per_user_turn_counts_across_consecutive_turns() -> None:
     assert echo.pasted_back_turns(turns[:2]) + echo.pasted_back_turns(turns[2:]) != []
 
 
+def test_a_mosaic_of_short_fragments_in_one_paragraph_is_the_documented_limit() -> None:
+    """Verbatim fragments shorter than the 60-character window, joined by the owner's own words
+    inside one paragraph, share no 60-character stretch and are not whole paragraphs, so they are
+    not carved however many there are. The documented boundary (docs, "The boundary, exactly")
+    is the window: the same fragments at 60 or more characters are carved."""
+    echo = AssistantEcho()
+    echo.add_assistant(ANSWER)
+    form = normalized(ANSWER)
+
+    def mosaic(size: int, count: int) -> str:
+        pieces = [form[10 + 110 * index : 10 + 110 * index + size] for index in range(count)]
+        return " and then ".join(piece.strip() for piece in pieces) + "."
+
+    for size in (30, 40, 55):  # (56 to 59 can run into the glue's first letters: partly carved)
+        text = mosaic(size, 6)
+        assert len(match_form(text)) > 200
+        assert echo.pasted_back(text) == (), size
+    for size in (60, 70):
+        text = mosaic(size, 6)
+        assert echo.pasted_back(text) == ((0, len(text)),), size
+
+
 def test_a_fenced_code_block_between_pasted_paragraphs_does_not_break_the_run() -> None:
     echo = AssistantEcho()
     echo.add_assistant("\n\n".join(LINES))

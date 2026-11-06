@@ -386,19 +386,33 @@ inline in a sentence is carved in 0.4 percent, one of 60 to 95 characters in 99 
 verifier's 20-to-95 shape in 50 percent; one quote of 20 to 95 characters as its own paragraph in
 46 percent; two such paragraphs in 73 percent; three quotes of 20 to 59 characters as separate
 paragraphs, which stack to the 100-character total, in 77 percent (0 percent before the echo-hit
-rule). That is the accepted conservative cost: text that is verbatim an assistant's, in amounts that
-add up, is not the owner's, and what is lost is recall, never precision. **Invisible characters,
+rule). **The boundary, exactly:** text is carved when it holds a verbatim stretch of 60 or more
+match-form characters shared with an earlier assistant turn of the conversation, or when it is made
+of whole paragraphs, of 20 or more match-form characters each, that are pieces of one earlier
+assistant turn and add up to 100 or more; what that costs is recall, never precision. Verbatim
+text below those sizes is not carved (see the mosaic, below). **Invisible characters,
 measured (300 generated pastes per shape: an assistant answer of five paragraphs of about 1,500
 characters, or of eight paragraphs of 20 to 59 characters, pasted back into one turn):** with U+2060 every 7 characters, U+200B or U+00AD every 15, or U+200B every 40, the
 paste was fully carved in 0, 0, 0 and 56 percent of the long-paragraph pastes and in 0, 0, 0 and
 11 percent of the short-paragraph pastes before the match form deleted such characters, and in
 100 percent of both after, the same as the unmarked paste; three copies of a 350-character
 paragraph with the later copies marked differently were found as boilerplate in 0 percent before
-and 100 percent after, and the carve table above is unchanged. **Known limits:** pieces
-pasted in turns with an assistant reply between them (a stretch ends at an assistant turn, so a
-"noted" between two pastes starts a new stretch), pastes from another conversation, and pastes of
-text beyond the indexed head are not recognised; the length strata below stay as defence in depth
-for what slips through. Only the first 400,000 match-form characters of an assistant turn are
+and 100 percent after, and the carve table above is unchanged. **Known limits, measured
+on 300 generated cases each, none of them solved:** a **mosaic**, verbatim fragments of an answer
+each shorter than 60 match-form characters joined by the owner's own words inside one paragraph,
+is not carved however many fragments there are, because no 60-character stretch is shared and the
+100-character total counts whole paragraphs only (6 to 10 fragments of 20 to 29, 30 to 39 and 40
+to 55 characters: carved in 0 percent of the pastes; of 56 to 59 characters: 33 percent; of 60 to
+70 characters: 100 percent). A stacking rule over fragments of 30 characters or more was
+considered and not built: a window that short also matches stock phrases that people and
+assistants both write, and what carving them costs can only be measured on real text, not on
+generated text. Eight short pieces (20 to 59 characters) of an answer pasted in turns with an
+assistant reply between each (a stretch ends at an assistant turn, so a "noted" between two pastes
+starts a new stretch), or pasted from another conversation, are credited to the owner in 100
+percent of the cases (0 percent when the same pieces are consecutive turns). Pastes of text
+beyond the indexed head are not recognised either. The length strata and the owner's review stay
+as defence in depth for what slips through: a mosaic typed as one turn is a `typed_prefix` span
+that the owner is shown in a sample and rejects, and one rejection rejects the text everywhere. Only the first 400,000 match-form characters of an assistant turn are
 indexed, at most 400,000 characters of assistant text are indexed per conversation (the oldest
 turns go first, the newest included in the count), and each indexed turn is kept as an array of
 64-bit window hashes and its normalized head, never its full text.
