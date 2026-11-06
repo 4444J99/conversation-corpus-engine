@@ -356,22 +356,41 @@ costs recall.
 before it in the same conversation. Both sides are put in a match form (NFKC, case-folded, list
 markers and numbering, emphasis, headings, backticks, punctuation, smart quotes and dashes dropped,
 whitespace collapsed), so re-casing, rewrapping, bulleting, renumbering or stripping markup does not
-hide a paste. A paragraph of at least 60 match-form characters that holds a stretch of 60 or more
-characters shared with an assistant turn is pasted back; so is a run of adjacent paragraphs, each
-touched by a match, whose joined text is at least 300 characters (as written or in match form) and
-that holds a shared stretch of at least 100. Fenced code blocks between the paragraphs of a run do
-not break it, and consecutive user turns with no assistant turn between them are matched as one
-run (at most two million characters wait at a time). A paragraph that quotes a shorter phrase (59
-shared characters or fewer) is never a candidate, nor is a short paragraph on its own. The
-thresholds are parameters of `AssistantEcho`. On 1,000 generated conversations no short owner turn
-that shared fewer than 60 characters with the assistant turn was carved; text that does share 60 or
-more verbatim characters (a long quoted phrase, a list of identifiers the assistant used, a draft the
-assistant quoted back) is carved by design, which costs recall, never precision. **Known limits:**
-only the first 400,000 match-form characters of an assistant turn are indexed (a paste of text
-beyond that head is not recognised), at most 400,000 characters of assistant text are indexed per
-conversation (the oldest turns go first, the newest included in the count), each indexed turn is
-an array of 64-bit window hashes, never text, and matching across conversations is not attempted.
-The length strata below stay as defence in depth for anything it misses.
+hide a paste. Three things are pasted back:
+
+- a paragraph of at least 60 match-form characters that holds a stretch of 60 or more characters
+  shared with an assistant turn;
+- a run of adjacent paragraphs, each touched by such a match, whose joined text is at least 300
+  characters (as written or in match form) and that holds a shared stretch of at least 100; fenced
+  code blocks between the paragraphs of a run do not break it, and consecutive user turns with no
+  assistant turn between them are matched as one run (at most two million characters wait at a
+  time);
+- every **echo hit** of a stretch of consecutive user turns once they add up. A prose paragraph
+  (not inside a fenced block) of at least 20 match-form characters that is, whole, a piece of one
+  earlier assistant message of the conversation is an echo hit; if the echo hits of one user turn,
+  or of consecutive user turns with no assistant turn between them, total at least 100
+  match-form characters, all of them are pasted back, whatever sits between them: code fences,
+  owner one-liners, other paragraphs, other user turns of the stretch. Pasting an answer as short
+  paragraphs, with a code block or a "right, carry on" between them, therefore earns no owner
+  credit. The owner's own paragraphs around the hits stay the owner's.
+
+A paragraph that quotes a shorter phrase (59 shared characters or fewer) is never a candidate on
+its own, nor is a short paragraph on its own; the thresholds are parameters of `AssistantEcho`.
+**Measured cost, on generated conversations (1,000 each):** owner prose that shares no 60 verbatim
+characters with the answer is never carved (0.0 percent); a verbatim quote of 20 to 59 characters
+inline in a sentence is carved in 0.4 percent, one of 60 to 95 characters in 99 percent, and the
+verifier's 20-to-95 shape in 50 percent; one quote of 20 to 95 characters as its own paragraph in
+46 percent; two such paragraphs in 73 percent; three quotes of 20 to 59 characters as separate
+paragraphs, which stack to the 100-character total, in 77 percent (0 percent before the echo-hit
+rule). That is the accepted conservative cost: text that is verbatim an assistant's, in amounts that
+add up, is not the owner's, and what is lost is recall, never precision. **Known limits:** pieces
+pasted in turns with an assistant reply between them (a stretch ends at an assistant turn, so a
+"noted" between two pastes starts a new stretch), pastes from another conversation, and pastes of
+text beyond the indexed head are not recognised; the length strata below stay as defence in depth
+for what slips through. Only the first 400,000 match-form characters of an assistant turn are
+indexed, at most 400,000 characters of assistant text are indexed per conversation (the oldest
+turns go first, the newest included in the count), and each indexed turn is kept as an array of
+64-bit window hashes and its normalized head, never its full text.
 
 Boilerplate is decided by a census over the slice that is scanned. A paragraph, or a whole
 multi-paragraph message, of at least 200 characters (`--repeat-min-chars`) that occurs at least

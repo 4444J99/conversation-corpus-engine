@@ -1145,23 +1145,43 @@ def test_an_answer_pasted_back_in_rewritten_markdown_is_found_in_every_variant_p
 LINES = [f"Step {i}: check the parser module stage {i * 7}." for i in range(14)]
 
 
-def test_adjacent_short_paragraphs_are_one_candidate_only_when_joined_300_and_100_shared() -> None:
+TINY = [f"Item {i} of {i * 7}" for i in range(40)]
+
+
+def pieces_of(text: str) -> tuple[tuple[int, int], ...]:
+    """The range of every blank-line separated piece of a text."""
+    ranges, position = [], 0
+    for piece in text.split("\n\n"):
+        ranges.append((position, position + len(piece)))
+        position += len(piece) + 2
+    return tuple(ranges)
+
+
+def carved_pieces(text: str, found: tuple[tuple[int, int], ...]) -> list[str]:
+    return [text[start:end] for start, end in found]
+
+
+def test_adjacent_tiny_paragraphs_are_one_run_only_when_joined_300_and_100_shared() -> None:
+    """Paragraphs under 20 characters cannot be echo hits; a run of them is the old 300/100 rule."""
     echo = AssistantEcho()
-    echo.add_assistant("\n\n".join(LINES))
-    assert max(len(line) for line in LINES) < 60
+    echo.add_assistant("\n\n".join(TINY))
+    assert max(len(line) for line in TINY) < 20
     carved = []
-    for count in (1, 2, 5, 6, 7, 8, 10, 14):
-        pasted = "\n\n".join(LINES[:count])
-        joined = len(" ".join(LINES[:count]))
+    for count in (3, 10, 20, 21, 22, 25, 40):
+        pasted = "\n\n".join(TINY[:count])
+        joined = len(" ".join(TINY[:count]))
         offset = len("Mine first.\n\n")
-        expected = ((offset, offset + len(pasted)),) if joined >= 300 and count > 1 else ()
+        expected = ((offset, offset + len(pasted)),) if joined >= 300 else ()
         assert echo.pasted_back(f"Mine first.\n\n{pasted}") == expected, count
         carved.append(bool(expected))
-    assert carved == [False, False, False, False, False, True, True, True]
-    assert len(" ".join(LINES[:7])) < 300 <= len(" ".join(LINES[:8]))
+    assert carved == [False, False, False, False, True, True, True]
+    assert len(" ".join(TINY[:21])) < 300 <= len(" ".join(TINY[:22]))
+    # Between tiny lines an owner one-liner breaks the run, and tiny lines are not echo hits.
+    spread = "\n\nhmm right\n\n".join(TINY[:30])
+    assert echo.pasted_back(spread) == ()
 
 
-def test_a_run_stops_at_an_untouched_paragraph_and_never_swallows_owner_text() -> None:
+def test_a_run_of_hits_is_one_range_and_owner_paragraphs_around_it_stay_out() -> None:
     echo = AssistantEcho()
     echo.add_assistant("\n\n".join(LINES))
     own = "My own paragraph about something else entirely, long enough to matter here, " * 2
@@ -1169,9 +1189,71 @@ def test_a_run_stops_at_an_untouched_paragraph_and_never_swallows_owner_text() -
     text = f"{own.strip()}\n\n{pasted}\n\n{own.strip()}"
     start = text.index(pasted)
     assert echo.pasted_back(text) == ((start, start + len(pasted)),)
-    # Two separate runs, each too short alone, around an owner paragraph: nothing is carved.
-    split = "\n\n".join([*LINES[:4], own.strip(), *LINES[4:8]])
-    assert echo.pasted_back(split) == ()
+
+
+def test_echo_hits_that_add_up_are_pasted_back_whatever_sits_between_them() -> None:
+    echo = AssistantEcho()
+    echo.add_assistant("\n\n".join(LINES))
+    code = "```\nx = 1\n```"
+    owner = "My own paragraph about something else entirely, long enough to matter here, " * 2
+    shapes = {
+        "only blank lines": "\n\n".join(LINES[:6]),
+        "a code fence after each paragraph": "\n\n".join(f"{line}\n\n{code}" for line in LINES[:6]),
+        "an owner one-liner after each paragraph": "\n\n".join(
+            f"{line}\n\nhmm right" for line in LINES[:6]
+        ),
+        "an owner paragraph after each paragraph": "\n\n".join(
+            f"{line}\n\n{owner.strip()}" for line in LINES[:6]
+        ),
+        "fences and one-liners mixed": "\n\n".join(
+            f"{line}\n\n{code if n % 2 else 'hmm right'}" for n, line in enumerate(LINES[:6])
+        ),
+        "halves around an owner paragraph": "\n\n".join([*LINES[:3], owner.strip(), *LINES[3:6]]),
+    }
+    for name, pasted in shapes.items():
+        text = f"look at this:\n\n{pasted}"
+        pieces = carved_pieces(text, echo.pasted_back(text))
+        for line in LINES[:6]:
+            assert any(line in piece for piece in pieces), (name, line)
+        assert not any("look at this" in piece or "hmm right" in piece for piece in pieces), name
+        assert not any(owner.strip() in piece for piece in pieces), name
+    # Several hits in one turn, two turns apart: each hit is its own range.
+    alone = "\n\n".join(LINES[:3])
+    assert carved_pieces(alone, echo.pasted_back(alone)) == LINES[:3]
+
+
+def test_echo_hits_total_a_hundred_characters_before_they_count() -> None:
+    echo = AssistantEcho()
+    echo.add_assistant("\n\n".join(LINES))
+    outcome = []
+    for count in (1, 2, 3, 6):
+        text = "Mine first.\n\n" + "\n\nhmm right\n\n".join(LINES[:count])
+        outcome.append(bool(echo.pasted_back(text)))
+    assert outcome == [False, False, True, True]
+    assert (
+        sum(len(match_form(line)) for line in LINES[:2])
+        < 100
+        <= sum(len(match_form(line)) for line in LINES[:3])
+    )
+    # A paragraph that is not whole in the answer is no hit, and nor is one inside a code fence.
+    edited = "\n\nhmm right\n\n".join(f"{line} (my edit)" for line in LINES[:6])
+    assert echo.pasted_back(edited) == ()
+    fenced = "```\n" + "\n\n".join(LINES[:6]) + "\n```"
+    assert echo.pasted_back(fenced) == ()
+
+
+def test_one_paragraph_per_user_turn_counts_across_consecutive_turns() -> None:
+    echo = AssistantEcho()
+    echo.add_assistant("\n\n".join(LINES))
+    turns = LINES[:5]
+    assert all(echo.pasted_back(turn) == () for turn in turns)
+    assert echo.pasted_back_turns(turns) == [((0, len(turn)),) for turn in turns]
+    comment = "Right, carry on with the next one please, I am following along."
+    found = echo.pasted_back_turns([turns[0], comment, *turns[1:4]])
+    assert found[1] == () and all(found[index] for index in (0, 2, 3, 4))
+    # Two such turns are not enough, and a stretch ends where the caller ends it.
+    assert echo.pasted_back_turns(turns[:2]) == [(), ()]
+    assert echo.pasted_back_turns(turns[:2]) + echo.pasted_back_turns(turns[2:]) != []
 
 
 def test_a_fenced_code_block_between_pasted_paragraphs_does_not_break_the_run() -> None:
@@ -1183,23 +1265,20 @@ def test_a_fenced_code_block_between_pasted_paragraphs_does_not_break_the_run() 
     pasted = "\n\n".join(LINES[:4]) + f"\n\n{code}\n\n" + "\n\n".join(LINES[4:8])
     assert len(" ".join(LINES[:4])) < 300 and len(" ".join(LINES[4:8])) < 300
     found = echo.pasted_back(f"mine:\n\n{pasted}")
-    assert found and found[0][0] == len("mine:\n\n")
-    assert found[-1][1] == len(f"mine:\n\n{pasted}")
-    # Without the fence the halves are separated by an owner paragraph and stay owner.
-    own = "an owner paragraph that is long enough to separate the two halves of a paste, " * 2
-    owner_between = "\n\n".join(LINES[:4]) + f"\n\n{own}\n\n" + "\n\n".join(LINES[4:8])
-    assert echo.pasted_back(owner_between) == ()
+    # One range from the first to the last line: the run rule and the echo hits agree.
+    assert found == ((len("mine:\n\n"), len(f"mine:\n\n{pasted}")),)
 
 
 def test_consecutive_user_turns_are_matched_as_one_run() -> None:
     echo = AssistantEcho()
     echo.add_assistant("\n\n".join(LINES))
-    turns = ["\n\n".join(LINES[0:3]), "\n\n".join(LINES[3:6]), "\n\n".join(LINES[6:9])]
+    turns = ["\n\n".join(LINES[0:2]), "\n\n".join(LINES[2:4]), "\n\n".join(LINES[4:6])]
     assert all(echo.pasted_back(turn) == () for turn in turns)
     found = echo.pasted_back_turns(turns)
-    assert [ranges for ranges in found] == [((0, len(turn)),) for turn in turns]
+    assert found == [pieces_of(turn) for turn in turns]
     comment = "A comment of my own, unrelated to the answer, about the weather and the walk home."
-    assert echo.pasted_back_turns([turns[0], comment, turns[1], turns[2]]) == [(), (), (), ()]
+    mixed = echo.pasted_back_turns([turns[0], comment, turns[1], turns[2]])
+    assert mixed == [pieces_of(turns[0]), (), pieces_of(turns[1]), pieces_of(turns[2])]
     assert echo.pasted_back_turns([]) == []
     assert AssistantEcho().pasted_back_turns(turns) == [(), (), ()]
 
@@ -1242,11 +1321,13 @@ def test_a_long_assistant_turn_is_indexed_by_its_head_only() -> None:
     assert echo.pasted_back(f"from the end:\n\n{tail}") == ()
 
 
-def test_assistant_windows_are_kept_as_compact_arrays_not_text() -> None:
-    echo = AssistantEcho()
+def test_assistant_windows_are_compact_arrays_and_the_kept_text_is_the_bounded_head() -> None:
+    echo = AssistantEcho(turn_limit=300)
     echo.add_assistant(ANSWER)
     assert echo._turns
-    assert all(isinstance(windows, array) and windows.itemsize == 8 for _, windows in echo._turns)
+    for size, windows, head in echo._turns:
+        assert isinstance(windows, array) and windows.itemsize == 8
+        assert size == len(head) <= 300 and head == match_form(ANSWER)[:300]
 
 
 def test_a_ten_megabyte_assistant_turn_stays_within_a_bounded_memory_budget() -> None:
@@ -1320,6 +1401,43 @@ def test_genuine_short_owner_turns_are_almost_never_carved_over_1000_generated_c
             owner = f'You said "{flat[start : start + rng.randint(15, 55)]}" but {owner}'
         carved += bool(echo.pasted_back(owner))
     assert carved / 1000 < 0.01, carved
+
+
+def test_quoting_one_short_line_of_an_answer_is_not_carved_but_stacked_quotes_are() -> None:
+    """The measured cost of the echo-hit rule (see the docs): one verbatim line of 20-59
+    characters, alone or inline, never reaches the 60-character or the 100-character threshold;
+    three such lines in separate paragraphs add up and are carved."""
+    rng = random.Random(3)
+    vocabulary = [
+        "".join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rng.randint(3, 9)))
+        for _ in range(400)
+    ]
+
+    def paragraph(minimum: int) -> str:
+        text = ""
+        while len(text) < minimum:
+            words = " ".join(rng.choice(vocabulary) for _ in range(rng.randint(6, 14)))
+            text += words.capitalize() + rng.choice([".", ".", "?"]) + " "
+        return text.strip()
+
+    def quote(flat: str) -> str:
+        size = rng.randint(20, 59)
+        start = rng.randint(0, len(flat) - size)
+        return flat[start : start + size]
+
+    single = inline = stacked = 0
+    for _ in range(300):
+        echo = AssistantEcho()
+        answer = "\n\n".join(paragraph(rng.randint(150, 500)) for _ in range(rng.randint(1, 4)))
+        echo.add_assistant(answer)
+        flat = " ".join(answer.split())
+        single += bool(echo.pasted_back(f"{paragraph(80)}\n\n{quote(flat)}\n\n{paragraph(80)}"))
+        inline += bool(echo.pasted_back(f'You said "{quote(flat)}" but {paragraph(120)}'))
+        stacked += bool(
+            echo.pasted_back("\n\n".join([quote(flat), paragraph(60), quote(flat), quote(flat)]))
+        )
+    assert single == 0 and inline <= 3
+    assert stacked > 150
 
 
 def test_match_form_ignores_case_markup_punctuation_numbering_and_spacing() -> None:

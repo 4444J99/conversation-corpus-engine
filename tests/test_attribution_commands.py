@@ -657,7 +657,7 @@ def build_chunked_paste_library(directory: Path) -> Path:
         return Message(role="assistant", channel="reply", id=identifier, text=text)
 
     answer = "\n\n".join(ANSWER_LINES)
-    chunks = ["\n\n".join(ANSWER_LINES[start : start + 3]) for start in (0, 3, 6)]
+    chunks = ["\n\n".join(ANSWER_LINES[start : start + 2]) for start in (0, 2, 4)]
     together = chat(
         "chunked",
         [
@@ -709,8 +709,22 @@ def test_an_answer_pasted_back_in_consecutive_messages_is_found_as_one_stretch(
 ) -> None:
     library = build_chunked_paste_library(tmp_path / "store" / "g")
     found = pasted_back_spans(library)
-    chunks = ["\n\n".join(ANSWER_LINES[start : start + 3]) for start in (0, 3, 6)]
-    assert found == {"chunked": [(2, chunks[0]), (3, chunks[1]), (4, chunks[2])]}
+    # Each message holds two short paragraphs, which are not enough on their own (77 characters);
+    # the three consecutive messages together are. The separated copy has an assistant turn
+    # between its messages, so each stays a stretch of its own.
+    assert found == {
+        "chunked": [
+            (index, line)
+            for index, line in (
+                (2, ANSWER_LINES[0]),
+                (2, ANSWER_LINES[1]),
+                (3, ANSWER_LINES[2]),
+                (3, ANSWER_LINES[3]),
+                (4, ANSWER_LINES[4]),
+                (4, ANSWER_LINES[5]),
+            )
+        ]
+    }
     report = report_of(capsys, library)
     assert report["partition"]["ok"] is True
     assert report["scan"]["messages"] == 12

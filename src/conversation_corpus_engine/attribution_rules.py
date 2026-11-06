@@ -916,6 +916,8 @@ DEFAULT_ECHO_MIN_PARAGRAPH = 60
 DEFAULT_ECHO_MIN_RUN = 300
 DEFAULT_ECHO_MIN_SHARED = 60
 DEFAULT_ECHO_MIN_RUN_SHARED = 100
+DEFAULT_ECHO_MIN_HIT = 20
+DEFAULT_ECHO_MIN_HIT_TOTAL = 100
 DEFAULT_ECHO_HISTORY = 400_000
 # Only the head of an assistant turn is indexed: a longer turn costs no more memory than this.
 DEFAULT_ECHO_TURN = 400_000
@@ -995,15 +997,23 @@ class AssistantEcho:
       `min_run` characters and that holds a stretch of at least `min_run_shared` shared
       characters (a pasted answer is often several short paragraphs). Fenced code blocks between
       paragraphs do not break a run, and the consecutive user turns given to `pasted_back_turns`
-      (no assistant turn between them) are matched as one run.
+      (no assistant turn between them) are matched as one run;
+    * every **echo hit** of a stretch of consecutive user turns, once they add up: a prose
+      paragraph (not inside a fenced block) of at least `min_hit` normalized characters that is,
+      whole, a substring of one earlier assistant turn is an echo hit, and if the echo hits of
+      the stretch total at least `min_hit_total` characters all of them are returned, whatever
+      sits between them (code fences, owner one-liners, other paragraphs, other user turns of the
+      stretch). Pasting an answer as short paragraphs with something between them therefore
+      does not earn owner credit.
 
-    A paragraph that only quotes a short phrase (fewer than `min_shared` shared characters) is
-    never a candidate, and neither is a short paragraph on its own. Memory is bounded: only the
-    first `turn_limit` normalized characters of an assistant turn are indexed (a paste of text
-    beyond that head is not recognised), the total indexed text never exceeds `history_limit`
-    (the oldest turns go first, the newest turn included in the count), and each indexed turn is
-    kept as an array of 64-bit window hashes, never as text. Matching across conversations is not
-    attempted.
+    A paragraph that only quotes a short phrase (fewer than `min_shared` shared characters, and
+    not echo hits that add up) is never a candidate, and neither is a short paragraph on its own.
+    Memory is bounded: only the first `turn_limit` normalized characters of an assistant turn
+    are indexed (a paste of text beyond that head is not recognised), the total indexed text
+    never exceeds `history_limit` (the oldest turns go first, the newest turn included in the
+    count), and each indexed turn is kept as an array of 64-bit window hashes and its normalized
+    head. Matching across conversations is not attempted, nor across an assistant turn between
+    the pasted pieces.
     """
 
     def __init__(
@@ -1013,6 +1023,8 @@ class AssistantEcho:
         min_run: int = DEFAULT_ECHO_MIN_RUN,
         min_shared: int = DEFAULT_ECHO_MIN_SHARED,
         min_run_shared: int = DEFAULT_ECHO_MIN_RUN_SHARED,
+        min_hit: int = DEFAULT_ECHO_MIN_HIT,
+        min_hit_total: int = DEFAULT_ECHO_MIN_HIT_TOTAL,
         history_limit: int = DEFAULT_ECHO_HISTORY,
         turn_limit: int = DEFAULT_ECHO_TURN,
     ) -> None:
@@ -1021,6 +1033,8 @@ class AssistantEcho:
             ("min_run", min_run),
             ("min_shared", min_shared),
             ("min_run_shared", min_run_shared),
+            ("min_hit", min_hit),
+            ("min_hit_total", min_hit_total),
             ("history_limit", history_limit),
             ("turn_limit", turn_limit),
         ):
@@ -1032,9 +1046,11 @@ class AssistantEcho:
         self.min_run = min_run
         self.min_shared = min_shared
         self.min_run_shared = min_run_shared
+        self.min_hit = min_hit
+        self.min_hit_total = min_hit_total
         self.history_limit = history_limit
         self.turn_limit = turn_limit
-        self._turns: deque[tuple[int, array]] = deque()
+        self._turns: deque[tuple[int, array, str]] = deque()
         self._size = 0
         self._index: set[int] | None = None
 
@@ -1052,7 +1068,7 @@ class AssistantEcho:
         if len(head) < self.min_shared:
             return
         windows = array("q", self._hashes(head))
-        self._turns.append((len(head), windows))
+        self._turns.append((len(head), windows, head))
         self._size += len(head)
         evicted = False
         while self._size > self.history_limit and self._turns:
@@ -1065,21 +1081,24 @@ class AssistantEcho:
 
     def _windows(self) -> set[int]:
         if self._index is None:
-            self._index = set().union(*(windows for _, windows in self._turns))
+            self._index = set().union(*(windows for _, windows, _ in self._turns))
         return self._index
 
     def pasted_back(self, text: str) -> tuple[Range, ...]:
         return self.pasted_back_turns([text])[0]
+
+    def _echoed(self, form: str) -> bool:
+        """True if the normalized paragraph is a substring of one earlier assistant turn."""
+        return any(len(form) <= len(head) and form in head for _, _, head in self._turns)
 
     def pasted_back_turns(self, texts: Sequence[str]) -> list[tuple[Range, ...]]:
         """The pasted-back ranges of consecutive user turns, matched as one conversation stretch;
         one tuple of ranges (offsets into that turn) per turn."""
         if not self._turns:
             return [() for _ in texts]
-        width = self.min_shared
         # Every paragraph of every turn: (turn, start, end, in a fenced block, normalized range,
-        # length with whitespace collapsed).
-        paragraphs: list[tuple[int, int, int, bool, Range | None, int]] = []
+        # length with whitespace collapsed, normalized text).
+        paragraphs: list[tuple[int, int, int, bool, Range | None, int, str]] = []
         pieces: list[str] = []
         position = 0
         for turn, text in enumerate(texts):
@@ -1098,15 +1117,44 @@ class AssistantEcho:
                 else:
                     span = None
                 collapsed = len(_SPACE_RUN.sub(" ", body))
-                paragraphs.append((turn, start, end, inside, span, collapsed))
+                paragraphs.append((turn, start, end, inside, span, collapsed, form))
         results: list[list[Range]] = [[] for _ in texts]
+
+        def original(turn: int, begin: int, finish: int) -> Range:
+            body = texts[turn][begin:finish]
+            lead = len(body) - len(body.lstrip())
+            return begin + lead, begin + len(body.rstrip())
+
+        # Echo hits: prose paragraphs that are, whole, a piece of an earlier assistant turn. Code
+        # fences and whatever sits between the hits (owner one-liners, other paragraphs) neither
+        # count nor break anything: if the hits of this stretch of user turns add up, all of them
+        # are pasted back.
+        hits_here = [
+            item
+            for item in paragraphs
+            if not item[3] and len(item[6]) >= self.min_hit and self._echoed(item[6])
+        ]
+        if sum(len(item[6]) for item in hits_here) >= self.min_hit_total:
+            for turn, begin, finish, *_ in hits_here:
+                results[turn].append(original(turn, begin, finish))
         combined = " ".join(pieces)
-        if len(combined) < width:
-            return [() for _ in texts]
-        index = self._windows()
-        hits = [i for i, h in enumerate(self._hashes(combined)) if h in index]
-        if not hits:
-            return [() for _ in texts]
+        if len(combined) >= self.min_shared:
+            index = self._windows()
+            hits = [i for i, h in enumerate(self._hashes(combined)) if h in index]
+            if hits:
+                self._claim_runs(paragraphs, hits, original, results)
+        return [tuple(_merged(found)) for found in results]
+
+    def _claim_runs(
+        self,
+        paragraphs: list[tuple[int, int, int, bool, Range | None, int, str]],
+        hits: list[int],
+        original: Callable[[int, int, int], Range],
+        results: list[list[Range]],
+    ) -> None:
+        """Paragraphs that hold a shared stretch of `min_shared` characters, and runs of adjacent
+        touched paragraphs (see the class doc), from the hash windows that matched."""
+        width = self.min_shared
         # Maximal stretches of consecutive matching windows, as normalized ranges.
         stretches: list[Range] = []
         first = last = hits[0]
@@ -1136,14 +1184,9 @@ class AssistantEcho:
                 at += 1
             return best
 
-        def original(turn: int, begin: int, finish: int) -> Range:
-            body = texts[turn][begin:finish]
-            lead = len(body) - len(body.lstrip())
-            return begin + lead, begin + len(body.rstrip())
-
         at = 0
         while at < len(paragraphs):
-            _, _, _, inside, span, _ = paragraphs[at]
+            _, _, _, inside, span, *_ = paragraphs[at]
             if inside or span is None or not touched(span):
                 at += 1
                 continue
@@ -1152,7 +1195,7 @@ class AssistantEcho:
             members = [at]
             probe = at + 1
             while probe < len(paragraphs):
-                _, _, _, inside_probe, span_probe, _ = paragraphs[probe]
+                _, _, _, inside_probe, span_probe, *_ = paragraphs[probe]
                 if inside_probe or span_probe is None:
                     probe += 1
                 elif touched(span_probe):
@@ -1185,11 +1228,21 @@ class AssistantEcho:
                     )
             else:
                 for member in members:
-                    turn, begin, finish, _, span, _ = paragraphs[member]
+                    turn, begin, finish, _, span, *_ = paragraphs[member]
                     if span[1] - span[0] >= self.min_paragraph and holds_match(span):
                         results[turn].append(original(turn, begin, finish))
             at = members[-1] + 1
-        return [tuple(sorted(found)) for found in results]
+
+
+def _merged(ranges: list[Range]) -> list[Range]:
+    """The ranges sorted, with any that overlap or nest joined into one."""
+    result: list[Range] = []
+    for start, end in sorted(ranges):
+        if result and start < result[-1][1]:
+            result[-1] = (result[-1][0], max(result[-1][1], end))
+        else:
+            result.append((start, end))
+    return result
 
 
 def rule_pasted_back(context: MessageContext) -> list[Claim]:
