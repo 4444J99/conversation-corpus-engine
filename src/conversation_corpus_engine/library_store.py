@@ -64,8 +64,11 @@ def validate_plan(plan: Any) -> str:
 
 def validate_max_seconds(value: Any) -> float | None:
     """A search time budget in seconds: ``None`` (unbounded) or a finite number in (0, 600]."""
-    if value is None:
-        return None
+    return None if value is None else validate_search_seconds(value)
+
+
+def validate_search_seconds(value: Any) -> float:
+    """A time budget that must be given: a finite number of seconds in (0, 600]."""
     if (
         isinstance(value, bool)
         or not isinstance(value, int | float)
@@ -722,7 +725,7 @@ class Library:
             if partial:
                 result["notice"] = (
                     f"the {seconds:g} s time budget ran out during the {name} plan; ranking was "
-                    "abandoned, so these hits are in index order, not by relevance"
+                    "not completed, so these hits are in index order, not by relevance"
                 )
             if partial or (name == "or" and not exact):
                 result["hint"] = BROAD_QUERY_HINT

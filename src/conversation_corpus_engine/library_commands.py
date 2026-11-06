@@ -16,7 +16,14 @@ from .corpus_store import CorpusStoreError
 from .library_analysis import AnalysisLimits, export_analysis
 from .library_build import build_library, current_generation, publish_library, verify_candidate
 from .library_export import export_library, verify_export
-from .library_store import Library
+from .library_store import (
+    BROAD_QUERY_HINT,
+    DEFAULT_SEARCH_SECONDS,
+    MAX_SEARCH_SECONDS,
+    SEARCH_PLANS,
+    Library,
+    validate_search_seconds,
+)
 from .paths import default_project_root
 from .persona_extract import extract_persona_lexicon
 
@@ -448,7 +455,20 @@ def add_library_parser(subparsers: Any) -> None:
     )
     for name in ("status", "verify"):
         common(sub.add_parser(name))
-    search = sub.add_parser("search", help="Paged full-text retrieval with exact match count")
+    search = sub.add_parser(
+        "search",
+        help="Paged full-text retrieval; the match count is exact up to 1000",
+        description=(
+            "Paged full-text retrieval. Several unquoted words are planned: an adjacent phrase "
+            "first, then every word (AND), then any word (OR), stopping at the first plan that "
+            'matches; the response names it in `plan`. A single word or a "quoted phrase" is '
+            "searched as written. OR on a large library is slow, so quote a phrase or add "
+            "terms for a faster, more precise search. The match count is exact up to 1000 and "
+            "then reads 1000+. The call is bounded by --max-seconds: when it runs out, ranking "
+            "is abandoned and a partial page is returned in index order (`partial` true, "
+            "`ranked` false)."
+        ),
+    )
     common(search)
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=20)
@@ -457,6 +477,21 @@ def add_library_parser(subparsers: Any) -> None:
     search.add_argument("--lane")
     search.add_argument("--provider", action="append")
     search.add_argument("--kind", action="append")
+    search.add_argument(
+        "--plan",
+        choices=SEARCH_PLANS,
+        default="auto",
+        help="auto (default): phrase, then and, then or, first match wins; or force one plan "
+        "(or is slow on a large library)",
+    )
+    search.add_argument(
+        "--max-seconds",
+        type=_search_seconds,
+        default=DEFAULT_SEARCH_SECONDS,
+        help=f"time budget in seconds, above 0 and at most {MAX_SEARCH_SECONDS:g} (default "
+        f"{DEFAULT_SEARCH_SECONDS:g}); on expiry a partial page in index order is returned, "
+        "not an error",
+    )
     read = sub.add_parser("read", help="Read one bounded message span from a source revision")
     common(read)
     read.add_argument("uid")
@@ -486,6 +521,13 @@ def add_library_parser(subparsers: Any) -> None:
     analyze.add_argument("--max-output-bytes", type=int, default=defaults.max_output_bytes)
     analyze.add_argument("--max-atoms", type=int, default=defaults.max_atoms)
     analyze.add_argument("--max-seconds", type=int, default=defaults.max_seconds)
+
+
+def _search_seconds(text: str) -> float:
+    try:
+        return validate_search_seconds(float(text))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
 
 
 def _progress(value: dict[str, Any]) -> None:
@@ -600,8 +642,14 @@ def handle_library(args: argparse.Namespace) -> int:
                         lane=args.lane,
                         providers=args.provider,
                         kinds=args.kind,
+                        plan=args.plan,
+                        max_seconds=args.max_seconds,
                     )
                     result["generation"] = str(generation)
+                    for line in (result.get("notice"), result.get("hint")):
+                        if line:
+                            prefix = "hint: " if line == BROAD_QUERY_HINT else ""
+                            print(f"library: {prefix}{line}", file=sys.stderr)
                 elif args.action == "read":
                     result = read_record(
                         library,
