@@ -1990,6 +1990,79 @@ def test_review_record_waits_for_a_locked_ledger_and_then_exits_2(
     assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
 
 
+AGENT_NAMES = (
+    "claude",
+    "chatgpt",
+    "gpt",
+    "gemini",
+    "copilot",
+    "codex",
+    "cursor",
+    "opencode",
+    "assistant",
+    "agent",
+    "system",
+    "bot",
+)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        "",
+        "   ",
+        "\u200b",
+        "\u200b\ufeff\u2060",
+        "\u00ad\u200d",
+        "\u0301\u0301",
+        "\u20dd",
+        " \u200b ",
+        *AGENT_NAMES,
+        "Claude",
+        "ChatGPT",
+        "GPT",
+        "GEMINI",
+        " codex ",
+        "Assistant",
+        "SYSTEM",
+        "Bot",
+    ],
+)
+def test_an_owner_identity_must_be_visible_and_must_not_be_an_agent_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], identity: str
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
+    for argv in (
+        ("--report", "--library", library, "--owner-id", identity),
+        ("apply", "--library", library, "--out", tmp_path / "o.json", "--owner-id", identity),
+        ("review-sample", "--library", library, "--owner-id", identity),
+    ):
+        code, _, err = run_cli(capsys, *argv)
+        assert code == 2 and "--owner-id" in err, (argv[0], identity)
+    assert not (tmp_path / "o.json").exists()
+
+
+@pytest.mark.parametrize("identity", ["\u200b", "\u0301", " ", *AGENT_NAMES, "CLAUDE", " Gpt "])
+def test_a_reviewer_identity_must_be_visible_and_must_not_be_an_agent_name(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], identity: str
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    answered(sample, answers, 1)
+    code, _, err = record_answers(capsys, library, ledger, sample, answers, reviewer=identity)
+    assert code == 2 and "--reviewer" in err and not ledger.exists()
+
+
+def test_people_and_prefixed_agent_identities_are_still_accepted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
+    for identity in ("rob", "Claude Monet", "agent:codex", "owner-1", "Émile"):
+        code, _, err = run_cli(capsys, "--report", "--library", library, "--owner-id", identity)
+        assert code == 0, (identity, err)
+
+
 def test_an_existing_output_is_refused_for_every_writer(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

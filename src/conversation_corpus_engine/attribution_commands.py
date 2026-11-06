@@ -934,11 +934,39 @@ class MatchRecorder:
                 )
 
 
+# Names of AI agents. An owner or reviewer identity is a person's: these bare names are refused.
+AGENT_IDENTITIES = frozenset(
+    {
+        "claude",
+        "chatgpt",
+        "gpt",
+        "gemini",
+        "copilot",
+        "codex",
+        "cursor",
+        "opencode",
+        "assistant",
+        "agent",
+        "system",
+        "bot",
+    }
+)
+
+
+def _identity(value: str, flag: str) -> str:
+    """An owner or reviewer identity as given, or ValueError: it must show something (not only
+    spaces, zero-width or format characters or lone combining marks) and must not be the bare
+    name of an AI agent."""
+    if blank_text(value):
+        raise ValueError(f"{flag} must not be empty or made only of invisible characters")
+    if value.strip().casefold() in AGENT_IDENTITIES:
+        raise ValueError(f"{flag} must name a person, not an AI agent ({value.strip()!r})")
+    return value
+
+
 def _owner(args: argparse.Namespace) -> str | None:
     owner = args.owner_id
-    if owner is not None and not owner.strip():
-        raise ValueError("--owner-id must be nonempty")
-    return owner
+    return None if owner is None else _identity(owner, "--owner-id")
 
 
 def _census(library: Library, args: argparse.Namespace, deadline: Deadline) -> RepeatCensus:
@@ -1211,7 +1239,7 @@ def _answers(path: Path, sample: ReviewSample) -> dict[str, str | None]:
 def _review_record(args: argparse.Namespace) -> int:
     # The one place a clock is read, at the command boundary; the ledger helpers take the time.
     reviewed_at = args.reviewed_at or utc_stamp(datetime.now(UTC))
-    reviewer = args.reviewer
+    reviewer = _identity(args.reviewer, "--reviewer")
     database = _database_path(args)
     ledger = check_ledger_path(args.ledger, library_roots(args, database))
     sample = parse_sample(args.sample.read_text(encoding="utf-8").split("\n"))

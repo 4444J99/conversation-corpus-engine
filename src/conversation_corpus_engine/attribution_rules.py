@@ -1422,9 +1422,11 @@ def _subtract(free: list[Range], pieces: list[Claim]) -> list[Range]:
     return result
 
 
-# Characters that show nothing: spaces, line breaks, control characters and the zero-width and
-# other format characters (U+200B, U+FEFF, U+2060, ...). Text made only of these is nobody's.
-_BLANK_CATEGORIES = frozenset({"Cf", "Zs", "Zl", "Zp", "Cc"})
+# Characters that show nothing by themselves: spaces, line breaks, control characters, the
+# zero-width and other format characters (U+200B, U+FEFF, U+2060, ...) and combining and
+# enclosing marks (a mark alone has nothing to sit on). Text made only of these is nobody's.
+_BLANK_CATEGORIES = frozenset({"Cf", "Zs", "Zl", "Zp", "Cc", "Mn", "Me"})
+_MARK_CATEGORIES = frozenset({"Mn", "Me"})
 
 
 def is_blank(char: str) -> bool:
@@ -1437,7 +1439,8 @@ def blank_text(text: str) -> bool:
 
 def _trimmed(text: str, pieces: list[Claim]) -> list[Claim]:
     """An owner span never starts or ends with a blank character (see `is_blank`) and is never
-    only blank characters."""
+    only blank characters. A combining mark that follows a visible character belongs to it (an
+    accent in decomposed text) and is not trimmed from the end."""
     result: list[Claim] = []
     for start, end, detail in pieces:
         first, last = start, end
@@ -1445,10 +1448,21 @@ def _trimmed(text: str, pieces: list[Claim]) -> list[Claim]:
             first += 1
         if first == last:
             continue
-        while is_blank(text[last - 1]):
+        while is_blank(text[last - 1]) and not _rides_on_letter(text, first, last - 1):
             last -= 1
         result.append((first, last, detail))
     return result
+
+
+def _rides_on_letter(text: str, first: int, at: int) -> bool:
+    """True if `text[at]` is a combining mark whose base, before it and not before `first`, is a
+    visible character."""
+    if unicodedata.category(text[at]) not in _MARK_CATEGORIES:
+        return False
+    before = at - 1
+    while before >= first and unicodedata.category(text[before]) in _MARK_CATEGORIES:
+        before -= 1
+    return before >= first and not is_blank(text[before])
 
 
 def partition_problems(

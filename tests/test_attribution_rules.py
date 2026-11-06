@@ -26,7 +26,9 @@ from conversation_corpus_engine.attribution_rules import (
     RecordInfo,
     RepeatCensus,
     attribute_message,
+    blank_text,
     boilerplate_ranges,
+    is_blank,
     match_form,
     partition_problems,
     record_info,
@@ -1563,6 +1565,21 @@ def test_ai_written_skill_document_is_machine_and_a_plain_authored_document_is_o
     assert view(body, run(body, channel="project", typed=0, record=plain)) == [
         ("note_owner", "owner", body)
     ]
+
+
+def test_combining_and_enclosing_marks_alone_are_blank_but_a_mark_on_a_letter_stays() -> None:
+    assert is_blank("\u0301") and is_blank("\u20dd") and blank_text("\u0301\u0301")
+    assert not is_blank("e")
+    only_marks = "\u0301\u0301"
+    assert [s for s in run(only_marks) if s.author == "owner"] == []
+    assert [s for s in run("\u0301\u0301 \u20dd") if s.author == "owner"] == []
+    decomposed = "cafe\u0301 and de\u0301ja\u0300 "
+    spans = [s for s in run(decomposed) if s.author == "owner"]
+    assert [decomposed[s.start : s.end] for s in spans] == ["cafe\u0301 and de\u0301ja\u0300"]
+    leading = "\u0301 hello"
+    assert [leading[s.start : s.end] for s in run(leading) if s.author == "owner"] == ["hello"]
+    emoji = "yes \U0001f600\ufe0f"
+    assert [emoji[s.start : s.end] for s in run(emoji) if s.author == "owner"] == [emoji]
 
 
 def test_the_rule_table_has_one_documented_order() -> None:
