@@ -279,7 +279,7 @@ short note that points back to the exact words it came from:
 
 ```bash
 cce library zettels --store-root /private/store --input /private/reviewed-ideas.json \
-  --format obsidian-md --out /private/wiki
+  --format obsidian-md --out /private/wiki --owner-id rob
 ```
 
 This writes one file per idea at `notes/zettel/<title>.md` under `--out`. It uses the same
@@ -308,23 +308,30 @@ What a note holds, in plain words:
 - **`id`** is the created day plus six characters of a hash of the envelope's idea id, for example
   `20260304-9afdfb`. It does not change when the text is edited. The envelope must therefore carry
   `created` (`YYYY-MM-DD`, or an ISO timestamp, which is cut to its day) on each idea.
-- **Title** is the file name: at most 100 characters, none of `/ \ : * ? " < > | # ^ [ ]`, unique
-  ignoring case. An unusable title is refused with its reason, not rewritten.
+- **Title** is the file name: at most 100 characters and `<title>.md` at most 255 bytes in UTF-8,
+  none of `/ \ : * ? " < > | # ^ [ ]`, unique ignoring case and Unicode normalisation (titles are
+  written in NFC, so a composed and a decomposed spelling are one name). An unusable title is
+  refused with its reason, not rewritten.
 - **Size**: every note is checked against the Wiki Standard caps before it is written (aim for 4
   KiB, a warning above 16 KiB, a refusal above 64 KiB), plus line, long-line, base64 and
   quote-count checks. Warnings are listed in the printed report. The idea text is never clipped.
 
 **Who wrote it.** `authorship` comes only from the attribution already in the envelope, and
-`status` is always `draft`; this command never marks an idea `stable`.
+`status` is always `draft`; this command never marks an idea `stable`. A note is only as
+attributed as its weakest part: the title (`title_attribution`), the idea text and every quoted
+word must each pass the test for the label.
 
 | `authorship` | When |
 |---|---|
-| `agent` | Every span of the idea text is asserted as agent-written. This is how an agent's draft enters. |
-| `human` | The idea text and every quoted word each carry an explicit, evidenced, profile-eligible owner assertion, and the author id of those assertions is the reviewer named in the envelope (the owner reviewed it). |
-| `generated` | Anything else: no attribution, mixed, third party, disputed, retracted, an owner claim with no evidence or not profile-eligible, or a reviewer who is not that owner. |
+| `agent` | The title and every span of the idea text are asserted as agent-written. This is how an agent's draft enters. The frontmatter `author` is the fixed label `agent`, never an id copied from the envelope. |
+| `human` | `--owner-id` names the owner, the envelope's reviewer is that owner, and the title, the idea text and every quoted word each carry an explicit, evidenced, profile-eligible owner assertion whose author id is that owner. `author` is the owner id. |
+| `generated` | Anything else: no attribution, an unannotated title, mixed, third party, disputed, retracted, an owner claim with no evidence or not profile-eligible, or a reviewer or author who is not the configured owner. |
 
-So unreviewed or unproven text is never labelled as owner-written. Attribution stays a supplied
-assertion; the note says so.
+Without `--owner-id` (or the `owner_id` argument of `export_zettel_notes`) nothing is labelled
+`human`: the reviewer and the author ids are free strings in the same envelope, so only an owner
+identity given outside the envelope can grant the label. `--owner-id` goes with
+`--format obsidian-md` only. So unreviewed or unproven text is never labelled as owner-written.
+Attribution stays a supplied assertion; the note says so.
 
 **Agent drafts and the review step.** The intake accepts an idea whose text is agent-written
 (`attribution` spans with `author: agent`) and the note comes out `authorship: agent`,
