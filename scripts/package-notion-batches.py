@@ -317,6 +317,11 @@ def package(
     source, output = Path(source).absolute(), Path(output).absolute()
     _safe_path(source)
     _safe_path(output)
+    if not source.is_file():
+        raise ValueError(
+            f"canonical ZIP not found: {source}. A generation built with --vault-profile none "
+            "writes no notion-import.zip; rebuild with --vault-profile cards or full"
+        )
     if output.exists():
         raise FileExistsError(output)
     if any(

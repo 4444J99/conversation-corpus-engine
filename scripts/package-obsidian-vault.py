@@ -622,7 +622,11 @@ def package(
     safe_path(output)
     if agent_entry:
         safe_path(agent_entry)
-    require(source.is_dir(), "source vault missing")
+    require(
+        source.is_dir(),
+        "source vault missing (a generation built with --vault-profile none has no vault; "
+        "rebuild with --vault-profile cards or full, or write one with `cce library export-cards`)",
+    )
     require(not output.exists(), "output already exists; replacement refused")
     require(
         not output.is_relative_to(source) and not source.is_relative_to(output),
