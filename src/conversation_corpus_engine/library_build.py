@@ -59,9 +59,11 @@ def _pointer(store_root: Path) -> dict[str, Any] | None:
     path = store_root / DIRECTORY / POINTER
     if path.is_symlink():
         raise ValueError("library pointer cannot be a symlink")
-    if not path.exists():
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = json.loads(raw)
     if value.get("schema") != "cce.library-current.v1":
         raise ValueError("unknown library pointer schema")
     return value

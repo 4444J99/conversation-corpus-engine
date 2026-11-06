@@ -42,6 +42,42 @@ cce library verify --store-root /private/store
 
 `CCE_LIBRARY_STORE_ROOT` supplies the store when a command omits it; the existing `CCE_CORPUS_STORE_ROOT` is a fallback. Search returns a total (exact up to 1000 matches; see [search planning](#search-planning-time-budget-and-capped-totals)), bounded excerpts, stable record identities, a `path` hint and the next offset, and it plans and time-bounds the query. The `path` is the note path of the legacy export layout (`vault/records/UID.md`); under the `none`, `cards` and `full` profiles the note for a record is named by the `path` of its `library-index.jsonl` row (null when it has none), and `cce library read UID` is the authoritative way to open a record under every layout. Read retrieves one message span and reports main/alternate sequence counts; use `--sequence alternate` (MCP `sequence: "alternate"`) to page retained conversation branches. `--around-query`, `--message-end` and `--toc` (with `--toc-mode`, `--toc-offset` and `--toc-limit`) are the command-line forms of the MCP arguments `around_query`, `message_end`, `toc`, `toc_mode`, `toc_offset` and `toc_limit` (see below): both surfaces run the same code, so they accept the same values, refuse the same combinations (`toc_*` without `toc`, `toc` with `around_query` or `message_end`, `around_query` with `offset` or `message_end`) and say so in the same words. History and digest selection also expose retained snapshots that were not selected as the current body. `cce-mcp --library-store-root /private/store` adds three read-only tools: `cce_library_search`, `cce_library_read`, and `cce_library_history`. Clients cannot choose arbitrary filesystem paths through these tools.
 
+### Attachment context and typed-text boundaries
+
+CLI and MCP passage reads report `attachment_count_observed` for the selected
+main or alternate message sequence. Each returned message has
+`attachment_count_in_message`, bounded `attachments`, `attachments_truncated`,
+and `attachment_refs_redacted`. The count describes normalized observations;
+partial or metadata-only sources can omit attachments, and metadata never proves
+that the original attachment bytes were retained. A read returns at most 20
+attachment entries in total, including a multi-message range. Names are limited
+to 512 characters, kinds to 128, and refs to 512. Sizes must be nonnegative
+integers; unknown or malformed sizes are null.
+
+Attachment refs retain simple identifiers containing letters, digits, dots,
+underscores and hyphens. URLs, paths, query strings, fragments and encoded URL
+strings are omitted and the redaction flag is set. The archived source remains
+unchanged; retrieve original evidence through the private archive when needed.
+
+`typed_chars` is a character offset in the entire normalized message, independent
+of the requested read offset and limit. It is returned only for a non-boolean
+integer within `0..len(text)`. `typed_chars_status: normalized` means the source
+record has that valid prefix boundary; it is not proof of who authored the text.
+Missing boundaries are null with status `unknown`, malformed boundaries have
+status `invalid`, and a boundary including an inline `[image]` marker alongside
+image metadata is null with status `synthetic-marker`. Older ChatGPT readers
+inserted those markers and defaulted to the whole message length. Read does not
+reorder the original text or infer a replacement boundary for those records.
+
+Compact MCP reads retain the same context under `tyc` (boundary), `tys` (status),
+`aco` (sequence count), `acm` (message count), `at` (metadata), `att` (truncated)
+and `arr` (refs redacted). Table-of-contents reads remain navigation responses.
+
+Unavailable stores, unreadable pointers and mounts that disappear during pointer
+lookup report an unavailable-store error. An accessible store with no published
+pointer still reports that no generation has been published. Read paths never
+create a missing store.
+
 ## Source manifest
 
 ```json
