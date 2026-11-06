@@ -26,6 +26,7 @@ import os
 import sqlite3
 import sys
 import time
+import types
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -615,12 +616,15 @@ def message_entry(
     spans: list[AttributedSpan],
     *,
     owner_id: str | None,
-    eligible: frozenset[str],
+    eligible: frozenset[tuple[str, str]],
+    verdicts: Mapping[str, str] = types.MappingProxyType({}),
 ) -> dict[str, Any] | None:
     """`{source, attribution}` for one message, validated against the existing contract."""
     if not message.referenceable or all(span.author == UNKNOWN for span in spans):
         return None
-    annotation = to_annotation(message.text, spans, owner_id=owner_id, eligible=eligible)
+    annotation = to_annotation(
+        message.text, spans, owner_id=owner_id, eligible=eligible, verdicts=verdicts
+    )
     attributed_spans(message.text, annotation)
     return {
         "source": {
@@ -918,7 +922,9 @@ def _apply(args: argparse.Namespace) -> int:
         counts: Counter[str] = Counter()
 
         def visit(message: ScannedMessage, spans: list[AttributedSpan]) -> None:
-            entry = message_entry(message, spans, owner_id=owner, eligible=eligible)
+            entry = message_entry(
+                message, spans, owner_id=owner, eligible=eligible, verdicts=summary.verdicts
+            )
             if entry is None:
                 counts["messages_without_annotation"] += 1
                 return
@@ -926,6 +932,7 @@ def _apply(args: argparse.Namespace) -> int:
             for span in entry["attribution"]["spans"]:
                 counts[f"{span['author']}_spans"] += 1
                 counts["profile_eligible_spans"] += bool(span["profile_eligible"])
+                counts["spans_withheld_by_verdict"] += span.get("owner_verdict") in ("no", "unsure")
 
         try:
             stats, tally = scan(
@@ -951,6 +958,7 @@ def _apply(args: argparse.Namespace) -> int:
         "messages_without_annotation": counts["messages_without_annotation"],
         "owner_spans": counts["owner_spans"],
         "profile_eligible_spans": counts["profile_eligible_spans"],
+        "spans_withheld_by_verdict": counts["spans_withheld_by_verdict"],
         "eligible_strata": sorted(f"{rule}:{stratum}" for rule, stratum in eligible),
         "ledger": str(view.path) if view.path else None,
         "ledger_rows": summary.rows,

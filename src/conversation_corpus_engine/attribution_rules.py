@@ -33,6 +33,7 @@ import itertools
 import json
 import os
 import re
+import types
 import unicodedata
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -1349,13 +1350,18 @@ def to_annotation(
     *,
     owner_id: str | None = None,
     eligible: Collection[tuple[str, str]] = frozenset(),
+    verdicts: Mapping[str, str] = types.MappingProxyType({}),
 ) -> dict[str, Any]:
     """The `cce.span-attribution.v1` annotation of one message (see `attribution.py`).
 
     Unknown spans are left out (the contract fills uncovered text as unknown). Evidence names the
     rules version, the deciding rule, the length stratum and the span id. `profile_eligible` is
-    False unless the span is the owner's, its (rule, stratum) passed the precision gate
-    (`eligible`) and an `owner_id` binds it.
+    decided per span: it is False unless the span is the owner's, its (rule, stratum) passed the
+    precision gate (`eligible`), an `owner_id` binds it and the owner did not answer `no` or
+    `unsure` for this very span. `verdicts` maps span ids to the owner's counted verdict; a span
+    with one carries it as `owner_verdict` (and as `owner_verdict:<verdict>` evidence, which
+    survives the contract's key filtering). A confirmed span is still not eligible while its
+    stratum is closed.
     """
     digest = text_digest(text)
     problems = partition_problems(text, spans, digest)
@@ -1373,19 +1379,26 @@ def to_annotation(
         ]
         if span.detail:
             evidence.append(f"detail:{span.detail}")
-        entries.append(
-            {
-                "start": span.start,
-                "end": span.end,
-                "author": span.author,
-                "author_id": owner_id if is_owner else None,
-                "evidence": evidence,
-                "assertion_status": "asserted",
-                "profile_eligible": bool(
-                    is_owner and owner_id and (span.rule, span.stratum) in eligible
-                ),
-            }
-        )
+        verdict = verdicts.get(span.span_id)
+        if verdict is not None:
+            evidence.append(f"owner_verdict:{verdict}")
+        entry = {
+            "start": span.start,
+            "end": span.end,
+            "author": span.author,
+            "author_id": owner_id if is_owner else None,
+            "evidence": evidence,
+            "assertion_status": "asserted",
+            "profile_eligible": bool(
+                is_owner
+                and owner_id
+                and (span.rule, span.stratum) in eligible
+                and verdict in (None, "yes")
+            ),
+        }
+        if verdict is not None:
+            entry["owner_verdict"] = verdict
+        entries.append(entry)
     return {"schema": ATTRIBUTION_SCHEMA, "text_digest": digest, "spans": entries}
 
 
@@ -1617,6 +1630,10 @@ class ReviewSummary:
     quarantined_rows: int = 0
     # Earlier answers to a span that a later row answered again (the last answer counts).
     superseded_rows: int = 0
+    # The owner's counted verdict on each span (the last answer). A span the ledger names but
+    # cannot count cleanly (conflicting or edited rows) is held back as `unsure`. Eligibility is
+    # decided per span from this map: `no` and `unsure` spans are never eligible.
+    verdicts: dict[str, str] = field(default_factory=dict)
 
     def for_rule(self, rule: str) -> list[StratumReview]:
         return [self.strata[(rule, stratum)] for stratum in STRATA]
@@ -1654,11 +1671,15 @@ def review_statistics(
     for row in candidates:
         kinds.setdefault(row["span_id"], set()).add((row["rule"], row["stratum"]))
     latest: dict[str, dict[str, Any]] = {}
+    held_back: set[str] = set()
     for row in candidates:
         if len(kinds[row["span_id"]]) > 1:
             quarantined += 1
+            held_back.add(row["span_id"])
         elif matched.get(row["span_id"]) != (row["rule"], row["stratum"]):
             orphan += 1
+            if row["span_id"] in matched:
+                held_back.add(row["span_id"])  # the span exists, but this row misdescribes it
         else:
             superseded += row["span_id"] in latest
             latest[row["span_id"]] = row
@@ -1684,6 +1705,9 @@ def review_statistics(
             eligible=reviewed >= GATE_MIN_REVIEWED
             and confirmed * 100 >= GATE_MIN_PRECISION_PERCENT * reviewed,
         )
+    verdicts = {span: row["verdict"] for span, row in latest.items()}
+    for span in held_back - verdicts.keys():
+        verdicts[span] = "unsure"
     return ReviewSummary(
         strata=reviews,
         rows=total,
@@ -1693,6 +1717,7 @@ def review_statistics(
         orphan_rows=orphan,
         quarantined_rows=quarantined,
         superseded_rows=superseded,
+        verdicts=verdicts,
     )
 
 

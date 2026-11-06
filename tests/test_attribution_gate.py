@@ -549,6 +549,63 @@ def test_annotation_refuses_spans_of_a_different_text() -> None:
         to_annotation("other words", spans)
 
 
+@pytest.mark.parametrize("verdict", ["no", "unsure"])
+def test_a_span_the_owner_rejected_or_doubted_is_never_eligible_in_an_open_stratum(
+    verdict: str,
+) -> None:
+    eligible = frozenset({("typed_prefix", "S")})
+    (span,) = spans_of(SHORT)
+    annotation = to_annotation(
+        SHORT, [span], owner_id="rob", eligible=eligible, verdicts={span.span_id: verdict}
+    )
+    (entry,) = annotation["spans"]
+    assert entry["profile_eligible"] is False and entry["owner_verdict"] == verdict
+    assert f"owner_verdict:{verdict}" in entry["evidence"]
+    (checked,) = attributed_spans(SHORT, annotation)
+    assert not owner_profile_eligible(checked, "rob")
+    assert f"owner_verdict:{verdict}" in checked["evidence"]
+
+
+def test_a_span_the_owner_confirmed_is_eligible_only_while_its_stratum_is_open() -> None:
+    (span,) = spans_of(SHORT)
+    verdicts = {span.span_id: "yes"}
+    opened = to_annotation(
+        SHORT,
+        [span],
+        owner_id="rob",
+        eligible=frozenset({("typed_prefix", "S")}),
+        verdicts=verdicts,
+    )
+    assert opened["spans"][0]["profile_eligible"] is True
+    assert opened["spans"][0]["owner_verdict"] == "yes"
+    closed = to_annotation(SHORT, [span], owner_id="rob", verdicts=verdicts)
+    assert closed["spans"][0]["profile_eligible"] is False
+    assert closed["spans"][0]["owner_verdict"] == "yes"
+    unreviewed = to_annotation(
+        SHORT, [span], owner_id="rob", eligible=frozenset({("typed_prefix", "S")})
+    )
+    assert unreviewed["spans"][0]["profile_eligible"] is True
+    assert "owner_verdict" not in unreviewed["spans"][0]
+    assert not any(item.startswith("owner_verdict:") for item in unreviewed["spans"][0]["evidence"])
+
+
+def test_the_summary_hands_back_the_last_counted_verdict_of_every_span() -> None:
+    rows = verdict_rows("typed_prefix", ["yes", "no", "unsure"])
+    rows += verdict_rows("typed_prefix", ["no"], start=0)  # span 0 answered again: now no
+    rows += [ledger_row("9" * 32, "typed_prefix", "no", "someone-else", STAMP, stratum="S")]
+    summary = summarize(rows)
+    assert summary.verdicts == {f"{0:032x}": "no", f"{1:032x}": "no", f"{2:032x}": "unsure"}
+
+
+def test_a_span_the_ledger_cannot_count_cleanly_is_held_back() -> None:
+    rows = verdict_rows("typed_prefix", ["yes", "yes"])
+    clash = ledger_row(f"{0:032x}", "quote", "yes", OWNER_ID, STAMP, stratum="S")
+    summary = summarize([*rows, clash])
+    assert summary.quarantined_rows == 2
+    assert summary.verdicts[f"{0:032x}"] == "unsure"
+    assert f"{1:032x}" in summary.verdicts and summary.verdicts[f"{1:032x}"] == "yes"
+
+
 # --- the review sample -----------------------------------------------------------------------
 
 

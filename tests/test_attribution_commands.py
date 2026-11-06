@@ -801,6 +801,48 @@ def test_a_long_pasted_answer_is_not_eligible_until_its_own_stratum_passes(
     assert max(len(text) for text in texts) <= 2000
 
 
+def span_id_of(span: dict) -> str:
+    return next(item.split("span:")[1] for item in span["evidence"] if item.startswith("span:"))
+
+
+def test_spans_the_owner_answered_no_are_never_eligible_once_their_stratum_opens(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=130)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    answered(sample, answers, 97)
+    rejected = {row["span_id"] for row in sample_rows(answers) if row["verdict"] == "no"}
+    assert len(rejected) == 3
+    assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
+    entries, result = apply_entries(
+        capsys, library, tmp_path / "out.json", "--ledger", ledger, "--owner-id", "rob"
+    )
+    assert result["eligible_strata"] == ["typed_prefix:S"]
+    assert result["profile_eligible_spans"] > 0
+    assert result["spans_withheld_by_verdict"] == 3
+    seen = {
+        span_id_of(span): span
+        for entry in entries
+        for span in entry["attribution"]["spans"]
+        if span_id_of(span) in rejected
+    }
+    assert set(seen) == rejected
+    assert all(span["profile_eligible"] is False for span in seen.values())
+    assert all(span["owner_verdict"] == "no" for span in seen.values())
+    confirmed = {row["span_id"] for row in sample_rows(answers) if row["verdict"] == "yes"}
+    flags = {
+        span_id_of(span): span["profile_eligible"]
+        for entry in entries
+        for span in entry["attribution"]["spans"]
+        if span_id_of(span) in confirmed
+    }
+    assert flags and all(flags.values())
+    refused_texts = {row["text"] for row in sample_rows(answers) if row["verdict"] == "no"}
+    owned = set(eligible_owner_texts(library, entries))
+    assert owned and refused_texts.isdisjoint(owned)
+
+
 def test_review_record_needs_the_sample_it_answers(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
