@@ -813,11 +813,29 @@ def _repeat_units(text: str, min_chars: int) -> list[tuple[int, int, int]]:
         stripped = piece.strip()
         if len(stripped) < min_chars:
             continue
-        normalized = " ".join(stripped.split())
-        if len(normalized) >= min_chars:
+        length, key = _collapsed_key(stripped)
+        if length >= min_chars:
             lead = len(piece) - len(piece.lstrip())
-            units.append((start + lead, start + lead + len(stripped), _repeat_key(normalized)))
+            units.append((start + lead, start + lead + len(stripped), key))
     return units
+
+
+def _collapsed_key(stripped: str) -> tuple[int, int]:
+    """Length and census key of a text with every whitespace run collapsed to one space. A huge
+    text is hashed piece by piece (the pieces end at whitespace, so the bytes hashed are exactly
+    those of the one-shot form) instead of being split into every one of its words at once."""
+    if len(stripped) <= 2 * ECHO_CHUNK:
+        collapsed = " ".join(stripped.split())
+        return len(collapsed), _repeat_key(collapsed)
+    digest = hashlib.sha256()
+    length = 0
+    for chunk in _chunks(stripped):
+        piece = " ".join(chunk.split())
+        if piece:
+            data = f" {piece}" if length else piece
+            digest.update(data.encode("utf-8"))
+            length += len(data)
+    return length, int.from_bytes(digest.digest()[:8], "big")
 
 
 class RepeatCensus:

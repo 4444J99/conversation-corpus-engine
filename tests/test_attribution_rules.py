@@ -25,6 +25,8 @@ from conversation_corpus_engine.attribution_rules import (
     MessageContext,
     RecordInfo,
     RepeatCensus,
+    _repeat_key,
+    _repeat_units,
     attribute_message,
     blank_text,
     boilerplate_ranges,
@@ -910,6 +912,54 @@ def test_rewinding_the_census_makes_the_next_pass_see_first_occurrences_again() 
     assert census.later_occurrences(texts[0]) != ()
     census.rewind()
     assert [census.later_occurrences(text) for text in texts] == first_pass
+
+
+def test_a_huge_paragraph_gets_the_same_census_key_as_a_one_shot_normalization() -> None:
+    rng = random.Random(9)
+    gaps = [" ", "  ", "\t", " \n", "\n  "]
+    words = [f"word{index}" for index in range(70_000)]
+    body = "".join(word + rng.choice(gaps) for word in words).strip()
+    assert len(body) > 4 * 65536 and "\n\n" not in body
+    units = _repeat_units(f"{body}\n\n{body}", 200)
+    assert len(units) == 3
+    expected = _repeat_key(" ".join(body.split()))
+    assert units[0][2] == units[1][2] == expected
+    assert units[2][2] == _repeat_key(" ".join(f"{body}\n\n{body}".split()))
+    small = _repeat_units("A short paragraph of words. " * 12, 200)
+    assert small[0][2] == _repeat_key(" ".join(("A short paragraph of words. " * 12).split()))
+
+
+def test_censusing_a_ten_megabyte_paragraph_does_not_split_every_word_at_once() -> None:
+    script = textwrap.dedent(
+        """
+        import json, resource, sys
+        from conversation_corpus_engine.attribution_rules import RepeatCensus
+        text = "alpha beta gamma delta " * 450_000
+        assert len(text) > 10_000_000
+        census = RepeatCensus()
+        census.observe(text)
+        census.observe(text)
+        census.observe(text)
+        found = census.later_occurrences(text)
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        print(json.dumps({
+            "peak_mb": peak / (1 if sys.platform == "darwin" else 1024) / 1_000_000,
+            "claimed": len(found),
+        }))
+        """
+    )
+    source_root = Path(attribution_rules.__file__).resolve().parents[1]
+    done = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "PYTHONPATH": str(source_root)},
+        timeout=300,
+    )
+    result = json.loads(done.stdout)
+    assert result["claimed"] == 0  # the first occurrence in scan order is left to the other rules
+    assert result["peak_mb"] < 100, result
 
 
 def test_text_the_census_never_saw_is_never_boilerplate() -> None:
