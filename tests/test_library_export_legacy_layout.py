@@ -9,7 +9,9 @@ idempotent (``plain`` in ``library_note_text``). The earlier escaper replaced ``
 and then escaped the ``#`` inside that entity, so a title or a metadata value with a Markdown
 special rendered as literal entity text (``metadata&&#35;95;only``). The fixture below has two
 such values; ``test_special_characters_are_escaped_once_in_the_legacy_layout`` pins the exact
-new bytes, and no other file of the layout changed.
+new bytes. Every differing line is a doubled escape (``&&#NN;``) becoming a single one
+(``&#NN;``), in the two record notes, the seven hub pages that list them and the Notion ZIP that
+embeds the same notes; no other byte of the layout changed.
 """
 
 from __future__ import annotations
