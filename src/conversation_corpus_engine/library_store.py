@@ -26,6 +26,8 @@ from typing import Any
 from .archive_database import WORD_RE, fts_terms
 from .archive_model import Conversation, stable_uid
 from .library_blocks import split_blocks
+from .web_capture import PROVIDER as WEB_CAPTURE_PROVIDER
+from .web_capture import capture_summary
 
 LIBRARY_SCHEMA = "cce.knowledge-library.v1"
 MAX_PAGE = 200
@@ -957,6 +959,12 @@ class Library:
                     hit[key] = hit[key][:128]
                 hit["excerpt"] = hit["excerpt"][:360]
                 hit["path"] = f"vault/records/{hit['uid']}.md"
+                if hit["provider"] == WEB_CAPTURE_PROVIDER:
+                    # A saved page shows where it came from and when it was fetched; the other
+                    # providers' hits keep exactly the keys they had.
+                    hit["capture"] = capture_summary(
+                        self.record(hit["uid"]).get("provenance") or {}
+                    )
                 hits.append(hit)
             return hits
 

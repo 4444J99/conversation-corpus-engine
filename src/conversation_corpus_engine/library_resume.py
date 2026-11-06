@@ -129,6 +129,9 @@ def prepare_resume(
             native = source.get("report", {})
             total += _count(native.get("records", 0), kind)
             native_paths.append(source.get("path"))
+        elif kind == "web_captures" and index < len(sources) - 1:
+            counts = source.get("report", {}).get("counts", {})
+            total += _count(counts.get("records", 0), "web capture records")
         elif kind == "documents" and index == len(sources) - 1:
             counts = source.get("report", {}).get("counts", {})
             total += _count(counts.get("ingested", 0), "documents ingested")

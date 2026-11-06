@@ -107,6 +107,53 @@ The manifest is private: it contains local source locations. Native readers reta
 
 To reuse a failed generation whose source ingestion finished, set `resume_generation` to its absolute generation directory and list only supplemental sources in the new manifest. The builder verifies the failed state, source counts, manifest, publication base, database integrity and every normalized object digest. It hash-binds and compacts a new copy, leaving the seed untouched; baseline observations count against the new record budget. The report retains the seed receipt and all coverage findings. Older candidates without a phase marker are explicitly labeled as weaker legacy ingestion evidence. Set measured `limits` in the manifest for the next invocation; a resume never changes global limits or hides the failed attempt.
 
+## Web captures
+
+A capture tool that fetches saved web pages writes *shards*: JSONL files with one row per page attempt. `cce library build` reads them through the `web_captures` key of the source manifest, the same intake as the other sources, so a saved page is searchable like a chat and is bounded, receipted and published the same way. The key lists absolute paths: a shard file, or a folder whose `*.jsonl` files (at any depth, symlinks never followed) are read in name order.
+
+```json
+{
+  "schema": "cce.library-sources.v1",
+  "web_captures": ["/private/web-captures/shards"],
+  "web_capture_max_row_bytes": 8388608
+}
+```
+
+`web_capture_max_row_bytes` is optional (default 8 MiB). A line over it is refused without being held in memory.
+
+**Input format (`capture-shard.v1`).** One JSON object per line, with exactly these fields (a missing or unexpected field refuses the row):
+
+| Field | Meaning |
+|---|---|
+| `schema` | the string `capture-shard.v1` |
+| `id` | `pg_` and the first 24 hex characters of the SHA-256 of `key` |
+| `key` | the normalized URL the page is identified by (nonempty) |
+| `requested_url` | the URL that was asked for, `http` or `https`, no whitespace |
+| `final_url` | the URL after redirects, or null when no response arrived |
+| `status` | `captured` or `failed` |
+| `http_status` | an integer of at least 100, or null |
+| `content_digest` | `sha256:` and the SHA-256 (64 hex) of the UTF-8 `text`; null on a failed row |
+| `captured_at` | the fetch time as a UTC stamp, `2026-01-02T03:04:05Z` |
+| `extractor` | an object with a nonempty `name` and `version` |
+| `text` | the extracted text; empty on a failed row |
+| `failure_class` | null on a captured row; on a failed row one of `dead_link`, `login_wall`, `paywall`, `non_html`, `rendered_empty`, `timeout`, `blocked` |
+| `license_note` | a nonempty free-text rights note |
+| `title` | optional string |
+| `tier` | optional, `A` or `B` |
+
+**What a row becomes.** One record per page: provider `webcapture`, kind `page`, wing `ai`, lane `web`, UID `webcapture-pg-` and the 24 hex of the page id. Its identity comes from the page id, so reading the same page again is the same record, and a page whose text changed is a new revision of it under the library's usual rules (a text change is a minor version, and every earlier revision stays readable). The record carries one message with the page text (role `tool`, channel `tool`), and provenance with `source: web_capture`, `requested_url`, `final_url`, `captured_at`, `content_digest`, `http_status`, `extractor`, `license_note` and `source_file` (the shard's name relative to the declared folder). `source_path`, and so a search hit's `source_ref` and the index's source reference, is the final URL (the requested URL when there was no redirect). No absolute path and no file time enters a record, so moving the shard folder changes nothing. The wing `ai` means only "not the person's own writing"; the authored wing is for text the person wrote.
+
+**Search.** A hit of a web capture carries `capture`: `url` (the requested URL), `final_url`, `captured_at`, `content_digest` and `http_status`, beside the usual fields; hits of other providers are unchanged. `cce library read UID` shows the full provenance.
+
+**Authorship.** A page is another party's text. The authorship engine labels every character of a record from the `webcapture` family `third_party` through its own first rule, whatever the role, channel or typed count says and whatever the URL or text looks like; it can never be `owner`. See [attributed knowledge](attributed-knowledge.md#rule-precedence).
+
+**Duplicates, failures and refusals.**
+
+- Several rows for one page (the same `id`, in one shard or many) keep one winner: a capture beats a failure, then the latest `captured_at`, then the larger `content_digest`, so the result does not depend on which shard is read first. The folded rows are counted as `duplicates` in the build report.
+- A `failed` row is kept as a record without a body (body status `metadata_only`, `body_reason` the failure class), so a page that could not be fetched stays visible. It makes `coverage_complete` false, like any other record without a body.
+- A row that cannot be trusted is refused with a finding in the build report (`scope: web_captures`, the shard, the line number, a code and a reason that never repeats page text), and the build continues. The codes are `malformed_row` (not JSON, not an object, a field of the wrong shape, an `id` that does not follow the `key`, a `content_digest` that does not match the `text`, a captured row without text or with a failure class, a failed row with a body, text with a NUL or invalid Unicode), `row_too_large`, `symlink_not_followed`, `missing_source`, `unreadable_file` and `source_changed_during_read`.
+- The report lists every shard with its SHA-256, size and row count (`sources[].report.shards`).
+
 ## Preservation and condensation
 
 The SQLite store retains compressed, hashed normalized source objects, provenance observations, and source snapshots. Original file hashes are retained where the adapter reads the original bytes. Semantic versions start at `1.0.0`: classification changes advance major, body changes minor, and metadata changes patch. A lower-coverage observation never replaces a fuller current body. Replaying a known source snapshot does not revert the current revision; all observations remain retrievable.
