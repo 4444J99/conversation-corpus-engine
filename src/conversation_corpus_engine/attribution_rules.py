@@ -701,6 +701,10 @@ class RepeatCensus:
         self._seen: set[int] = set()
         self._claiming = False
 
+    def rewind(self) -> None:
+        """Start the claim pass over: the next scan sees every first occurrence as a first."""
+        self._seen.clear()
+
     def observe(self, text: str) -> None:
         if self._claiming:
             raise RuntimeError("observe every message before asking for later occurrences")
@@ -1178,29 +1182,48 @@ class StratumReview:
 class ReviewSummary:
     strata: dict[tuple[str, str], StratumReview]
     rows: int
-    stale_rows: int
+    # Rows of another rules version or an older ledger schema: read, never counted.
+    stale_rows: int = 0
+    # Rows whose reviewer is not the owner identity: never counted.
+    non_owner_rows: int = 0
+    non_owner_reviewers: dict[str, int] = field(default_factory=dict)
+    # Rows whose span id does not exist in the scan under the same rule and stratum.
+    orphan_rows: int = 0
 
     def for_rule(self, rule: str) -> list[StratumReview]:
         return [self.strata[(rule, stratum)] for stratum in STRATA]
 
 
 def review_statistics(
-    rows: Iterable[dict[str, Any]], *, rules_version: str = RULES_VERSION
+    rows: Iterable[dict[str, Any]],
+    *,
+    matched: Mapping[str, tuple[str, str]],
+    owner: str | None,
+    rules_version: str = RULES_VERSION,
 ) -> ReviewSummary:
     """Per-(rule, stratum) review counts and eligibility from ledger rows.
 
-    A span counts once, by its last verdict in file order. Only current-schema rows of
-    `rules_version` count; rows of another version or of an older schema (no stratum) are reported
-    as stale and ignored. `unsure` and `no` both count as reviewed and not confirmed. The
-    precision test is integer arithmetic.
+    A row counts only when all of these hold: it is current (this `rules_version`, the current
+    schema); its reviewer equals `owner` (None identifies nobody, so nothing counts); and its span
+    id exists in the scan (`matched` maps span id to (rule, stratum)) under the same rule and
+    stratum. A span counts once, by its last verdict in file order. `unsure` and `no` both count
+    as reviewed and not confirmed. The precision test is integer arithmetic.
     """
     latest: dict[str, dict[str, Any]] = {}
-    total = stale = 0
+    total = stale = non_owner = orphan = 0
+    reviewers: dict[str, int] = {}
     for raw in rows:
         row = validate_ledger_row(raw)
         total += 1
         if row["rules_version"] != rules_version or row["schema"] != LEDGER_SCHEMA:
             stale += 1
+            continue
+        if owner is None or row["reviewer"] != owner:
+            non_owner += 1
+            reviewers[row["reviewer"]] = reviewers.get(row["reviewer"], 0) + 1
+            continue
+        if matched.get(row["span_id"]) != (row["rule"], row["stratum"]):
+            orphan += 1
             continue
         latest[row["span_id"]] = row
     counts = {
@@ -1225,7 +1248,14 @@ def review_statistics(
             eligible=reviewed >= GATE_MIN_REVIEWED
             and confirmed * 100 >= GATE_MIN_PRECISION_PERCENT * reviewed,
         )
-    return ReviewSummary(strata=reviews, rows=total, stale_rows=stale)
+    return ReviewSummary(
+        strata=reviews,
+        rows=total,
+        stale_rows=stale,
+        non_owner_rows=non_owner,
+        non_owner_reviewers=reviewers,
+        orphan_rows=orphan,
+    )
 
 
 def eligible_strata(summary: ReviewSummary) -> frozenset[tuple[str, str]]:

@@ -52,7 +52,10 @@ PASTED_ANSWER = (
 
 
 def conversations(
-    typed_records: int = 0, medium_records: int = 0, pasted_answer: bool = False
+    typed_records: int = 0,
+    medium_records: int = 0,
+    pasted_answer: bool = False,
+    text_suffix: str = "",
 ) -> list[Conversation]:
     items = [
         _chat(
@@ -149,7 +152,12 @@ def conversations(
     items.extend(
         _chat(
             f"typed-{index:03d}",
-            [typed("t0", f"Typed words number {index} in my own voice about topic {index * 7}.")],
+            [
+                typed(
+                    "t0",
+                    f"Typed words number {index} in my own voice about topic {index * 7}.{text_suffix}",
+                )
+            ],
         )
         for index in range(typed_records)
     )
@@ -177,10 +185,13 @@ def build_library(
     typed_records: int = 0,
     medium_records: int = 0,
     pasted_answer: bool = False,
+    text_suffix: str = "",
 ) -> Path:
     """Create `directory/library.sqlite` and return its path; the generation is closed again."""
     directory.mkdir(parents=True, exist_ok=True)
     with Library.create(directory / "library.sqlite") as library:
-        for conversation in conversations(typed_records, medium_records, pasted_answer):
+        for conversation in conversations(
+            typed_records, medium_records, pasted_answer, text_suffix
+        ):
             library.put(conversation)
     return directory / "library.sqlite"

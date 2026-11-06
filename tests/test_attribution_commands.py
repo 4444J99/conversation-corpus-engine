@@ -132,6 +132,9 @@ def test_report_has_no_eligible_rule_without_a_ledger(
         "ledger": None,
         "ledger_rows": 0,
         "stale_rows": 0,
+        "orphan_rows": 0,
+        "non_owner_rows": 0,
+        "non_owner_reviewers": {},
     }
 
 
@@ -376,21 +379,15 @@ def test_apply_writes_valid_digest_bound_annotations_in_the_profile_input_form(
 
 
 def test_apply_output_feeds_the_strict_profile_with_no_owner_text_until_the_gate_passes(
-    library_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    library_path = build_library(tmp_path / "g", typed_records=110)
     entries, _ = apply_entries(capsys, library_path, tmp_path / "plain.json", "--owner-id", "rob")
     with Library(library_path) as library:
         owner, other = collect_owner_segments(library, entries, "rob")
     assert owner == [] and other
 
-    ledger = tmp_path / "ledger.jsonl"
-    append_ledger(
-        ledger,
-        [
-            ledger_row(f"{index:032x}", "typed_prefix", "yes", "rob", STAMP, stratum="S")
-            for index in range(100)
-        ],
-    )
+    ledger = approve(capsys, library_path, tmp_path)
     gated, result = apply_entries(
         capsys,
         library_path,
@@ -416,19 +413,80 @@ def test_apply_output_feeds_the_strict_profile_with_no_owner_text_until_the_gate
 
 
 def test_apply_without_an_owner_id_never_marks_a_span_eligible(
-    library_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    ledger = tmp_path / "ledger.jsonl"
+    library_path = build_library(tmp_path / "g", typed_records=110)
+    ledger = approve(capsys, library_path, tmp_path)
+    _, result = apply_entries(capsys, library_path, tmp_path / "a.json", "--ledger", ledger)
+    assert result["eligible_strata"] == []
+    assert result["profile_eligible_spans"] == 0
+    assert result["non_owner_rows"] == 100
+
+
+def test_fabricated_ledger_rows_count_for_nothing_in_report_and_apply(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library_path = build_library(tmp_path / "g", typed_records=110)
+    forged = tmp_path / "forged.jsonl"
     append_ledger(
-        ledger,
+        forged,
         [
             ledger_row(f"{index:032x}", "typed_prefix", "yes", "rob", STAMP, stratum="S")
             for index in range(100)
         ],
     )
-    _, result = apply_entries(capsys, library_path, tmp_path / "a.json", "--ledger", ledger)
-    assert result["eligible_strata"] == ["typed_prefix:S"]
-    assert result["profile_eligible_spans"] == 0
+    report = report_of(capsys, library_path, "--ledger", forged, "--owner-id", "rob")
+    assert report["gate"]["orphan_rows"] == 100 and report["profile_eligible"] == []
+    row = next(item for item in report["rules"] if item["rule"] == "typed_prefix")
+    assert row["strata"]["S"]["reviewed"] == 0
+    entries, result = apply_entries(
+        capsys, library_path, tmp_path / "f.json", "--ledger", forged, "--owner-id", "rob"
+    )
+    assert result["eligible_strata"] == [] and result["orphan_rows"] == 100
+    with Library(library_path) as library:
+        owner, _ = collect_owner_segments(library, entries, "rob")
+    assert owner == []
+
+
+def test_rows_from_a_non_owner_reviewer_are_listed_and_never_counted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library_path = build_library(tmp_path / "g", typed_records=110)
+    ledger = approve(capsys, library_path, tmp_path, reviewer="agent:codex")
+    report = report_of(capsys, library_path, "--ledger", ledger, "--owner-id", "rob")
+    gate_info = report["gate"]
+    assert gate_info["non_owner_rows"] == 100 and gate_info["orphan_rows"] == 0
+    assert gate_info["non_owner_reviewers"] == {"agent:codex": 100}
+    assert report["profile_eligible"] == []
+    owner_report = report_of(capsys, library_path, "--ledger", ledger, "--owner-id", "agent:codex")
+    assert owner_report["profile_eligible"] == ["typed_prefix:S"]
+
+
+def test_editing_the_text_of_a_message_orphans_every_review_of_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library_path = build_library(tmp_path / "g", typed_records=110)
+    ledger = approve(capsys, library_path, tmp_path)
+    ok = report_of(capsys, library_path, "--ledger", ledger, "--owner-id", "rob")
+    assert ok["profile_eligible"] == ["typed_prefix:S"]
+    edited = build_library(tmp_path / "edited", typed_records=110, text_suffix="!")
+    report = report_of(capsys, edited, "--ledger", ledger, "--owner-id", "rob")
+    assert report["profile_eligible"] == []
+    # Only the fixture messages whose text did not change keep their reviews.
+    row = next(item for item in report["rules"] if item["rule"] == "typed_prefix")
+    assert report["gate"]["orphan_rows"] >= 90
+    assert row["strata"]["S"]["reviewed"] + report["gate"]["orphan_rows"] == 100
+
+
+def test_a_limited_scan_counts_only_the_spans_it_saw(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library_path = build_library(tmp_path / "g", typed_records=110)
+    ledger = approve(capsys, library_path, tmp_path)
+    report = report_of(
+        capsys, library_path, "--ledger", ledger, "--owner-id", "rob", "--limit-records", "40"
+    )
+    assert report["profile_eligible"] == [] and report["gate"]["orphan_rows"] > 0
 
 
 def test_apply_refuses_to_overwrite_or_to_write_into_the_library(
@@ -509,6 +567,49 @@ def answered(sample: Path, target: Path, yes: int, stratum: str = "S") -> None:
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def record_answers(
+    capsys: pytest.CaptureFixture[str],
+    ledger: Path,
+    sample: Path,
+    answers: Path,
+    *extra: str,
+    reviewer: str = "rob",
+) -> tuple[int, str, str]:
+    return run_cli(
+        capsys,
+        "review-record",
+        "--ledger",
+        ledger,
+        "--sample",
+        sample,
+        "--answers",
+        answers,
+        "--reviewer",
+        reviewer,
+        "--reviewed-at",
+        STAMP,
+        *extra,
+    )
+
+
+def approve(
+    capsys: pytest.CaptureFixture[str],
+    library: Path,
+    tmp_path: Path,
+    *,
+    yes: int = 100,
+    reviewer: str = "rob",
+    name: str = "approved",
+) -> Path:
+    """Sample, answer the short typed_prefix rows and record them: a ledger of real reviews."""
+    sample, answers, ledger = (tmp_path / f"{name}-{kind}.jsonl" for kind in ("s", "a", "l"))
+    assert run_cli(capsys, "review-sample", "--library", library, "--out", sample)[0] == 0
+    answered(sample, answers, yes)
+    code, _, err = record_answers(capsys, ledger, sample, answers, reviewer=reviewer)
+    assert code == 0, err
+    return ledger
+
+
 @pytest.mark.parametrize(("yes", "eligible"), [(95, True), (94, False)])
 def test_sampling_answering_and_reporting_close_the_gate_loop(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], yes: int, eligible: bool
@@ -517,30 +618,19 @@ def test_sampling_answering_and_reporting_close_the_gate_loop(
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
     run_cli(capsys, "review-sample", "--library", library, "--out", sample)
     answered(sample, answers, yes)
-    code, out, err = run_cli(
-        capsys,
-        "review-record",
-        "--ledger",
-        ledger,
-        "--answers",
-        answers,
-        "--reviewer",
-        "rob",
-        "--reviewed-at",
-        STAMP,
-        "--json",
-    )
+    code, out, err = record_answers(capsys, ledger, sample, answers, "--json")
     assert code == 0, err
     recorded = json.loads(out)
     assert recorded["appended"] == 100 and recorded["unanswered"] > 0
-    assert recorded["strata"]["typed_prefix:S"]["eligible"] is eligible
-    report = report_of(capsys, library, "--ledger", ledger)
+    assert recorded["strata"]["typed_prefix:S"]["appended"] == 100
+    report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
     row = next(item for item in report["rules"] if item["rule"] == "typed_prefix")
     short = row["strata"]["S"]
     assert (short["reviewed"], short["confirmed"], short["eligible"]) == (100, yes, eligible)
     assert not row["strata"]["M"]["eligible"] and not row["strata"]["L"]["eligible"]
     assert report["profile_eligible"] == (["typed_prefix:S"] if eligible else [])
     assert report["gate"]["ledger_rows"] == 100
+    assert (report["gate"]["orphan_rows"], report["gate"]["non_owner_rows"]) == (0, 0)
     _, result = apply_entries(
         capsys, library, tmp_path / "out.json", "--ledger", ledger, "--owner-id", "rob"
     )
@@ -573,11 +663,10 @@ def test_a_long_pasted_answer_is_not_eligible_until_its_own_stratum_passes(
     )
     sample, ledger = tmp_path / "sample.jsonl", tmp_path / "ledger.jsonl"
     run_cli(capsys, "review-sample", "--library", library, "--out", sample)
-    record = ("review-record", "--ledger", ledger, "--reviewer", "rob", "--reviewed-at", STAMP)
 
     short_answers = tmp_path / "short.jsonl"
     answered(sample, short_answers, 100, stratum="S")
-    assert run_cli(capsys, *record, "--answers", short_answers)[0] == 0
+    assert record_answers(capsys, ledger, sample, short_answers)[0] == 0
     entries, result = apply_entries(
         capsys, library, tmp_path / "one.json", "--ledger", ledger, "--owner-id", "rob"
     )
@@ -588,7 +677,7 @@ def test_a_long_pasted_answer_is_not_eligible_until_its_own_stratum_passes(
 
     medium_answers = tmp_path / "medium.jsonl"
     answered(sample, medium_answers, 100, stratum="M")
-    assert run_cli(capsys, *record, "--answers", medium_answers)[0] == 0
+    assert record_answers(capsys, ledger, sample, medium_answers)[0] == 0
     entries, result = apply_entries(
         capsys, library, tmp_path / "two.json", "--ledger", ledger, "--owner-id", "rob"
     )
@@ -598,50 +687,95 @@ def test_a_long_pasted_answer_is_not_eligible_until_its_own_stratum_passes(
     assert max(len(text) for text in texts) <= 2000
 
 
+def test_review_record_needs_the_sample_it_answers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    answers = tmp_path / "answers.jsonl"
+    answers.write_text("", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(
+            [
+                "library",
+                "attribute",
+                "review-record",
+                "--ledger",
+                str(tmp_path / "l.jsonl"),
+                "--answers",
+                str(answers),
+                "--reviewer",
+                "rob",
+            ]
+        )
+    capsys.readouterr()
+
+
+def test_review_record_refuses_answers_that_are_not_in_the_sample(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "g", typed_records=3)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    real = next(row for row in sample_rows(sample) if row["rule"] == "typed_prefix")
+    real["verdict"] = "yes"
+    forgeries = {
+        "fabricated id": {**real, "span_id": "f" * 32},
+        "edited rule": {**real, "rule": "note_owner"},
+        "edited stratum": {**real, "stratum": "M"},
+        "missing stratum": {key: value for key, value in real.items() if key != "stratum"},
+        "other rules version": {**real, "rules_version": "cce.attribution-rules@0"},
+    }
+    for name, forged in forgeries.items():
+        answers.write_text(json.dumps(real) + "\n" + json.dumps(forged) + "\n", encoding="utf-8")
+        code, _, err = record_answers(capsys, ledger, sample, answers)
+        assert code == 2 and "answers line 2" in err and "sample" in err, name
+        assert not ledger.exists(), name
+    answers.write_text(json.dumps(real) + "\n", encoding="utf-8")
+    assert record_answers(capsys, ledger, sample, answers)[0] == 0
+
+
 def test_review_record_rejects_bad_answers_before_writing_anything(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    ledger = tmp_path / "ledger.jsonl"
-    answers = tmp_path / "answers.jsonl"
-    good = {"span_id": "a" * 32, "rule": "quote", "stratum": "S", "verdict": "yes"}
+    library = build_library(tmp_path / "g", typed_records=3)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    good = next(row for row in sample_rows(sample) if row["rule"] == "typed_prefix")
+    good["verdict"] = "yes"
     answers.write_text(
         json.dumps(good) + "\n" + json.dumps({**good, "verdict": "maybe"}) + "\n", encoding="utf-8"
     )
-    code, _, err = run_cli(
-        capsys,
-        "review-record",
-        "--ledger",
-        ledger,
-        "--answers",
-        answers,
-        "--reviewer",
-        "rob",
-    )
+    code, _, err = record_answers(capsys, ledger, sample, answers)
     assert code == 2 and "answers line 2" in err
     assert not ledger.exists()
-    answers.write_text(json.dumps({**good, "rule": "nope"}) + "\n", encoding="utf-8")
-    code, _, err = run_cli(
-        capsys, "review-record", "--ledger", ledger, "--answers", answers, "--reviewer", "rob"
-    )
+    answers.write_text("{bad\n", encoding="utf-8")
+    code, _, err = record_answers(capsys, ledger, sample, answers)
     assert code == 2 and "answers line 1" in err and not ledger.exists()
 
 
 def test_review_record_stamps_the_current_utc_time_only_when_none_is_given(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    ledger = tmp_path / "ledger.jsonl"
-    answers = tmp_path / "answers.jsonl"
-    answers.write_text(
-        json.dumps({"span_id": "b" * 32, "rule": "quote", "stratum": "S", "verdict": "YES"}) + "\n",
-        encoding="utf-8",
-    )
+    library = build_library(tmp_path / "g", typed_records=3)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    row = next(item for item in sample_rows(sample) if item["rule"] == "typed_prefix")
+    answers.write_text(json.dumps({**row, "verdict": "YES"}) + "\n", encoding="utf-8")
     code, _, _ = run_cli(
-        capsys, "review-record", "--ledger", ledger, "--answers", answers, "--reviewer", "rob"
+        capsys,
+        "review-record",
+        "--ledger",
+        ledger,
+        "--sample",
+        sample,
+        "--answers",
+        answers,
+        "--reviewer",
+        "rob",
     )
     assert code == 0
-    row = json.loads(ledger.read_text(encoding="utf-8"))
-    assert row["verdict"] == "yes" and row["reviewer"] == "rob"
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", row["reviewed_at"])
+    recorded = json.loads(ledger.read_text(encoding="utf-8"))
+    assert recorded["verdict"] == "yes" and recorded["reviewer"] == "rob"
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", recorded["reviewed_at"])
 
 
 # --- registration ----------------------------------------------------------------------------

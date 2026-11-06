@@ -703,6 +703,18 @@ def test_first_means_first_in_the_order_the_slice_is_scanned() -> None:
         census.observe("late text")
 
 
+def test_rewinding_the_census_makes_the_next_pass_see_first_occurrences_again() -> None:
+    texts = [f"{TEMPLATE}\n\nSuffix {index}." for index in range(3)]
+    census = RepeatCensus()
+    for text in texts:
+        census.observe(text)
+    first_pass = [census.later_occurrences(text) for text in texts]
+    assert first_pass[0] == () and first_pass[1] and first_pass[2]
+    assert census.later_occurrences(texts[0]) != ()
+    census.rewind()
+    assert [census.later_occurrences(text) for text in texts] == first_pass
+
+
 def test_text_the_census_never_saw_is_never_boilerplate() -> None:
     assert RepeatCensus().later_occurrences(TEMPLATE) == ()
 

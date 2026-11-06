@@ -43,6 +43,7 @@ from .attribution_rules import (
     RULES,
     RULES_VERSION,
     SAMPLE_PER_STRATUM,
+    SAMPLE_SCHEMA,
     SAMPLE_SEED,
     STRATA,
     UNATTRIBUTED,
@@ -359,6 +360,9 @@ def build_report(
             "ledger": str(ledger) if ledger else None,
             "ledger_rows": summary.rows,
             "stale_rows": summary.stale_rows,
+            "orphan_rows": summary.orphan_rows,
+            "non_owner_rows": summary.non_owner_rows,
+            "non_owner_reviewers": dict(sorted(summary.non_owner_reviewers.items())),
         },
         "profile_eligible": sorted(
             f"{rule}:{stratum}" for rule, stratum in eligible_strata(summary)
@@ -550,6 +554,14 @@ def _scan_arguments(parser: argparse.ArgumentParser, *, nested: bool) -> None:
         help="Owner-review ledger (JSONL) that decides which rules passed the precision gate",
     )
     parser.add_argument(
+        "--owner-id",
+        default=default(None),
+        help=(
+            "The owner identity: the author_id of owner spans, and the only reviewer whose "
+            "ledger rows count toward the gate"
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         default=default(False),
@@ -576,10 +588,6 @@ def add_attribute_parser(library_actions: Any) -> None:
     )
     _scan_arguments(apply, nested=True)
     apply.add_argument("--out", type=Path, required=True, help="New annotation file (JSON list)")
-    apply.add_argument(
-        "--owner-id",
-        help="author_id of owner spans; a strict profile counts only spans bound to its persona",
-    )
     sample = sub.add_parser(
         "review-sample",
         help="Draw the deterministic sample of short spans the owner confirms or rejects",
@@ -599,6 +607,9 @@ def add_attribute_parser(library_actions: Any) -> None:
         "review-record", help="Append the owner's verdicts on a sample to the review ledger"
     )
     record.add_argument("--ledger", type=Path, required=True)
+    record.add_argument(
+        "--sample", type=Path, required=True, help="The review-sample file the answers belong to"
+    )
     record.add_argument("--answers", type=Path, required=True, help="The sample, answered")
     record.add_argument("--reviewer", required=True)
     record.add_argument(
@@ -619,10 +630,41 @@ def _open_target(args: argparse.Namespace) -> tuple[Library, Path]:
     return library, generation / "library.sqlite"
 
 
-def _summary(args: argparse.Namespace) -> tuple[ReviewSummary, Path | None]:
+@dataclass
+class LedgerView:
+    """The ledger as read for one command, and the span ids the scan must look for."""
+
+    path: Path | None
+    rows: list[dict[str, Any]]
+    wanted: set[str]
+
+
+def _ledger_view(args: argparse.Namespace) -> LedgerView:
     if args.ledger is None:
-        return review_statistics([]), None
-    return review_statistics(read_ledger(args.ledger)), args.ledger
+        return LedgerView(None, [], set())
+    rows = read_ledger(args.ledger)
+    wanted = {row["span_id"] for row in rows if row["rules_version"] == RULES_VERSION}
+    return LedgerView(args.ledger, rows, wanted)
+
+
+class MatchRecorder:
+    """Notes which ledger span ids exist in the scan, and under which rule and stratum."""
+
+    def __init__(self, wanted: set[str]) -> None:
+        self.wanted = wanted
+        self.matched: dict[str, tuple[str, str]] = {}
+
+    def visit(self, message: ScannedMessage, spans: list[AttributedSpan]) -> None:
+        for span in spans:
+            if span.span_id in self.wanted:
+                self.matched[span.span_id] = (span.rule, span.stratum)
+
+
+def _owner(args: argparse.Namespace) -> str | None:
+    owner = args.owner_id
+    if owner is not None and not owner.strip():
+        raise ValueError("--owner-id must be nonempty")
+    return owner
 
 
 def _census(library: Library, args: argparse.Namespace, deadline: Deadline) -> RepeatCensus:
@@ -640,17 +682,25 @@ def _emit(payload: dict[str, Any], text: str, as_json: bool) -> None:
 
 
 def _report(args: argparse.Namespace) -> int:
-    summary, ledger = _summary(args)
+    view, owner = _ledger_view(args), _owner(args)
+    recorder = MatchRecorder(view.wanted)
     deadline = Deadline(args.deadline_seconds)
     library, _ = _open_target(args)
     with library:
         census = _census(library, args, deadline)
-        stats, tally = scan(library, census, limit_records=args.limit_records, deadline=deadline)
+        stats, tally = scan(
+            library,
+            census,
+            limit_records=args.limit_records,
+            deadline=deadline,
+            visit=recorder.visit if view.wanted else None,
+        )
+    summary = review_statistics(view.rows, matched=recorder.matched, owner=owner)
     report = build_report(
         stats,
         tally,
         summary,
-        ledger=ledger,
+        ledger=view.path,
         min_chars=args.repeat_min_chars,
         min_occurrences=args.repeat_min_occurrences,
     )
@@ -666,10 +716,7 @@ def _inside(path: Path, folder: Path) -> bool:
 
 
 def _apply(args: argparse.Namespace) -> int:
-    if args.owner_id is not None and not args.owner_id.strip():
-        raise ValueError("--owner-id must be nonempty")
-    summary, ledger = _summary(args)
-    eligible = eligible_strata(summary)
+    view, owner = _ledger_view(args), _owner(args)
     deadline = Deadline(args.deadline_seconds)
     library, database = _open_target(args)
     with library:
@@ -679,11 +726,29 @@ def _apply(args: argparse.Namespace) -> int:
         if out.exists() or out.is_symlink():
             raise ValueError(f"output already exists: {out}")
         census = _census(library, args, deadline)
+        recorder = MatchRecorder(view.wanted)
+        if view.wanted:
+            # Which reviews exist in this scan decides what is eligible, so find out first.
+            gate_stats, _ = scan(
+                library,
+                census,
+                limit_records=args.limit_records,
+                deadline=deadline,
+                visit=recorder.visit,
+            )
+            if gate_stats.deadline_reached:
+                raise DeadlineReached(
+                    f"wall deadline of {args.deadline_seconds:g} seconds reached while "
+                    "matching the review ledger"
+                )
+            census.rewind()
+        summary = review_statistics(view.rows, matched=recorder.matched, owner=owner)
+        eligible = eligible_strata(summary)
         writer = AnnotationWriter(out)
         counts: Counter[str] = Counter()
 
         def visit(message: ScannedMessage, spans: list[AttributedSpan]) -> None:
-            entry = message_entry(message, spans, owner_id=args.owner_id, eligible=eligible)
+            entry = message_entry(message, spans, owner_id=owner, eligible=eligible)
             if entry is None:
                 counts["messages_without_annotation"] += 1
                 return
@@ -716,7 +781,11 @@ def _apply(args: argparse.Namespace) -> int:
         "owner_spans": counts["owner_spans"],
         "profile_eligible_spans": counts["profile_eligible_spans"],
         "eligible_strata": sorted(f"{rule}:{stratum}" for rule, stratum in eligible),
-        "ledger": str(ledger) if ledger else None,
+        "ledger": str(view.path) if view.path else None,
+        "ledger_rows": summary.rows,
+        "stale_rows": summary.stale_rows,
+        "orphan_rows": summary.orphan_rows,
+        "non_owner_rows": summary.non_owner_rows,
     }
     text = (
         f"wrote {writer.count} annotations for {tally.messages} messages to {written}"
@@ -780,9 +849,33 @@ def _review_sample(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_sample(path: Path) -> dict[str, dict[str, Any]]:
+    """The rows of a review-sample file by span id; a malformed sample is refused."""
+    rows: dict[str, dict[str, Any]] = {}
+    for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as error:
+            raise ValueError(f"sample line {number}: not JSON") from error
+        if (
+            not isinstance(row, dict)
+            or row.get("schema") != SAMPLE_SCHEMA
+            or not all(
+                isinstance(row.get(key), str) and row[key]
+                for key in ("span_id", "rule", "stratum", "rules_version")
+            )
+        ):
+            raise ValueError(f"sample line {number}: not a {SAMPLE_SCHEMA} row")
+        rows.setdefault(row["span_id"], row)
+    return rows
+
+
 def _review_record(args: argparse.Namespace) -> int:
     # The one place a clock is read, at the command boundary; the ledger helpers take the time.
     reviewed_at = args.reviewed_at or utc_stamp(datetime.now(UTC))
+    sample = _load_sample(args.sample)
     rows: list[dict[str, Any]] = []
     skipped = 0
     for number, line in enumerate(args.answers.read_text(encoding="utf-8").split("\n"), start=1):
@@ -801,35 +894,38 @@ def _review_record(args: argparse.Namespace) -> int:
         verdict = str(verdict).strip().lower()
         if verdict not in VERDICTS:
             raise ValueError(f"answers line {number}: verdict must be one of {list(VERDICTS)}")
+        bound = sample.get(str(answer.get("span_id")))
+        if (
+            bound is None
+            or answer.get("rule") != bound["rule"]
+            or answer.get("stratum") != bound["stratum"]
+            or answer.get("rules_version", bound["rules_version"]) != bound["rules_version"]
+        ):
+            raise ValueError(
+                f"answers line {number}: the span id, rule and stratum are not those of a row "
+                "of the sample"
+            )
         try:
             rows.append(
                 ledger_row(
-                    str(answer.get("span_id")),
-                    str(answer.get("rule")),
+                    bound["span_id"],
+                    bound["rule"],
                     verdict,
                     args.reviewer,
                     reviewed_at,
-                    stratum=str(answer.get("stratum")),
-                    rules_version=str(answer.get("rules_version") or RULES_VERSION),
+                    stratum=bound["stratum"],
+                    rules_version=bound["rules_version"],
                 )
             )
         except ValueError as error:
             raise ValueError(f"answers line {number}: {error}") from error
     appended = append_ledger(args.ledger, rows)
-    summary = review_statistics(read_ledger(args.ledger))
+    counts = Counter(f"{row['rule']}:{row['stratum']}" for row in rows)
     result = {
         "ledger": str(args.ledger),
         "appended": appended,
         "unanswered": skipped,
-        "strata": {
-            f"{rule}:{stratum}": {
-                "reviewed": review.reviewed,
-                "confirmed": review.confirmed,
-                "eligible": review.eligible,
-            }
-            for (rule, stratum), review in summary.strata.items()
-            if review.reviewed
-        },
+        "strata": {key: {"appended": count} for key, count in sorted(counts.items())},
     }
     _emit(
         result, f"appended {appended} verdicts to {args.ledger} ({skipped} unanswered)", args.json
@@ -854,7 +950,7 @@ def handle_attribute(args: argparse.Namespace) -> int:
         return handler(args)
     except DeadlineReached as error:
         print(
-            f"attribute: {error} before the repeated-text census finished; nothing was written",
+            f"attribute: {error}; nothing was written",
             file=sys.stderr,
         )
         return 3
