@@ -429,6 +429,12 @@ def _lineage_problems(
         )
     else:
         report["lineage"] = {"status": "absent", "note": LINEAGE_ABSENT_NOTE}
+    if paths.digests_pending.exists():
+        problems.append(
+            f"interrupted lineage commit: {paths.digests_pending.name} is left over from an "
+            "ingest that stopped between its steps; run `cce archive ingest` to finish or "
+            "discard it"
+        )
     for index, record in enumerate(ledger, 1):
         parent = ledger[index - 2]["fingerprint"] if index > 1 else ""
         if record.get("generation") != index or record.get("parent") != parent:

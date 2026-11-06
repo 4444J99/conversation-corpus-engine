@@ -3,6 +3,7 @@ and recent changes. Every string here is invented."""
 
 from __future__ import annotations
 
+import hashlib
 import html
 import importlib
 import json
@@ -735,7 +736,10 @@ def test_ingest_records_the_first_generation_with_every_conversation_added(built
         "added",
         "changed",
         "removed",
+        "baseline",
     }, "no wall-clock field: a generation is named by its fingerprint and the data's own day"
+    digest = hashlib.sha256(built.paths.digests.read_bytes()).hexdigest()
+    assert first["baseline"] == digest, "the row carries the sha256 of the baseline it describes"
 
 
 def test_ingesting_an_unchanged_export_again_adds_no_generation(built) -> None:

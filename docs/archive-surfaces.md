@@ -501,10 +501,17 @@ moves an existing conversation page URL.
   added, changed and removed (continued on linked pages past the cap) above a table of the last
   20 generations, and each conversation page ends with a *History* section: its newest 8
   revisions, linking to their row on that page while the generation is still in the table.
-  Nothing is derived by diffing pages. The ledger row is written before the digest file, so an
-  ingest that dies between the two is completed by running it again on the same sources (the
-  row is not recorded twice and its changes are not lost), and a lost digest file is rewritten
-  by an ingest of unchanged sources without adding a generation.
+  Nothing is derived by diffing pages. The ledger and the digest file change together in
+  three steps, each safe to stop after: the new digests are written and synced to
+  `index-all-digests.jsonl.pending`; the ledger row is appended, carrying the sha256 of that
+  file in its `baseline` field; the pending file is renamed over the digest file. Every ingest
+  begins by settling an interrupted commit: a pending file the last row describes is renamed into
+  place, any other is discarded. What a crash leaves behind therefore does not depend on what the
+  next ingest reads: changed sources are diffed against the baseline the ledger describes, and no
+  generation is lost or recorded twice. `cce archive verify` reports a leftover pending file
+  and names the remedy (`cce archive ingest`). A digest file that is simply gone is rewritten by
+  an ingest of unchanged sources without adding a generation; if the sources changed meanwhile,
+  the next generation lists every conversation as added.
 
 `cce archive verify` (and the verify that closes `build`) reports a `wiki` block (pages,
 messages and messages anchored, pages with a table of contents, backlink and history pages,

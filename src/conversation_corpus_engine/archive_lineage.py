@@ -17,7 +17,12 @@ Recent changes and per-page history on the site are read from the ledger, not by
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 from collections.abc import Callable, Iterable
+from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .archive_model import iter_jsonl, write_jsonl_atomic
@@ -45,6 +50,60 @@ def load_digests(paths: ArchivePaths) -> dict[str, dict[str, str]]:
     return found
 
 
+def _write_pending(path: Path, rows: Iterable[dict[str, Any]]) -> str:
+    """Write the new baseline beside the real one and make it durable; return the sha256 of its
+    bytes, which the ledger row will carry as the proof of which baseline it describes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256()
+    with path.open("wb") as handle:
+        for row in rows:
+            line = (json.dumps(row, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+            digest.update(line)
+            handle.write(line)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return digest.hexdigest()
+
+
+def _commit_baseline(pending: Path, baseline: Path) -> None:
+    """Move the pending baseline over the real one in a single atomic step."""
+    pending.replace(baseline)
+    with suppress(OSError):  # best effort: make the rename durable
+        descriptor = os.open(baseline.parent, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def finish_interrupted_commit(paths: ArchivePaths, ledger: list[dict[str, Any]]) -> str:
+    """Settle a generation whose commit was cut short, before any diff is computed.
+
+    A commit writes the new baseline to `<baseline>.pending`, appends the ledger row (which carries
+    the sha256 of that file) and renames the pending file over the baseline. If the pending file is
+    what the last row says it is, the row was written and only the rename is missing: finish it.
+    Otherwise no row describes it (the crash came first, or the file is partial), and it is
+    discarded. Either way the baseline and the ledger agree afterwards, whatever the sources hold
+    now. Returns "" (nothing was pending), "finished" or "discarded".
+    """
+    pending = paths.digests_pending
+    if not pending.is_file():
+        return ""
+    if ledger and ledger[-1].get("baseline") == _file_digest(pending):
+        _commit_baseline(pending, paths.digests)
+        return "finished"
+    pending.unlink(missing_ok=True)
+    return "discarded"
+
+
 def record_generation(
     paths: ArchivePaths,
     manifest: dict[str, Any],
@@ -65,14 +124,22 @@ def record_generation(
     its conversations are part of this generation's baseline and not "added" by the next one.
     Nothing is recorded when the sources are unchanged (same fingerprint, no uid differs).
 
-    The ledger row is written before the digest file, because the next ingest diffs against the
-    digests: written the other way round, a crash between the two would leave a baseline that
-    already holds this generation's changes and no row to say what they were. Written in this
-    order, a crash leaves the row and a baseline one generation behind, and rerunning the same
-    sources finds that its changes are the last row's and records nothing twice; a baseline that
-    is simply gone is rewritten the same way, since sources whose fingerprint is the last row's
-    hold exactly what its generation held.
+    The next ingest diffs against the baseline, so the baseline and the ledger must change
+    together. They are two files, so a generation is committed in three steps, each safe to
+    stop after: (1) the new baseline is written and synced to `<baseline>.pending`; (2) the ledger
+    row is appended, carrying the sha256 of the pending file; (3) the pending file is renamed over
+    the baseline. Every run begins with `finish_interrupted_commit`, which completes step 3 if the
+    row exists and throws the pending file away if it does not, so what a crash leaves behind
+    never depends on what the next run reads: changed sources are diffed against the baseline
+    the ledger describes, and no generation is lost or recorded twice.
+
+    The one thing recovery cannot reconstruct is a baseline file that is simply gone (no pending
+    file either): it is rewritten from the current content, without a new generation, only when
+    the sources are those of the last row (same fingerprint). Otherwise the next generation lists
+    every conversation as added.
     """
+    ledger = load_lineage(paths)
+    finish_interrupted_commit(paths, ledger)
     baseline_present = paths.digests.is_file()
     previous = load_digests(paths)
     read_now = set(read)
@@ -90,7 +157,6 @@ def record_generation(
     added = sorted(after.keys() - before.keys())
     removed = sorted(before.keys() - after.keys())
     changed = sorted(uid for uid in after.keys() & before.keys() if after[uid] != before[uid])
-    ledger = load_lineage(paths)
     fingerprint = manifest["source_fingerprint"]
     record: dict[str, Any] | None = {
         "generation": len(ledger) + 1,
@@ -102,25 +168,23 @@ def record_generation(
         "changed": changed,
         "removed": removed,
     }
-    if ledger and ledger[-1]["fingerprint"] == fingerprint:
-        last = ledger[-1]
-        interrupted = last["conversations"] == len(after) and (added, changed, removed) == (
-            last["added"],
-            last["changed"],
-            last["removed"],
-        )  # the last row is this very generation, whose baseline write did not complete
-        if not (added or changed or removed) or not baseline_present or interrupted:
-            record = None
-    if record is not None:
-        write_jsonl_atomic(paths.lineage, [*ledger, record])
-    write_jsonl_atomic(
-        paths.digests,
-        (
+    same_sources = bool(ledger) and ledger[-1]["fingerprint"] == fingerprint
+    if same_sources and (not (added or changed or removed) or not baseline_present):
+        record = None
+
+    def baseline_rows() -> Iterable[dict[str, Any]]:
+        return (
             {"provider": name, "uid": uid, "digest": digest}
             for name, rows in sorted(current.items())
             for uid, digest in sorted(rows.items())
-        ),
-    )
+        )
+
+    if record is None:
+        write_jsonl_atomic(paths.digests, baseline_rows())
+        return None
+    record["baseline"] = _write_pending(paths.digests_pending, baseline_rows())
+    write_jsonl_atomic(paths.lineage, [*ledger, record])
+    _commit_baseline(paths.digests_pending, paths.digests)
     return record
 
 

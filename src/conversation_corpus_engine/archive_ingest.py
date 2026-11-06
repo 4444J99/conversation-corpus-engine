@@ -246,6 +246,11 @@ class ArchivePaths:
         return self.root / layout.DIGESTS_FILENAME
 
     @property
+    def digests_pending(self) -> Path:
+        """The new baseline while a generation is being committed (see `record_generation`)."""
+        return self.digests.with_name(self.digests.name + ".pending")
+
+    @property
     def vault(self) -> Path:
         return self.root / layout.VAULT_DIRNAME
 

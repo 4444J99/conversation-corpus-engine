@@ -7,15 +7,24 @@ next successful build. Every string here is invented.
 
 from __future__ import annotations
 
+import itertools
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
+from archive_support import gpt_conversation
 from test_archive_site_wiki import change_rows, edit_export, history_of, lineage_of, rebuild
 
-from conversation_corpus_engine import archive_commands, archive_ingest, archive_lineage
+from conversation_corpus_engine import (
+    archive_commands,
+    archive_ingest,
+    archive_lineage,
+)
+from conversation_corpus_engine import (
+    archive_layout as layout,
+)
 from conversation_corpus_engine.archive_commands import verify_archive
 from conversation_corpus_engine.archive_ingest import (
     BUILD_DIRNAME,
@@ -63,19 +72,61 @@ def every_uid(paths: ArchivePaths) -> list[str]:
     return sorted(row["uid"] for row in load_index(paths))
 
 
-def crash_on_lineage_write(monkeypatch, nth: int) -> list[str]:
-    """Fail the nth write the lineage module makes (a ledger row, then the digest baseline)."""
-    real = archive_lineage.write_jsonl_atomic
-    written: list[str] = []
+CRASH_STEPS = ["pending", "ledger", "rename"]
 
-    def flaky(path, rows):
-        written.append(path.name)
-        if len(written) == nth:
-            raise OSError("simulated crash while recording the generation")
-        return real(path, rows)
 
-    monkeypatch.setattr(archive_lineage, "write_jsonl_atomic", flaky)
-    return written
+def crash_at(monkeypatch, step: str) -> None:
+    """Make the commit of a generation fail at one of its three steps: the new baseline written
+    beside the old one (a part of it reaches the disk), the ledger row appended, or the baseline
+    renamed into place."""
+    if step == "pending":
+        real_pending = archive_lineage._write_pending
+
+        def partly_written(path, rows):
+            real_pending(path, itertools.islice(rows, 3))
+            raise OSError("simulated crash while writing the pending baseline")
+
+        monkeypatch.setattr(archive_lineage, "_write_pending", partly_written)
+    elif step == "ledger":
+        real_atomic = archive_lineage.write_jsonl_atomic
+
+        def ledger_fails(path, rows):
+            if path.name == layout.LINEAGE_FILENAME:
+                raise OSError("simulated crash while appending the ledger row")
+            return real_atomic(path, rows)
+
+        monkeypatch.setattr(archive_lineage, "write_jsonl_atomic", ledger_fails)
+    else:
+
+        def rename_fails(pending, baseline):
+            raise OSError("simulated crash while renaming the baseline into place")
+
+        monkeypatch.setattr(archive_lineage, "_commit_baseline", rename_fails)
+
+
+def edit_export_again(env) -> dict[str, str]:
+    """A second, independent change of the sources: one conversation changed, one added."""
+    path = env.export / "chatgpt" / "conversations-000.json"
+    payload = json.loads(path.read_text("utf-8"))
+    for item in payload:
+        if item["conversation_id"] == "aaaa1111":
+            item["mapping"]["aaaa1111-0"]["message"]["content"]["parts"][0] += " and a second edit"
+    payload.append(
+        gpt_conversation("eeee5555", "Second arrival", [("user", "another"), ("assistant", "ok")])
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return {"added": "chatgpt-eeee5555", "changed": "chatgpt-aaaa1111"}
+
+
+def assert_exact_rows(env) -> None:
+    """Recent changes lists exactly what the latest generation did, once, and nothing is pending."""
+    ledger = lineage_of(env.paths)
+    latest = ledger[-1]
+    want = [(uid, kind) for kind in ("added", "changed", "removed") for uid in latest[kind]]
+    assert sorted(change_rows(env)) == sorted(want)
+    assert not env.paths.digests_pending.exists()
+    assert sum(len(rows) for rows in digests_of(env.paths).values()) == len(every_uid(env.paths))
+    assert verify_site_wiki(env.paths)["problems"] == []
 
 
 def assert_chained(ledger: list[dict[str, Any]]) -> None:
@@ -144,12 +195,12 @@ def test_a_rebuild_of_a_build_that_died_after_recording_adds_no_second_generatio
     assert verify_archive(env.paths) == []
 
 
-@pytest.mark.parametrize("nth", [1, 2], ids=["first-write", "second-write"])
-def test_a_crash_while_recording_the_first_generation_is_rerun_to_a_complete_ledger(
-    archive_env, monkeypatch, nth
+@pytest.mark.parametrize("step", CRASH_STEPS)
+def test_a_crash_at_each_step_of_the_first_generation_is_rerun_to_a_complete_ledger(
+    archive_env, monkeypatch, step
 ) -> None:
     env = archive_env
-    crash_on_lineage_write(monkeypatch, nth)
+    crash_at(monkeypatch, step)
     with pytest.raises(OSError, match="simulated crash"):
         ingest(export_root=env.export, paths=env.paths, authorization=env.auth)
     monkeypatch.undo()
@@ -158,19 +209,17 @@ def test_a_crash_while_recording_the_first_generation_is_rerun_to_a_complete_led
     assert first["generation"] == 1 and first["parent"] == ""
     assert first["added"] == every_uid(env.paths), "the generation's changes were not lost"
     assert first["changed"] == [] and first["removed"] == []
-    assert sorted(uid for uid, kind in change_rows(env) if kind == "added") == every_uid(env.paths)
-    assert sum(len(rows) for rows in digests_of(env.paths).values()) == len(every_uid(env.paths))
-    assert verify_site_wiki(env.paths)["problems"] == []
+    assert_exact_rows(env)
 
 
-@pytest.mark.parametrize("nth", [1, 2], ids=["first-write", "second-write"])
-def test_a_crash_while_recording_a_later_generation_is_rerun_to_its_exact_changes(
-    archive_env, monkeypatch, nth
+@pytest.mark.parametrize("step", CRASH_STEPS)
+def test_a_crash_at_each_step_of_a_later_generation_is_rerun_to_its_exact_changes(
+    archive_env, monkeypatch, step
 ) -> None:
     env = archive_env
     rebuild(env)
     uids = edit_export(env)
-    crash_on_lineage_write(monkeypatch, nth)
+    crash_at(monkeypatch, step)
     with pytest.raises(OSError, match="simulated crash"):
         ingest(export_root=env.export, paths=env.paths, authorization=env.auth)
     monkeypatch.undo()
@@ -186,8 +235,52 @@ def test_a_crash_while_recording_a_later_generation_is_rerun_to_its_exact_change
         [uids["removed"]],
     )
     assert history_of(env, uids["changed"]).entries == [(2, "changed"), (1, "added")]
-    assert verify_site_wiki(env.paths)["problems"] == []
-    assert sum(len(rows) for rows in digests_of(env.paths).values()) == len(every_uid(env.paths))
+    assert_exact_rows(env)
+
+
+@pytest.mark.parametrize("step", CRASH_STEPS)
+def test_a_crash_at_each_step_then_changed_sources_lose_and_repeat_nothing(
+    archive_env, monkeypatch, step
+) -> None:
+    """Recovery does not depend on the rerun reading the same sources. A crash before the ledger
+    row leaves no row for the first change, so the rerun records both changes as one generation
+    against the old baseline; a crash after the row finishes that generation first and records the
+    second change as the next, against the baseline the row describes."""
+    env = archive_env
+    rebuild(env)
+    first = edit_export(env)
+    crash_at(monkeypatch, step)
+    with pytest.raises(OSError, match="simulated crash"):
+        ingest(export_root=env.export, paths=env.paths, authorization=env.auth)
+    monkeypatch.undo()
+    second = edit_export_again(env)
+    rebuild(env)
+    ledger = lineage_of(env.paths)
+    assert_chained(ledger)
+    assert_no_uid_added_twice(ledger)
+    if step == "rename":
+        assert len(ledger) == 3
+        assert (ledger[1]["added"], ledger[1]["changed"], ledger[1]["removed"]) == (
+            [first["added"]],
+            [first["changed"]],
+            [first["removed"]],
+        )
+        assert (ledger[2]["added"], ledger[2]["changed"], ledger[2]["removed"]) == (
+            [second["added"]],
+            [second["changed"]],
+            [],
+        )
+        assert history_of(env, first["changed"]).entries == [(2, "changed"), (1, "added")]
+        assert history_of(env, second["changed"]).entries == [(3, "changed"), (1, "added")]
+    else:
+        assert len(ledger) == 2
+        assert (ledger[1]["added"], ledger[1]["changed"], ledger[1]["removed"]) == (
+            sorted([first["added"], second["added"]]),
+            sorted([first["changed"], second["changed"]]),
+            [first["removed"]],
+        )
+        assert history_of(env, second["changed"]).entries == [(2, "changed"), (1, "added")]
+    assert_exact_rows(env)
 
 
 def test_a_crash_between_the_manifest_and_the_lineage_is_rerun_to_the_exact_changes(
@@ -236,13 +329,66 @@ def test_a_crash_rewriting_an_unchanged_baseline_changes_nothing_that_was_record
     env = archive_env
     rebuild(env)
     ledger, baseline = lineage_of(env.paths), digests_of(env.paths)
-    crash_on_lineage_write(
-        monkeypatch, 1
-    )  # a rerun with nothing new to say writes the baseline only
+    real = archive_lineage.write_jsonl_atomic
+
+    def baseline_fails(path, rows):  # a rerun with nothing new to say writes the baseline only
+        if path.name == layout.DIGESTS_FILENAME:
+            raise OSError("simulated crash while rewriting the baseline")
+        return real(path, rows)
+
+    monkeypatch.setattr(archive_lineage, "write_jsonl_atomic", baseline_fails)
     with pytest.raises(OSError, match="simulated crash"):
         ingest(export_root=env.export, paths=env.paths, authorization=env.auth)
     monkeypatch.undo()
     assert lineage_of(env.paths) == ledger and digests_of(env.paths) == baseline
+    assert not env.paths.digests_pending.exists()
+
+
+# --- a commit left half done is reported, and finished or discarded by the next ingest ----------
+
+
+def test_verify_reports_a_leftover_pending_baseline_and_names_the_remedy(archive_env) -> None:
+    env = archive_env
+    rebuild(env)
+    assert verify_site_wiki(env.paths)["problems"] == []
+    pending = env.paths.digests.with_name(env.paths.digests.name + ".pending")
+    pending.write_text('{"provider": "chatgpt", "uid": "x", "digest": "0"}\n', encoding="utf-8")
+    problems = verify_site_wiki(env.paths)["problems"]
+    (leftover,) = [p for p in problems if "pending" in p]
+    assert pending.name in leftover and "cce archive ingest" in leftover
+    ingest(export_root=env.export, paths=env.paths, authorization=env.auth)
+    assert not pending.exists() and verify_site_wiki(env.paths)["problems"] == []
+
+
+@pytest.mark.parametrize("step", ["pending", "ledger", "rename"])
+def test_a_crashed_commit_is_flagged_until_the_next_ingest_settles_it(
+    archive_env, monkeypatch, step
+) -> None:
+    env = archive_env
+    rebuild(env)
+    edit_export(env)
+    crash_at(monkeypatch, step)
+    with pytest.raises(OSError, match="simulated crash"):
+        ingest(export_root=env.export, paths=env.paths, authorization=env.auth)
+    monkeypatch.undo()
+    assert any("pending" in p for p in verify_site_wiki(env.paths)["problems"])
+    rebuild(env)
+    assert verify_site_wiki(env.paths)["problems"] == []
+    assert not env.paths.digests_pending.exists()
+
+
+def test_a_pending_baseline_that_no_row_describes_is_discarded_not_adopted(archive_env) -> None:
+    """A stray pending file (here a different baseline) must never replace the real one."""
+    env = archive_env
+    rebuild(env)
+    ledger, baseline = lineage_of(env.paths), digests_of(env.paths)
+    env.paths.digests_pending.write_text(
+        json.dumps({"provider": "chatgpt", "uid": "chatgpt-zzzz", "digest": "f" * 64}) + "\n",
+        encoding="utf-8",
+    )
+    ingest(export_root=env.export, paths=env.paths, authorization=env.auth)
+    assert lineage_of(env.paths) == ledger and digests_of(env.paths) == baseline
+    assert not env.paths.digests_pending.exists()
 
 
 # --- (c) retained shards of a failed provider ---------------------------------------------------
