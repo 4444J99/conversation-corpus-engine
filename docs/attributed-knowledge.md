@@ -270,11 +270,13 @@ new attribution; the supplied assertions keep the assurance stated in the export
 `cce library attribute` derives span attributions from the exact text of every message of a
 published library generation. A provider's `user` role is not proof that the owner wrote a
 span: injected system text, command output and tool results sit inside user turns, pasted logs,
-quotes and code are not the owner's prose, and AI-written skill and instruction files are filed
-under documents. The engine (`conversation_corpus_engine.attribution_rules`, version
-`cce.attribution-rules@1`) therefore labels a span `owner` only when an owner-granting rule
-claims it and no other rule does. **No rule is profile-eligible until the precision gate below is
-met**, and every span the engine writes has `profile_eligible: false` until then.
+quotes, tables, emails and code are not the owner's prose, an assistant's answer can be pasted
+back into a turn, and AI-written skill and instruction files are filed under documents. The
+engine (`conversation_corpus_engine.attribution_rules`, version `cce.attribution-rules@1`)
+therefore labels a span `owner` only when an owner-granting rule claims it and no other rule
+does. When a rule is ambiguous the text becomes `unknown` or a non-owner class, never owner.
+**No rule is profile-eligible until the precision gate below is met**, and every span the
+engine writes has `profile_eligible: false` until then.
 
 ### Partition and classes
 
@@ -284,8 +286,12 @@ the rule that decided it, and the SHA-256 of the whole message text, so it can n
 to different text. The classes are the contract's: `owner`, `agent` (everything a machine wrote,
 injected or printed), `third_party` (quoted, pasted, copied or repeated text) and `unknown`.
 Characters no rule claims are `unknown`, rule id `unattributed`, whitespace included. An owner
-span never starts or ends with whitespace and is never whitespace only. The engine checks each
-partition before returning it, and `cce library attribute --report` checks it again.
+span never starts or ends with a blank character (whitespace, control and zero-width or other
+format characters such as U+200B and U+FEFF) and is never only blank characters. The engine
+checks each partition before returning it, and `cce library attribute --report` checks it again.
+A message that cannot be encoded as UTF-8 (a lone surrogate) has no digest: it is counted as
+`unreadable_messages`, treated as unknown, and kept out of the annotations, the census and the
+sample; it does not abort the run.
 
 ### Rule precedence
 
@@ -296,22 +302,29 @@ so no higher rule can lose a character to an owner claim.
 | # | Rule id | Class | Decides |
 |---|---------|-------|---------|
 | 1 | `agent_family` | agent | assistant, model, tool and system turns of every provider; user turns on a machine channel; provider metadata naming an agent; a coding CLI's subagent prompts and turns that `archive_provenance.classify_user_turn` calls harness text |
-| 2 | `document_origin` | agent | a record whose provenance states an agent produced it (`agent_authored`, `generated_by`, ...), the agent memory and plan families, agent instruction or skill files by file name or folder, and for documents, notes and plans a generated-by footer or skill frontmatter |
-| 3 | `inline_injection` | agent | wrapper blocks inside a turn: the archive's injected tags (`system-reminder`, `local-command-*`, ...), `command-name`, `command-message`, `command-args`, tool-result and attachment blocks; an unclosed block runs to the end |
+| 2 | `document_origin` | agent | a record whose provenance says an agent produced it (`agent_authored`, `generated_by`, ...), the agent memory and plan families, agent instruction or skill files by file name or folder, and for documents, notes and plans a generated-by footer, co-author line or skill frontmatter anywhere in the text |
+| 3 | `inline_injection` | agent | wrapper blocks inside a turn: the archive's injected tags (`system-reminder`, `local-command-*`, ...), `command-name`, `command-message`, `command-args`, tool-result and attachment blocks. Same-name tags nest (a depth counter), quoted attribute values may hold angle brackets, and an unclosed block runs to the end |
 | 4 | `typed_remainder` | agent | on a user turn of the `typed` channel, the text after the first `typed_chars` characters |
 | 5 | `code` | third_party | fenced code blocks and indented code (two or more indented lines after a blank line) |
-| 6 | `quote` | third_party | markdown blockquote lines, passages of 40 or more characters inside matching quotation marks, and pasted-content wrappers |
-| 7 | `log_trace` | agent | timestamped log lines, Python tracebacks and runs of three or more tool-output shaped lines (log levels, grep hits, diffs, shell prompts, stack frames) |
-| 8 | `boilerplate` | third_party | later occurrences of a long text that repeats verbatim after whitespace normalization |
-| 9 | `typed_prefix` | owner | the first `typed_chars` characters of a user turn on the `typed` channel |
-| 10 | `note_owner` | owner | the body of a note or document in an authored-library family (Apple Notes, Drive, authored documents) |
+| 6 | `quote` | third_party | markdown blockquote lines (and the lazy continuation lines that follow one), passages of 40 or more characters inside matching quotation marks, and pasted-content wrappers |
+| 7 | `log_trace` | agent | timestamped log lines, Python tracebacks, stack traces (an exception header with its frame, or two frames, even at two lines) and runs of three or more tool-output shaped lines |
+| 8 | `pasted_block` | third_party | a pasted email (header run, original-message or forward marker, on-date-wrote line), to the end of the message because its extent cannot be proven, and markdown tables with a separator row |
+| 9 | `boilerplate` | third_party | later occurrences of a long text that repeats verbatim after whitespace normalization |
+| 10 | `pasted_back` | third_party | a paragraph of 600 or more characters that shares 100 or more characters (after whitespace normalization) with an earlier assistant turn of the same conversation |
+| 11 | `ambiguous` | unknown | a paragraph with an odd number of ASCII double quotes; and a note or document of the owner's own library that states an AI had a hand in it anywhere (generated, written, drafted, summarised or edited by or with an AI or a named assistant; with the help of; as an AI; AI-generated) |
+| 12 | `typed_prefix` | owner | the first `typed_chars` characters of a user turn on the `typed` channel |
+| 13 | `note_owner` | owner | the body of a note or document in an authored-library family (Apple Notes, Drive, authored documents) |
 | - | `unattributed` | unknown | everything left over |
 
-Rules 4 and 9 apply only when the record states `typed_chars` and not to an authored family,
-whose reader sets `typed_chars` to the whole body. Rule 10 does not claim a message whose
-metadata marks an agent origin. Two consequences differ from the archive's own author column,
-which is looser: the slash-command wrapper blocks are machine here although the person typed the
-command, and a CLI turn that begins with an injected tag is machine as a whole.
+Rules 4 and 12 apply only when the record states `typed_chars` and not to an authored family,
+whose reader sets `typed_chars` to the whole body. Rule 13 does not claim a message whose
+metadata marks an agent origin or a record carrying an AI marker. An AI marker anywhere in any
+message of a note makes every message of that record unknown, because section boundaries cannot
+be proven; there is no window, the whole text is searched. Two consequences differ from the
+archive's own author column, which is looser: the slash-command wrapper blocks are machine here
+although the person typed the command, and a CLI turn that begins with an injected tag is machine
+as a whole. Rule 10 is paragraph based: a long answer pasted back as several short paragraphs is
+not caught by it and is contained by the length strata below.
 
 Boilerplate is decided by a census over the slice that is scanned. A paragraph, or a whole
 multi-paragraph message, of at least 200 characters (`--repeat-min-chars`) that occurs at least
@@ -323,60 +336,106 @@ differently. The census keeps one digest per distinct long unit, never the text.
 ### Reports, annotations and bounds
 
 ```bash
-cce library attribute --report --library /private/store/library-all [--json] [--ledger L]
+cce library attribute --report --library /private/store/library-all --owner-id rob [--json] [--ledger L]
 cce library attribute apply --library /private/store/library-all --out /private/annotations.json \
   --owner-id rob [--ledger L]
 cce library profile --store-root /private/store --persona rob --annotations /private/annotations.json
 ```
 
 `--library` accepts a `library.sqlite` file, a generation folder or a store folder; without it
-`--store-root` or the library store variable is used. All commands open the generation read-only
-and write only the file named by `--out` (never into the generation, never over an existing
-file). `--limit-records N` scans the first N records in uid order and `--deadline-seconds`
-(default 900) is a wall-clock budget: a deadline during the census stops the command with exit
-status 3 and writes nothing, and one during the scan marks the report partial and exits 3; an `apply` cut short that way
-leaves its file under the name `<out>.partial` so it cannot pass for a whole export.
+`--store-root` or the library store variable is used. Every command opens the generation
+read-only (SQLite `mode=ro`) and never writes into it. The only files a command writes are the
+ones you name (`--out`, `--ledger`), and each is subject to the output rules below.
+`--limit-records N` scans the first N records in uid order and `--deadline-seconds` (default 900)
+is a wall-clock budget: a deadline during the census, or while `apply` matches the ledger, stops
+the command with exit status 3 and writes nothing; one during the scan marks the result partial
+and exits 3. The census is a first pass over the slice, so a scan reads the slice twice, and
+`apply` with a ledger reads it three times (census, ledger matching, annotations).
 
-`--report` prints, per rule, spans, characters, share of all characters, reviewed spans,
-precision and eligibility; the partition check (characters covered, overlaps, gaps); the five
-largest categories (rules, by characters); and the rules that passed the gate. `--json` prints
-the same as JSON. `apply` writes a JSON list of `{source, attribution}` entries in the form
-`cce library profile --annotations` already reads: `source` is the exact canonical reference
-without offsets and `attribution` a `cce.span-attribution.v1` annotation whose spans are the
-non-unknown spans (uncovered text is unknown by the contract). Messages whose id is empty or not
-unique in their sequence cannot be referenced exactly and are counted, not annotated. The file
-holds offsets, ids and evidence (`cce.attribution-rules@1:rule:<id>`, `span:<id>`), no message
-text. Owner spans carry `--owner-id` as `author_id`; without it no span can reach a strict
-profile.
+`--report` prints, per rule and length stratum, spans, characters, share of all characters,
+reviewed spans, precision and eligibility; the partition check (characters covered, overlaps,
+gaps); the five largest categories (rules, by characters); the ledger accounting; and the
+(rule, stratum) pairs that passed the gate. `--json` prints the same as JSON. `apply` writes a
+JSON list of `{source, attribution}` entries in the form `cce library profile --annotations`
+already reads: `source` is the exact canonical reference without offsets and `attribution` a
+`cce.span-attribution.v1` annotation whose spans are the non-unknown spans (uncovered text is
+unknown by the contract). Messages whose id is empty or not unique in their sequence cannot be
+referenced exactly and are counted, not annotated. The file holds offsets, ids and evidence
+(`cce.attribution-rules@1:rule:<id>`, `stratum:<S|M|L>`, `span:<id>`), no message text. Owner
+spans carry `--owner-id` as `author_id`; without it no span can reach a strict profile.
+
+### Output rules
+
+- **Outside the store.** `apply --out`, `review-sample --out` and the ledger given to
+  `review-record` must be outside the library generation, its parent folder and the library
+  store (found through the builder's `library-all` folder, a store folder given as `--library`,
+  `--store-root` or the configured store), the store root included. A bare generation with no
+  discoverable store protects its folder and its parent.
+- **Git custody.** Each destination directory must pass the same check as the archive writers
+  (`require_git_private`): outside any work tree, or ignored by Git. A Git-visible destination is
+  refused before any work starts.
+- **Private files.** Missing directories are created with mode 0700, files exclusively with mode
+  0600 and never through a symlink; the ledger is created 0600. A command never overwrites: an
+  existing output is refused.
+- **Partial output.** `apply` and `review-sample` write to `<out>.partial` and rename it into
+  place only when the whole library was scanned. A scan cut short by `--limit-records` or the
+  deadline leaves its output at `<out>.partial` (the summary and every sample row say
+  `partial: true`); the deadline also exits 3. A leftover `<out>.partial` from an earlier run is
+  refused with a one-line message before the census starts.
 
 ### The precision gate and owner review
 
-A rule is profile-eligible only when the owner-review ledger holds at least 100 reviewed spans
-for it at the current rules version and at least 95 percent of them are confirmed
-(`100 * confirmed >= 95 * reviewed`, integer arithmetic). A span counts once, by its last
-verdict in file order; `no` and `unsure` both count as reviewed and not confirmed; rows of another
-rules version are ignored (reported as stale). Only owner spans of a gate-passing rule, with
-`--owner-id` and `--ledger`, are written with `profile_eligible: true`.
+A (rule, length stratum) is profile-eligible only when the owner-review ledger holds at least
+100 reviewed spans of that rule and stratum at the current rules version, at least 95 percent of
+them confirmed (`100 * confirmed >= 95 * reviewed`, integer arithmetic). The strata are **S**
+(up to 240 characters), **M** (241 to 2000) and **L** (more). A span is `profile_eligible: true`
+only when it is the owner's, its own (rule, stratum) passed, and `--owner-id` and `--ledger` are
+given. Short reviews therefore never vouch for long spans: a long pasted answer typed as one turn
+stays ineligible until 100 spans of its own stratum were reviewed.
+
+Which ledger rows count, in order: a row is **stale** (another rules version or an older ledger
+schema, which carries no stratum) and ignored; a row whose reviewer is not the `--owner-id`
+identity is a **non-owner row**, listed by reviewer and never counted (without `--owner-id`
+nothing counts); one reviewer's rows that name the same span as different rules or strata are
+**quarantined**, as are malformed lines, and never counted; a row whose span id does not exist
+in the current scan under the same rule and stratum is an **orphan** (a fabricated id, an edited
+rule or stratum, or a message whose text changed, since the id includes the text digest) and is
+never counted; of the rest a span counts once, by its last answer, and earlier answers to it are
+reported as **superseded**. `no` and `unsure` both count as reviewed and not confirmed. A scan cut
+short by `--limit-records` counts only the spans it saw, so decide eligibility from a full scan.
+Malformed lines and conflicting rows are reported, not fatal; if one of them was a `no`, the
+precision is overstated, so look at `quarantined_rows`.
+
+**What this protects, honestly.** The reviewer and the review time are plain strings the caller
+supplies; `--owner-id` is self-reported. A process that can write the ledger and read the library
+can append rows with real span ids and the owner's name, and the gate cannot tell them from the
+owner's own. The gate protects against mistakes and fabrication (made-up ids, a rule edited in a
+row, a reviewer that is not the owner), not against an adversary holding the owner's permissions.
 
 The ledger is append-only JSONL, one object per line with exactly these keys: `schema`
-(`cce.attribution-review-ledger.v1`), `rules_version`, `span_id`, `rule`, `verdict` (`yes`,
-`no` or `unsure`), `reviewer` and `reviewed_at` (a UTC time such as `2026-01-02T03:04:05Z`). A
-malformed row fails the command with its line number; it is never skipped. The ledger holds no
-text.
+(`cce.attribution-review-ledger.v2`), `rules_version`, `span_id`, `rule`, `stratum` (`S`, `M` or
+`L`), `verdict` (`yes`, `no` or `unsure`), `reviewer` and `reviewed_at` (a UTC time such as
+`2026-01-02T03:04:05Z`). It holds no text. Appends read, check and write under one exclusive
+lock: a row that names a span one reviewer already reviewed as a different rule or stratum is
+refused with nothing written (re-answering under the same rule and stratum is allowed).
 
 ```bash
 cce library attribute review-sample --library /private/store/library-all --out /private/sample.jsonl
 # fill in "verdict": "yes" | "no" | "unsure" on each row, then
-cce library attribute review-record --ledger /private/ledger.jsonl --answers /private/sample.jsonl \
+cce library attribute review-record --library /private/store/library-all \
+  --ledger /private/ledger.jsonl --sample /private/sample.jsonl --answers /private/sample.jsonl \
   --reviewer rob
 ```
 
-`review-sample` draws, per rule, up to `--per-rule` (default 100) spans of at most 240
-characters: the distinct texts with the smallest seeded hash, so the sample is the same for the
-same library and does not depend on scan order. Each row shows only the span text, its rule id
-and description and the author class the rule claims (the claim to confirm). Spans longer than
-240 characters are never offered, so the measured precision describes short spans only. Passing
-`--ledger` leaves out spans already reviewed. A sample file holds private text: keep it out of version
-control. `review-record` appends only rows whose verdict
-is filled in and stamps the current UTC time unless `--reviewed-at` is given; the engine's own
-functions take the time as a parameter and never read the clock.
+`review-sample` draws, per rule and stratum, up to `--per-stratum` (alias `--per-rule`, default
+100) distinct span texts, chosen by a seeded hash so the sample is the same for the same library
+and does not depend on scan order. Every stratum is sampled. A span of up to 360 characters is
+shown whole; a longer one as its first 240 characters, `[...N chars omitted...]` and its last 120,
+with its exact `length`. Each row shows the span text, the rule and its description, the claimed
+author class and the stratum, nothing about the record. Passing `--ledger` leaves out spans
+already reviewed. A sample file holds private text: keep it out of version control.
+`review-record` requires `--sample` (the file `review-sample` wrote) and `--library` or
+`--store-root` (so the ledger is kept out of the store), and refuses any answer whose span id,
+rule and stratum are not a row of that sample; it appends only rows whose verdict is filled in
+and stamps the current UTC time unless `--reviewed-at` is given. The engine's own functions take
+the time as a parameter and never read the clock.

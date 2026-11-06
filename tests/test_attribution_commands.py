@@ -1008,6 +1008,27 @@ def test_no_writer_may_write_inside_the_generation_or_anywhere_in_the_store(
     assert not (store / "notes").exists()
 
 
+def test_review_record_must_know_the_library_so_the_ledger_stays_out_of_its_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store")
+    sample, answers = sample_and_answers(capsys, library, tmp_path)
+    ledger = tmp_path / "ledger.jsonl"
+    code, _, err = run_cli(
+        capsys,
+        "review-record",
+        "--ledger",
+        ledger,
+        "--sample",
+        sample,
+        "--answers",
+        answers,
+        "--reviewer",
+        "rob",
+    )
+    assert code == 2 and "store-root" in err and not ledger.exists()
+
+
 def test_a_bare_generation_protects_its_folder_and_its_parent(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
