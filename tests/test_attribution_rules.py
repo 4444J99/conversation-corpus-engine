@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import time
 
 import pytest
 
@@ -355,6 +356,90 @@ def test_self_closing_tag_with_attributes_is_claimed_alone() -> None:
     text = 'x <skill name="a"/> y <system-reminder>z</system-reminder>'
     claims = rule_inline_injection(ctx(text))
     assert [(s, e) for s, e, _ in claims] == [(2, 19), (22, 58)]
+
+
+def test_nested_reminders_end_at_their_matching_close_so_no_tail_leaks() -> None:
+    text = "hi <system-reminder>a <system-reminder>b</system-reminder> TAIL</system-reminder> after"
+    claims = rule_inline_injection(ctx(text))
+    end = text.index("</system-reminder> after") + len("</system-reminder>")
+    assert ranges(claims) == [(3, end)]
+    owner = [text[s.start : s.end] for s in run(text) if s.author == "owner"]
+    assert owner == ["hi", "after"]
+
+
+def test_an_unclosed_nested_reminder_makes_the_rest_of_the_message_machine() -> None:
+    text = "hi <system-reminder>a <system-reminder>b</system-reminder> TAIL and more"
+    assert ranges(rule_inline_injection(ctx(text))) == [(3, len(text))]
+    assert [text[s.start : s.end] for s in run(text) if s.author == "owner"] == ["hi"]
+
+
+def test_a_self_closing_inner_tag_does_not_deepen_the_nesting() -> None:
+    text = "a <system-reminder>x <system-reminder/> y</system-reminder> TAIL"
+    end = text.index(" TAIL")
+    assert ranges(rule_inline_injection(ctx(text))) == [(2, end)]
+
+
+@pytest.mark.parametrize(
+    "opening",
+    [
+        '<system-reminder note="a<b">',
+        '<system-reminder note="a>b">',
+        "<system-reminder note='a<b>c'>",
+        "<system-reminder  a=\"1\"   b='2' >",
+        '<system-reminder note="x < y" other="p > q">',
+    ],
+)
+def test_angle_brackets_inside_quoted_attribute_values_do_not_hide_a_reminder(
+    opening: str,
+) -> None:
+    text = f"hi {opening}SECRET</system-reminder> after"
+    end = text.index("</system-reminder> after") + len("</system-reminder>")
+    assert ranges(rule_inline_injection(ctx(text))) == [(3, end)]
+    assert not any("SECRET" in text[s.start : s.end] for s in run(text) if s.author == "owner")
+
+
+def test_a_malformed_opening_tag_of_a_wrapper_still_claims_the_block() -> None:
+    text = 'hi <system-reminder note="oops>SECRET</system-reminder> after'
+    claims = rule_inline_injection(ctx(text))
+    assert claims and claims[0][0] == 3 and claims[0][1] >= text.index("SECRET")
+    assert not any("SECRET" in text[s.start : s.end] for s in run(text) if s.author == "owner")
+
+
+def test_a_wrapper_tag_inside_another_wrapper_is_part_of_the_outer_block() -> None:
+    text = "x <system-reminder>a <command-name>y</command-name> b</system-reminder> TAIL"
+    end = text.index(" TAIL")
+    assert ranges(rule_inline_injection(ctx(text))) == [(2, end)]
+
+
+def test_pathological_wrapper_input_is_linear_and_never_owner() -> None:
+    started = time.monotonic()
+    unclosed = "<system-reminder>" * 60_000
+    assert not any(span.author == "owner" for span in run(unclosed))
+    junk = "<b x " * 60_000 + "<system-reminder>z"
+    assert [s.rule for s in run(junk) if s.rule == "inline_injection"] == ["inline_injection"]
+    assert time.monotonic() - started < 10
+
+
+def test_reminder_variants_never_leak_owner_text_over_seeded_cases() -> None:
+    rng = random.Random(4004)
+    shapes = [
+        "<system-reminder>{b}</system-reminder>",
+        "<SYSTEM-REMINDER>{b}</SYSTEM-REMINDER>",
+        '<system-reminder priority="high" id="x">{b} a > b</system-reminder>',
+        "<system-reminder>\n```\ncode > here\n```\n{b}\n</system-reminder>",
+        "<system-reminder>outer {b} <system-reminder>inner</system-reminder> LEAK {b}</system-reminder>",
+        '<system-reminder note="a<b">{b}</system-reminder>',
+        "<system-reminder >{b}</system-reminder >",
+        "<system-reminder>outer <system-reminder>mid <system-reminder>deep</system-reminder> LEAK"
+        "</system-reminder> LEAK {b}</system-reminder>",
+    ]
+    for _ in range(300):
+        body = prose(rng)
+        block = rng.choice(shapes).format(b=body)
+        text = f"Owner opening words. {block} Owner closing words."
+        owner_text = " ".join(text[s.start : s.end] for s in run(text) if s.author == "owner")
+        assert "LEAK" not in owner_text and body not in owner_text
+        assert "Owner opening words." in owner_text and "Owner closing words." in owner_text
 
 
 # --- a: typed prefix and remainder -----------------------------------------------------------

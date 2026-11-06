@@ -358,12 +358,16 @@ WRAPPER_TAGS = frozenset(tag.lower() for tag in INJECTED_TAGS) | frozenset(
         "attachments",
     }
 )
-_TAG_OPEN = re.compile(r"<([A-Za-z_][\w:.-]{0,40})((?:\s[^<>]*)?)(/?)>")
+# The name of an opening tag, and the rest of it up to the closing angle bracket. Quoted attribute
+# values may hold angle brackets; the alternatives start with different characters, so matching
+# never backtracks.
+_TAG_NAME = re.compile(r"<([A-Za-z_][\w:.-]{0,40})(?=[\s/>])")
+_TAG_REST = re.compile(r"""(?:\s(?:[^<>"'/]|"[^"]*"|'[^']*'|/(?!>))*)?(/?)>""")
 
 
 @functools.lru_cache(maxsize=256)
-def _closing_tag(name: str) -> re.Pattern[str]:
-    return re.compile(rf"</{re.escape(name)}\s*>", re.IGNORECASE)
+def _tag_pair(name: str) -> re.Pattern[str]:
+    return re.compile(rf"<(/?){re.escape(name)}(?=[\s/>])", re.IGNORECASE)
 
 
 def _is_wrapper(name: str) -> bool:
@@ -371,22 +375,49 @@ def _is_wrapper(name: str) -> bool:
     return lowered in WRAPPER_TAGS or lowered.startswith("ide_")
 
 
+def _opening_end(text: str, name_end: int) -> tuple[int, bool]:
+    """Where an opening tag ends and whether it is self-closing. A malformed one (an attribute
+    quote never closed) is still an opening tag: it ends at the next angle bracket, or at the end
+    of the text."""
+    found = _TAG_REST.match(text, name_end)
+    if found:
+        return found.end(), bool(found.group(1))
+    bracket = text.find(">", name_end)
+    return (bracket + 1 if bracket != -1 else len(text)), False
+
+
+def _matching_close(text: str, name: str, start: int) -> int:
+    """The end of the block opened just before `start`: its matching close tag, counting nested
+    tags of the same name. A block that is never closed runs to the end of the text."""
+    pattern = _tag_pair(name)
+    depth, position = 1, start
+    while (found := pattern.search(text, position)) is not None:
+        if found.group(1):
+            bracket = text.find(">", found.end())
+            position = bracket + 1 if bracket != -1 else len(text)
+            depth -= 1
+            if depth == 0:
+                return position
+        else:
+            position, self_closing = _opening_end(text, found.end())
+            depth += not self_closing
+    return len(text)
+
+
 def _tag_blocks(text: str, wanted: Callable[[str], bool]) -> list[Claim]:
-    """Blocks `<name ...>...</name>` for wanted names; an unclosed block runs to the end."""
+    """Blocks `<name ...>...</name>` for wanted names. Same-name tags nest; an unclosed block runs
+    to the end of the text."""
     claims: list[Claim] = []
     position = 0
-    while (match := _TAG_OPEN.search(text, position)) is not None:
+    while (match := _TAG_NAME.search(text, position)) is not None:
         name = match.group(1)
         if not wanted(name):
             position = match.end()
             continue
-        if match.group(0).endswith("/>"):
-            end = match.end()
-        else:
-            close = _closing_tag(name).search(text, match.end())
-            end = close.end() if close else len(text)
+        opening_end, self_closing = _opening_end(text, match.end())
+        end = opening_end if self_closing else _matching_close(text, name, opening_end)
         claims.append((match.start(), end, f"tag={name.lower()}"))
-        position = end
+        position = max(end, match.end())
     return claims
 
 
