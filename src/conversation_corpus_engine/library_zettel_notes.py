@@ -17,7 +17,7 @@ import json
 import re
 import unicodedata
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +86,7 @@ class Note:
     sources: int
     warnings: tuple[str, ...]
     library_id: str
+    caller_digest: str
 
     @property
     def filename(self) -> str:
@@ -93,25 +94,35 @@ class Note:
 
 
 def _day(value: Any, what: str) -> str:
-    text = str(value or "").strip()
+    text = value.strip() if isinstance(value, str) else ""
     if not _DATE.match(text):
         raise ValueError(f"{what} must be a date written YYYY-MM-DD (a stable id needs it)")
     try:
-        date.fromisoformat(text[:10])
+        if len(text) == 10:
+            day = date.fromisoformat(text)
+        else:
+            if text[10] not in {"T", " "}:
+                raise ValueError("invalid timestamp separator")
+            day = datetime.fromisoformat(text).date()
     except ValueError:
-        raise ValueError(f"{what} is not a real calendar date") from None
-    return text[:10]
+        raise ValueError(f"{what} is not a real calendar date or ISO timestamp") from None
+    return day.isoformat()
 
 
-def note_id(created: str, caller_id: str) -> str:
-    """Stable id: the created day plus six characters of a hash of the canonical inputs."""
+def _caller_digest(caller_id: str) -> str:
+    """Full identity binding; the six-character display prefix never establishes ownership."""
     canonical = json.dumps(
         {"id": caller_id, "schema": "cce.zettel-note-id.v1"},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     )
-    return created.replace("-", "") + "-" + hashlib.sha256(canonical.encode()).hexdigest()[:6]
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def note_id(created: str, caller_id: str) -> str:
+    """Stable id: the created day plus six characters of a hash of the canonical inputs."""
+    return created.replace("-", "") + "-" + _caller_digest(caller_id)[:6]
 
 
 def _title(zettel: dict[str, Any]) -> str:
@@ -156,7 +167,15 @@ def _summary(body: str) -> str:
 
 def quote_block(text: str) -> str:
     """The quote as a blockquote: inert Markdown, one `> ` line per source line, no loss."""
-    return "\n".join("> " + inert_line(line) for line in text.split("\n"))
+    lines = []
+    for line in text.split("\n"):
+        escaped = inert_line(line)
+        leading = len(escaped) - len(escaped.lstrip(" \t"))
+        # Entities begin a paragraph, not an indented code block (which would show the
+        # punctuation entities literally). Decoding them restores every space and tab.
+        prefix = "".join(f"&#{ord(char)};" for char in escaped[:leading])
+        lines.append("> " + prefix + escaped[leading:])
+    return "\n".join(lines)
 
 
 def recover_quote(block: str) -> str:
@@ -241,16 +260,16 @@ def _render(
         out.append(f"- Reviewer: {inert(review['reviewer'], 300)}\n")
     for evidence in review["evidence"][:8]:
         out.append(f"- Review evidence: {inert(evidence, 300)}\n")
-    for span in item["title_spans"][:12]:
+    for span in item["title_spans"]:
         out.append(f"- Idea title: {inert(_span_label(span, 80))}\n")
-    for span in item["body_attribution"][:12]:
+    for span in item["body_attribution"]:
         out.append(f"- Idea text: {inert(_span_label(span, 80))}\n")
     for number, source in enumerate(item["sources"], 1):
         ref = source["source"]
         out.append(f"\n### Source {number}\n\n`{_tuple(ref)}`\n\n`{_reader(ref)}`\n\n")
         out.append(f"- Role: {inert(source['role'], 80)}; channel: ")
         out.append(f"{inert(source['channel'], 80) or 'not recorded'}\n")
-        for span in source["attributed_spans"][:6]:
+        for span in source["attributed_spans"]:
             out.append(f"- Quote attribution: {inert(_span_label(span, 80))}\n")
         out.append("\n" + quote_block(source["text"]) + "\n")
     text = "".join(out)
@@ -258,7 +277,14 @@ def _render(
     if findings["errors"]:
         raise ValueError("; ".join(findings["errors"]))
     return Note(
-        identity, title, text, label, len(item["sources"]), tuple(findings["warnings"]), library_id
+        identity,
+        title,
+        text,
+        label,
+        len(item["sources"]),
+        tuple(findings["warnings"]),
+        library_id,
+        _caller_digest(caller_id),
     )
 
 
@@ -277,6 +303,8 @@ def _front(text: str) -> tuple[dict[str, Any], list[str]]:
         try:
             if top:
                 current = top[1]
+                if current in values:
+                    problems.append(f"duplicate frontmatter key: {current}")
                 raw = top[2]
                 values[current] = [] if raw in (None, "[]") else json.loads(raw)
             elif listed and isinstance(values.get(current), list):
@@ -286,6 +314,18 @@ def _front(text: str) -> tuple[dict[str, Any], list[str]]:
         except json.JSONDecodeError:
             problems.append(f"frontmatter value is not a quoted scalar: {line[:60]!r}")
     return values, problems
+
+
+def _front_shapes(values: dict[str, Any]) -> list[str]:
+    """The emitted flat frontmatter uses strings and lists of strings, never nested data."""
+    problems = []
+    for key, value in values.items():
+        if key in {"sources", "links", "aliases", "tags"}:
+            if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+                problems.append(f"{key} must be a flat list of strings")
+        elif not isinstance(value, str):
+            problems.append(f"{key} must be a string")
+    return problems
 
 
 def lint_note(text: str, expected_quotes: list[str] | None = None) -> dict[str, list[str]]:
@@ -311,6 +351,8 @@ def lint_note(text: str, expected_quotes: list[str] | None = None) -> dict[str, 
     if not problems:
         if tuple(values) != FRONTMATTER_KEYS:
             errors.append(f"frontmatter keys must be exactly {', '.join(FRONTMATTER_KEYS)}")
+        elif shape_errors := _front_shapes(values):
+            errors += shape_errors
         else:
             if not _ID.match(values["id"]):
                 errors.append("id is not YYYYMMDD-xxxxxx")
@@ -324,8 +366,13 @@ def lint_note(text: str, expected_quotes: list[str] | None = None) -> dict[str, 
             if len(values["summary"]) > SUMMARY_LIMIT:
                 errors.append(f"summary is over {SUMMARY_LIMIT} characters")
             for key in ("created", "updated"):
-                if not (isinstance(values[key], str) and _DATE.fullmatch(values[key])):
+                if not _DATE.fullmatch(values[key]):
                     errors.append(f"{key} must be YYYY-MM-DD")
+                else:
+                    try:
+                        date.fromisoformat(values[key])
+                    except ValueError:
+                        errors.append(f"{key} is not a real calendar date")
             if values["authorship"] not in AUTHORSHIP_VALUES:
                 errors.append(f"authorship must be one of {', '.join(AUTHORSHIP_VALUES)}")
             if values["status"] not in STATUS_VALUES:
@@ -379,15 +426,17 @@ def build_notes(library: Library, zettels: list[dict[str, Any]]) -> list[Note]:
 
     Raises `ValueError` listing every refusal; nothing is returned partially.
     """
-    owns_transaction = not library.connection.in_transaction
-    if owns_transaction:
-        library.connection.execute("BEGIN")
+    if library.connection.in_transaction:
+        raise ValueError(
+            "refused, nothing written: commit or roll back the caller-owned library transaction "
+            "before exporting notes"
+        )
+    library.connection.execute("BEGIN")
     try:
         exported = export_zettels(library, zettels, allow_agent_drafts=True)["zettels"]
         library_id = "library-" + library.evidence_fingerprint()
     finally:
-        if owns_transaction:
-            library.connection.rollback()
+        library.connection.rollback()
     problems: list[str] = []
     prepared: list[tuple[dict[str, Any], str, str]] = []
     titles: dict[str, list[str]] = {}
@@ -445,6 +494,7 @@ def write_notes(notes: list[Note], destination: Path) -> dict[str, Any]:
     planned = {
         note.filename: {
             "id": note.id,
+            "caller_digest": note.caller_digest,
             "data": note.text.encode("utf-8"),
             "sha256": hashlib.sha256(note.text.encode("utf-8")).hexdigest(),
         }
