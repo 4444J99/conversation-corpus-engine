@@ -279,7 +279,7 @@ published library generation. A provider's `user` role is not proof that the own
 span: injected system text, command output and tool results sit inside user turns, pasted logs,
 quotes, tables, emails and code are not the owner's prose, an assistant's answer can be pasted
 back into a turn, and AI-written skill and instruction files are filed under documents. The
-engine (`conversation_corpus_engine.attribution_rules`, version `cce.attribution-rules@6`)
+engine (`conversation_corpus_engine.attribution_rules`, version `cce.attribution-rules@7`)
 therefore labels a span `owner` only when an owner-granting rule claims it and no other rule
 does. When a rule is ambiguous the text becomes `unknown` or a non-owner class, never owner.
 **No rule is profile-eligible until the precision gate below is met**, and every span the
@@ -304,10 +304,12 @@ annotations, the census and the sample; it does not abort the run.
 
 ### Rules version
 
-The version string (`cce.attribution-rules@6`) names the rule semantics and every artifact carries
+The version string (`cce.attribution-rules@7`) names the rule semantics and every artifact carries
 it: span ids (so a span id from another version never matches), the annotation evidence
-(`cce.attribution-rules@6:rule:<id>`), the rows of review samples and the rows of the review
-ledger. When the rules or the gate change meaning the version is bumped (`@6` made "the same
+(`cce.attribution-rules@7:rule:<id>`), the rows of review samples and the rows of the review
+ledger. When the rules or the gate change meaning the version is bumped (`@7` retains short
+assistant replies so their whole-paragraph hits and fragments can contribute to aggregate echo
+matching; the ledger and sample formats remain at `.v6`; `@6` made "the same
 text" the text as a reader sees it, one `text_key` for the gate, the draw and the twin veto, made
 the echo and the repeated-text census ignore invisible characters and made the echo stack short
 verbatim fragments; `@5`
@@ -508,7 +510,7 @@ already reads: `source` is the exact canonical reference without offsets and `at
 `cce.span-attribution.v1` annotation whose spans are the non-unknown spans (uncovered text is
 unknown by the contract). Messages whose id is empty or not unique in their sequence cannot be
 referenced exactly and are counted, not annotated. The file holds offsets, ids and evidence
-(`cce.attribution-rules@6:rule:<id>`, `stratum:<S|M|L>`, `span:<id>`, and `owner_verdict:<verdict>`
+(`cce.attribution-rules@7:rule:<id>`, `stratum:<S|M|L>`, `span:<id>`, and `owner_verdict:<verdict>`
 for a span the owner answered), no message text. A span the owner answered also carries
 `owner_verdict` as a key of its own. Owner spans carry `--owner-id` as `author_id`; without it no
 span can reach a strict profile.

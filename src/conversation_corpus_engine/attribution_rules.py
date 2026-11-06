@@ -50,7 +50,7 @@ from .archive_provenance import INJECTED_TAGS, classify_user_turn
 from .archive_read_library import FAMILIES
 from .attribution import ATTRIBUTION_SCHEMA, text_digest
 
-RULES_VERSION = "cce.attribution-rules@6"
+RULES_VERSION = "cce.attribution-rules@7"
 
 OWNER = "owner"
 AGENT = "agent"
@@ -1131,7 +1131,8 @@ class AssistantEcho:
 
     def add_assistant(self, text: str) -> None:
         head = _match_head(text, min(self.turn_limit, self.history_limit))
-        if len(head) < self.min_shared:
+        # A short head can still contribute whole-paragraph hits or fragments to an aggregate.
+        if len(head) < min(self.min_shared, self.min_hit, self.min_fragment):
             return
         windows = array("q", self._hashes(head))
         self._turns.append((len(head), windows, head))
@@ -1876,11 +1877,12 @@ def validate_ledger_row(row: Any) -> dict[str, Any]:
     """A copy of a ledger row, or ValueError: nothing malformed is ever skipped silently."""
     if not isinstance(row, dict):
         raise ValueError("ledger row must be an object")
-    legacy = row.get("schema") in LEGACY_LEDGER_SCHEMAS
-    expected = _LEGACY_KEYS_BY_SCHEMA[row["schema"]] if legacy else _LEDGER_KEYS
+    schema = row.get("schema")
+    legacy = isinstance(schema, str) and schema in LEGACY_LEDGER_SCHEMAS
+    expected = _LEGACY_KEYS_BY_SCHEMA[schema] if legacy else _LEDGER_KEYS
     if set(row) != expected:
         raise ValueError(f"ledger row keys must be exactly {sorted(expected)}")
-    if row["schema"] != LEDGER_SCHEMA and not legacy:
+    if schema != LEDGER_SCHEMA and not legacy:
         raise ValueError(f"ledger row schema must be {LEDGER_SCHEMA}")
     version = row["rules_version"]
     if not isinstance(version, str) or not version.strip():
