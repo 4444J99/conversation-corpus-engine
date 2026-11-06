@@ -107,6 +107,57 @@ The manifest is private: it contains local source locations. Native readers reta
 
 To reuse a failed generation whose source ingestion finished, set `resume_generation` to its absolute generation directory and list only supplemental sources in the new manifest. The builder verifies the failed state, source counts, manifest, publication base, database integrity and every normalized object digest. It hash-binds and compacts a new copy, leaving the seed untouched; baseline observations count against the new record budget. The report retains the seed receipt and all coverage findings. Older candidates without a phase marker are explicitly labeled as weaker legacy ingestion evidence. Set measured `limits` in the manifest for the next invocation; a resume never changes global limits or hides the failed attempt.
 
+## Web captures
+
+A capture tool that fetches saved web pages writes *shards*: JSONL files with one row per page attempt. `cce library build` reads them through the `web_captures` key of the source manifest, the same intake as the other sources, so a saved page is searchable like a chat and is bounded, receipted and published the same way. The key lists absolute paths: a shard file, or a folder whose `*.jsonl` files (at any depth, symlinks never followed) are read in name order. Both `capture-shard.v1` pages and `wikipedia-article.v1` articles are supported. Select body shards explicitly; clip ledgers, receipt files, fetch logs and manifests are operational state, not page text. Intake does not fetch URLs.
+
+```json
+{
+  "schema": "cce.library-sources.v1",
+  "web_captures": ["/private/web-captures/shards"],
+  "web_capture_max_row_bytes": 8388608
+}
+```
+
+`web_capture_max_row_bytes` is optional (default 8 MiB). A line over it is refused without being held in memory. Directory discovery, line scanning and oversized-line draining all check the build deadline. The first pass enforces the remaining record budget on distinct page identities. Finding details are capped at 4,096 entries; `findings_omitted` counts further details while the refusal totals remain complete.
+
+**Input format (`capture-shard.v1`).** One JSON object per line, with exactly these fields (a missing or unexpected field refuses the row):
+
+| Field | Meaning |
+|---|---|
+| `schema` | the string `capture-shard.v1` |
+| `id` | `pg_` and the first 24 hex characters of the SHA-256 of `key` |
+| `key` | the normalized requested URL: lowercase scheme/host/path/query, remove `www.`, tracking parameters, the fragment and a trailing path slash; sort remaining query parameters |
+| `requested_url` | the URL that was asked for, `http` or `https`, a valid host, no whitespace or embedded credentials; its normalized key must match `key` |
+| `final_url` | the URL after redirects, or null when no response arrived |
+| `status` | `captured` or `failed` |
+| `http_status` | an integer of at least 100, or null |
+| `content_digest` | `sha256:` and the SHA-256 (64 hex) of the UTF-8 `text`; null on a failed row |
+| `captured_at` | the fetch time as a UTC stamp, `2026-01-02T03:04:05Z` |
+| `extractor` | an object with a nonempty `name` and `version` |
+| `text` | the extracted text; empty on a failed row |
+| `failure_class` | null on a captured row; on a failed row one of `dead_link`, `login_wall`, `paywall`, `non_html`, `rendered_empty`, `timeout`, `blocked` |
+| `license_note` | a nonempty free-text rights note |
+| `title` | optional string |
+| `tier` | optional, `A` or `B` |
+
+**What a row becomes.** One record per page: provider `webcapture`, kind `page`, wing `ai`, lane `web`, UID `webcapture-pg-` and the 24 hex of the page id. Its identity comes from the page id, so reading the same page again is the same record, and a page whose text changed is a new revision of it under the library's usual rules (a text change is a minor version, and every earlier revision stays readable). The record carries one message with the page text (role `tool`, channel `tool`), and provenance with `source: web_capture`, `requested_url`, `final_url`, `captured_at`, `content_digest`, `http_status`, `extractor`, `license_note` and `source_file` (the shard's name relative to the declared folder). `source_path`, and so a search hit's `source_ref` and the index's source reference, is the final URL (the requested URL when there was no redirect). No absolute path and no file time enters a record, so moving the shard folder changes nothing. The wing `ai` means only "not the person's own writing"; the authored wing is for text the person wrote.
+
+**Search.** A hit of a web capture carries `capture`: `url` (the requested URL), `final_url`, `captured_at`, `content_digest` and `http_status`, beside the usual fields; hits of other providers are unchanged. The projection is stored under the immutable source-object digest and checked against that source by full verification. Search reads this bounded projection without decoding a full page. URLs longer than 2,048 characters are clipped with `truncated: true`; `cce library read UID` exposes the original provenance under its existing metadata bounds. Compact MCP maps `capture` to `cp`, with `ur` URL, `fu` final URL, `ca` capture time, `cd` content digest and `hs` HTTP status. Passage search retains the exact read handoff.
+
+**Wikipedia articles.** The `wikipedia-article.v1` producer uses a case-sensitive `wikipedia:<language>:<requested title>` key. The reader checks the requested URL, language/API host, normalized title, page ID, content digest and text length, and retains the full metadata under `provenance.wikipedia`, including resolved title, redirect chain, revision ID/time, categories, disambiguation evidence and worker version. `fetched_at` becomes the common `captured_at` search field and `content_sha256` becomes `content_digest`; neither the body nor its hash is rewritten. Stored bodies are third-party text with the producer's CC BY-SA 4.0 rights note. A missing article becomes a metadata-only record with its reason; a refusal is a counted finding and produces no record. Neither is counted as captured article text.
+
+**Authorship.** A page is another party's text. The authorship engine labels every character of a record from the `webcapture` family `third_party` through its own first rule, whatever the role, channel or typed count says and whatever the URL or text looks like; it can never be `owner`. See [attributed knowledge](attributed-knowledge.md#rule-precedence).
+
+**Duplicates, failures and refusals.**
+
+- Several rows for one page (the same `id`, in one shard or many) keep one winner: a capture beats a failure, then the latest `captured_at`, then the larger `content_digest`. Equal-body/time ties use the normalized metadata digest and relative shard name, so the result does not depend on declared source order. The folded rows are counted as `duplicates` in the build report. The reader never edits the input shards, and previously accepted library revisions remain readable.
+- A `failed` row is kept as a record without a body (body status `metadata_only`, `body_reason` the failure class), so a page that could not be fetched stays visible. It makes `coverage_complete` false, like any other record without a body.
+- A row that cannot be trusted is refused with a finding in the build report (`scope: web_captures`, the shard, the line number, a code and a reason that never repeats page text), and the build continues. The codes are `malformed_row` (not JSON, not an object, a field of the wrong shape, an `id` that does not follow the `key`, a `content_digest` that does not match the `text`, a captured row without text or with a failure class, a failed row with a body, text with a NUL or invalid Unicode), `row_too_large`, `symlink_not_followed`, `missing_source`, `unreadable_file` and `source_changed_during_read`.
+- The report lists every shard with its SHA-256, size and row count (`sources[].report.shards`). Raw successful/failed/refused row counts are separate from the selected record count. Resume qualification binds the declared capture sources to these receipts before copying a failed generation.
+
+The producer contracts are pinned to browser tool commit `a8dc102ce1fc641d9454f0e3f2a6cf7d6d08d6ce`: `schemas/capture-shard.v1.json`, `capture_schema.py`, and `wikipedia_worker.py`. Their tested fixture formats are the integration boundary. Synthetic builds and source-contract checks establish code compatibility; they do not establish a production crawl, completeness of saved pages or native application acceptance. See [the reader design and verification scope](logos/library-web-capture.md).
+
 ## Preservation and condensation
 
 The SQLite store retains compressed, hashed normalized source objects, provenance observations, and source snapshots. Original file hashes are retained where the adapter reads the original bytes. Semantic versions start at `1.0.0`: classification changes advance major, body changes minor, and metadata changes patch. A lower-coverage observation never replaces a fuller current body. Replaying a known source snapshot does not revert the current revision; all observations remain retrievable.
