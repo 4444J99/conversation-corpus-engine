@@ -44,7 +44,7 @@ from .archive_provenance import INJECTED_TAGS, classify_user_turn
 from .archive_read_library import FAMILIES
 from .attribution import ATTRIBUTION_SCHEMA, text_digest
 
-RULES_VERSION = "cce.attribution-rules@1"
+RULES_VERSION = "cce.attribution-rules@2"
 
 OWNER = "owner"
 AGENT = "agent"

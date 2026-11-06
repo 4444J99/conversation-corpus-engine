@@ -847,6 +847,50 @@ def test_review_record_refuses_answers_that_are_not_in_the_sample(
     assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
 
 
+def test_a_sample_drawn_under_the_previous_rules_version_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
+    sample, old_sample, answers, ledger = (
+        tmp_path / name for name in ("s.jsonl", "old.jsonl", "a.jsonl", "l.jsonl")
+    )
+    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    rows = [row for row in sample_rows(sample) if row["rule"] == "typed_prefix"]
+    stale = [{**row, "rules_version": "cce.attribution-rules@1"} for row in rows]
+    old_sample.write_text("".join(json.dumps(row) + "\n" for row in stale), encoding="utf-8")
+    answers.write_text(
+        "".join(json.dumps({**row, "verdict": "yes"}) + "\n" for row in stale), encoding="utf-8"
+    )
+    code, _, err = record_answers(capsys, library, ledger, old_sample, answers)
+    assert code == 2 and "rules version" in err and "draw a new sample" in err
+    assert not ledger.exists()
+
+
+def test_ledger_rows_from_the_previous_rules_version_are_reported_as_stale(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=110)
+    ledger = approve(capsys, library, tmp_path)
+    assert report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")[
+        "profile_eligible"
+    ] == ["typed_prefix:S"]
+    rewritten = tmp_path / "old-ledger.jsonl"
+    rewritten.write_text(
+        ledger.read_text(encoding="utf-8").replace(
+            "cce.attribution-rules@2", "cce.attribution-rules@1"
+        ),
+        encoding="utf-8",
+    )
+    report = report_of(capsys, library, "--ledger", rewritten, "--owner-id", "rob")
+    assert report["gate"]["stale_rows"] == 100 and report["gate"]["ledger_rows"] == 100
+    assert report["profile_eligible"] == [] and report["gate"]["orphan_rows"] == 0
+    _, result = apply_entries(
+        capsys, library, tmp_path / "stale.json", "--ledger", rewritten, "--owner-id", "rob"
+    )
+    assert result["stale_rows"] == 100 and result["eligible_strata"] == []
+    assert result["rules_version"] == "cce.attribution-rules@2"
+
+
 def test_review_record_rejects_bad_answers_before_writing_anything(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -1043,6 +1043,11 @@ def _load_sample(path: Path) -> dict[str, dict[str, Any]]:
             )
         ):
             raise ValueError(f"sample line {number}: not a {SAMPLE_SCHEMA} row")
+        if row["rules_version"] != RULES_VERSION:
+            raise ValueError(
+                f"sample line {number}: drawn under rules version {row['rules_version']}, "
+                f"not the current {RULES_VERSION}; draw a new sample"
+            )
         rows.setdefault(row["span_id"], row)
     return rows
 

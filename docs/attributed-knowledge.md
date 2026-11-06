@@ -272,7 +272,7 @@ published library generation. A provider's `user` role is not proof that the own
 span: injected system text, command output and tool results sit inside user turns, pasted logs,
 quotes, tables, emails and code are not the owner's prose, an assistant's answer can be pasted
 back into a turn, and AI-written skill and instruction files are filed under documents. The
-engine (`conversation_corpus_engine.attribution_rules`, version `cce.attribution-rules@1`)
+engine (`conversation_corpus_engine.attribution_rules`, version `cce.attribution-rules@2`)
 therefore labels a span `owner` only when an owner-granting rule claims it and no other rule
 does. When a rule is ambiguous the text becomes `unknown` or a non-owner class, never owner.
 **No rule is profile-eligible until the precision gate below is met**, and every span the
@@ -293,6 +293,15 @@ A message that cannot be encoded as UTF-8 (a lone surrogate) has no digest: it i
 `unreadable_messages`, treated as unknown, and kept out of the annotations, the census and the
 sample; it does not abort the run.
 
+### Rules version
+
+The version string (`cce.attribution-rules@2`) names the rule semantics and every artifact carries
+it: span ids (so a span id from another version never matches), the annotation evidence
+(`cce.attribution-rules@2:rule:<id>`), the rows of review samples and the rows of the review
+ledger. When the rules change meaning the version is bumped. Ledger rows of any other version are
+**stale**: read, reported as `stale_rows` and never counted, so reviews must be redone for the new
+rules. `review-record` refuses a sample drawn under another version and asks for a new one.
+
 ### Rule precedence
 
 Rules run in this order; the first rule to claim a character keeps it and a later rule only
@@ -308,7 +317,7 @@ so no higher rule can lose a character to an owner claim.
 | 5 | `code` | third_party | fenced code blocks and indented code (two or more indented lines after a blank line) |
 | 6 | `quote` | third_party | markdown blockquote lines (and the lazy continuation lines that follow one), passages of 40 or more characters inside matching quotation marks, and pasted-content wrappers |
 | 7 | `log_trace` | agent | timestamped log lines, Python tracebacks, stack traces (an exception header with its frame, or two frames, even at two lines) and runs of three or more tool-output shaped lines |
-| 8 | `pasted_block` | third_party | a pasted email (header run, original-message or forward marker, on-date-wrote line), to the end of the message because its extent cannot be proven, and markdown tables with a separator row |
+| 8 | `pasted_block` | third_party | a pasted email (header run, original-message or forward marker, on-date-wrote line), to the end of the message because its extent cannot be proven, and markdown tables with a separator row. Consequence: owner text written after a pasted email in the same message is third party too; put your own words before the paste or in a separate message |
 | 9 | `boilerplate` | third_party | later occurrences of a long text that repeats verbatim after whitespace normalization |
 | 10 | `pasted_back` | third_party | text a user turn pastes back from an earlier assistant turn of the same conversation: a paragraph of 150 or more characters that shares 100 or more characters (after whitespace normalization) with it, or a run of adjacent paragraphs, each touched by such a match, whose joined text is 300 or more characters |
 | 11 | `ambiguous` | unknown | a paragraph with an odd number of ASCII double quotes; and a note or document of the owner's own library that states an AI had a hand in it anywhere (generated, written, drafted, summarised or edited by or with an AI or a named assistant; with the help of; as an AI; AI-generated) |
@@ -362,7 +371,7 @@ already reads: `source` is the exact canonical reference without offsets and `at
 `cce.span-attribution.v1` annotation whose spans are the non-unknown spans (uncovered text is
 unknown by the contract). Messages whose id is empty or not unique in their sequence cannot be
 referenced exactly and are counted, not annotated. The file holds offsets, ids and evidence
-(`cce.attribution-rules@1:rule:<id>`, `stratum:<S|M|L>`, `span:<id>`), no message text. Owner
+(`cce.attribution-rules@2:rule:<id>`, `stratum:<S|M|L>`, `span:<id>`), no message text. Owner
 spans carry `--owner-id` as `author_id`; without it no span can reach a strict profile.
 
 ### Output rules
@@ -371,7 +380,11 @@ spans carry `--owner-id` as `author_id`; without it no span can reach a strict p
   `review-record` must be outside the library generation, its parent folder and the library
   store (found through the builder's `library-all` folder, a store folder given as `--library`,
   `--store-root` or the configured store), the store root included. A bare generation with no
-  discoverable store protects its folder and its parent.
+  discoverable store protects its folder and its parent. The layout rule, then: for a library at
+  `<dir>/library.sqlite`, nothing may be written under `<dir>` or under `<dir>/..`, so keep the
+  library two levels below the folder outputs go to (library in `/private/lib/gen/`, outputs in
+  `/private/out/`). A library under the builder's `library-all/generations/<name>` layout
+  protects the whole store above `library-all` instead.
 - **Git custody.** Each destination directory must pass the same check as the archive writers
   (`require_git_private`): outside any work tree, or ignored by Git. A Git-visible destination is
   refused before any work starts.

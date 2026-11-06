@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from conversation_corpus_engine import attribution_rules
 from conversation_corpus_engine.attribution import (
     ATTRIBUTION_SCHEMA,
     attributed_spans,
@@ -232,6 +233,31 @@ def test_rows_from_another_rules_version_or_an_older_schema_are_ignored_not_coun
     assert summary.strata[("typed_prefix", "S")].reviewed == 0
     assert (summary.rows, summary.stale_rows) == (101, 101)
     assert eligible_strata(summary) == frozenset()
+
+
+PREVIOUS_VERSION = "cce.attribution-rules@1"
+
+
+def test_rows_written_under_the_previous_rules_version_are_stale_and_never_counted() -> None:
+    assert RULES_VERSION == "cce.attribution-rules@2"
+    old = verdict_rows("typed_prefix", ["yes"] * 100, version=PREVIOUS_VERSION)
+    summary = summarize(old)
+    assert (summary.rows, summary.stale_rows) == (100, 100)
+    assert summary.strata[("typed_prefix", "S")].reviewed == 0
+    assert eligible_strata(summary) == frozenset()
+    mixed = old + verdict_rows("typed_prefix", ["yes"] * 100, start=5000)
+    assert summarize(mixed).stale_rows == 100 and gate(mixed).reviewed == 100
+
+
+def test_span_ids_and_annotation_evidence_are_bound_to_the_rules_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (span,) = spans_of(SHORT)
+    current = span.span_id
+    evidence = to_annotation(SHORT, [span], owner_id="rob")["spans"][0]["evidence"]
+    assert evidence[0] == f"{RULES_VERSION}:rule:typed_prefix"
+    monkeypatch.setattr(attribution_rules, "RULES_VERSION", PREVIOUS_VERSION)
+    assert span.span_id != current
 
 
 def test_eligible_strata_lists_only_what_passes() -> None:
