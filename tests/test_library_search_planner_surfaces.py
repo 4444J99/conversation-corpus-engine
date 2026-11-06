@@ -321,9 +321,30 @@ BAD_BUDGET = "max_seconds must be a number greater than 0 and at most 600"
         (("--max-seconds", "0"), BAD_BUDGET),
         (("--max-seconds", "-3"), BAD_BUDGET),
         (("--max-seconds", "601"), BAD_BUDGET),
-        (("--max-seconds", "nan"), BAD_BUDGET),
-        (("--max-seconds", "inf"), BAD_BUDGET),
-        (("--max-seconds", "abc"), "argument --max-seconds: 'abc' is not a number"),
+        (("--max-seconds", "-0.0"), BAD_BUDGET),
+        (("--max-seconds", "0.0"), BAD_BUDGET),
+        (("--max-seconds", "1" + "0" * 400), BAD_BUDGET),
+        *(
+            (("--max-seconds", text), f"argument --max-seconds: {text!r} is not a decimal number")
+            for text in (
+                "nan",
+                "inf",
+                "infinity",
+                "abc",
+                "",
+                "5_0",
+                " 5 ",
+                "5 ",
+                "0x10",
+                "1e-9",
+                "1E3",
+                "+5",
+                "1.2.3",
+                ".",
+                "\u0665",  # an Arabic-Indic digit, which float() accepts
+                "\uff15",  # a full-width digit, which float() accepts
+            )
+        ),
     ],
 )
 def test_cli_rejects_a_bad_plan_or_budget_before_searching(extra, message, capsys):
@@ -331,6 +352,14 @@ def test_cli_rejects_a_bad_plan_or_budget_before_searching(extra, message, capsy
         parse(*extra)
     assert raised.value.code == 2
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("text", "seconds"),
+    [("15", 15.0), ("2.5", 2.5), (".5", 0.5), ("5.", 5.0), ("600", 600.0), ("007", 7.0)],
+)
+def test_cli_accepts_plain_decimal_budgets(text, seconds):
+    assert parse("--max-seconds", text).max_seconds == seconds
 
 
 def test_cli_help_documents_the_plan_order_the_budget_and_the_cost_of_or(capsys):

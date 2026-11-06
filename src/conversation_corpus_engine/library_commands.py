@@ -489,7 +489,8 @@ def add_library_parser(subparsers: Any) -> None:
         "--max-seconds",
         type=_search_seconds,
         default=DEFAULT_SEARCH_SECONDS,
-        help=f"time budget in seconds, above 0 and at most {MAX_SEARCH_SECONDS:g} (default "
+        help=f"time budget in seconds as a plain decimal such as 15 or 2.5, above 0 and at most "
+        f"{MAX_SEARCH_SECONDS:g} (default "
         f"{DEFAULT_SEARCH_SECONDS:g}); on expiry a partial page in index order is returned, "
         "not an error",
     )
@@ -524,13 +525,15 @@ def add_library_parser(subparsers: Any) -> None:
     analyze.add_argument("--max-seconds", type=int, default=defaults.max_seconds)
 
 
+_DECIMAL_SECONDS = re.compile(r"-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)")
+
+
 def _search_seconds(text: str) -> float:
+    """A plain decimal number of seconds; float() alone also takes 5_0, " 5 ", nan and 1e3."""
+    if not _DECIMAL_SECONDS.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"{text!r} is not a decimal number")
     try:
-        number = float(text)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
-    try:
-        return validate_search_seconds(number)
+        return validate_search_seconds(float(text))
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from None
 
