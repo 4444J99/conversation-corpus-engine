@@ -2,6 +2,8 @@
 
 The canonical library export remains the complete source. The standalone [batch packer](../scripts/package-notion-batches.py) creates exclusive private derivatives without rebuilding or modifying the published generation.
 
+The source ZIP exists only for the `cards` and `full` vault profiles and the legacy layout; a generation built with the default `--vault-profile none` has no `notion-import.zip`, and the packer then exits with code 2 and a one-line message naming `--vault-profile`. Write the ZIP from the published generation with `cce library export --vault-profile cards --out DIR` (or `full`) and package `DIR/notion-import.zip` (see [vault profiles](knowledge-library.md#vault-profiles)).
+
 Notion documents a 5 GB ZIP limit and warns that imports containing at least 10,000 files may fail or import partially. Its Markdown/CSV file limits are 5 MB on Free and 50 MB on paid plans. The packer reports these as decimal byte thresholds. Notion also recommends wrapping the contents in a folder. [Official import guidance](https://www.notion.com/help/import-data-into-notion), checked 2026-10-27.
 
 ```sh
@@ -12,7 +14,7 @@ python3 scripts/package-notion-batches.py \
   --max-output-bytes 8589934592
 ```
 
-Choose a new output directory outside the published generation. The CLI lowers process priority. It has a hard POSIX wall timer, cooperative checkpoints, a logical output cap, and a measured 1 GiB free-space floor. Failed attempts retain their partial outputs and failure receipt; the completed manifest is written last. Existing destinations and source symlinks are rejected.
+Choose a new output directory outside the published generation. The CLI refuses, before it reads the source, an output directory that Git can see (inside a work tree and not ignored by it): the batches hold the library as plaintext. The CLI lowers process priority. It has a hard POSIX wall timer, cooperative checkpoints, a logical output cap, and a measured 1 GiB free-space floor. Failed attempts retain their partial outputs and failure receipt; the completed manifest is written last. Existing destinations and source symlinks are rejected.
 
 | Setting | Default / meaning |
 | --- | --- |

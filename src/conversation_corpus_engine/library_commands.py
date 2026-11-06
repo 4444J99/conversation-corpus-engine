@@ -12,11 +12,28 @@ from typing import Any
 
 from .archive_database import PHRASE_RE, WORD_RE
 from .attributed_knowledge import ZETTEL_SCHEMA, export_zettels, zettel_atoms
-from .corpus_store import CorpusStoreError
+from .corpus_store import CorpusStoreError, require_git_private
 from .library_analysis import AnalysisLimits, export_analysis
-from .library_build import build_library, current_generation, publish_library, verify_candidate
-from .library_export import export_library, verify_export
-from .library_store import Library
+from .library_build import (
+    DEFAULT_VAULT_PROFILE,
+    build_library,
+    current_generation,
+    publish_library,
+    verify_candidate,
+)
+from .library_cards import export_cards, is_card_folder, verify_cards
+from .library_export import EXPORT_PROFILES, LEGACY_PROFILE, export_library, verify_export
+from .library_store import (
+    BROAD_QUERY_HINT,
+    DEFAULT_SEARCH_SECONDS,
+    MAX_SEARCH_SECONDS,
+    SEARCH_PLANS,
+    Library,
+    bounded_int,
+    validate_search_seconds,
+)
+from .library_vault import VAULT_PROFILES
+from .library_vault_gate import describe_findings, measure_vault
 from .paths import default_project_root
 from .persona_extract import extract_persona_lexicon
 
@@ -44,7 +61,7 @@ PASSAGE_LIMIT = 1500
 MAX_RANGE_MESSAGES = 200
 MAX_TOC_ENTRIES = 500
 PREVIEW_CHARS = 80
-HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t#]*$")
+LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|[\r\n])|[^\r\n]+")
 STEM_SUFFIXES = ("ing", "ed", "es", "s", "ly")
 
 
@@ -108,8 +125,15 @@ def _sequences(
 
 def passage_handoff(
     payload: dict[str, Any], query: str, limit: int = PASSAGE_LIMIT
-) -> dict[str, Any]:
-    """Exact read arguments for the passage of a record that best answers a search query."""
+) -> tuple[dict[str, Any], bool]:
+    """Read arguments for the passage of a record that best answers a search query, and whether
+    that passage was located.
+
+    The arguments are exactly what `cce_library_read` takes (`message`, `offset`, `limit`, plus
+    `sequence` for the alternate branch), nothing else, so a caller can pass them as they are.
+    When no query term occurs in any message they point at the start of the record and the flag
+    is False; the caller reports that beside the arguments, never inside them.
+    """
     main, alternates = _sequences(payload)
     best = None
     for sequence, messages in (("main", main), ("alternate", alternates)):
@@ -121,7 +145,7 @@ def passage_handoff(
             break
         best = best or (sequence, messages, match)
     if best is None:
-        return {"message": 0, "offset": 0, "limit": limit, "located": False}
+        return {"message": 0, "offset": 0, "limit": limit}, False
     sequence, messages, match = best
     length = len(str(messages[match["message"]].get("text", "")))
     handoff = {
@@ -131,7 +155,7 @@ def passage_handoff(
     }
     if sequence != "main":
         handoff["sequence"] = sequence
-    return handoff
+    return handoff, True
 
 
 def _check_cursor(message: int, offset: int, limit: int, sequence: str) -> None:
@@ -309,14 +333,198 @@ def _read_range(
     return result
 
 
+def _atx_heading(line: str) -> tuple[int, str] | None:
+    """(level, title) of an ATX heading line, or None for any other line (CommonMark: up to three
+    spaces of indent, one to six `#`, then a space, a tab or the end of the line; an optional
+    closing run of `#` after whitespace is not part of the title, which may be empty).
+    Linear in the line: nothing here backtracks."""
+    body = line.rstrip("\r\n")
+    stripped = body.lstrip(" ")
+    if len(body) - len(stripped) > 3:
+        return None
+    rest = stripped.lstrip("#")
+    level = len(stripped) - len(rest)
+    if not 1 <= level <= 6 or (rest and rest[0] not in " \t"):
+        return None
+    title = rest.strip(" \t")
+    unclosed = title.rstrip("#")
+    if unclosed != title and (not unclosed or unclosed[-1] in " \t"):
+        title = unclosed.rstrip(" \t")
+    return level, title
+
+
+FENCE_LINE_RE = re.compile(r"(`{3,}|~{3,})(.*)")
+ITEM_MARKER_RE = re.compile(r"([-*+]|(\d{1,9})[.)])(?=[ \t]|$)")
+THEMATIC_BREAK_RE = re.compile(r"([-*_])(?:[ \t]*\1){2,}[ \t]*")
+SETEXT_UNDERLINE_RE = re.compile(r"(?:=+|-+)[ \t]*")
+TAB_STOP = 4
+QUOTE, ITEM = "quote", "item"  # the two containers a heading can be inside of
+# Containers nested deeper than this are read as text: a line of ten thousand `>` costs a line's
+# worth of work per container, so the depth is bounded. markdown-it-py bounds it too (at 20).
+MAX_CONTAINERS = 32
+
+
+def _indentation(body: str, start: int = 0) -> tuple[int, str]:
+    """(column reached, rest of the line) after the leading spaces and tabs, a tab running to the
+    next multiple of four, counting from column `start`."""
+    column, index = start, 0
+    while index < len(body) and body[index] in " \t":
+        column += 1 if body[index] == " " else TAB_STOP - column % TAB_STOP
+        index += 1
+    return column, body[index:]
+
+
+def _advance(text: str, column: int, columns: int) -> tuple[str, int]:
+    """`text`, which starts at `column`, without up to `columns` columns of its leading spaces and
+    tabs. A tab that straddles the end leaves the rest of its width behind as spaces."""
+    index = 0
+    while index < len(text) and columns > 0 and text[index] in " \t":
+        width = 1 if text[index] == " " else TAB_STOP - column % TAB_STOP
+        if width > columns:
+            return " " * (width - columns) + text[index + 1 :], column + columns
+        columns -= width
+        column += width
+        index += 1
+    return text[index:], column
+
+
 def _headings(text: str) -> list[tuple[int, int, str]]:
-    found, position, fenced = [], 0, False
-    for line in text.splitlines(keepends=True):
-        if line.strip().startswith(("```", "~~~")):
-            fenced = not fenced
-        elif not fenced and (heading := HEADING_RE.match(line.rstrip("\r\n"))):
-            found.append((position, len(heading.group(1)), heading.group(2)))
-        position += len(line)
+    """(character offset of the line, level, title) of every top-level ATX heading outside code.
+
+    This follows CommonMark (as markdown-it-py reads it) for what decides whether a heading line
+    is one. Each line is matched against the containers still open (a block quote needs its `>`,
+    a list item needs its content offset or a blank line), and what is left is read as a new block
+    start inside the last container that matched:
+
+    * Lines end at `\\n`, `\\r\\n` or `\\r` only; the other separators `str.splitlines` honours
+      (U+2028, form feed, ...) are ordinary characters, and so is a no-break space. A title is
+      cut of spaces and tabs only, so a no-break space at its edge stays in it.
+    * A fence opens on three or more backticks or tildes indented 0-3 spaces. A tab, four spaces
+      or any other character before it makes the line indented code or paragraph text. It closes
+      only on the same character, at least as long, indented 0-3 spaces and followed by nothing.
+    * A block quote starts on `>` indented 0-3 spaces and an item on a marker followed by a space,
+      a tab or the end of the line. An item's content starts one column after the marker, or
+      after the spaces that follow it when there are one to four; with five or more, or with
+      nothing, the content is the first column after the marker, so five spaces make the first line
+      indented code. An item that starts empty ends at the next blank line. A fence in a quote or
+      an item may be indented 0-3 columns past its content start, and ends with its container.
+    * A line that matches no open container is a lazy continuation, and keeps them all open, only
+      if it would otherwise continue a paragraph: not after indented code, a fence or a heading,
+      and not when it starts a block (a quote, a heading, a fence, a rule or a list item that may
+      interrupt a paragraph: a bullet or `1.` with text). A heading, rule or fence ends the
+      containers it is not inside of.
+    * A heading inside a list item or a quote is not top level, and is not listed.
+
+    HTML blocks and link reference definitions are not modelled: a line that markdown-it-py
+    reads as one is read here as paragraph text, so a document that has them can differ.
+    """
+    found: list[tuple[int, int, str]] = []
+    position = 0
+    containers: list[
+        list[Any]
+    ] = []  # open containers, outermost first: kind, content offset, child
+    fence: tuple[str, int] | None = None  # character and length of the open fence
+    paragraph = False  # the open leaf block is a paragraph, which a lazy continuation may extend
+    for line in LINE_RE.findall(text):
+        start, position = position, position + len(line)
+        remaining, column, matched = line.rstrip("\r\n"), 0, 0
+        blank = not remaining.strip(" \t")
+        for kind, offset, has_child in containers:
+            reached, rest = _indentation(remaining, column)
+            if kind == QUOTE:
+                if not rest.startswith(">") or reached - column > 3:
+                    break
+                remaining, column = _advance(remaining, column, reached - column)
+                remaining, column = remaining[1:], column + 1
+                if remaining[:1] in (" ", "\t"):
+                    remaining, column = _advance(remaining, column, 1)
+            elif blank:
+                if not has_child:
+                    break  # an item that starts empty cannot go on past a blank line
+            elif reached - column >= offset:
+                remaining, column = _advance(remaining, column, offset)
+            else:
+                break
+            matched += 1
+        whole = matched == len(containers)  # every open container goes on with this line
+        if not blank:
+            for entry in containers[:matched]:
+                entry[2] = True
+        if fence is not None:
+            if not whole:
+                fence = None  # its container ended, and it with it: read the line afresh
+            else:
+                reached, rest = _indentation(remaining, column)
+                closing = FENCE_LINE_RE.match(rest)
+                if (
+                    closing
+                    and closing.group(1)[0] == fence[0]
+                    and len(closing.group(1)) >= fence[1]
+                    and not closing.group(2).strip(" \t")
+                    and reached - column <= 3
+                ):
+                    fence = None
+                continue
+        interrupting = paragraph and whole  # the line would continue the open paragraph
+        ended = False  # the line was a leaf block of its own
+        while True:
+            reached, rest = _indentation(remaining, column)
+            relative = reached - column
+            if not rest or relative > 3:
+                break
+            if rest[0] == ">" and len(containers) < MAX_CONTAINERS:
+                del containers[matched:]
+                remaining, column = _advance(remaining, column, relative)
+                remaining, column = remaining[1:], column + 1
+                if remaining[:1] in (" ", "\t"):
+                    remaining, column = _advance(remaining, column, 1)
+                containers.append([QUOTE, 0, True])
+            elif heading := _atx_heading(rest):
+                del containers[matched:]
+                if not containers and heading[1]:
+                    found.append((start, *heading))
+                ended = True
+            elif (opener := FENCE_LINE_RE.match(rest)) and not (
+                opener.group(1)[0] == "`" and "`" in opener.group(2)
+            ):
+                del containers[matched:]
+                fence = (opener.group(1)[0], len(opener.group(1)))
+                ended = True
+            elif interrupting and SETEXT_UNDERLINE_RE.fullmatch(rest):
+                ended = True  # the paragraph is a setext heading, which is not listed
+            elif THEMATIC_BREAK_RE.fullmatch(rest):
+                del containers[matched:]
+                ended = True
+            elif len(containers) < MAX_CONTAINERS and (marker := ITEM_MARKER_RE.match(rest)):
+                content_column, content = _indentation(rest[marker.end() :], reached + marker.end())
+                numbered = marker.group(2)
+                if interrupting and (not content or (numbered and int(numbered) != 1)):
+                    break  # an empty item, or one not numbered 1, cannot interrupt a paragraph
+                gap = content_column - (reached + marker.end())
+                width = marker.end() + (gap if content and 1 <= gap <= 4 else 1)
+                del containers[matched:]
+                remaining, column = _advance(remaining, column, relative)
+                remaining, column = remaining[marker.end() :], column + marker.end()
+                remaining, column = _advance(remaining, column, width - marker.end())
+                containers.append([ITEM, relative + width, bool(content)])
+            else:
+                break
+            if ended:
+                break
+            matched, whole, interrupting = len(containers), True, False
+            paragraph = False
+        if ended:
+            paragraph = False
+            continue
+        reached, rest = _indentation(remaining, column)
+        if not rest:
+            del containers[matched:]
+            paragraph = False
+        elif not whole and paragraph:
+            continue  # a lazy continuation: every open container stays open
+        else:
+            del containers[matched:]
+            paragraph = paragraph or reached - column <= 3  # indented text is a paragraph or code
     return found
 
 
@@ -407,6 +615,13 @@ def add_library_parser(subparsers: Any) -> Any:
     common(build)
     build.add_argument("--manifest", type=Path, required=True)
     build.add_argument("--publish", action="store_true", help="Publish only after verification")
+    build.add_argument(
+        "--vault-profile",
+        choices=VAULT_PROFILES,
+        default=DEFAULT_VAULT_PROFILE,
+        help="Reading vault written into the generation: none (default, no vault), cards "
+        "(one capped card per record) or full (whole records in capped linked parts)",
+    )
     publish = sub.add_parser("publish", help="Verify and atomically publish an existing candidate")
     common(publish)
     publish.add_argument("generation", type=Path)
@@ -427,12 +642,43 @@ def add_library_parser(subparsers: Any) -> Any:
         "export", help="Write the private reading export, optionally with reviewed Zettel pages"
     )
     common(export)
-    export.add_argument("--out", type=Path, required=True, help="New export directory")
+    export.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="New export directory, outside every Git work tree or ignored by it",
+    )
     export.add_argument(
         "--zettels", type=Path, help="Private reviewed-Zettels JSON envelope to render as pages"
     )
+    export.add_argument(
+        "--vault-profile",
+        choices=EXPORT_PROFILES,
+        default=LEGACY_PROFILE,
+        help="legacy (default) is the original layout, one flat note per record and per repeated "
+        "passage, which a reading app may be unable to open at scale; none, cards and full are "
+        "the capped layouts of `library build`",
+    )
+    cards = sub.add_parser(
+        "export-cards",
+        help="Write a small capped card vault (one card per record) for a reading app",
+    )
+    common(cards)
+    cards.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="Vault folder: empty, or an earlier card vault (never inside the library store)",
+    )
+    cards.add_argument(
+        "--limit-notes",
+        type=int,
+        help="Most notes (cards, hubs and Home) the vault may hold; default 10000, at most 20000",
+    )
     verify_export = sub.add_parser(
-        "verify-export", help="Verify an export directory, including its Zettel pages and anchors"
+        "verify-export",
+        help="Verify an export directory, including its Zettel pages and anchors, or an "
+        "export-cards folder (its listed files and the vault caps)",
     )
     common(verify_export)
     verify_export.add_argument("directory", type=Path)
@@ -449,7 +695,21 @@ def add_library_parser(subparsers: Any) -> Any:
     )
     for name in ("status", "verify"):
         common(sub.add_parser(name))
-    search = sub.add_parser("search", help="Paged full-text retrieval with exact match count")
+    search = sub.add_parser(
+        "search",
+        help="Paged full-text retrieval; the match count is exact up to 1000",
+        description=(
+            "Paged full-text retrieval. Several unquoted words are planned: an adjacent phrase "
+            "first, then every word (AND), then any word (OR), stopping at the first plan that "
+            'matches; the response names it in `plan`. A single word or a "quoted phrase" is '
+            "searched as written. OR on a large library is slow, so quote a phrase or add "
+            "terms for a faster, more precise search. The match count is exact up to 1000 and "
+            "then reads 1000+ (a count cut short by the budget is a lower bound, N+). The call is "
+            "bounded by --max-seconds: when it runs out, ranking "
+            "is abandoned and a partial page is returned in index order (`partial` true, "
+            "`ranked` false)."
+        ),
+    )
     common(search)
     search.add_argument("query")
     search.add_argument("--limit", type=int, default=20)
@@ -458,7 +718,27 @@ def add_library_parser(subparsers: Any) -> Any:
     search.add_argument("--lane")
     search.add_argument("--provider", action="append")
     search.add_argument("--kind", action="append")
-    read = sub.add_parser("read", help="Read one bounded message span from a source revision")
+    search.add_argument(
+        "--plan",
+        choices=SEARCH_PLANS,
+        default="auto",
+        help="auto (default): phrase, then and, then or, first match wins; or force one plan "
+        "(or is slow on a large library)",
+    )
+    search.add_argument(
+        "--max-seconds",
+        type=_search_seconds,
+        default=DEFAULT_SEARCH_SECONDS,
+        help=f"time budget in seconds as a plain decimal such as 15 or 2.5, above 0 and at most "
+        f"{MAX_SEARCH_SECONDS:g} (default "
+        f"{DEFAULT_SEARCH_SECONDS:g}); on expiry a partial page in index order is returned, "
+        "not an error",
+    )
+    read = sub.add_parser(
+        "read",
+        help="Read one bounded message span, a message range or the table of contents of a "
+        "source revision",
+    )
     common(read)
     read.add_argument("uid")
     read.add_argument("--version")
@@ -467,6 +747,35 @@ def add_library_parser(subparsers: Any) -> Any:
     read.add_argument("--sequence", choices=("main", "alternate"), default="main")
     read.add_argument("--offset", type=int, default=0)
     read.add_argument("--limit", type=int, default=12000)
+    read.add_argument(
+        "--around-query",
+        help="centre the passage on the first match of these terms at or after --message; the "
+        "result reports match {message, start, end} or null",
+    )
+    read.add_argument(
+        "--message-end",
+        type=int,
+        help="range read: the messages from --message up to (excluding) this one, with --limit "
+        "as the total character budget (at most 200 messages a call); resume with the "
+        "next_message and next_offset it returns",
+    )
+    read.add_argument(
+        "--toc",
+        action="store_true",
+        help="list a table of contents (markdown headings with message and offset, or a "
+        "per-message index) instead of text",
+    )
+    read.add_argument(
+        "--toc-mode",
+        choices=("auto", "headings", "messages"),
+        help="with --toc: headings, a per-message index, or auto (headings when there are any)",
+    )
+    read.add_argument("--toc-offset", type=int, help="with --toc: entries to skip (default 0)")
+    read.add_argument(
+        "--toc-limit",
+        type=int,
+        help=f"with --toc: entries to list, 1 to {MAX_TOC_ENTRIES} (default 50)",
+    )
     history = sub.add_parser("history", help="Read accepted semantic revisions")
     common(history)
     history.add_argument("uid")
@@ -490,6 +799,19 @@ def add_library_parser(subparsers: Any) -> Any:
     return sub
 
 
+_DECIMAL_SECONDS = re.compile(r"-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)")
+
+
+def _search_seconds(text: str) -> float:
+    """A plain decimal number of seconds; float() alone also takes 5_0, " 5 ", nan and 1e3."""
+    if not _DECIMAL_SECONDS.fullmatch(text):
+        raise argparse.ArgumentTypeError(f"{text!r} is not a decimal number")
+    try:
+        return validate_search_seconds(float(text))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
 def _progress(value: dict[str, Any]) -> None:
     print(json.dumps({"library_progress": value}, sort_keys=True), file=sys.stderr, flush=True)
 
@@ -501,7 +823,119 @@ def _load_zettel_envelope(path: Path) -> dict[str, Any]:
     return envelope
 
 
+def _warn_over_caps(out: Path) -> None:
+    """Say, on stderr, when the legacy layout just written is one a reading app may not open."""
+    report = measure_vault(Path(out) / "vault")
+    if report["findings"]:
+        print(
+            "library: warning: the legacy export layout is outside the vault caps "
+            f"({describe_findings(report)}). "
+            "A reading app may be unable to open it. Use --vault-profile cards or full, or "
+            "`cce library export-cards --out DIR`, for a vault that fits.",
+            file=sys.stderr,
+        )
+
+
+def integer_argument(arguments: dict[str, Any], name: str, default: int, maximum: int) -> int:
+    """`arguments[name]` as an integer from its minimum (1 for the counts that must be positive,
+    else 0) to `maximum`, or `default` when it is absent; anything else is a `ValueError`."""
+    value = arguments.get(name, default)
+    minimum = 1 if name in {"limit", "message_end", "toc_limit"} else 0
+    if not bounded_int(value, minimum, maximum):
+        raise ValueError(f"{name} must be an integer from {minimum} to {maximum}")
+    return value
+
+
+def flag_argument(arguments: dict[str, Any], name: str) -> bool:
+    value = arguments.get(name, False)
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
+def read_cursor(arguments: dict[str, Any]) -> tuple[int, int]:
+    """The (offset, limit) of a read, after the checks made of every read before the library is
+    opened: a nonempty `uid`, `offset` from 0 to 1,000,000,000 and `limit` from 1 to 32,000
+    (default 12,000). A table of contents ignores both but is held to them all the same."""
+    uid = arguments.get("uid")
+    if not isinstance(uid, str) or not uid.strip():
+        raise ValueError("uid must be a nonempty string")
+    return (
+        integer_argument(arguments, "offset", 0, 1000000000),
+        integer_argument(arguments, "limit", 12000, 32000),
+    )
+
+
+def read_arguments(
+    library: Library, arguments: dict[str, Any], offset: int, limit: int
+) -> dict[str, Any]:
+    """The read the MCP tool and `cce library read` share: a passage, a message range
+    (`message_end`) or a table of contents (`toc`), from the arguments the caller gave.
+
+    Only the arguments actually given are in `arguments` (the command line leaves out what it was
+    not passed), so a surface cannot accept what the other refuses: `toc_mode`, `toc_offset` and
+    `toc_limit` need `toc`, `toc` excludes `around_query` and `message_end`, and every bound
+    and message is the same.
+    """
+    toc = flag_argument(arguments, "toc")
+    around = arguments.get("around_query")
+    if around is not None and (not isinstance(around, str) or not around.strip()):
+        raise ValueError("around_query must be a nonempty string")
+    toc_args = {"toc_mode", "toc_offset", "toc_limit"} & set(arguments)
+    if toc_args and not toc:
+        raise ValueError("toc_mode, toc_offset and toc_limit require toc")
+    sequence = arguments.get("sequence", "main")
+    if toc:
+        if around is not None or "message_end" in arguments:
+            raise ValueError("toc cannot be combined with around_query or message_end")
+        return record_toc(
+            library,
+            arguments["uid"],
+            version=arguments.get("version"),
+            digest=arguments.get("digest"),
+            sequence=sequence,
+            mode=arguments.get("toc_mode", "auto"),
+            toc_offset=integer_argument(arguments, "toc_offset", 0, 1000000000),
+            toc_limit=integer_argument(arguments, "toc_limit", 50, MAX_TOC_ENTRIES),
+        )
+    return read_record(
+        library,
+        arguments["uid"],
+        version=arguments.get("version"),
+        digest=arguments.get("digest"),
+        message=integer_argument(arguments, "message", 0, 10000000),
+        sequence=sequence,
+        offset=offset,
+        limit=limit,
+        around_query=around,
+        message_end=(
+            integer_argument(arguments, "message_end", 1, 10000000)
+            if "message_end" in arguments
+            else None
+        ),
+    )
+
+
+def _verify_cards_command(args: argparse.Namespace) -> int:
+    if args.zettels is not None:
+        raise ValueError("reviewed Zettels do not apply to a card folder")
+    checked = verify_cards(args.directory)
+    problems = checked["problems"]
+    report = {
+        "directory": str(args.directory),
+        "kind": "cards",
+        "cards": checked["cards"],
+        "unlisted": checked["unlisted"],
+        "valid": not problems,
+        "problems": problems,
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 1 if problems else 0
+
+
 def _verify_export_command(args: argparse.Namespace) -> int:
+    if is_card_folder(args.directory):
+        return _verify_cards_command(args)
     reviewed = None
     if args.zettels is not None:
         entries = _load_zettel_envelope(args.zettels).get("zettels")
@@ -531,11 +965,19 @@ def handle_library(args: argparse.Namespace) -> int:
     try:
         if args.action == "verify-export":
             return _verify_export_command(args)
+        if args.action in {"export", "export-cards"}:
+            # The export is the library's text as plaintext (all of it, or a card per record):
+            # authorise where it lands before the library or the reviewed envelope is read.
+            require_git_private(args.out)
         store = configured_store(args.store_root)
         if args.action == "build":
             manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
             report = build_library(
-                manifest, project_root=args.project_root, store_root=store, progress=_progress
+                manifest,
+                project_root=args.project_root,
+                store_root=store,
+                progress=_progress,
+                vault_profile=args.vault_profile,
             )
             result = {
                 key: report[key]
@@ -546,6 +988,7 @@ def handle_library(args: argparse.Namespace) -> int:
                     "coverage_complete",
                     "artifact_bytes",
                     "elapsed_seconds",
+                    "vault_profile",
                 )
             }
             result["findings_count"] = len(report["findings"])
@@ -563,7 +1006,15 @@ def handle_library(args: argparse.Namespace) -> int:
             with library:
                 if args.action == "export":
                     envelope = _load_zettel_envelope(args.zettels) if args.zettels else None
-                    result = export_library(library, args.out, zettels=envelope)
+                    result = export_library(
+                        library, args.out, zettels=envelope, vault_profile=args.vault_profile
+                    )
+                    if args.vault_profile == LEGACY_PROFILE:
+                        _warn_over_caps(args.out)
+                elif args.action == "export-cards":
+                    result = export_cards(
+                        library, args.out, store_root=store, limit_notes=args.limit_notes
+                    )
                 elif args.action == "zettels":
                     envelope = _load_zettel_envelope(args.input)
                     exporter = zettel_atoms if args.format == "atoms-jsonl" else export_zettels
@@ -602,19 +1053,38 @@ def handle_library(args: argparse.Namespace) -> int:
                         lane=args.lane,
                         providers=args.provider,
                         kinds=args.kind,
+                        plan=args.plan,
+                        max_seconds=args.max_seconds,
                     )
                     result["generation"] = str(generation)
+                    for line in (result.get("notice"), result.get("hint")):
+                        if line:
+                            prefix = "hint: " if line == BROAD_QUERY_HINT else ""
+                            print(f"library: {prefix}{line}", file=sys.stderr)
                 elif args.action == "read":
-                    result = read_record(
-                        library,
-                        args.uid,
-                        version=args.version,
-                        digest=args.digest,
-                        message=args.message,
-                        sequence=args.sequence,
-                        offset=args.offset,
-                        limit=args.limit,
-                    )
+                    # The same arguments, checks and messages as the MCP read tool: give only
+                    # what was passed, so an option that needs another is refused alike.
+                    arguments: dict[str, Any] = {
+                        "uid": args.uid,
+                        "message": args.message,
+                        "sequence": args.sequence,
+                        "offset": args.offset,
+                        "limit": args.limit,
+                    }
+                    for name in (
+                        "version",
+                        "digest",
+                        "around_query",
+                        "message_end",
+                        "toc_mode",
+                        "toc_offset",
+                        "toc_limit",
+                    ):
+                        if getattr(args, name) is not None:
+                            arguments[name] = getattr(args, name)
+                    if args.toc:
+                        arguments["toc"] = True
+                    result = read_arguments(library, arguments, *read_cursor(arguments))
                 elif args.action == "history":
                     if args.offset < 0 or not 1 <= args.limit <= 200:
                         raise ValueError("history needs nonnegative offset and limit from 1 to 200")

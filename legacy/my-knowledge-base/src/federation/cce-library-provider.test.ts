@@ -92,6 +92,21 @@ describe('CCE library consumer', () => {
     scan.verifyUnchanged();
   });
 
+  it('names --vault-profile when a generation was built without the legacy notes', () => {
+    const root = temporary();
+    const location = generation(root, 'generation-a', [record('chatgpt-one')]);
+    const manifest = JSON.stringify({ schema: 'cce.library-export.v2', profile: 'none', records: 1, blocks: 0, files: ['export-manifest.json'] });
+    writeFileSync(join(location, 'export-manifest.json'), manifest);
+    const report = JSON.parse(readFileSync(join(location, 'report.json'), 'utf8'));
+    report.artifacts['export-manifest.json'] = { sha256: digest(manifest), bytes: Buffer.byteLength(manifest) };
+    const pinned = JSON.stringify(report);
+    writeFileSync(join(location, 'report.json'), pinned);
+    writeFileSync(join(root, 'library-all/current.json'), JSON.stringify({
+      schema: 'cce.library-current.v1', generation: 'generations/generation-a', report_sha256: digest(pinned),
+    }));
+    expect(() => new CceLibraryProvider().scan(source(root))).toThrow(/--vault-profile none/);
+  });
+
   it('loads bodies lazily and rejects body tampering against the pinned report', () => {
     const root = temporary();
     const location = generation(root, 'generation-a', [record('chatgpt-one')]);

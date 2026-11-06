@@ -218,12 +218,19 @@ cce library export --store-root /private/store --zettels /private/reviewed-ideas
 cce library verify-export /private/zettel-export --zettels /private/reviewed-ideas.json --json
 ```
 
-The Python equivalents are `export_library(library, destination, zettels=envelope)` and
-`verify_export(destination, expected_zettels=count)`. The envelope is validated against the
+The export is the whole library as plaintext, so `--out` must be outside every Git work tree or
+ignored by the one it is in; any other `--out` is refused with exit status 2 before the library or
+the envelope is read. `verify-export` writes nothing and needs no such check.
+
+The Python equivalents are `export_library(library, destination, zettels=envelope)` (it applies the
+same refusal) and `verify_export(destination, expected_zettels=count)`. The envelope is validated against the
 exact canonical library first (the same validation as `export_zettels`); an invalid
 envelope writes nothing. A Zettel id longer than 512 characters is refused because the
 id is shown on its page. Without the option the export is byte-for-byte unchanged and its
-manifest has no `zettels` key.
+manifest has no `zettels` key. Zettel pages exist only in the legacy export layout (the
+default `--vault-profile legacy`); `--zettels` with `none`, `cards` or `full` is refused,
+because those capped layouts have no `vault/records/UID.md#message-N` anchors to cite (see
+[vault profiles](knowledge-library.md#vault-profiles)).
 
 - **One page per Zettel** at `vault/zettels/<h>.md`, where `<h>` is the first 16 hex digits of
   the SHA-256 of the caller's id (ids are not safe file names; the id stays visible and is

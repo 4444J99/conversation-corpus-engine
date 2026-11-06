@@ -26,8 +26,11 @@ Measurement basis
   library, runs the query and renders JSON; client and transport time are not included.
 * ``response_bytes`` is the UTF-8 size of the text content block of the MCP result.
   ``est_tokens`` is ``ceil(response_bytes / 4)``. This is an estimate, not a tokenizer count.
-* Levels: ``cce_library_search`` is L0 (locate), ``cce_library_read`` is L2 (evidence),
-  ``cce_library_history`` is ``meta``. There is no L1 (unit) tool yet, so L1 is not reported.
+* Levels: ``cce_library_search`` is reported at the depth the harness requested, and the harness
+  requests ``depth: "L0"`` (locate) explicitly, because a search that names no depth is answered
+  at L1 (full, unbudgeted hits) and would otherwise be mislabelled L0. ``cce_library_read`` is L2
+  (evidence), ``cce_library_history`` is ``meta``. The L0 token gate applies to L0 calls only; a
+  run with none fails it.
 * Cold: the first search of the first query in a fresh Python process (``--cold subprocess``,
   the default) or on a fresh in-process server (``--cold inprocess``). The operating system
   page cache is not dropped (that needs privileges), so cold means a fresh process and a fresh
@@ -74,10 +77,11 @@ TOKEN_ESTIMATE = (
     "ceil(response_bytes / 4); response_bytes is the UTF-8 size of the MCP text content block"
 )
 LEVELS = {
-    library_mcp.SEARCH_TOOL: "L0",
     library_mcp.READ_TOOL: "L2",
     library_mcp.HISTORY_TOOL: "meta",
 }
+# The depth a search is answered at when its arguments name none (the server's own default).
+DEFAULT_SEARCH_DEPTH = "L1"
 QUERY_KEYS = {"id", "query", "expected_uid", "expected_text", "expected_message", "filters"}
 FILTER_KEYS = {"wing", "lane", "provider", "kind"}
 HASHED_PREFIX = "library.sqlite"
@@ -276,6 +280,17 @@ def estimate_tokens(byte_count: int) -> int:
     return math.ceil(byte_count / 4)
 
 
+def level_of(tool: str, arguments: dict[str, Any]) -> str:
+    """The level a call is reported under: a search by the depth it requested, the others by tool.
+
+    A search that names no depth is answered at L1 by the server, so it is reported as L1 and can
+    neither stand in for an L0 measurement nor be held to the L0 gate.
+    """
+    if tool == library_mcp.SEARCH_TOOL:
+        return str(arguments.get("depth", DEFAULT_SEARCH_DEPTH))
+    return LEVELS.get(tool, "other")
+
+
 def invoke(
     server: CceMcpServer, tool: str, arguments: dict[str, Any], *, phase: str, query_id: str
 ) -> dict[str, Any]:
@@ -299,7 +314,7 @@ def invoke(
         "query_id": query_id,
         "phase": phase,
         "tool": tool,
-        "level": LEVELS.get(tool, "other"),
+        "level": level_of(tool, arguments),
         "wall_s": wall,
         "response_bytes": size,
         "est_tokens": estimate_tokens(size),
@@ -311,7 +326,14 @@ def invoke(
 
 
 def first_search_arguments(query: dict[str, Any], limit: int) -> dict[str, Any]:
-    return {"query": query["query"], "limit": limit, "offset": 0, **query.get("filters", {})}
+    """Locate at depth L0, asked for explicitly: left out, the server answers at L1."""
+    return {
+        "query": query["query"],
+        "limit": limit,
+        "offset": 0,
+        "depth": "L0",
+        **query.get("filters", {}),
+    }
 
 
 def run_query(

@@ -28,7 +28,7 @@ from . import (
 )
 from .archive_author import AUTHORS, author_of, container_of
 from .archive_limits import SHARD_BYTES
-from .archive_lineage import record_generation
+from .archive_lineage import check_lineage, record_generation
 from .archive_model import (
     SCHEMA,
     Conversation,
@@ -244,6 +244,11 @@ class ArchivePaths:
     def digests(self) -> Path:
         """The content digest of every conversation as of the latest generation."""
         return self.root / layout.DIGESTS_FILENAME
+
+    @property
+    def digests_pending(self) -> Path:
+        """The new baseline while a generation is being committed (see `record_generation`)."""
+        return self.digests.with_name(self.digests.name + ".pending")
 
     @property
     def vault(self) -> Path:
@@ -936,14 +941,20 @@ def ingest(
     merge: bool = False,
     allow_input_loss: bool = False,
     folder_entries: int | None = None,
+    rebuild_lineage: bool = False,
 ) -> dict[str, Any]:
     """Read the chosen providers into the normalized shards and write the archive manifest.
 
     With `merge`, the providers the manifest already lists and this call does not touch keep
     their entries, so a store is built one provider at a time and a failed one is re-read alone.
     Without it the manifest lists exactly the providers of this call.
+
+    A lineage that cannot be trusted (a damaged ledger, or a digest baseline that the ledger does
+    not describe) raises `LineageError` before anything is read or written; `rebuild_lineage`
+    records the generation anyway as a rebuilt one (see `archive_lineage.record_generation`).
     """
     require_inside(authorization, paths.root)
+    check_lineage(paths, rebuild=rebuild_lineage)
     options = dict(options or {})
     options["source_hash_cache"] = {}
     options["protected_capture_uids"] = {}
@@ -1042,6 +1053,7 @@ def ingest(
             conversation.uid: content_digest(conversation)
             for conversation in iter_store(paths, [name])
         },
+        rebuild=rebuild_lineage,
     )
     return manifest
 

@@ -330,19 +330,24 @@ def _hub_rows(rows: list[dict[str, Any]]) -> list[str]:
 
 
 def hub_pages(
-    name: str, title: str, intro: str, rows: list[dict[str, Any]], note_bytes: int
+    name: str,
+    title: str,
+    intro: str,
+    rows: list[dict[str, Any]],
+    note_bytes: int,
+    max_entries: int | None = None,
 ) -> list[tuple[str, str]]:
     """A hub as (note name, text) pages of at most `note_bytes`: the hub, then `part-...` pages.
 
     Every row lands on some page whole; the hub's own name stays the first page, so every
-    existing link to it still resolves.
+    existing link to it still resolves. `max_entries` also closes a page at that many rows.
     """
     lines = _hub_rows(rows)
     head = [f"# {title}", "", intro, ""]
     later_head = [f"# {title} — continued", ""]
     first_budget = note_bytes - sum(utf8_size(line) + 1 for line in head) - NAV_RESERVE
     budget = note_bytes - sum(utf8_size(line) + 1 for line in later_head) - NAV_RESERVE
-    pages = paginate_rows([], lines, first_budget, budget)
+    pages = paginate_rows([], lines, first_budget, budget, max_entries)
     names = [name] + [layout.part_name("all", number, name) for number in range(2, len(pages) + 1)]
     out: list[tuple[str, str]] = []
     for index, group in enumerate(pages):

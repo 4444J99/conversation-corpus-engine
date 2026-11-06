@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import unicodedata
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .federation import REGISTRY_VERSION, load_registry, now_iso, registry_path, save_registry
 
@@ -75,22 +76,56 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
     return True
 
 
-def _run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+# Variables that tell git where a repository is, or hide it. Left in, GIT_DIR=/nonexistent makes git
+# answer "not a git repository" for every directory, which the guards would read as "outside every
+# work tree". Configuration variables (GIT_CONFIG_GLOBAL and the like) are kept: they are how a
+# developer's own ignore rules reach git, and the guards are meant to honour them.
+GIT_LOCATION_VARIABLES = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_NAMESPACE",
+)
+
+
+def _git_environment() -> dict[str, str]:
+    environment = {
+        name: value for name, value in os.environ.items() if name not in GIT_LOCATION_VARIABLES
+    }
+    environment["LC_ALL"] = "C"  # git's messages are matched by text below
+    return environment
+
+
+def _run_git(cwd: Path, *args: str, stdin: str | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", str(cwd), *args],
         check=False,
         capture_output=True,
         text=True,
-        env={**os.environ, "LC_ALL": "C"},  # git's messages are matched by text below
+        input=stdin,
+        env=_git_environment(),
     )
+
+
+def _enclosing_dot_git(path: Path) -> Path | None:
+    """The nearest `.git` (a directory, or the file of a linked work tree) at or above `path`."""
+    for candidate in (path, *path.parents):
+        marker = candidate / ".git"
+        if marker.exists() or marker.is_symlink():
+            return marker
+    return None
 
 
 def _git_root(path: Path) -> Path | None:
     """The work tree `path` sits in, or None when it sits in none.
 
-    None means exactly one thing: git said this is not a repository. Any other failure (no git
-    binary, a permission error, an ownership refusal) is raised, because treating it as "outside
-    every work tree" would let private text land somewhere Git can see.
+    None means exactly one thing: git said this is not a repository, and no `.git` exists at or
+    above `path` to contradict it (git says the same of a damaged `.git`). Any other failure (no
+    git binary, a permission error, an ownership refusal) is raised, because treating it as
+    "outside every work tree" would let private text land somewhere Git can see.
     """
     try:
         result = _run_git(path, "rev-parse", "--show-toplevel")
@@ -98,6 +133,12 @@ def _git_root(path: Path) -> Path | None:
         raise CorpusStoreError(f"Could not run git to inspect {path}: {exc}") from exc
     if result.returncode != 0:
         if result.returncode == NOT_A_REPOSITORY_EXIT and NOT_A_REPOSITORY in result.stderr:
+            marker = _enclosing_dot_git(path)
+            if marker is not None:
+                raise CorpusStoreError(
+                    f"git could not inspect {path}: it says this is not a repository, but "
+                    f"{marker} exists, so the answer cannot be trusted"
+                )
             return None
         raise CorpusStoreError(
             f"git could not inspect {path} (exit {result.returncode}): "
@@ -189,20 +230,219 @@ def _validate_git_privacy(root: Path) -> Path | None:
     return git_root
 
 
-def require_git_private(directory: Path) -> Path:
-    """Refuse a directory that private text must not land in.
+# Names Git is asked about beneath a destination inside a work tree: private text written there
+# must not be visible to Git under any of them. A rule that ignores only dotfiles, only one
+# extension or only the first name cannot make the destination pass, and `x/y.md` also covers a
+# negation that re-includes a subdirectory of an otherwise ignored parent.
+PRIVATE_PROBE_CHILDREN = (".private-probe", "x.md", "x.json", "x.jsonl", "x/y.md")
 
-    A directory outside any Git work tree is private. One inside a work tree must be ignored by
-    Git, so the files written there can never be staged by accident. Returns the resolved path.
+
+def _check_ignore(git_root: Path, paths: Sequence[str]) -> set[str]:
+    """Those of the work-tree-relative `paths` that Git ignores, judged by name.
+
+    Nothing has to exist: `check-ignore` reads the ignore rules (every .gitignore, `info/exclude`
+    and the global excludes file) and answers for the names given. `--no-index` keeps a tracked
+    path from hiding a matching rule.
+    """
+    result = _run_git(
+        git_root,
+        "check-ignore",
+        "--no-index",
+        "--stdin",
+        "-z",
+        stdin="".join(f"{p}\0" for p in paths),
+    )
+    if result.returncode not in (0, 1):  # 1 means none of them is ignored
+        raise CorpusStoreError(
+            f"git could not check the ignore rules (exit {result.returncode}): "
+            f"{result.stderr.strip() or 'no message'}"
+        )
+    return {item for item in result.stdout.split("\0") if item}
+
+
+def _directory_pattern_ignores(git_root: Path, relative: str) -> bool:
+    """Whether a rule that only matches directories ignores `relative`, a directory not yet made.
+
+    Git cannot tell that a name which does not exist is a directory, so the bare name misses a
+    rule like `out/`. Asked as `out/`, a rule like `out/*` (which ignores what is inside, not
+    `out`) also answers yes, because `*` matches the empty name. The matching rule is therefore
+    read back, and only one that ends in a slash, and is not a negation, counts.
+    """
+    result = _run_git(
+        git_root, "check-ignore", "--no-index", "-v", "--stdin", "-z", stdin=f"{relative}/\0"
+    )
+    if result.returncode not in (0, 1):
+        raise CorpusStoreError(
+            f"git could not check the ignore rules (exit {result.returncode}): "
+            f"{result.stderr.strip() or 'no message'}"
+        )
+    fields = result.stdout.split("\0")  # source, line number, pattern, path
+    return len(fields) >= 4 and fields[2].endswith("/") and not fields[2].startswith("!")
+
+
+def _list_directory(directory: Path) -> list[str]:
+    with os.scandir(directory) as entries:
+        return [entry.name for entry in entries]
+
+
+def _fold(name: str) -> str:
+    """What a case- and normalisation-insensitive volume (APFS by default) takes for one name."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def canonical_spelling(
+    path: Path,
+    *,
+    list_directory: Callable[[Path], Sequence[str]] = _list_directory,
+    exists: Callable[[Path], bool] = os.path.lexists,
+) -> Path:
+    """`path` with every component that exists spelled the way its directory lists it.
+
+    On a case-insensitive volume `repo/IGNORED/x` reaches the directory `repo/ignored`, while Git
+    (with `core.ignorecase=false`) matches rules to the spelling it is given. Walking from the
+    root, each component is looked up among its parent's entries: an exact entry is kept, and one
+    that differs only in case or Unicode normalisation is replaced by the entry on disk. A
+    component with no such entry is new (on a case-sensitive volume `Docs` is not `docs`, and
+    `exists` says so), so it and everything below it keep the caller's spelling. Two entries that
+    both fold to the name, none exact, cannot be told apart and are refused, as is a directory
+    that cannot be listed: the answer would otherwise rest on a guess.
+
+    `list_directory` and `exists` are the filesystem; a test can supply a made-up one.
+    """
+    parts = path.parts
+    current = Path(parts[0]) if parts else path
+    for index, name in enumerate(parts[1:], start=1):
+        try:
+            names = list(list_directory(current))
+        except OSError as exc:
+            raise CorpusStoreError(
+                f"Could not list {current} to establish the on-disk spelling of {path}: {exc}"
+            ) from exc
+        if name in names:
+            current = current / name
+            continue
+        if not exists(current / name):
+            return current.joinpath(*parts[index:])
+        matches = [entry for entry in names if _fold(entry) == _fold(name)]
+        if not matches:
+            raise CorpusStoreError(
+                f"{current / name} exists but {current} lists no entry for it, so the on-disk "
+                f"spelling of {path} cannot be established"
+            )
+        if len(matches) > 1:
+            raise CorpusStoreError(
+                f"{current} holds more than one entry that {name!r} could name "
+                f"({', '.join(sorted(matches))}), so the on-disk spelling of {path} is ambiguous"
+            )
+        current = current / matches[0]
+    return current
+
+
+def require_git_private(directory: Path) -> Path:
+    """Refuse a directory that private text must not land in. Returns the resolved path.
+
+    Outside every Git work tree a directory is private. Inside one it is private only when Git
+    ignores the directory itself and also ignores the names a library or archive export writes
+    beneath it (`PRIVATE_PROBE_CHILDREN`), and the directory holds no tracked file; otherwise the
+    files written there would be untracked, Git-visible files. "Ignores" is Git's own answer from
+    `git check-ignore --no-index`, so every rule counts (nested .gitignore files,
+    `.git/info/exclude`, the global excludes file, negations) and nothing is created to find out.
+    The directory may not exist yet. Symlinks are followed first, so the answer is for where the
+    text would really land.
+
+    Case is settled before Git is asked (`canonical_spelling`): every component that exists is
+    spelled the way the disk lists it, and when that differs from what the caller wrote, both
+    spellings must be private, so a rule that matches only the caller's spelling cannot clear a
+    directory that is Git-visible under its real name (a repository with `core.ignorecase=false`
+    on a case-insensitive volume), and the strictest answer wins.
+
+    Git runs without the variables that relocate or hide a repository (`GIT_LOCATION_VARIABLES`),
+    and its "not a git repository" counts as "outside every work tree" only when no `.git` exists
+    at or above the path. Any other failure to run or understand git is an error, never a pass.
+
+    The answer is Git's, asked in the caller's environment, so it can differ between a developer's
+    shell and a clean one. `GIT_CONFIG_GLOBAL=/dev/null` hides the global config file but not the
+    default global excludes file (`$XDG_CONFIG_HOME/git/ignore`, else `~/.config/git/ignore`),
+    which is still read: isolating a run takes `HOME` and `XDG_CONFIG_HOME` as well. Process-scoped
+    configuration (`GIT_CONFIG_COUNT` with its `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n`, and
+    `GIT_CONFIG_PARAMETERS`) is passed to git on purpose, so an excludes file set that way counts.
+    `git` is found on `PATH`: one that cannot run is an error, but a stand-in that answers
+    wrongly is not detected.
+
+    This says whether the text would be visible to Git, not that it is secret. It does not stop
+    `git add -f`, a hook or tool that bypasses ignore rules, or a backup or sync client; it does
+    not look at a repository's tracked files outside the directory; and a directory that ignores
+    its own contents through an inner `.gitignore` of `*` is refused, because that file does not
+    ignore the directory itself. See "Where private text may be written" in
+    docs/knowledge-library.md.
     """
     resolved = _absolute_path(directory).resolve(strict=False)
     probe = resolved
-    while not probe.exists():
+    while not probe.is_dir():  # git can be asked from a directory only: a file's folder will do
         probe = probe.parent
     git_root = _git_root(probe)
-    if git_root is not None and not _git_path_is_ignored(git_root, resolved / ".private-probe"):
-        raise CorpusStoreError(f"Directory is Git-visible and cannot hold private text: {resolved}")
+    if git_root is None:
+        return resolved
+
+    def visible(why: str) -> CorpusStoreError:
+        return CorpusStoreError(
+            f"Directory is Git-visible and cannot hold private text: {resolved} ({why})"
+        )
+
+    canonical = canonical_spelling(resolved)
+    root_parts = canonical_spelling(git_root).parts
+    depth = len(root_parts)
+    if canonical.parts[:depth] != root_parts:
+        raise visible(f"it is not under the work tree {git_root} that Git reported")
+    exists = resolved.exists()
+
+    def judge(relative: str) -> str | None:
+        """Why Git would show text written under `relative`, or None when it would not."""
+        if relative == ".":
+            return "it is the work tree itself"
+        if exists:
+            tracked = _run_git(git_root, "ls-files", "-z", "--", relative)
+            if tracked.returncode != 0:
+                raise CorpusStoreError(f"Could not list the tracked files beneath {resolved}")
+            if tracked.stdout:
+                return "it holds Git-tracked files"
+        children = [f"{relative}/{name}" for name in PRIVATE_PROBE_CHILDREN]
+        ignored = _check_ignore(git_root, [relative, *children])
+        if relative not in ignored and (
+            exists or not _directory_pattern_ignores(git_root, relative)
+        ):
+            return "Git does not ignore the directory itself"
+        for child in children:
+            if child not in ignored:
+                return f"Git would show {child.removeprefix(relative + '/')} written inside it"
+        return None
+
+    on_disk = "/".join(canonical.parts[depth:]) or "."
+    as_given = "/".join(resolved.parts[depth:]) or "."
+    spellings = [("on-disk", on_disk)]
+    if as_given != on_disk:
+        spellings.append(("given", as_given))
+    for which, relative in spellings:
+        why = judge(relative)
+        if why is not None:
+            raise visible(
+                why if len(spellings) == 1 else f"{why}; the {which} spelling is {relative}"
+            )
     return resolved
+
+
+def git_visible_refusal(directory: Path) -> str | None:
+    """Why private text may not be written to `directory`, or None when it may.
+
+    For a command line that answers with a message and an exit status instead of an exception:
+    `require_git_private`, with its `CorpusStoreError` (a Git-visible directory, or a git that could
+    not be asked) returned as the message.
+    """
+    try:
+        require_git_private(directory)
+    except CorpusStoreError as exc:
+        return str(exc)
+    return None
 
 
 def _resolve_existing_store_root(root: Path) -> Path:

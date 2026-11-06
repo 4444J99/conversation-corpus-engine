@@ -465,3 +465,71 @@ def test_cli_prints_json_and_exits_by_threshold_with_a_fresh_cold_process(synthe
     assert done.returncode in (0, 1) and done.returncode == (0 if report["pass"] else 1)
     assert report["cold"]["mode"] == "subprocess"
     assert report["cold"]["first_call_s"] > 0 and report["cold"]["process_wall_s"] > 0
+
+
+def test_the_first_search_asks_for_l0_explicitly(bench):
+    arguments = bench.first_search_arguments({"query": "q", "filters": {"wing": "ai"}}, 8)
+    assert arguments == {"query": "q", "limit": 8, "offset": 0, "depth": "L0", "wing": "ai"}
+
+
+def test_every_search_sent_requests_l0_and_is_reported_at_the_level_requested(
+    bench, synthetic, capsys, monkeypatch
+):
+    """The server answers a search without `depth` at L1 (full, unbudgeted hits), so a harness that
+    omits it would label those responses L0 and hold them to the 900-token L0 gate."""
+    seen = []
+    original = library_mcp.call_tool
+
+    def spy(store_root, name, arguments):
+        result = original(store_root, name, arguments)
+        seen.append((name, dict(arguments), result))
+        return result
+
+    monkeypatch.setattr(library_mcp, "call_tool", spy)
+    code, out = run(bench, capsys, *fast(synthetic["database"]), "--include-calls")
+    report = json.loads(out.out)
+    searches = [item for item in seen if item[0] == library_mcp.SEARCH_TOOL]
+    assert searches and all(arguments.get("depth") == "L0" for _, arguments, _ in searches)
+    # What came back is an L0 response: only uid, title, score and read, inside the budget.
+    for _, _, result in searches:
+        assert result["token_estimate"]["tokens"] <= 900
+        assert all(set(hit) == {"uid", "title", "score", "read"} for hit in result["hits"])
+    labelled = [call for call in report["calls"] if call["tool"] == library_mcp.SEARCH_TOOL]
+    assert labelled and {call["level"] for call in labelled} == {"L0"}
+    assert report["cold"]["est_tokens"] <= 900
+    assert code in (0, 1)
+
+
+def test_a_search_is_labelled_by_the_depth_it_requested(bench):
+    class Server:
+        def call_tool(self, tool, arguments):
+            return {"content": [{"type": "text", "text": "{}"}], "structuredContent": {}}
+
+    def level(tool, arguments):
+        return bench.invoke(Server(), tool, arguments, phase="first", query_id="q")["level"]
+
+    assert level(library_mcp.SEARCH_TOOL, {"query": "x", "depth": "L0"}) == "L0"
+    assert level(library_mcp.SEARCH_TOOL, {"query": "x", "depth": "L1"}) == "L1"
+    # No depth is the server's L1, never L0: it must not satisfy or be held to the L0 gate.
+    assert level(library_mcp.SEARCH_TOOL, {"query": "x"}) == "L1"
+    assert level(library_mcp.READ_TOOL, {"uid": "x"}) == "L2"
+    assert level(library_mcp.HISTORY_TOOL, {"uid": "x"}) == "meta"
+
+
+def test_without_any_l0_search_the_l0_gate_fails_instead_of_passing_vacuously(
+    bench, synthetic, capsys, monkeypatch
+):
+    monkeypatch.setattr(
+        bench,
+        "first_search_arguments",
+        lambda query, limit: {
+            "query": query["query"],
+            "limit": limit,
+            "offset": 0,
+        },
+    )
+    code, out = run(bench, capsys, *fast(synthetic["database"]))
+    report = json.loads(out.out)
+    gate = next(item for item in report["checks"] if item["name"] == "l0_response_tokens")
+    assert gate["ok"] is False and gate["value"] is None
+    assert "L0" not in report["levels"] and code == 1

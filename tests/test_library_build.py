@@ -57,7 +57,7 @@ def setup_sources(tmp_path):
 
 def test_build_publish_and_reopen_share_both_wings(tmp_path):
     project, store, manifest = setup_sources(tmp_path)
-    result = build_library(manifest, project_root=project, store_root=store)
+    result = build_library(manifest, project_root=project, store_root=store, vault_profile="full")
     generation = Path(result["generation"])
     assert current_generation(store) is None
     assert result["status"]["by_wing"] == {"ai": 1, "authored": 1}
@@ -213,7 +213,7 @@ def test_changed_source_adds_revision_and_retains_missing_source(tmp_path):
 
 def test_publication_refuses_modified_candidate_and_foreign_parent(tmp_path):
     project, store, manifest = setup_sources(tmp_path)
-    first = build_library(manifest, project_root=project, store_root=store)
+    first = build_library(manifest, project_root=project, store_root=store, vault_profile="full")
     generation = Path(first["generation"])
     (generation / "vault" / "Home.md").write_text("tampered")
     with pytest.raises(ValueError, match="hash"):
@@ -232,7 +232,7 @@ def test_bounded_build_does_not_publish_partial_work(tmp_path):
 @pytest.mark.parametrize("extra", ["file", "symlink", "directory_symlink"])
 def test_publication_refuses_unlisted_files_and_symlinks(tmp_path, extra):
     project, store, manifest = setup_sources(tmp_path)
-    result = build_library(manifest, project_root=project, store_root=store)
+    result = build_library(manifest, project_root=project, store_root=store, vault_profile="full")
     generation = Path(result["generation"])
     unexpected = generation / "vault" / "unverified.md"
     if extra == "file":
