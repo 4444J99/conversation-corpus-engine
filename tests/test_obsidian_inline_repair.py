@@ -3,6 +3,8 @@
 import importlib.util
 import json
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -337,3 +339,59 @@ def test_existing_history_copy_is_charged_to_the_output_cap(repairer, tmp_path):
         )
     assert sum(p.stat().st_size for p in output.rglob("*") if p.is_file()) <= maximum
     assert repairer.base.hash_file(marker) == prior
+
+
+def _git_work_tree(path):
+    path.mkdir()
+    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True, capture_output=True)
+    return path
+
+
+def test_cli_refuses_a_git_visible_output_before_reading_the_source(
+    repairer, tmp_path, monkeypatch, capsys
+):
+    work_tree = _git_work_tree(tmp_path / "work")
+
+    def repaired(*args, **kwargs):
+        raise AssertionError("the source was read before the output was authorised")
+
+    monkeypatch.setattr(repairer, "repair", repaired)
+    monkeypatch.setattr(repairer.os, "nice", lambda increment: 0)
+    visible = work_tree / "visible"
+    argv = ["repair-obsidian-inline", "--source", str(tmp_path / "v1")]
+    monkeypatch.setattr(
+        sys, "argv", [*argv, "--output", str(visible), "--audit", str(tmp_path / "audit.json")]
+    )
+    with pytest.raises(SystemExit) as refused:
+        repairer.main()
+    assert refused.value.code == 2 and "Git-visible" in capsys.readouterr().err
+    assert not visible.exists() and sorted(p.name for p in work_tree.iterdir()) == [".git"]
+
+
+def test_cli_hands_an_output_git_ignores_to_the_repair(repairer, tmp_path, monkeypatch, capsys):
+    work_tree = _git_work_tree(tmp_path / "work")
+    (work_tree / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    received = []
+
+    def repaired(*args, **kwargs):
+        received.append(args)
+        return {"complete": True}
+
+    monkeypatch.setattr(repairer, "repair", repaired)
+    monkeypatch.setattr(repairer.os, "nice", lambda increment: 0)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "repair-obsidian-inline",
+            "--source",
+            str(tmp_path / "v1"),
+            "--output",
+            str(work_tree / "ignored"),
+            "--audit",
+            str(tmp_path / "audit.json"),
+        ],
+    )
+    repairer.main()
+    assert received == [(tmp_path / "v1", work_tree / "ignored", tmp_path / "audit.json")]
+    assert json.loads(capsys.readouterr().out) == {"complete": True}

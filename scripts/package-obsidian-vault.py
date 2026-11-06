@@ -844,6 +844,24 @@ def package(
                 connection.close()
 
 
+def require_private_output(parser, path):
+    """Refuse an output directory Git can see: the derivative holds the library as plaintext.
+
+    An output outside every Git work tree, or one the work tree ignores, passes. The check runs
+    before the source is read; a refusal exits with the usage-error status.
+    """
+    # The engine is needed only by the command line; the packager itself stays standalone.
+    from conversation_corpus_engine.corpus_store import (  # noqa: PLC0415
+        CorpusStoreError,
+        require_git_private,
+    )
+
+    try:
+        require_git_private(path)
+    except CorpusStoreError as error:
+        parser.error(str(error))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
@@ -854,6 +872,7 @@ def main():
     parser.add_argument("--max-source-bytes", type=int, default=128 * 1024**2)
     parser.add_argument("--max-seconds", type=int, default=1800)
     arguments = parser.parse_args()
+    require_private_output(parser, arguments.output)
     os.umask(0o077)
     os.nice(10)
     result = package(**vars(arguments))

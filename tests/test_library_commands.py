@@ -1,12 +1,14 @@
 import json
+import subprocess
 
 import pytest
 
 from conversation_corpus_engine import library_commands, library_mcp
 from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.cli import build_parser
-from conversation_corpus_engine.corpus_store import register_corpus_store
+from conversation_corpus_engine.corpus_store import CorpusStoreError, register_corpus_store
 from conversation_corpus_engine.library_commands import handle_library, read_record
+from conversation_corpus_engine.library_export import export_library
 from conversation_corpus_engine.library_mcp import READ_TOOL, SEARCH_TOOL
 from conversation_corpus_engine.library_store import Library
 from conversation_corpus_engine.mcp_server import CceMcpServer
@@ -189,3 +191,106 @@ def test_analysis_cli_requires_one_selection_and_explicit_output(tmp_path):
     ):
         with pytest.raises(SystemExit):
             parser.parse_args(["library", "analyze", *options])
+
+
+# --- the private reading export must not land where Git can see it -------------------------------
+
+
+def _git(cwd, *argv):
+    subprocess.run(["git", "-C", str(cwd), *argv], check=True, capture_output=True)
+
+
+def _private_library(tmp_path):
+    database = tmp_path / "library.sqlite"
+    with Library.create(database) as library:
+        library.put(
+            Conversation(
+                provider="chatgpt",
+                source_id="export-guard",
+                title="Export guard",
+                messages=[Message(role="user", text="Plaintext that must stay private.")],
+            )
+        )
+    return database
+
+
+def _export_command(tmp_path, out, *extra):
+    return build_parser().parse_args(
+        ["library", "export", "--store-root", str(tmp_path), "--out", str(out), *extra]
+    )
+
+
+def test_export_refuses_a_git_visible_destination_before_reading_or_writing(
+    tmp_path, monkeypatch, capsys
+):
+    database = _private_library(tmp_path)
+    work_tree = tmp_path / "work"
+    work_tree.mkdir()
+    _git(work_tree, "init", "-q")
+    reviewed = tmp_path / "reviewed.json"
+    reviewed.write_text("{}", encoding="utf-8")
+
+    def opened(root):
+        raise AssertionError("the library was opened before the destination was authorised")
+
+    def loaded(path):
+        raise AssertionError("the envelope was read before the destination was authorised")
+
+    monkeypatch.setattr(library_commands, "open_library", opened)
+    monkeypatch.setattr(library_commands, "_load_zettel_envelope", loaded)
+    visible = work_tree / "visible"
+    for extra in ((), ("--zettels", str(reviewed))):
+        assert handle_library(_export_command(tmp_path, visible, *extra)) == 2
+        assert "Git-visible" in capsys.readouterr().err
+        assert not visible.exists()
+    assert sorted(path.name for path in work_tree.iterdir()) == [".git"]
+
+    monkeypatch.undo()
+    monkeypatch.setattr(
+        library_commands, "open_library", lambda root: (tmp_path, Library(database))
+    )
+    (work_tree / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    assert handle_library(_export_command(tmp_path, work_tree / "ignored")) == 0
+    assert json.loads(capsys.readouterr().out)["records"] == 1
+    assert (work_tree / "ignored" / "vault" / "Home.md").is_file()
+
+
+def test_export_to_a_directory_outside_every_work_tree_is_unchanged(tmp_path, monkeypatch, capsys):
+    database = _private_library(tmp_path)
+    monkeypatch.setattr(
+        library_commands, "open_library", lambda root: (tmp_path, Library(database))
+    )
+    assert handle_library(_export_command(tmp_path, tmp_path / "plain" / "export")) == 0
+    assert json.loads(capsys.readouterr().out)["files"] > 0
+
+
+def test_the_export_api_refuses_a_git_visible_destination_and_writes_nothing(tmp_path):
+    database = _private_library(tmp_path)
+    work_tree = tmp_path / "work"
+    work_tree.mkdir()
+    _git(work_tree, "init", "-q")
+    with Library(database) as library, pytest.raises(CorpusStoreError, match="Git-visible"):
+        export_library(library, work_tree / "visible")
+    assert sorted(path.name for path in work_tree.iterdir()) == [".git"]
+
+
+def test_verify_export_writes_nothing_so_it_needs_no_custody_check(tmp_path, monkeypatch, capsys):
+    database = _private_library(tmp_path)
+    monkeypatch.setattr(
+        library_commands, "open_library", lambda root: (tmp_path, Library(database))
+    )
+    export = tmp_path / "plain-export"
+    assert handle_library(_export_command(tmp_path, export)) == 0
+    capsys.readouterr()
+
+    def tree(root):
+        return {
+            str(path.relative_to(root)): (path.stat().st_size, path.stat().st_mtime_ns)
+            for path in sorted(root.rglob("*"))
+        }
+
+    before = tree(export)
+    args = build_parser().parse_args(["library", "verify-export", str(export)])
+    assert handle_library(args) == 0
+    assert json.loads(capsys.readouterr().out)["valid"] is True
+    assert tree(export) == before

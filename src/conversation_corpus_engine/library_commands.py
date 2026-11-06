@@ -12,7 +12,7 @@ from typing import Any
 
 from .archive_database import PHRASE_RE, WORD_RE
 from .attributed_knowledge import ZETTEL_SCHEMA, export_zettels, zettel_atoms
-from .corpus_store import CorpusStoreError
+from .corpus_store import CorpusStoreError, require_git_private
 from .library_analysis import AnalysisLimits, export_analysis
 from .library_build import build_library, current_generation, publish_library, verify_candidate
 from .library_export import export_library, verify_export
@@ -426,7 +426,12 @@ def add_library_parser(subparsers: Any) -> None:
         "export", help="Write the private reading export, optionally with reviewed Zettel pages"
     )
     common(export)
-    export.add_argument("--out", type=Path, required=True, help="New export directory")
+    export.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="New export directory, outside every Git work tree or ignored by it",
+    )
     export.add_argument(
         "--zettels", type=Path, help="Private reviewed-Zettels JSON envelope to render as pages"
     )
@@ -529,6 +534,10 @@ def handle_library(args: argparse.Namespace) -> int:
     try:
         if args.action == "verify-export":
             return _verify_export_command(args)
+        if args.action == "export":
+            # The export is the whole library as plaintext: authorise where it lands before
+            # the library or the reviewed envelope is read.
+            require_git_private(args.out)
         store = configured_store(args.store_root)
         if args.action == "build":
             manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
