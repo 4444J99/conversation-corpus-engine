@@ -47,6 +47,18 @@ MAX_UNIT = 4 * 1024 * 1024
 HISTORY_GIT_TIMEOUT_SECONDS = 30
 HISTORY_MAX_COMMITS = 10000
 HEX = re.compile(r"[0-9a-f]{64}")
+PACKED_FORMAT = "cce-sealed.v2"
+
+
+def _packing():
+    from . import archive_sealed_packing  # noqa: PLC0415 - optional versioned storage layer
+
+    return archive_sealed_packing
+
+
+def _cipher_paths(repo: Path) -> Iterator[Path]:
+    for kind in ("objects", "shards"):
+        yield from (repo / kind).glob("*/*")
 
 
 def safe_path(path: Path) -> Path:
@@ -274,13 +286,13 @@ def _tree(repo: Path) -> None:
         for name in [*dirs, *files]:
             path = safe_path(root / name)
             rel = path.relative_to(repo).as_posix()
-            if rel in {".git", "HEAD.cce", "objects"}:
+            if rel in {".git", "HEAD.cce", "objects", "shards"}:
                 continue
-            if path.is_dir() and re.fullmatch(r"objects/[0-9a-f]{2}", rel):
+            if path.is_dir() and re.fullmatch(r"(?:objects|shards)/[0-9a-f]{2}", rel):
                 continue
             if (
                 path.is_file()
-                and re.fullmatch(r"objects/[0-9a-f]{2}/[0-9a-f]{64}", rel)
+                and re.fullmatch(r"(?:objects|shards)/[0-9a-f]{2}/[0-9a-f]{64}", rel)
                 and path.parent.name == path.name[:2]
             ):
                 continue
@@ -310,16 +322,21 @@ def _open(repo: Path, identity: Identity, trust: dict[str, Any]) -> tuple[dict, 
     if raw != canonical(head):
         raise SealedError("noncanonical-head")
     authenticate(head, trust["owner"])
-    if head["format"] != FORMAT or head["vault"] != trust["vault"]:
+    if head["format"] not in (FORMAT, PACKED_FORMAT) or head["vault"] != trust["vault"]:
         raise SealedError("wrong-vault")
     generation = head["generation"]
     if generation < trust["generation"] or (
         generation == trust["generation"] and digest(raw) != trust["head"]
     ):
         raise SealedError("rollback-or-equivocation")
-    context = f"{FORMAT}:{head['vault']}:{generation}"
+    context = f"{head['format']}:{head['vault']}:{generation}"
     secret = unwrap(head["envelopes"], identity, context)
-    manifest = json.loads(decrypt(secret, bytes.fromhex(head["manifest"]), context + ":manifest"))
+    plain_manifest = decrypt(secret, bytes.fromhex(head["manifest"]), context + ":manifest")
+    if len(plain_manifest) > MAX_MANIFEST:
+        raise SealedError("manifest-too-large")
+    manifest = json.loads(plain_manifest)
+    if not isinstance(manifest, dict) or manifest.get("format") != head["format"]:
+        raise SealedError("manifest-format-mismatch")
     return head, manifest, secret
 
 
@@ -365,6 +382,9 @@ def _read_object(repo: Path, oid: str, info: dict, secret: bytes) -> bytes:
 
 
 def _check(repo: Path, manifest: dict, secret: bytes) -> None:
+    if manifest["format"] == PACKED_FORMAT:
+        _packing().check(repo, manifest, secret)
+        return
     for oid, info in manifest["objects"].items():
         _read_object(repo, oid, info, secret)
     for name, recipe in manifest["files"].items():
@@ -382,10 +402,20 @@ def _check(repo: Path, manifest: dict, secret: bytes) -> None:
 
 def _check_retained(repo: Path, trust: dict) -> None:
     # Authenticate old epochs without disclosing their plaintext to new recipients.
-    for path in (repo / "objects").glob("*/*"):
-        if path.stat().st_size > MAX_UNIT + 8192:
-            raise SealedError("object-too-large")
-        authenticate_object(path.read_bytes(), path.name, trust["vault"], trust["owner"])
+    for path in _cipher_paths(repo):
+        if path.parent.parent.name == "shards":
+            data = _packing().read_cipher(path)
+        else:
+            if path.stat().st_size > MAX_UNIT + 8192:
+                raise SealedError("object-too-large")
+            data = path.read_bytes()
+        authenticate_object(data, path.name, trust["vault"], trust["owner"])
+
+
+def _object_reader(repo: Path, manifest: dict, secret: bytes) -> Callable[[str], bytes]:
+    if manifest["format"] == PACKED_FORMAT:
+        return _packing().Reader(repo, manifest, secret).object
+    return lambda oid: _read_object(repo, oid, manifest["objects"][oid], secret)
 
 
 def publish(
@@ -399,8 +429,16 @@ def publish(
     rotate: bool = False,
     budget: int = DEFAULT_BUDGET,
     audit_budget: int | None = None,
+    storage_format: str | None = None,
+    max_projection_line_bytes: int | None = None,
     _plan_only: bool = False,
 ) -> dict[str, Any]:
+    if storage_format not in (None, "v1", "v2"):
+        raise SealedError("unsupported-storage-format")
+    if max_projection_line_bytes is not None and (
+        type(max_projection_line_bytes) is not int or max_projection_line_bytes < 1
+    ):
+        raise SealedError("invalid-projection-bound")
     source, repo = safe_path(source), safe_path(repo)
     try:
         require_git_private(source)
@@ -444,10 +482,22 @@ def publish(
             rotate,
             budget,
             plan_only=True,
+            storage_format=storage_format,
+            max_projection_line_bytes=max_projection_line_bytes,
         )
     with _lock(repo):
         return _publish(
-            source, sorted(selection), repo, identity, trust_path, trust, recipients, rotate, budget
+            source,
+            sorted(selection),
+            repo,
+            identity,
+            trust_path,
+            trust,
+            recipients,
+            rotate,
+            budget,
+            storage_format=storage_format,
+            max_projection_line_bytes=max_projection_line_bytes,
         )
 
 
@@ -500,6 +550,8 @@ def _publish(
     budget: int,
     *,
     plan_only: bool = False,
+    storage_format: str | None = None,
+    max_projection_line_bytes: int | None = None,
 ) -> dict[str, Any]:
     previous: dict = {}
     secret = os.urandom(32)
@@ -516,6 +568,35 @@ def _publish(
             secret = old_secret
     elif trust["generation"]:
         raise SealedError("missing-head")
+
+    target_format = previous.get("format", FORMAT)
+    if storage_format is not None:
+        target_format = {"v1": FORMAT, "v2": PACKED_FORMAT}[storage_format]
+    if previous.get("format") == PACKED_FORMAT and target_format == FORMAT:
+        raise SealedError("format-downgrade-refused")
+    if target_format == PACKED_FORMAT:
+        return _packing().publish_generation(
+            source=source,
+            selection=selection,
+            repo=repo,
+            identity=identity,
+            trust_path=trust_path,
+            trust=trust,
+            recipients=recipients,
+            previous=previous,
+            secret=secret,
+            generation=generation,
+            parent=parent,
+            budget=budget,
+            plan_only=plan_only,
+            projection_line_bytes=(
+                _packing().PROJECTION_LINE_LIMIT
+                if max_projection_line_bytes is None
+                else max_projection_line_bytes
+            ),
+        )
+    if max_projection_line_bytes is not None:
+        raise SealedError("projection-bound-requires-v2")
 
     pending: dict[str, bytes] = {}
     objects: dict[str, dict] = {}
@@ -662,8 +743,8 @@ def _capacity(
     changed: bool,
     pending_objects: int = 0,
 ) -> dict[str, Any]:
-    retained = sum(p.stat().st_size for p in (repo / "objects").glob("*/*") if p.is_file())
-    retained_count = sum(1 for p in (repo / "objects").glob("*/*") if p.is_file())
+    retained = sum(p.stat().st_size for p in _cipher_paths(repo) if p.is_file())
+    retained_count = sum(1 for p in _cipher_paths(repo) if p.is_file())
     current = retained + ((repo / "HEAD.cce").stat().st_size if (repo / "HEAD.cce").exists() else 0)
     history = _git_bytes(repo)
     tree = retained + pending + head_bytes
@@ -699,6 +780,8 @@ def plan_capacity(
     rotate: bool = False,
     budget: int = DEFAULT_BUDGET,
     audit_budget: int | None = None,
+    storage_format: str | None = None,
+    max_projection_line_bytes: int | None = None,
 ) -> dict[str, Any]:
     """Forecast selected content and a conservative next Git snapshot without writing.
 
@@ -715,6 +798,8 @@ def plan_capacity(
         rotate=rotate,
         budget=budget,
         audit_budget=audit_budget,
+        storage_format=storage_format,
+        max_projection_line_bytes=max_projection_line_bytes,
         _plan_only=True,
     )
 
@@ -742,6 +827,7 @@ def restore(repo: Path, target: Path, identity: Identity, trust_path: Path) -> d
     head, manifest, secret = _open(repo, identity, trust)
     _check(repo, manifest, secret)
     _check_retained(repo, trust)
+    read_object = _object_reader(repo, manifest, secret)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     stage = Path(tempfile.mkdtemp(prefix=".cce-restore-", dir=target.parent))
     try:
@@ -752,7 +838,7 @@ def restore(repo: Path, target: Path, identity: Identity, trust_path: Path) -> d
             with path.open("xb") as handle:
                 path.chmod(0o600)
                 for oid in recipe["chunks"]:
-                    data = _read_object(repo, oid, manifest["objects"][oid], secret)
+                    data = read_object(oid)
                     checksum.update(data)
                     handle.write(data)
             if checksum.hexdigest() != recipe["sha256"]:
@@ -776,7 +862,9 @@ def read_unit(repo: Path, unit_id: str, identity: Identity, trust_path: Path) ->
     oid = manifest["atoms"].get(unit_id)
     if oid is None:
         raise SealedError("unit-not-found")
-    result = json.loads(_read_object(repo, oid, manifest["objects"][oid], secret))
+    result = json.loads(_object_reader(repo, manifest, secret)(oid))
+    if not isinstance(result, dict) or result.get("id") != unit_id:
+        raise SealedError("unit-id-mismatch")
     _accept(trust_path, trust, head)
     return result
 
@@ -794,6 +882,18 @@ def repair(repo: Path, mirror: Path, identity: Identity, trust_path: Path) -> di
         if digest(canonical(head)) != trust["head"]:
             raise SealedError("recovery-checkpoint-mismatch") from None
         repaired_head = True
+    if manifest["format"] == PACKED_FORMAT:
+        return _packing().repair(
+            repo,
+            mirror,
+            manifest,
+            secret,
+            head,
+            trust_path,
+            trust,
+            observed,
+            repaired_head,
+        )
     replacements = {}
     for oid, info in manifest["objects"].items():
         try:
@@ -893,12 +993,20 @@ def audit_history(
 
     def allow(manifest: dict) -> None:
         nonlocal allowed_entries
-        for oid, info in manifest["objects"].items():
+        if manifest.get("format") == PACKED_FORMAT:
+            _packing().validate_manifest(manifest)
+            kind, entries = "shards", manifest["shards"]
+        elif manifest.get("format") == FORMAT:
+            kind, entries = "objects", manifest["objects"]
+        else:
+            raise SealedError("manifest-format-mismatch")
+        for oid, info in entries.items():
+            storage_key = f"{kind}/{oid}"
             checksum = info["cipher_sha256"]
-            if checksum not in allowed.get(oid, set()):
+            if checksum not in allowed.get(storage_key, set()):
                 if allowed_entries >= metadata_limit:
                     raise SealedError("history-audit-limit")
-                allowed.setdefault(oid, set()).add(checksum)
+                allowed.setdefault(storage_key, set()).add(checksum)
                 allowed_entries += 1
 
     if (repo / "HEAD.cce").is_file():
@@ -922,16 +1030,24 @@ def audit_history(
             if mode != b"100644" or object_kind != b"blob":
                 raise SealedError("history-entry-refused")
             is_head = name == "HEAD.cce"
-            if not is_head and not re.fullmatch(r"objects/[0-9a-f]{2}/[0-9a-f]{64}", name):
+            if not is_head and not re.fullmatch(
+                r"(?:objects|shards)/[0-9a-f]{2}/[0-9a-f]{64}", name
+            ):
                 raise SealedError("history-path-refused")
             if not is_head and name.split("/")[1] != name.split("/")[2][:2]:
                 raise SealedError("history-path-refused")
             size = int(size_bytes)
-            maximum = MAX_MANIFEST * 3 if is_head else MAX_UNIT + 8192
+            packed = not is_head and name.startswith("shards/")
+            maximum = (
+                MAX_MANIFEST * 3
+                if is_head
+                else (_packing().SHARD_LIMIT if packed else MAX_UNIT + 8192)
+            )
             if size < 0 or size > maximum:
                 raise SealedError("history-blob-too-large")
             oid = "" if is_head else name.rsplit("/", 1)[1]
-            if not is_head and blob in object_oids and object_oids[blob] != oid:
+            storage_key = "" if is_head else f"{name.split('/')[0]}/{oid}"
+            if not is_head and blob in object_oids and object_oids[blob] != storage_key:
                 raise SealedError("history-blob-alias-refused")
             if (
                 blob not in blobs
@@ -948,26 +1064,32 @@ def audit_history(
                     if raw != canonical(head):
                         raise SealedError("history-head-refused")
                     authenticate(head, trust["owner"])
-                    if head["vault"] != trust["vault"] or head["format"] != FORMAT:
+                    if head["vault"] != trust["vault"] or head["format"] not in (
+                        FORMAT,
+                        PACKED_FORMAT,
+                    ):
                         raise SealedError("history-vault-refused")
-                    context = f"{FORMAT}:{head['vault']}:{head['generation']}"
+                    context = f"{head['format']}:{head['vault']}:{head['generation']}"
                     secret = unwrap(head["envelopes"], identity, context)
                     plain = decrypt(secret, bytes.fromhex(head["manifest"]), context + ":manifest")
                     if len(plain) > MAX_MANIFEST:
                         raise SealedError("manifest-too-large")
-                    allow(json.loads(plain))
+                    historical_manifest = json.loads(plain)
+                    if historical_manifest.get("format") != head["format"]:
+                        raise SealedError("manifest-format-mismatch")
+                    allow(historical_manifest)
                     heads.add(blob)
                     del head, plain
                 else:
                     # Verify the owner/address binding before caching or retaining any path.
                     authenticate_object(raw, oid, trust["vault"], trust["owner"])
-                    object_oids[blob] = oid
+                    object_oids[blob] = storage_key
                 blobs[blob] = digest(raw)
                 del raw
             if is_head:
                 found_head = True
             else:
-                observed.setdefault(oid, set()).add(blobs[blob])
+                observed.setdefault(storage_key, set()).add(blobs[blob])
         if not found_head:
             raise SealedError("history-head-missing")
     for oid, hashes in observed.items():
@@ -988,7 +1110,7 @@ def list_units(repo: Path, identity: Identity, trust_path: Path) -> list[str]:
 def storage_status(repo: Path, identity: Identity, trust_path: Path) -> dict[str, int]:
     result = verify(repo, identity, trust_path)
     result["ciphertext_tree_bytes"] = (
-        sum(p.stat().st_size for p in (repo / "objects").glob("*/*") if p.is_file())
+        sum(p.stat().st_size for p in _cipher_paths(repo) if p.is_file())
         + (repo / "HEAD.cce").stat().st_size
     )
     result["git_object_store_bytes"] = _git_bytes(repo)

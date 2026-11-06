@@ -19,8 +19,9 @@ reviewed revision for operation. Existing CCE commands do not require cryptograp
 
 New credentials use `cce-protected-identity.v1`: a random 16-byte salt, fixed Scrypt
 (N=32768, r=8, p=1, 32-byte key) and authenticated ChaCha20-Poly1305 encryption. Private key
-JSON exists only after explicit unlocking in process memory. Publication remains `cce-sealed.v1`;
-its format, algorithms and recipient semantics are unchanged. Credential files are mode 0600 on
+JSON exists only after explicit unlocking in process memory. New vaults still default to
+`cce-sealed.v1`; the optional [v2 compressed packing layout](encrypted-packing-v2.md) preserves
+the existing cryptographic primitives and recipient semantics. Credential files are mode 0600 on
 POSIX and outside Git. Supply exact passphrase bytes from a mode-0600 private file with
 `--passphrase-file`, or a protected producer through `--passphrase-stdin`. The CLI has no secret
 argument and does not print keys or passphrases. Creating a **new** identity requires a passphrase
@@ -259,6 +260,36 @@ object's exact digest. Preserve the existing raw-source backups throughout.
 
 ## Capacity and disclosure limits
 
+Before a synthetic acceptance publication, plant distinctive invented marker strings
+in selected source content, filenames and app/instance labels. Keep a JSON array of
+those strings in a private control file outside the ciphertext tree. The read-only
+canary scanner needs no key and makes no commit or network request:
+
+```bash
+python scripts/vault_canary_check.py --repo "$CIPHER" --markers "$PRIVATE/canaries.json"
+# From an uninstalled checkout, prefix the command with PYTHONPATH=src.
+```
+
+Run it on the current tree and again after the local Git commit. It scans regular
+working files and names plus reachable local Git objects, including deleted-file
+history, raw tree names and commit metadata. A shallow history, unreadable path,
+symlink, Git inspection failure or exhausted byte budget is an error, never a clean
+result. The default 512-MiB scan budget counts both working files and Git inspection
+output; `--budget` can select a reviewed larger bound. A total monotonic deadline
+(300 seconds by default, `--max-seconds` to override) is checked across directory,
+file, chunk and Git traversal; each Git call also receives only the remaining time.
+Exit 0 means no supplied
+literal marker was found, 1 means at least one was found, and 2 means the scan was
+incomplete or invalid. JSON results contain counts only; markers and inspected
+paths/content are not echoed.
+
+This is a literal planted-marker check. It does not detect every secret or encoded
+transformation, inspect unreachable/reflog/remote-only history, authenticate the
+encrypted archive, or attest an application process. Continue to run `sealed verify`,
+`sealed audit-history`, independent exact restoration and the separate secret scan.
+Tests create disposable synthetic material only; they do not enroll an owner device
+or constitute a real-data publication receipt.
+
 Encryption does not make GitHub unlimited free storage. Rechecked on 2026-11-01, GitHub
 [recommends repositories ideally below 1 GB and strongly recommends below 5 GB](https://docs.github.com/en/repositories/working-with-files/managing-large-files/about-large-files-on-github),
 [enforces a 2-GB push limit and an approximately 100-MB individual object limit](https://docs.github.com/en/repositories/creating-and-managing-repositories/repository-limits).
@@ -281,6 +312,20 @@ bytes, a Git metadata/allocation reserve, planned tree/history/combined bytes, b
 It does not create the destination,
 write ciphertext or advance the private checkpoint. Unchanged inputs produce identical counts;
 `--rotate` forecasts a new epoch. This is an observation, not a storage reservation.
+
+For content-addressed compressed shards, add `--storage-format v2` to `plan` and
+the separately authorized `publish` command. V2 compresses bounded plaintext slabs
+before encryption, caps each complete signed/padded ciphertext shard at 48 MiB,
+and stages pending ciphertext privately on disk. Its plan also reports unique
+packed plaintext bytes, compressed bytes, shard count, maximum final shard bytes,
+and the source JSONL projection-line limit. Source rows default to a separate
+64-MiB bound, with `--max-projection-line-bytes` available for an explicit larger
+or smaller limit; this does not change the 32-MiB slab or 4-MiB logical-unit limits.
+V1 does not silently accept that v2-only override. Existing v1 archives remain
+readable, an explicit v1-to-v2 upgrade retains prior ciphertext/history, and a v2
+vault stays v2 when the format flag is omitted. Downgrades are refused. See the
+[format and migration contract](encrypted-packing-v2.md) before changing a vault's
+storage layout.
 
 The default 512-MiB budget applies to the sum of the complete retained ciphertext tree and a
 conservative next Git snapshot estimate (existing Git object-store bytes, pending object and
