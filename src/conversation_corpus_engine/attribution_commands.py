@@ -568,7 +568,13 @@ class PrivateOutput:
         self.handle.close()
         if partial:
             return self.temp
-        self.temp.replace(self.out)
+        # A hard link is created only if nothing is at the output name, unlike a rename, which
+        # would silently replace a file that appeared while the run was going on.
+        try:
+            os.link(self.temp, self.out)
+        except FileExistsError:
+            raise ValueError(f"output already exists: {self.out}") from None
+        self.temp.unlink(missing_ok=True)
         return self.out
 
     def abort(self) -> None:

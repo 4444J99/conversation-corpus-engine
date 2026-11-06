@@ -1905,6 +1905,29 @@ def test_a_leftover_partial_file_is_refused_before_any_work_starts(
         assert out.with_name(name + ".partial").read_text(encoding="utf-8") == "old"
 
 
+@pytest.mark.parametrize("command", ["apply", "review-sample"])
+def test_a_file_created_at_the_output_during_the_run_is_never_replaced(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    library = build_library(tmp_path / "store" / "gen", typed_records=3)
+    out = tmp_path / "result.out"
+    real_scan = attribution_commands.scan
+
+    def scan_then_somebody_creates_the_output(*args, **kwargs):
+        done = real_scan(*args, **kwargs)
+        out.write_text("A FILE THE OWNER MADE DURING THE RUN\n", encoding="utf-8")
+        return done
+
+    monkeypatch.setattr(attribution_commands, "scan", scan_then_somebody_creates_the_output)
+    code, _, err = run_cli(capsys, command, "--owner-id", "rob", "--library", library, "--out", out)
+    assert code == 2 and "already exists" in err
+    assert out.read_text(encoding="utf-8") == "A FILE THE OWNER MADE DURING THE RUN\n"
+    assert not out.with_name("result.out.partial").exists()
+
+
 def test_an_existing_output_is_refused_for_every_writer(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
