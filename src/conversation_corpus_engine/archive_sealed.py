@@ -439,6 +439,25 @@ def publish(
         )
 
 
+def _discard_unreferenced(repo: Path, created: list[Path], head: bytes) -> None:
+    """Remove the objects a publication wrote before it failed, unless its head took effect.
+
+    The head is replaced atomically and names every object of the new generation, so until it is
+    in place the objects this attempt created are referenced by nothing. Left behind they count
+    against the storage budget of every retry (and, when the retry draws a fresh secret, they can
+    never be reused), so a publication that was planned to fit would no longer fit. Objects that
+    already existed are never in `created`. Best effort: the failure being reported stays the
+    failure reported.
+    """
+    with suppress(OSError):
+        if (repo / "HEAD.cce").read_bytes() == head:
+            return  # the head landed (an interrupt after the replace): its objects are in use
+    for path in created:
+        with suppress(OSError):
+            path.unlink(missing_ok=True)
+            path.parent.rmdir()  # only when it is now empty
+
+
 def _publish(
     source: Path,
     selection: list[str],
@@ -576,14 +595,20 @@ def _publish(
     total = capacity["planned_tree_bytes"]
     if not capacity["fits"]:
         raise SealedError("storage-budget-exceeded")
-    for oid, data in pending.items():
-        path = _object(repo, oid)
-        if path.exists():
-            if path.read_bytes() != data:
-                raise SealedError("object-collision")
-        else:
-            _write(path, data, exclusive=True)
-    _write(repo / "HEAD.cce", encoded)
+    created: list[Path] = []
+    try:
+        for oid, data in pending.items():
+            path = _object(repo, oid)
+            if path.exists():
+                if path.read_bytes() != data:
+                    raise SealedError("object-collision")
+            else:
+                _write(path, data, exclusive=True)
+                created.append(path)
+        _write(repo / "HEAD.cce", encoded)
+    except BaseException:
+        _discard_unreferenced(repo, created, encoded)
+        raise
     _accept(trust_path, trust, head)
     return {
         "changed": True,
