@@ -619,7 +619,9 @@ def _plan_cards(
         hubs = _hubs(chosen, lambda row: _join(nominal, row["uid"] + ".md"), caps)
         return count + _page_count(hubs) + 1
 
-    if total(len(ranked)) <= limit:
+    # Every card is a note, so more records than notes cannot all fit: skip laying out the hubs
+    # of a library of any size just to learn that, and search the count that does fit.
+    if len(ranked) + HUB_FLOOR <= limit and total(len(ranked)) <= limit:
         count = len(ranked)
     else:
         low, high = 0, min(len(ranked), limit)
@@ -643,8 +645,8 @@ def _plan_cards(
             f"This card vault shows {count} of {len(rows)} records, the most recently updated "
             f"first, because it is limited to {limit} notes (cards, hub pages and this page). "
             f"{omitted} records have no card here; find them with `cce library search` and read "
-            "them with `cce library read`. Raise the limit with `--limit-notes`; the vault hard "
-            f"cap is {caps.vault_notes_fail} notes.\n\n"
+            "them with `cce library read`. `cce library export-cards --limit-notes N` writes a "
+            f"vault with another limit; the vault hard cap is {caps.vault_notes_fail} notes.\n\n"
         )
     else:
         status = (

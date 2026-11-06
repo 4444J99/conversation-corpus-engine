@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from vault_support import REPEATED, sentinel_lines, synthetic_library
 
+from conversation_corpus_engine import library_vault
 from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.attributed_knowledge import ZETTEL_SCHEMA
 from conversation_corpus_engine.library_export import export_library, verify_export
@@ -273,6 +274,22 @@ def test_cards_truncate_visibly_to_the_note_limit_keeping_the_newest(tmp_path: P
         manifest = manifest_of(destination)
         assert manifest["cards"]["truncated"] is True and manifest["cards"]["limit_notes"] == 14
         assert verify_export(destination) == []
+
+
+def test_cards_never_lay_out_hubs_for_more_records_than_the_budget_can_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sizes: list[int] = []
+    original = library_vault._hubs
+
+    def counted(rows, *args, **kwargs):
+        sizes.append(len(rows))
+        return original(rows, *args, **kwargs)
+
+    monkeypatch.setattr(library_vault, "_hubs", counted)
+    with synthetic_library(tmp_path, 60) as library:
+        result = export_library(library, tmp_path / "export", vault_profile="cards", limit_notes=20)
+    assert result["truncated"] is True and sizes and max(sizes) <= 20
 
 
 def test_cards_refuse_a_limit_the_standard_forbids_or_cannot_hold(tmp_path: Path) -> None:

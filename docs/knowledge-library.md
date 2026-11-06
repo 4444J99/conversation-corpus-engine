@@ -89,6 +89,8 @@ Each generation contains `graph.jsonl`, `library-index.jsonl`, `records.csv` and
 
 `cce library export-cards --out DIR [--limit-notes N]` writes the `cards` profile on demand for the current generation. It reads the library and never writes inside the library store. DIR may be empty or an earlier card vault (it carries the `.cce-cards-vault` marker); any other non-empty DIR is refused. It records exactly what it wrote in `.cce-cards-manifest.json` (path, size, SHA-256) and a later run replaces and deletes only files that manifest lists. It refuses, before changing anything, when a listed file was edited or when a file it did not write already sits where a card would go, so annotations are never overwritten; an identical file is adopted, which makes an interrupted run safe to repeat. `--limit-notes` is at most 20,000 (the hard cap).
 
+Publication compares source evidence, not reading derivatives: rebuilding unchanged sources under another profile makes `publish` report `changed: false` and leave the current generation in place, so use `export-cards` for a vault on demand. A `full` build that would pass a hard cap fails at its export stage, after ingestion; repeat it with `"resume_mode": "export"` (see the output budget notes) and another profile.
+
 The caps are the Wiki Standard v1 policy defaults, enforced by `library_vault_gate.measure_vault` (note count, total bytes, largest note, widest folder, hub entries; one `warn` or `fail` finding per breach). The profiles stay inside them by construction and the gate is checked again after writing and by `verify-export`:
 
 | Measure | Aim | Warn above | Fail above |
@@ -111,7 +113,8 @@ Consumers of the old layout, and what happens to each:
 |---|---|
 | `scripts/package-obsidian-vault.py` | Works on the `vault/` of `cards` and `full` (tested). Without a vault it fails with a message naming `--vault-profile` and `export-cards`. It is still the tool for a legacy bulk vault. |
 | `scripts/package-notion-batches.py` | Works on the ZIP of `cards` and `full` (tested). With no ZIP (`none`) it fails with a message naming `--vault-profile`. |
-| `library-index.jsonl` and `records.csv` (My Knowledge Base, LingFrame) | Same fields; schema `cce.library-index.v2` for the profiles, `path` is the note or null (empty in the CSV). |
+| `library-index.jsonl` and `records.csv` (LingFrame and other index readers) | Same fields; schema `cce.library-index.v2` for the profiles, `path` is the note or null (empty in the CSV). |
+| My Knowledge Base federation provider (`legacy/my-knowledge-base/src/federation/cce-library-provider.ts`) | It indexes the legacy `vault/records/UID.md` and `vault/blocks/DIGEST.md` notes as documents (shared passages are documents of their own), a real dependency on the layout the profiles drop, so it accepts only a v1 manifest and index. A generation built with any profile, the default included, is refused with a message naming `--vault-profile`; earlier generations still scan. |
 | `graph.jsonl` | Record nodes carry `path` only when the record has a note; `block:` nodes never do under a profile. |
 | `agent-entry.md` | Rewritten per profile (it no longer links `vault/Home.md` when there is no vault). Legacy text unchanged. |
 | `cce library search` hit `path`, MCP field `pa` | Unchanged hint (see above); use `read` by UID or the index. |
