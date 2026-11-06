@@ -120,3 +120,20 @@ def test_two_pages_of_a_ranked_search_do_not_repeat_or_skip_a_record(path):
     seen = [hit["uid"] for hit in first["hits"]] + [hit["uid"] for hit in second["hits"]]
     assert sorted(seen) == sorted({conv("one", "x").uid, conv("two", "x").uid})
     assert second["next_offset"] is None
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_a_next_generation_keeps_search_rows_under_their_record_rows(path, tmp_path, compact):
+    """Both ways of inheriting a generation (online backup and VACUUM INTO) must keep the
+    row-number alignment the search join relies on, including after a record is revised."""
+    following = tmp_path / ("compact.sqlite" if compact else "backup.sqlite")
+    with Library.create(following, previous=path, compact_previous=compact) as library:
+        library.put(conv("two", "alpha gamma shared and revised"))
+        library.put(conv("four", "alpha newcomer shared"))
+    with Library(following) as library:
+        assert library.verify(full=False) == []
+        result = library.search("alpha shared")
+        revised = library.search("revised")
+    expected = {conv(name, "x").uid for name in ("one", "two", "four")}
+    assert {hit["uid"] for hit in result["hits"]} == expected
+    assert [hit["uid"] for hit in revised["hits"]] == [conv("two", "x").uid]
