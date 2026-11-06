@@ -1,9 +1,12 @@
 """Hostile and degenerate inputs to the library search planner, on synthetic libraries only."""
 
+import sqlite3
 import time
 
 import pytest
+from test_library_search_planner import legacy_search
 
+from conversation_corpus_engine.archive_database import PHRASE_RE, WORD_RE, fts_query, fts_terms
 from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.library_store import (
     MAX_QUERY_CHARS,
@@ -162,3 +165,55 @@ def test_the_budget_validators_reject_a_huge_integer_with_their_standard_message
     for validator in (validate_max_seconds, validate_search_seconds):
         with pytest.raises(ValueError, match="max_seconds must be a number"):
             validator(value)
+
+
+# --- control characters in a query ---------------------------------------------------------------
+
+CONTROLS = ["\x00", "\x01", "\x08", "\x1f", "\x7f", "\t", "\n", "\r"]
+
+
+def result_core(result: dict) -> tuple:
+    return result["total"], uids(result), result["plan"]
+
+
+@pytest.mark.parametrize("control", CONTROLS)
+@pytest.mark.parametrize("plan", ["auto", "phrase", "and", "or"])
+def test_a_control_character_inside_a_quoted_phrase_acts_as_a_space(hardened, control, plan):
+    """A NUL used to end the FTS5 string early and raise "unterminated string" (also in base)."""
+    expected = hardened.search('"zeta stands"', plan=plan)
+    assert expected["total"] == 1
+    assert result_core(hardened.search(f'"zeta{control}stands"', plan=plan)) == result_core(
+        expected
+    )
+    assert result_core(hardened.search(f'x "zeta{control}stands" y', plan=plan))[0] in (0, 1)
+    assert hardened.search(f"zeta{control}stands", plan=plan)["total"] == 1
+
+
+def test_the_base_search_fails_on_a_nul_and_the_planner_does_not(hardened):
+    with pytest.raises(sqlite3.OperationalError, match="unterminated string"):
+        legacy_search(hardened, '"zeta\x00stands"')
+    assert hardened.search('"zeta\x00stands"')["total"] == 1
+
+
+def test_fts_query_replaces_control_characters_and_leaves_clean_text_alone():
+    assert fts_query('"alpha\x00beta"') == '"alpha beta"'
+    assert fts_query('"alpha\x01\x1f\x7fbeta" gamma') == '"alpha   beta" "gamma"'
+    assert fts_terms('"a\tb"') == (["a b"], [])
+    for text in ('"alpha beta" gamma', "alpha-beta don't", '"a  b"', "", '" OR *'):
+        assert fts_query(text) == " ".join(
+            [
+                *(f'"{p.strip()}"' for p in PHRASE_RE.findall(text) if WORD_RE.search(p)),
+                *(f'"{w}"' for w in WORD_RE.findall(PHRASE_RE.sub(" ", text))),
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "query",
+    ['"zeta\tstands"', '"zeta\nstands"', '"zeta\r\nstands"', "alpha\tomega", '"omega\n filler"'],
+)
+def test_queries_the_base_accepted_return_the_same_hits(hardened, query):
+    """Whitespace controls were valid before: replacing them with a space changes no result."""
+    expected = legacy_search(hardened, query)
+    got = hardened.search(query, plan="and")
+    assert {k: got[k] for k in expected} == expected

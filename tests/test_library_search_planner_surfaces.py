@@ -449,3 +449,23 @@ def test_the_cli_reports_a_huge_integer_without_a_traceback(cli, tmp_path, capsy
         assert handle_library(args) == 2
         captured = capsys.readouterr()
         assert f"library: {name} must be" in captured.err and captured.out == ""
+
+
+def test_a_nul_inside_a_quoted_phrase_is_answered_not_an_internal_error(
+    library_path, tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(library_mcp, "open_library", lambda root: (tmp_path, Library(library_path)))
+    server = CceMcpServer(default_project_root=tmp_path, library_store_root=tmp_path)
+    raw = (
+        '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"cce_library_search",'
+        '"arguments":{"query":"\\"lumen\\u0000glyph\\""}}}'
+    )
+    response = server.handle_request(json.loads(raw))
+    assert "error" not in response and response["result"]["isError"] is False
+    assert response["result"]["structuredContent"]["total"] == 1
+    assert capsys.readouterr().err == ""
+
+
+def test_the_cli_answers_a_query_with_a_nul(cli, tmp_path, capsys):
+    code, result, err = run_search(tmp_path, capsys, '"lumen\x00glyph"')
+    assert code == 0 and result["total"] == 1 and err == ""
