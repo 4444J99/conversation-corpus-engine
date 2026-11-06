@@ -224,6 +224,7 @@ def test_every_library_family_is_a_provider_that_reads_the_library_root() -> Non
         "documents",
         "agentmemory",
         "agentplans",
+        "webcapture",
     }
     assert all(PROVIDER_SPECS[name].source == SOURCE_LIBRARY for name in names)
 

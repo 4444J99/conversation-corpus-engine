@@ -326,6 +326,7 @@ so no higher rule can lose a character to an owner claim.
 
 | # | Rule id | Class | Decides |
 |---|---------|-------|---------|
+| 0 | `third_party_origin` | third_party | every message of a record from a third-party family: the fetched web pages of the `webcapture` family ([web captures](knowledge-library.md#web-captures)). It runs before every other rule, whatever the role, channel, typed count, URL or text, so nothing of a saved page is ever `owner` or `agent`. It claims only records of that provider; it changes no existing span, so `cce.attribution-rules@6` and the review ledgers stay valid |
 | 1 | `agent_family` | agent | assistant, model, tool and system turns of every provider; user turns on a machine channel; provider metadata naming an agent; a coding CLI's subagent prompts and turns that `archive_provenance.classify_user_turn` calls harness text |
 | 2 | `document_origin` | agent | a record whose provenance says an agent produced it (`agent_authored`, `generated_by`, ...), the agent memory and plan families, agent instruction or skill files by file name or folder, and for documents, notes and plans a generated-by footer, co-author line or skill frontmatter anywhere in the text |
 | 3 | `inline_injection` | agent | wrapper blocks inside a turn: the archive's injected tags (`system-reminder`, `local-command-*`, ...), `command-name`, `command-message`, `command-args`, tool-result and attachment blocks. Same-name tags nest (a depth counter), quoted attribute values may hold angle brackets, and an unclosed block runs to the end |

@@ -154,6 +154,9 @@ class RecordInfo:
     # An AI-authorship marker found anywhere in a note or document of the person's own library:
     # section boundaries cannot be proven, so none of the record can be attributed to the owner.
     ai_marker: str = ""
+    # Why the whole record is another party's text ('' when nothing says so): the provider is a
+    # family of captured third-party text, such as a fetched web page.
+    third_party_origin: str = ""
 
 
 def record_info(payload: Mapping[str, Any]) -> RecordInfo:
@@ -187,6 +190,14 @@ def record_info(payload: Mapping[str, Any]) -> RecordInfo:
                 origin = f"text:{marker}" if marker else ""
             if authored and kind in NOTE_KINDS and not ai_marker:
                 ai_marker = _ai_marker(body)
+    third_party = next(
+        (
+            f"family:{family.name}"
+            for family in FAMILIES
+            if family.third_party and family.selects(row)
+        ),
+        "",
+    )
     return RecordInfo(
         provider=provider,
         kind=kind,
@@ -195,6 +206,7 @@ def record_info(payload: Mapping[str, Any]) -> RecordInfo:
         authored_family=authored,
         agent_origin=origin,
         ai_marker=ai_marker,
+        third_party_origin=third_party,
     )
 
 
@@ -264,6 +276,18 @@ def span_id(rule: str, digest: str, start: int, end: int) -> str:
     """Stable identity of a span: bound to the rules version, the rule, the text and the range."""
     key = f"{RULES_VERSION}\n{rule}\n{digest}\n{start}\n{end}"
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+
+# --- third-party families: captured text that someone else wrote ------------------------------
+
+
+def rule_third_party_origin(context: MessageContext) -> list[Claim]:
+    """Every message of a record from a third-party family (a fetched web page) is another
+    party's text, whatever its role, channel or typed count says and whatever its URL or body
+    looks like. It runs before every other rule so that no later rule, owner or agent, can take a
+    character of it."""
+    origin = context.record.third_party_origin
+    return [(0, len(context.text), f"origin={origin}")] if origin else []
 
 
 # --- i: agent families -----------------------------------------------------------------------
@@ -1487,6 +1511,12 @@ class Rule:
 
 
 RULES: tuple[Rule, ...] = (
+    Rule(
+        "third_party_origin",
+        THIRD_PARTY,
+        "a record from a third-party family (a fetched web page): all of it, never owner",
+        rule_third_party_origin,
+    ),
     Rule("agent_family", AGENT, "assistant, model, tool and harness turns", rule_agent_family),
     Rule(
         "document_origin",

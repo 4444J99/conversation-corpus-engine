@@ -11,7 +11,8 @@ A name is a kind word followed by up to four more segments, joined by single hyp
   Version notes: 1 the first table; 2 the `manifest` kind accepts an optional subject; 3 the
   bounded layout adds the kinds `shard`, `part`, `day`, `bucket` and `container`, and the
   structural folder word `undated`; 4 adds the provider words of the families that are not web
-  chat exports (the coding CLIs, notes, Drive, documents, agent memory and plans, local memory).
+  chat exports (the coding CLIs, notes, Drive, documents, agent memory and plans, local memory);
+  5 adds the provider word `webcapture` (pages a capture tool fetched).
 * scope: a provider word (see PROVIDER_SCOPES) or the word `all`.
 * subject: lowercase words `[a-z0-9]+` joined by hyphens, at most 32 characters. A subject is
   validated, never transformed: a title, prompt text or free text is not a subject.
@@ -46,7 +47,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-NAMING_VERSION = 4
+NAMING_VERSION = 5
 
 MAX_NAME_LENGTH = 80
 MAX_SUBJECT_LENGTH = 32
@@ -83,6 +84,7 @@ PROVIDER_SCOPES: tuple[str, ...] = (
     "notebooklm",
     "opencode",
     "perplexity",
+    "webcapture",
 )
 SCOPES: tuple[str, ...] = (*PROVIDER_SCOPES, SCOPE_ALL)
 
