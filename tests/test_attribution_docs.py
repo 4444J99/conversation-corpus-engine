@@ -82,9 +82,16 @@ def test_every_attribute_command_line_in_the_recipes_runs(
     executed: list[str] = []
     skipped: list[str] = []
 
+    def substitute(match: re.Match[str]) -> str:
+        found = match.group(0)
+        if found == LIBRARY_PLACEHOLDER:
+            return str(library.parent)
+        return str(outputs / Path(found).name)
+
     def place(line: str) -> str:
-        line = line.replace(LIBRARY_PLACEHOLDER, str(library.parent))
-        return PLACEHOLDER.sub(lambda match: str(outputs / Path(match.group(0)).name), line)
+        # One pass: a substituted path (which may itself start with /private/, as every
+        # temporary directory does on macOS) is never matched again.
+        return PLACEHOLDER.sub(substitute, line)
 
     for block in recipe_blocks():
         for kind, line in steps(block):
