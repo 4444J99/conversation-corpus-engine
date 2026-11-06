@@ -478,6 +478,11 @@ def _shards(
     return sorted(found, key=lambda item: item[1])
 
 
+def normalized_source_path(declared: str | Path) -> Path:
+    """The lexical source path recorded at intake; do not resolve or follow symlinks."""
+    return Path(declared).expanduser().absolute()
+
+
 def iter_web_captures(
     sources: list[str] | list[Path],
     *,
@@ -509,7 +514,7 @@ def iter_web_captures(
     seen: dict[Path, os.stat_result] = {}
     for declared in sources:
         check()
-        root = Path(declared).expanduser().absolute()
+        root = normalized_source_path(declared)
         entry = {"path": str(root), "status": "scanned"}
         report["sources"].append(entry)
         if any(part.is_symlink() for part in [root, *root.parents]):
@@ -571,8 +576,14 @@ def iter_web_captures(
                         counts["duplicates"] += 1
                     if previous is None or rank > previous.rank:
                         best[row["id"]] = _Candidate(rank, path, offset, number, relative)
-                after = path.stat()
-            if (info.st_size, info.st_mtime_ns, info.st_ino) != (
+                try:
+                    after = path.stat()
+                except OSError as error:
+                    # A producer may rotate a shard after the scan. Keep the observed
+                    # byte/count receipt; the second pass will refuse its missing rows.
+                    _finding(report, relative, "source_changed_during_read", type(error).__name__)
+                    after = None
+            if after is not None and (info.st_size, info.st_mtime_ns, info.st_ino) != (
                 after.st_size,
                 after.st_mtime_ns,
                 after.st_ino,

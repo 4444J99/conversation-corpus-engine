@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .library_store import Library, candidate_evidence_fingerprint, canonical_json, digest_json
+from .web_capture import normalized_source_path
 
 
 def _safe(path: Path) -> None:
@@ -147,7 +148,12 @@ def prepare_resume(
             raise ValueError("invalid or incomplete resume source sequence")
     if native_paths != manifest.get("estate_databases", []):
         raise ValueError("resume native source collection differs from declared sources")
-    if capture_paths != manifest.get("web_captures", []):
+    declared_captures = manifest.get("web_captures", [])
+    if not isinstance(declared_captures, list) or any(
+        not isinstance(path, str) or not Path(path).is_absolute() for path in declared_captures
+    ):
+        raise ValueError("invalid resume web capture source collection declaration")
+    if capture_paths != [str(normalized_source_path(path)) for path in declared_captures]:
         raise ValueError("resume web capture source collection differs from declared sources")
     if total != _count(report.get("accepted_observations"), "accepted_observations"):
         raise ValueError("resume accepted observations differ from source counts")

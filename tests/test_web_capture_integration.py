@@ -355,3 +355,77 @@ def test_unreadable_directories_are_explicit_coverage_findings(tmp_path, monkeyp
     assert [(finding["code"], finding["path"]) for finding in report["findings"]] == [
         ("unreadable_directory", "unavailable")
     ]
+
+
+def test_disappearing_shard_keeps_receipts_and_does_not_abort_other_pages(tmp_path, monkeypatch):
+    gone = write_shard(tmp_path / "a.jsonl", page_rows()[:1])
+    present = write_shard(tmp_path / "b.jsonl", page_rows()[1:2])
+    original = web_capture._lines
+    calls = 0
+
+    def rotate_after_scan(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        yield from original(*args, **kwargs)
+        if calls == 1:
+            gone.rename(gone.with_suffix(".rotated"))
+
+    monkeypatch.setattr(web_capture, "_lines", rotate_after_scan)
+    report = {}
+    items = list(web_capture.iter_web_captures([str(gone), str(present)], report=report))
+    assert len(items) == 1 and items[0].title == "Kettle guide"
+    counts = report["counts"]
+    assert (
+        counts["files"],
+        counts["rows"],
+        counts["captured"],
+        counts["records"],
+        counts["refused"],
+    ) == (2, 2, 2, 1, 1)
+    assert len(report["shards"]) == 2
+    assert (
+        report["shards"][0]["sha256"]
+        == hashlib.sha256(gone.with_suffix(".rotated").read_bytes()).hexdigest()
+    )
+    assert any(
+        finding["code"] == "source_changed_during_read" and finding["path"] == "a.jsonl"
+        for finding in report["findings"]
+    )
+    assert any(
+        finding["path"] == "a.jsonl" and finding["detail"] == "FileNotFoundError"
+        for finding in report["findings"]
+    )
+
+
+@pytest.mark.parametrize("spelling", ["trailing_slash", "redundant_separators_and_dot"])
+def test_resume_accepts_the_intake_normalization_of_declared_capture_paths(
+    tmp_path, monkeypatch, spelling
+):
+    project, store, shards = setup(tmp_path)
+    write_shard(shards / "one.jsonl", page_rows())
+    declared = (
+        str(shards) + "/" if spelling == "trailing_slash" else f"{shards.parent}//{shards.name}/./"
+    )
+
+    def fail_after_ingestion(self, **kwargs):
+        raise ValueError("synthetic ingestion checkpoint")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Library, "index_blocks", fail_after_ingestion)
+        with pytest.raises(ValueError, match="synthetic ingestion checkpoint"):
+            build_library(
+                {"schema": "cce.library-sources.v1", "web_captures": [declared]},
+                project_root=project,
+                store_root=store,
+            )
+    seed = next((store / "library-all" / "generations").iterdir())
+    state = json.loads((seed / "build-state.json").read_text())
+    assert state["report"]["sources"][0]["report"]["sources"][0]["path"] == str(shards)
+    shards.rename(shards.with_name("offline-shards"))
+    result = build_library(
+        {"schema": "cce.library-sources.v1", "resume_generation": str(seed)},
+        project_root=project,
+        store_root=store,
+    )
+    assert result["baseline_accepted_observations"] == 3 and result["new_observations"] == 0
+    assert result["status"]["records"] == 3
