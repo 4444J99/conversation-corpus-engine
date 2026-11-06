@@ -9,17 +9,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
+import time
+import unicodedata
 import zlib
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
-from .archive_database import fts_query
+from .archive_database import WORD_RE, fts_terms
 from .archive_model import Conversation, stable_uid
 from .library_blocks import split_blocks
 
@@ -28,6 +32,216 @@ MAX_PAGE = 200
 # Document records state their reason in ``body_reason`` only; other providers may instead
 # record coverage findings, so findings never explain a document.
 DOCUMENT_PROVIDER = "documents"
+
+# Search planning. ``auto`` runs an unquoted multi-word query as an adjacent phrase, then as the
+# AND of its words, then as the OR of its words, and stops at the first plan that matches.
+SEARCH_PLANS = ("auto", "phrase", "and", "or")
+CONCRETE_PLANS = SEARCH_PLANS[1:]
+# Totals are counted only up to this many matches, so a huge match set is never counted in full.
+DEFAULT_COUNT_CAP = 1000
+# Every plan runs on at most this much of the query: the first MAX_QUERY_CHARS characters, at most
+# MAX_QUERY_TERMS distinct terms, each cut to MAX_TERM_CHARS characters.
+MAX_QUERY_CHARS = 1000
+MAX_QUERY_TERMS = 32
+MAX_TERM_CHARS = 64
+MAX_COUNT_CAP = 1_000_000_000
+MAX_SEARCH_SECONDS = 600.0
+# The time budget applied by the command line and the MCP tool; the Python API has none unless
+# the caller passes ``max_seconds``.
+DEFAULT_SEARCH_SECONDS = 15.0
+# After the budget runs out, the unranked page and each plan probe get their own allowance of at
+# most this many seconds (and at most max_seconds)...
+UNRANKED_GRACE_SECONDS = 2.0
+# ...and never less than this, so even a tiny budget leaves time to produce a page.
+MIN_UNRANKED_GRACE_SECONDS = 0.25
+# VM instructions between budget checks. SQLite computes bm25 for a long match list inside a few
+# instructions per row, so the interval stays small; a test lowers it to exercise a tiny library.
+SEARCH_PROGRESS_INSTRUCTIONS = 1000
+BROAD_QUERY_HINT = "quote a phrase or add terms for a faster, more precise search"
+_TERMS_TRUNCATED_NOTICE = (
+    f"the query was shortened to its limits ({MAX_QUERY_TERMS} distinct terms, {MAX_TERM_CHARS} "
+    f"characters per term, the first {MAX_QUERY_CHARS} characters) and the search ran on what is left."
+)
+_UNRANKED_STUCK_TAIL = (
+    " No hit arrived before the allowance for this page ran out and the plan is not proven "
+    "empty, so next_offset repeats this offset: retry it, or narrow the query."
+)
+_UNPROVEN_TAIL = (
+    " No plan could be searched in time, so having no hits does not mean there are none: "
+    "retry with next_offset (the same offset), a narrower query or a larger max_seconds."
+)
+# The time source of the search budget; a test substitutes a controllable clock.
+_clock = time.monotonic
+
+
+class _BudgetExpired(Exception):
+    """The search time budget ran out; raised from the SQLite progress callback."""
+
+
+def validate_plan(plan: Any) -> str:
+    if not isinstance(plan, str) or plan not in SEARCH_PLANS:
+        raise ValueError("plan must be one of: " + ", ".join(SEARCH_PLANS))
+    return plan
+
+
+def validate_max_seconds(value: Any) -> float | None:
+    """A search time budget in seconds: ``None`` (unbounded) or a finite number in (0, 600]."""
+    return None if value is None else validate_search_seconds(value)
+
+
+def bounded_int(value: Any, minimum: int, maximum: int) -> bool:
+    """Whether ``value`` is a real integer in [minimum, maximum]; never raises, whatever it is."""
+    try:
+        return (
+            not isinstance(value, bool) and isinstance(value, int) and minimum <= value <= maximum
+        )
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def validate_search_seconds(value: Any) -> float:
+    """A time budget that must be given: a finite number of seconds in (0, 600].
+
+    Anything else, including an integer too large to be a float, is a ``ValueError``.
+    """
+    try:
+        valid = (
+            not isinstance(value, bool)
+            and isinstance(value, int | float)
+            and math.isfinite(value)
+            and 0 < value <= MAX_SEARCH_SECONDS
+        )
+    except (OverflowError, TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise ValueError(
+            f"max_seconds must be a number greater than 0 and at most {MAX_SEARCH_SECONDS:g}"
+        )
+    return float(value)
+
+
+def validate_count_cap(value: Any) -> int | None:
+    if value is None:
+        return None
+    if not bounded_int(value, 1, MAX_COUNT_CAP):
+        raise ValueError(f"count_cap must be an integer from 1 to {MAX_COUNT_CAP}, or None")
+    return int(value)
+
+
+_TRAILING_FRAGMENT = re.compile(r"\s\S*$")
+
+
+def _has_token(term: str) -> bool:
+    """Whether FTS5 would find a token in ``term``. ``___`` is a word to the query parser but all
+    separators to the tokenizer, where it matches nothing and constrains nothing. A character
+    the running Python does not know yet counts as a token, so a term is never dropped by mistake.
+    """
+    return any(char.isalnum() or unicodedata.category(char) in ("Co", "Cn") for char in term)
+
+
+@dataclass(frozen=True)
+class QueryTerms:
+    """The bounded terms of a query: what the search actually runs on.
+
+    Every plan sees at most ``MAX_QUERY_TERMS`` distinct terms (compared case-insensitively) of
+    at most ``MAX_TERM_CHARS`` characters, taken from the first ``MAX_QUERY_CHARS`` characters,
+    so a hostile or machine-made query cannot make SQLite build thousands of phrases.
+    """
+
+    phrases: tuple[str, ...]
+    words: tuple[str, ...]
+    # The words in query order, repeats kept, for the adjacent-phrase plan.
+    sequence: tuple[str, ...]
+    clipped: bool
+    shortened: bool
+    terms_cut: bool
+    sequence_cut: bool
+
+    def lost(self, plan: str) -> bool:
+        """Whether the bounds dropped anything that could change what ``plan`` matches."""
+        cut = self.sequence_cut if plan == "phrase" else self.terms_cut
+        return self.clipped or self.shortened or cut
+
+
+def query_terms(query: str) -> QueryTerms:
+    examined = query[:MAX_QUERY_CHARS]
+    if len(query) > MAX_QUERY_CHARS and not query[MAX_QUERY_CHARS].isspace():
+        # The cut fell inside a token: drop that fragment, which would be a term nobody wrote.
+        fragment = _TRAILING_FRAGMENT.search(examined)
+        if fragment:
+            examined = examined[: fragment.start()]
+    raw_phrases, raw_words = (
+        [term for term in terms if _has_token(term)] for terms in fts_terms(examined)
+    )
+    shortened = terms_cut = False
+    seen: set[str] = set()
+    kept: tuple[list[str], list[str]] = ([], [])
+    for target, raw in zip(kept, (raw_phrases, raw_words), strict=True):
+        for term in raw:
+            text = term[:MAX_TERM_CHARS].strip()
+            shortened = shortened or len(term) > MAX_TERM_CHARS
+            key = " ".join(text.split()).casefold()
+            if key in seen:
+                continue
+            if len(seen) >= MAX_QUERY_TERMS:
+                terms_cut = True
+                continue
+            seen.add(key)
+            target.append(text)
+    ordered = [word for word in WORD_RE.findall(examined.replace('"', " ")) if _has_token(word)]
+    shortened = shortened or any(len(word) > MAX_TERM_CHARS for word in ordered[:MAX_QUERY_TERMS])
+    return QueryTerms(
+        phrases=tuple(kept[0]),
+        words=tuple(kept[1]),
+        sequence=tuple(word[:MAX_TERM_CHARS] for word in ordered[:MAX_QUERY_TERMS]),
+        clipped=len(query) > MAX_QUERY_CHARS,
+        shortened=shortened,
+        terms_cut=terms_cut,
+        sequence_cut=len(ordered) > MAX_QUERY_TERMS,
+    )
+
+
+def _match(terms: QueryTerms, plan: str) -> str:
+    if plan == "phrase":
+        return '"' + " ".join(terms.sequence) + '"' if terms.sequence else ""
+    units = [*(f'"{phrase}"' for phrase in terms.phrases), *(f'"{word}"' for word in terms.words)]
+    return (" OR " if plan == "or" else " ").join(units)
+
+
+def plan_match(query: str, plan: str) -> str:
+    """The FTS5 MATCH expression of one concrete plan; empty when the query has no terms.
+
+    ``and`` is the pre-planner behavior (every word and quoted phrase must match), ``or`` accepts
+    any of them, and ``phrase`` requires all the words of the query adjacent and in order.
+    """
+    if plan not in CONCRETE_PLANS:
+        raise ValueError("plan must be one of: " + ", ".join(CONCRETE_PLANS))
+    return _match(query_terms(query), plan)
+
+
+def plan_locator_query(query: str, plan: str) -> str:
+    """The query text that best locates a hit's passage when ``plan`` answered it."""
+    terms = query_terms(query)
+    if plan == "phrase" and terms.sequence:
+        return _match(terms, "phrase")
+    return " ".join([*(f'"{phrase}"' for phrase in terms.phrases), *terms.words])
+
+
+def _plan_steps(query: str, plan: str) -> tuple[list[tuple[str, str]], QueryTerms]:
+    """The (plan, MATCH expression) steps to try in order, empty when the query has no terms."""
+    terms = query_terms(query)
+    if plan == "auto":
+        # A single term, or a query that already quotes a phrase, is searched as written.
+        names = CONCRETE_PLANS if not terms.phrases and len(terms.sequence) > 1 else ("and",)
+    else:
+        names = (plan,)
+    steps: list[tuple[str, str]] = []
+    for name in names:
+        match = _match(terms, name)
+        # A plan whose expression repeats an earlier one (one distinct term) adds nothing.
+        if match and all(match != earlier for _, earlier in steps):
+            steps.append((name, match))
+    return steps, terms
 
 
 def _bounded_sql(method: Any) -> Any:
@@ -534,6 +748,34 @@ class Library:
         value = row[0]
         return zlib.decompress(value).decode("utf-8") if isinstance(value, bytes) else value
 
+    def _budget_scope(self, deadline: float | None) -> AbstractContextManager[None]:
+        """Interrupt SQL once ``_clock()`` reaches ``deadline`` by raising ``_BudgetExpired``.
+
+        This reuses ``sql_progress``. An enclosing owned scope keeps being consulted, and its own
+        interruption still reaches it: this scope re-raises it as an ``OperationalError``, which
+        the enclosing scope turns back into its original error.
+        """
+        if deadline is None:
+            return nullcontext()
+
+        def check() -> None:
+            if _clock() >= deadline:
+                raise _BudgetExpired
+
+        outer = self._owned_sql_handler
+        if outer is None:
+            return self.sql_progress(check, instructions=SEARCH_PROGRESS_INSTRUCTIONS)
+        outer_progress, outer_instructions = outer
+
+        def composed() -> None:
+            if outer_progress():
+                raise sqlite3.OperationalError("interrupted by an enclosing progress scope")
+            check()
+
+        return self.sql_progress(
+            composed, instructions=min(SEARCH_PROGRESS_INSTRUCTIONS, outer_instructions)
+        )
+
     def search(
         self,
         query: str,
@@ -544,58 +786,226 @@ class Library:
         lane: str | None = None,
         providers: list[str] | None = None,
         kinds: list[str] | None = None,
+        plan: str = "auto",
+        max_seconds: float | None = None,
+        count_cap: int | None = DEFAULT_COUNT_CAP,
     ) -> dict[str, Any]:
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_PAGE:
+        """Paged full-text retrieval with a planned match, a time budget and a capped count.
+
+        ``plan="auto"`` runs an unquoted query of several words as an adjacent phrase, then as
+        the AND of its words, then as the OR of its words, and answers from the first plan with
+        at least one match in the filtered set (the offset plays no part). A single term or a
+        query with a quoted phrase runs as written, which is the AND of its terms. A named plan
+        (``phrase``, ``and``, ``or``) runs only that plan; ``and`` is the pre-planner behavior.
+
+        ``max_seconds`` bounds the whole call through the SQLite progress handler. When it runs
+        out the call still returns: ranking is abandoned and the page is the first matches in
+        index order (``ranked`` false, ``partial`` true). ``count_cap`` stops counting matches
+        beyond that many (``total_exact`` false, ``total_label`` ``"<cap>+"``); ``None`` counts
+        them all. Hits and their order do not depend on the cap.
+        """
+        if not bounded_int(limit, 1, MAX_PAGE):
             raise ValueError(f"limit must be an integer from 1 to {MAX_PAGE}")
-        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 1000000000:
+        if not bounded_int(offset, 0, 1000000000):
             raise ValueError("offset must be an integer from 0 to 1000000000")
-        match = fts_query(query)
-        empty = {
-            "query": query,
-            "total": 0,
-            "offset": offset,
-            "limit": limit,
-            "next_offset": None,
-            "hits": [],
-        }
-        if not match:
-            return empty
-        clauses, params = ["record_fts MATCH ?"], [match]
+        plan = validate_plan(plan)
+        seconds = validate_max_seconds(max_seconds)
+        cap = validate_count_cap(count_cap)
+        started = _clock()
+        deadline = None if seconds is None else started + seconds
+        steps, terms = _plan_steps(query, plan)
+
+        def finish(
+            name: str,
+            total: int,
+            exact: bool,
+            hits: list[dict[str, Any]],
+            next_offset: int | None,
+            *,
+            expired_in: str | None = None,
+            tail: str = "",
+        ) -> dict[str, Any]:
+            partial = expired_in is not None
+            result: dict[str, Any] = {
+                "query": query,
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "next_offset": next_offset,
+                "hits": hits,
+                "total_exact": exact,
+                "total_label": str(total) if exact else f"{total}+",
+                "plan": name,
+                "partial": partial,
+                "ranked": not partial,
+                "elapsed_s": round(_clock() - started, 3),
+            }
+            notices = []
+            if terms.lost(name):
+                result["terms_truncated"] = True
+                notices.append(_TERMS_TRUNCATED_NOTICE)
+            if partial:
+                notices.append(
+                    f"the {seconds:g} s time budget ran out while running the {expired_in} plan; "
+                    f"the {name} plan's matches are shown in index order, not by relevance." + tail
+                )
+            if notices:
+                result["notice"] = " ".join(notices)
+            if partial or (name == "or" and not exact):
+                result["hint"] = BROAD_QUERY_HINT
+            return result
+
+        if not steps:
+            return finish("and" if plan == "auto" else plan, 0, True, [], None)
+        clauses: list[str] = []
+        filters: list[Any] = []
         for column, value in (("wing", wing), ("lane", lane)):
             if value:
                 clauses.append(f"r.{column}=?")
-                params.append(value)
+                filters.append(value)
         for column, values in (("provider", providers), ("kind", kinds)):
             if values:
                 clauses.append(f"r.{column} IN ({','.join('?' for _ in values)})")
-                params.extend(values)
-        source = "FROM record_fts JOIN records r ON r.uid=record_fts.uid WHERE " + " AND ".join(
-            clauses
-        )
-        total = self.connection.execute("SELECT COUNT(*) " + source, params).fetchone()[0]
-        results = self.connection.execute(
-            "SELECT r.uid,r.title,r.provider,r.kind,r.wing,r.lane,r.current_version AS version,"
-            "r.body_status,r.message_count,r.source_ref,snippet(record_fts,-1,'[',']','...',28) AS excerpt "
-            + source
-            + " ORDER BY bm25(record_fts,0,5,1),r.uid LIMIT ? OFFSET ?",
-            [*params, limit, offset],
-        )
-        hits = []
-        for row in results:
-            hit = dict(row)
-            hit["title"] = hit["title"][:512]
-            hit["source_ref"] = hit["source_ref"][:2048]
-            for key in ("kind", "lane"):
-                hit[key] = hit[key][:128]
-            hit["excerpt"] = hit["excerpt"][:360]
-            hit["path"] = f"vault/records/{hit['uid']}.md"
-            hits.append(hit)
-        return {
-            **empty,
-            "total": total,
-            "hits": hits,
-            "next_offset": offset + len(hits) if offset + len(hits) < total else None,
-        }
+                filters.extend(values)
+
+        def source(match: str) -> tuple[str, list[Any]]:
+            where = " AND ".join(["record_fts MATCH ?", *clauses])
+            return (
+                "FROM record_fts JOIN records r ON r.uid=record_fts.uid WHERE " + where,
+                [match, *filters],
+            )
+
+        def check() -> None:
+            if deadline is not None and _clock() >= deadline:
+                raise _BudgetExpired
+
+        def count(match: str) -> tuple[int, bool]:
+            text, params = source(match)
+            if cap is None:
+                return self.connection.execute("SELECT COUNT(*) " + text, params).fetchone()[
+                    0
+                ], True
+            found = self.connection.execute(
+                "SELECT COUNT(*) FROM (SELECT 1 " + text + " LIMIT ?)", [*params, cap + 1]
+            ).fetchone()[0]
+            return (cap, False) if found > cap else (found, True)
+
+        def page(match: str, order: str) -> Any:
+            # One row beyond the page says whether another page follows, whatever the total says.
+            text, params = source(match)
+            return self.connection.execute(
+                "SELECT r.uid,r.title,r.provider,r.kind,r.wing,r.lane,r.current_version AS version,"
+                "r.body_status,r.message_count,r.source_ref,snippet(record_fts,-1,'[',']','...',28) AS excerpt "
+                + text
+                + order
+                + " LIMIT ? OFFSET ?",
+                [*params, limit + 1, offset],
+            )
+
+        def shape(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
+            hits = []
+            for row in rows[:limit]:
+                hit = dict(row)
+                hit["title"] = hit["title"][:512]
+                hit["source_ref"] = hit["source_ref"][:2048]
+                for key in ("kind", "lane"):
+                    hit[key] = hit[key][:128]
+                hit["excerpt"] = hit["excerpt"][:360]
+                hit["path"] = f"vault/records/{hit['uid']}.md"
+                hits.append(hit)
+            return hits
+
+        def grace_deadline() -> float:
+            allowance = min(seconds or UNRANKED_GRACE_SECONDS, UNRANKED_GRACE_SECONDS)
+            return _clock() + max(allowance, MIN_UNRANKED_GRACE_SECONDS)
+
+        def unranked(chosen: str) -> tuple[list[sqlite3.Row], bool]:
+            """The first matches of a plan in index order, under a short allowance of their own.
+            The flag says that allowance cut the page short."""
+            rows: list[sqlite3.Row] = []
+            try:
+                with self._budget_scope(grace_deadline()):
+                    rows.extend(page(chosen, " ORDER BY record_fts.rowid"))
+            except _BudgetExpired:
+                return rows, True
+            return rows, False
+
+        def probe(chosen: str) -> bool | None:
+            """Whether a plan matches anything; None when its short allowance ran out first."""
+            text, params = source(chosen)
+            try:
+                with self._budget_scope(grace_deadline()):
+                    found = self.connection.execute("SELECT 1 " + text + " LIMIT 1", params)
+                    return found.fetchone() is not None
+            except _BudgetExpired:
+                return None
+
+        def partial_page(
+            chosen: str, expired_in: str, rows: list[sqlite3.Row], cut: bool, total: int | None
+        ) -> dict[str, Any]:
+            """A page of unranked matches. A page cut before its first row is not the end of the
+            results, so it repeats its offset for the pager to retry."""
+            hits = shape(rows)
+            stuck = cut and not hits
+            more = bool(hits) and (len(rows) > limit or cut)
+            next_offset = offset + len(hits) if more else (offset if stuck else None)
+            counted = total is not None
+            return finish(
+                chosen,
+                total if counted else offset + len(hits),
+                counted and exact,
+                hits,
+                next_offset,
+                expired_in=expired_in,
+                tail=_UNRANKED_STUCK_TAIL if stuck else "",
+            )
+
+        index, total, exact = 0, 0, True
+        name, match = steps[-1]
+        try:
+            while index < len(steps):
+                name, match = steps[index]
+                check()
+                with self._budget_scope(deadline):
+                    total, exact = count(match)
+                if total:
+                    break
+                index += 1
+            rows: list[sqlite3.Row] = []
+            if total:
+                check()
+                with self._budget_scope(deadline):
+                    rows = page(match, " ORDER BY bm25(record_fts,0,5,1),r.uid").fetchall()
+        except _BudgetExpired:
+            expired_in = steps[index][0]
+            if total:
+                # The count finished, so the plan has matches; only its ranking ran out of time.
+                unranked_rows, cut = unranked(match)
+                return partial_page(name, expired_in, unranked_rows, cut, total)
+            # The budget ran out before this plan was known to be empty, which says nothing about
+            # the plans after it: take the first plan that a short probe shows to match.
+            unproven: str | None = None
+            for later_name, later_match in steps[index:]:
+                found = probe(later_match)
+                if found:
+                    unranked_rows, cut = unranked(later_match)
+                    return partial_page(later_name, expired_in, unranked_rows, cut, None)
+                if found is None and unproven is None:
+                    unproven = later_name
+            if unproven is not None:
+                return finish(
+                    unproven,
+                    offset,
+                    False,
+                    [],
+                    offset,
+                    expired_in=expired_in,
+                    tail=_UNPROVEN_TAIL,
+                )
+            # Every plan finished its probe and found nothing: the empty answer is complete.
+            return finish(steps[-1][0], 0, True, [], None)
+        hits = shape(rows)
+        return finish(name, total, exact, hits, offset + len(hits) if len(rows) > limit else None)
 
     @_bounded_sql
     def status(self, *, check_callback: Any = None) -> dict[str, Any]:

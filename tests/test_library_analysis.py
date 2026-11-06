@@ -283,3 +283,30 @@ def test_blank_query_cannot_ignore_explicit_uids(tmp_path: Path, query: str) -> 
             uids=["chatgpt-one"],
         )
     assert not (store / "blank").exists()
+
+
+def test_query_selection_keeps_and_semantics_and_an_exact_matched_count(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The search planner and capped total are for retrieval; the analysis selection is exact."""
+    project, store, database = setup_library(tmp_path)
+    calls: list[dict] = []
+    real = Library.search
+
+    def spy(self, query, **kwargs):
+        calls.append(kwargs)
+        return real(self, query, **kwargs)
+
+    monkeypatch.setattr(Library, "search", spy)
+    with Library(database) as library:
+        receipt = export_analysis(
+            library,
+            store / "exact",
+            project_root=project,
+            store_root=store,
+            query="lattice prose",
+            limit=1,
+            target="lingframe",
+        )
+    assert [(call["plan"], call["count_cap"]) for call in calls] == [("and", None)]
+    assert receipt["selection"]["matched_records"] == 2
