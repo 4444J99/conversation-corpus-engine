@@ -351,20 +351,30 @@ claim. A `reviewed` entry still needs its reviewer and evidence. Existing JSON, 
 library reviewed-Zettel exports continue to reject unreviewed drafts. CCE does not write idea
 text itself.
 
-**Re-running.** Output is deterministic: the same envelope gives the same bytes, and a second run
-rewrites nothing (the report shows `written: 0`). The `cce-zettel-notes-manifest.json` receipt
-owns each filename, idea ID and exact output hash. A changed idea updates only its owned note
+**Re-running.** Output is deterministic for the same envelope and the same library evidence
+snapshot: they give the same bytes, and a second run rewrites nothing (the report shows
+`written: 0`). A changed evidence snapshot changes the embedded library identity and can update
+the notes even when the envelope is unchanged; an envelope pinned to the previous `library_id`
+is refused against the new snapshot. The `cce-zettel-notes-manifest.json` receipt owns each
+filename, visible idea ID, full caller-identity SHA-256 and exact output hash. The full digest
+distinguishes different caller IDs that share a six-character visible suffix. An older ownership
+entry without that digest refuses an ambiguous update rather than inferring its caller.
+A changed idea updates only its owned note
 and the receipt, and retains the displaced inode in the recovery surface described below.
 An existing file without that ownership record is never adopted, even if its
 ID or bytes match, and a manually edited owned file is preserved with an explicit refusal.
 Renaming an existing idea also refuses. Retained manifest names remain reserved even when
 their file is absent, so a deleted `Test.md` cannot acquire a conflicting `test.md` identity.
 Notes omitted from a later envelope are retained;
-no output is deleted. The manifest records pending old/new hashes before writes, so an
-interrupted run can resume without losing ownership or guessing which files it created.
+no output is deleted. The manifest records pending old/new hashes before writes. After successful
+exclusive creation, it records the created file's device and inode; resuming a pending new file
+requires that proof and the expected bytes. A stop before the creation proof is recorded can
+leave an ambiguous file: the next run preserves it and refuses to claim ownership, even when its
+bytes match the plan. An absent pending name omitted from the next batch stays a reservation;
+completing other notes cannot authorize adoption of a later file at that name.
 Concurrent writers are refused using a per-destination lock. The flat `notes/zettel` folder
-warns above 200 entries and refuses above 1,000, counting retained entries and incoming files
-together, with updates to an existing file counted once.
+warns above 200 entries and refuses above 1,000, counting on-disk entries, retained manifest names
+(including absent reservations) and incoming files together, with each name counted once.
 
 **Concurrent edits and recovery.** Before an owned update, the current file is moved into an
 exclusively created private slot under `.cce-zettel-recovery/` at the output root. Its
@@ -376,15 +386,19 @@ inode. The exporter verifies the captured bytes before publishing the new note e
 It never deletes the captured inode after success, so those later editor writes remain reachable.
 The live note name is briefly absent between capture and publication: this is a recoverable
 update with atomic creation of the new name, not an atomic replacement of the old name.
-Recovery receipts and the directories affected by capture/publication are synced before the
-operation completes.
+Every new directory's parent is synced after creation. The pending manifest is synced before
+note publication; each new note name is synced before its creation proof, and the final manifest
+is synced after those proofs. Recovery receipts and the directories affected by capture are
+also synced. A sync failure is reported as a failure; it never reports a durable successful
+publication.
 
 On a capture or publication failure, the exporter reattaches the retained inode only if the
 original name is still free. If an editor has created a replacement there, both files are kept
 and the operation refuses with the recovery path. A hard process stop can leave the prior file
 only in its recovery slot; its receipt and the pending ownership manifest remain available, and
-a rerun can complete the requested notes. Inspect recovery receipts for an interrupted note
-omitted from the next batch.
+a rerun can complete the requested notes when their ownership is established. A file without
+the required creation proof needs inspection rather than automatic adoption. Inspect recovery
+receipts for an interrupted note omitted from the next batch.
 
 Recovery is limited to 1,000 retained slots and 64 MiB of observed payload/receipt bytes. The
 whole batch reserves existing file sizes plus a 4-KiB receipt allowance per update before any

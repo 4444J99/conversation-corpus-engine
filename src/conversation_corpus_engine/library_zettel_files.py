@@ -14,6 +14,7 @@ import re
 import stat
 import tempfile
 import unicodedata
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +24,7 @@ from .library_export import _absolute, _no_symlinks
 NOTES_FOLDER = "notes/zettel"
 MANIFEST_NAME = "cce-zettel-notes-manifest.json"
 MANIFEST_SCHEMA = "cce.zettel-note-manifest.v1"
+CREATION_JOURNAL = "exclusive-create.v1"
 LOCK_NAME = ".cce-zettel-notes.lock"
 RECOVERY_FOLDER = ".cce-zettel-recovery"
 RECOVERY_SCHEMA = "cce.zettel-note-recovery.v1"
@@ -82,6 +84,42 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _valid_filename(name: Any) -> bool:
+    return (
+        isinstance(name, str)
+        and Path(name).name == name
+        and name.endswith(".md")
+        and len(name.encode("utf-8")) <= FILENAME_BYTES
+        and not any(char in name for char in ("\\", "\x00", "\n", "\r"))
+    )
+
+
+def _valid_digest(value: Any) -> bool:
+    return isinstance(value, str) and _DIGEST.fullmatch(value) is not None
+
+
+def _validate_planned(planned: dict[str, dict[str, Any]]) -> None:
+    identities: set[str] = set()
+    callers: set[str] = set()
+    for name, entry in planned.items():
+        if not _valid_filename(name):
+            raise ValueError("invalid incoming filename for Zettel ownership")
+        if (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("id"), str)
+            or not _ID.fullmatch(entry["id"])
+            or not _valid_digest(entry.get("caller_digest"))
+            or not _valid_digest(entry.get("sha256"))
+            or not isinstance(entry.get("data"), bytes)
+            or hashlib.sha256(entry["data"]).hexdigest() != entry["sha256"]
+        ):
+            raise ValueError("invalid incoming Zettel identity or bytes")
+        if entry["id"] in identities or entry["caller_digest"] in callers:
+            raise ValueError("duplicate incoming Zettel identity")
+        identities.add(entry["id"])
+        callers.add(entry["caller_digest"])
+
+
 def _read_manifest(root: Path) -> dict[str, Any]:
     path = root / MANIFEST_NAME
     _no_symlinks(path)
@@ -97,20 +135,19 @@ def _read_manifest(root: Path) -> dict[str, Any]:
         or not isinstance(data.get("files"), dict)
     ):
         raise ValueError("unsupported Zettel ownership manifest")
+    if data["state"] == "writing" and data.get("creation_journal") != CREATION_JOURNAL:
+        raise ValueError("interrupted Zettel manifest has no exclusive-creation proof")
     identities: set[str] = set()
+    callers: set[str] = set()
     names: set[str] = set()
     for name, entry in data["files"].items():
         if (
-            not isinstance(name, str)
-            or Path(name).name != name
-            or not name.endswith(".md")
-            or len(name.encode("utf-8")) > FILENAME_BYTES
-            or any(char in name for char in ("\\", "\x00", "\n", "\r"))
+            not _valid_filename(name)
             or not isinstance(entry, dict)
             or not isinstance(entry.get("id"), str)
             or not _ID.fullmatch(entry["id"])
-            or not isinstance(entry.get("sha256"), str)
-            or not _DIGEST.fullmatch(entry["sha256"])
+            or not _valid_digest(entry.get("sha256"))
+            or ("caller_digest" in entry and not _valid_digest(entry["caller_digest"]))
         ):
             raise ValueError("invalid file entry in Zettel ownership manifest")
         previous = entry.get("previous_sha256")
@@ -120,11 +157,46 @@ def _read_manifest(root: Path) -> dict[str, Any]:
             or not _DIGEST.fullmatch(previous)
         ):
             raise ValueError("invalid previous hash in Zettel ownership manifest")
-        if entry["id"] in identities or folded(name) in names:
+        if "creation_pending" in entry and (
+            data["state"] != "writing" or entry["creation_pending"] is not True
+        ):
+            raise ValueError("invalid creation state in Zettel ownership manifest")
+        created = entry.get("created_inode")
+        if created is not None and (
+            not entry.get("creation_pending")
+            or not isinstance(created, dict)
+            or set(created) != {"device", "inode"}
+            or any(type(value) is not int or not 0 <= value < 2**128 for value in created.values())
+        ):
+            raise ValueError("invalid creation proof in Zettel ownership manifest")
+        caller = entry.get("caller_digest")
+        if (
+            entry["id"] in identities
+            or folded(name) in names
+            or caller is not None
+            and caller in callers
+        ):
             raise ValueError("duplicate identity or filename in Zettel ownership manifest")
         identities.add(entry["id"])
+        if caller is not None:
+            callers.add(caller)
         names.add(folded(name))
     return data
+
+
+def _check_recorded_file(path: Path, found: str, owned: dict[str, Any]) -> None:
+    if owned.get("creation_pending") and found != owned.get("previous_sha256"):
+        # A planned hash is not evidence of ownership: a foreign file can have
+        # identical bytes. Only a successfully journaled exclusive creation can
+        # establish the new inode during an interrupted batch.
+        info = path.stat(follow_symlinks=False)
+        created = {"device": info.st_dev, "inode": info.st_ino}
+        if not stat.S_ISREG(info.st_mode) or owned.get("created_inode") != created:
+            raise ValueError(
+                f"{path.name}: missing or mismatched creation proof; preserving the file"
+            )
+    if found not in {owned["sha256"], owned.get("previous_sha256")}:
+        raise ValueError(f"{path.name} was edited after export; refusing overwrite")
 
 
 def _plan(
@@ -134,12 +206,17 @@ def _plan(
     _no_symlinks(folder)
     previous = _read_manifest(root)
     entries = {path.name: path for path in folder.iterdir()} if folder.is_dir() else {}
-    count = len(set(entries) | set(planned))
+    count = len(set(entries) | set(previous["files"]) | set(planned))
     if count > max_entries:
         raise ValueError(
             f"{count} retained and incoming entries exceed the {max_entries} folder cap"
         )
     by_id = {entry["id"]: name for name, entry in previous["files"].items()}
+    by_caller = {
+        entry["caller_digest"]: name
+        for name, entry in previous["files"].items()
+        if "caller_digest" in entry
+    }
     owners = {name: dict(entry) for name, entry in previous["files"].items()}
     if previous["state"] == "writing":
         # A new batch can omit an interrupted update. Retain whichever previously
@@ -149,15 +226,21 @@ def _plan(
                 continue
             actual = _digest(folder / name)
             if actual is not None:
-                if actual not in {entry["sha256"], entry.get("previous_sha256")}:
-                    raise ValueError(f"{name} was edited during an interrupted export")
+                _check_recorded_file(folder / name, actual, entry)
                 entry["sha256"] = actual
-            entry.pop("previous_sha256", None)
+                for field in ("previous_sha256", "creation_pending", "created_inode"):
+                    entry.pop(field, None)
+            # An absent, never-created name stays a pending reservation. Completing
+            # a different batch cannot turn that reservation into file ownership.
     observed: dict[str, str | None] = {}
     for name, entry in planned.items():
         if by_id.get(entry["id"]) not in (None, name):
             raise ValueError(
                 f"{entry['id']}: already written as {by_id[entry['id']]}; keep its title"
+            )
+        if by_caller.get(entry["caller_digest"]) not in (None, name):
+            raise ValueError(
+                f"{name}: caller identity already has a different filename; keep its title"
             )
         reserved = set(entries) | set(previous["files"]) | set(planned)
         collisions = sorted(
@@ -170,14 +253,15 @@ def _plan(
         owned = previous["files"].get(name)
         if owned is not None and owned["id"] != entry["id"]:
             raise ValueError(f"{name} already holds a different note")
+        if owned is not None and owned.get("caller_digest") != entry["caller_digest"]:
+            raise ValueError(f"{name}: caller identity differs or is absent from legacy ownership")
         if found is not None:
             if owned is None:
                 raise ValueError(
                     f"{name} already holds a different note or is not owned by the manifest"
                 )
-            if found not in {owned["sha256"], owned.get("previous_sha256")}:
-                raise ValueError(f"{name} was edited after export; refusing overwrite")
-        owners[name] = {key: entry[key] for key in ("id", "sha256")}
+            _check_recorded_file(folder / name, found, owned)
+        owners[name] = {key: entry[key] for key in ("id", "caller_digest", "sha256")}
         if found is not None and found != entry["sha256"]:
             owners[name]["previous_sha256"] = found
     return previous, owners, observed, count
@@ -192,7 +276,13 @@ def _bytes(manifest: dict[str, Any]) -> bytes:
     return data
 
 
-def _atomic_write(path: Path, data: bytes, *, exclusive: bool = False) -> None:
+def _atomic_write(
+    path: Path,
+    data: bytes,
+    *,
+    exclusive: bool = False,
+    on_created: Callable[[dict[str, int]], None] | None = None,
+) -> None:
     _no_symlinks(path)
     descriptor, temporary = tempfile.mkstemp(prefix=".cce-zettel-", dir=path.parent)
     temporary_path = Path(temporary)
@@ -201,6 +291,7 @@ def _atomic_write(path: Path, data: bytes, *, exclusive: bool = False) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
+            info = os.fstat(stream.fileno())
         if exclusive:
             try:
                 # Linking the completed temporary file creates the new name atomically
@@ -212,6 +303,9 @@ def _atomic_write(path: Path, data: bytes, *, exclusive: bool = False) -> None:
                 ) from None
         else:
             temporary_path.replace(path)
+        _sync_directory(path.parent)
+        if exclusive and on_created is not None:
+            on_created({"device": info.st_dev, "inode": info.st_ino})
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -281,6 +375,19 @@ def _sync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _make_directory(path: Path) -> None:
+    """Create the requested chain and sync each new name's containing directory."""
+    missing = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for directory in reversed(missing):
+        _no_symlinks(directory)
+        directory.mkdir(mode=0o700, exist_ok=True)
+        _sync_directory(directory.parent)
+
+
 def _restore_captured(captured: Path, target: Path) -> str:
     """Reattach the retained inode only to a free name; never replace an editor's file."""
     try:
@@ -296,7 +403,13 @@ def _restore_captured(captured: Path, target: Path) -> str:
     return "the prior file was restored"
 
 
-def _update_owned(root: Path, path: Path, entry: dict[str, Any], expected: str) -> str:
+def _update_owned(
+    root: Path,
+    path: Path,
+    entry: dict[str, Any],
+    expected: str,
+    on_created: Callable[[dict[str, int]], None],
+) -> str:
     """Capture the displaced inode, then publish exclusively; keep the inode indefinitely.
 
     An editor can keep writing through a descriptor opened before the capture. Its
@@ -316,6 +429,7 @@ def _update_owned(root: Path, path: Path, entry: dict[str, Any], expected: str) 
         "schema": RECOVERY_SCHEMA,
         "filename": path.name,
         "id": entry["id"],
+        "caller_digest": entry["caller_digest"],
         "previous_sha256": expected,
         "proposed_sha256": entry["sha256"],
         "captured_sha256": None,
@@ -335,7 +449,7 @@ def _update_owned(root: Path, path: Path, entry: dict[str, Any], expected: str) 
         _sync_directory(slot)
         if receipt["captured_sha256"] != expected:
             raise ValueError("captured note changed during export")
-        _atomic_write(path, entry["data"], exclusive=True)
+        _atomic_write(path, entry["data"], exclusive=True, on_created=on_created)
         _sync_directory(path.parent)
     except BaseException as error:
         # A signal or late filesystem error can arrive after rename landed but
@@ -357,9 +471,10 @@ def write_owned_notes(
 ) -> dict[str, Any]:
     """Preflight the whole batch, retain displaced inodes, then publish new names exclusively.
 
-    A pending manifest permits an interrupted write to resume from either recorded hash.
+    Pending updates retain the old hash; new inodes require exclusive-creation proof.
     Files absent from the current batch are retained; no output is deleted.
     """
+    _validate_planned(planned)
     root = authorize_destination(destination)
     _previous, _owners, initial, _count = _plan(root, planned, max_entries)
     _reserve_recovery(
@@ -370,7 +485,7 @@ def write_owned_notes(
             if initial[name] is not None and initial[name] != planned[name]["sha256"]
         ],
     )  # ordinary refusal does not create any output
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _make_directory(root)
     lock_path = root / LOCK_NAME
     _no_symlinks(lock_path)
     try:
@@ -389,14 +504,22 @@ def write_owned_notes(
             raise ValueError("another Zettel export owns this destination") from None
         authorize_destination(root)
         previous, owners, observed, count = _plan(root, planned, max_entries)
+        complete_files = {
+            name: (
+                {key: entry[key] for key in ("id", "caller_digest", "sha256")}
+                if name in planned
+                else dict(entry)
+            )
+            for name, entry in owners.items()
+        }
+        still_pending = any(entry.get("creation_pending") for entry in complete_files.values())
         complete = {
             "schema": MANIFEST_SCHEMA,
-            "state": "complete",
-            "files": {
-                name: {key: value for key, value in entry.items() if key != "previous_sha256"}
-                for name, entry in owners.items()
-            },
+            "state": "writing" if still_pending else "complete",
+            "files": complete_files,
         }
+        if still_pending:
+            complete["creation_journal"] = CREATION_JOURNAL
         final_bytes = _bytes(complete)
         changed = [name for name in planned if observed[name] != planned[name]["sha256"]]
         retained = _reserve_recovery(
@@ -404,19 +527,38 @@ def write_owned_notes(
         )
         captured = []
         if changed:
-            pending = {"schema": MANIFEST_SCHEMA, "state": "writing", "files": owners}
+            for name in changed:
+                owners[name]["creation_pending"] = True
+            pending = {
+                "schema": MANIFEST_SCHEMA,
+                "state": "writing",
+                "creation_journal": CREATION_JOURNAL,
+                "files": owners,
+            }
             _atomic_write(root / MANIFEST_NAME, _bytes(pending))
             folder = root / NOTES_FOLDER
-            folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _make_directory(folder)
+
+            def record_creation(identity: dict[str, int]) -> None:
+                owners[name]["created_inode"] = identity
+                _atomic_write(root / MANIFEST_NAME, _bytes(pending))
+
             for name in changed:
                 previous_digest = observed[name]
                 if _digest(folder / name) != previous_digest:
                     raise ValueError(f"{name} changed during export; refusing overwrite")
                 if previous_digest is None:
-                    _atomic_write(folder / name, planned[name]["data"], exclusive=True)
+                    _atomic_write(
+                        folder / name,
+                        planned[name]["data"],
+                        exclusive=True,
+                        on_created=record_creation,
+                    )
                 else:
                     captured.append(
-                        _update_owned(root, folder / name, planned[name], previous_digest)
+                        _update_owned(
+                            root, folder / name, planned[name], previous_digest, record_creation
+                        )
                     )
         if previous != complete or changed or not (root / MANIFEST_NAME).exists():
             _atomic_write(root / MANIFEST_NAME, final_bytes)

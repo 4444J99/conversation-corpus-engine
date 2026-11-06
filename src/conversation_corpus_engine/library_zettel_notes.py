@@ -486,7 +486,7 @@ def build_notes(library: Library, zettels: list[dict[str, Any]]) -> list[Note]:
 def write_notes(notes: list[Note], destination: Path) -> dict[str, Any]:
     """Write the notes under `destination/notes/zettel/`, changing only what differs.
 
-    A re-run with the same envelope rewrites nothing. A file that holds a different note, or an
+    A re-run with the same rendered notes rewrites nothing. A file that holds a different note, or an
     older file for the same id under another title, is refused before any file is touched.
     """
     root = authorize_destination(destination)

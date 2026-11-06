@@ -1266,8 +1266,13 @@ def test_actual_recovery_git_worktree_is_refused_before_source_reads(tmp_path, m
 def test_hard_interruption_keeps_recovery_reachable_and_a_retry_can_complete(tmp_path):
     root = tmp_path / "wiki"
     name = "Synthetic.md"
-    old = {"id": "20260304-aaaaaa", "data": b"old note", "sha256": sha("old note")}
-    new = {"id": old["id"], "data": b"new note", "sha256": sha("new note")}
+    old = {
+        "id": "20260304-aaaaaa",
+        "caller_digest": sha("synthetic-1"),
+        "data": b"old note",
+        "sha256": sha("old note"),
+    }
+    new = {**old, "data": b"new note", "sha256": sha("new note")}
     library_zettel_files.write_owned_notes(root, {name: old}, max_entries=1000)
     script = """
 import json, os, sys
@@ -1306,8 +1311,18 @@ files.write_owned_notes(root, {name: entry}, max_entries=1000)
 def test_deleted_owned_name_remains_reserved_in_the_manifest(tmp_path, original_title, new_title):
     root = tmp_path / "wiki"
     old_name, new_name = original_title + ".md", new_title + ".md"
-    old = {"id": "20260304-aaaaaa", "data": b"old note", "sha256": sha("old note")}
-    new = {"id": "20260304-bbbbbb", "data": b"new note", "sha256": sha("new note")}
+    old = {
+        "id": "20260304-aaaaaa",
+        "caller_digest": sha("synthetic-1"),
+        "data": b"old note",
+        "sha256": sha("old note"),
+    }
+    new = {
+        "id": "20260304-bbbbbb",
+        "caller_digest": sha("synthetic-2"),
+        "data": b"new note",
+        "sha256": sha("new note"),
+    }
     library_zettel_files.write_owned_notes(root, {old_name: old}, max_entries=1000)
     (root / "notes/zettel" / old_name).unlink()
     before = snapshot(root)
