@@ -1,14 +1,20 @@
-"""A fence cut by a split closes and reopens in the container it was opened in.
+"""A fence cut by a split closes and reopens at the indentation it was opened with.
 
 `FenceTracker` is flat: it keeps the opener's marker, not where the opener sat. A bare column-0
 closing line does not close a fence that lives inside a list item. It leaves the item, which ends
 the fence, and then opens a new top-level fence that swallows everything after the cut, the
-"Next part" link of a vault note included. With ``container_fences`` (CommonMark output) the part
-closes with the opener's own indentation and the next part reopens in an equivalent container.
+"Next part" link of a vault note included. With ``container_fences`` (CommonMark output) a fence
+whose opener is indented one to three plain spaces, CommonMark's own limit for a fence relative to
+its container, closes and reopens at that indentation.
 
-Every case below is split, rejoined byte for byte, and each part is parsed by the CommonMark
-parser the packager tests use: no part may end inside an open fence, which shows as the trailing
-navigation link failing to render as a link.
+Everything else keeps the column-0 lines: no indent, four columns or more (indented code in
+CommonMark, which `FenceTracker` still reads as an opener), tabs and any other whitespace. The
+flat tracker and CommonMark can disagree about which line opened a fence there, and an indented
+closer then leaves a real fence open where the column-0 one happened to close it.
+
+Every container-aware case is split, rejoined byte for byte, and each part is parsed by the
+CommonMark parser the packager tests use: no part may end inside an open fence, which shows as the
+trailing navigation link failing to render as a link.
 """
 
 from __future__ import annotations
@@ -19,14 +25,10 @@ import pytest
 from markdown_it import MarkdownIt
 from markdown_it.token import Token
 
-from conversation_corpus_engine.archive_split import (
-    MAX_FENCE_INDENT,
-    Chunk,
-    rejoin,
-    split_text,
-    utf8_size,
-)
+from conversation_corpus_engine.archive_split import Chunk, rejoin, split_text, utf8_size
 
+NO_BREAK_SPACE = chr(0xA0)
+IDEOGRAPHIC_SPACE = chr(0x3000)
 LIMIT = 1024  # small, so one fenced block is cut into several parts
 NAV = "Part 1 of 3 - [Next part](next.md)"
 PARSER = MarkdownIt("commonmark", {"html": True})
@@ -49,20 +51,31 @@ def _document(
     return eol.join(lines)
 
 
+# Fences whose opener is indented one to three plain spaces: closed and reopened in place.
 CASES = {
     "plain": _document([], ""),
+    "top-level-tilde": _document([], "", marker="~~~"),
+    "top-level-indent-1": _document([], " "),
+    "top-level-indent-2": _document([], "  "),
     "list-item-indent-2": _document(["- item"], "  "),
     "list-item-indent-3": _document(["1. item"], "   "),
-    "list-item-indent-4": _document(["- item"], "    "),
     "tight-list": _document(["- first", "- second"], "  ", tail=["- third", "after"]),
-    "nested-list-width-4": _document(["- outer", "  - inner"], "    "),
-    "nested-list-width-6": _document(["- a", "  - b", "    - c"], "      "),
     "tilde-fence": _document(["- item"], "  ", marker="~~~"),
-    "top-level-tilde": _document([], "", marker="~~~"),
     "info-string": _document(["- item"], "  ", info="python linenos=true"),
     "closer-longer-than-opener": _document(["- item"], "  ", closer="`````"),
     "crlf": _document(["- item"], "  ", eol="\r\n"),
-    "tab-indented-fence": _document(["- item"], "\t"),
+}
+# Fences the splitter keeps closing and reopening at column 0, as before the flag existed.
+COLUMN_ZERO = {
+    "list-item-indent-4": _document(["- item"], "    "),
+    "nested-list-width-4": _document(["- outer", "  - inner"], "    "),
+    "nested-list-width-6": _document(["- a", "  - b", "    - c"], "      "),
+    "wide-indent-30": _document([], " " * 30),
+    "tab": _document(["- item"], "\t"),
+    "space-then-tab": _document(["- item"], " \t"),
+    "form-feed": _document([], "\x0c"),
+    "ideographic-space": _document([], IDEOGRAPHIC_SPACE),
+    "no-break-space": _document([], NO_BREAK_SPACE),
 }
 
 
@@ -79,6 +92,10 @@ def _fence_text(tokens: list[Token]) -> str:
     return "\n".join(token.content for token in tokens if token.type == "fence")
 
 
+def _renders_next_link(chunk: Chunk) -> bool:
+    return "next.md" in _links(PARSER.parse(f"{chunk.text()}\n{NAV}\n"))
+
+
 def _assert_every_part_renders(text: str, chunks: list[Chunk]) -> None:
     assert len(chunks) > 2 and any(chunk.prefix for chunk in chunks), "no fence was cut"
     assert rejoin(chunks) == text
@@ -91,15 +108,27 @@ def _assert_every_part_renders(text: str, chunks: list[Chunk]) -> None:
 
 
 @pytest.mark.parametrize("name", CASES)
-def test_a_cut_fence_closes_and_reopens_in_its_own_container(name: str) -> None:
+def test_a_cut_fence_closes_and_reopens_at_its_own_indentation(name: str) -> None:
     text = CASES[name]
     _assert_every_part_renders(text, split_text(text, LIMIT, container_fences=True))
 
 
 @pytest.mark.parametrize("name", ["plain", "top-level-tilde"])
-def test_a_top_level_fence_is_unchanged_by_the_flag(name: str) -> None:
+def test_a_fence_opened_at_column_zero_is_unchanged_by_the_flag(name: str) -> None:
     text = CASES[name]
     assert split_text(text, LIMIT, container_fences=True) == split_text(text, LIMIT)
+
+
+@pytest.mark.parametrize("name", COLUMN_ZERO)
+def test_other_openers_keep_the_column_zero_lines_with_the_flag(name: str) -> None:
+    text = COLUMN_ZERO[name]
+    chunks = split_text(text, LIMIT, container_fences=True)
+    assert chunks == split_text(text, LIMIT)
+    assert any(chunk.prefix for chunk in chunks), "no fence was cut"
+    assert {chunk.prefix for chunk in chunks} == {"", "```"}
+    assert {chunk.suffix for chunk in chunks} == {"", "```"}
+    assert rejoin(chunks) == text
+    assert all(utf8_size(chunk.text()) <= LIMIT for chunk in chunks)
 
 
 def test_without_the_flag_the_synthetic_lines_stay_at_column_zero() -> None:
@@ -110,28 +139,15 @@ def test_without_the_flag_the_synthetic_lines_stay_at_column_zero() -> None:
     assert split_text(CASES["list-item-indent-2"], LIMIT, container_fences=False) == chunks
 
 
-def test_a_closer_repeats_the_opener_indentation_and_a_reopener_nests_wide_fences() -> None:
-    narrow = split_text(CASES["list-item-indent-2"], LIMIT, container_fences=True)
-    assert {chunk.suffix for chunk in narrow} == {"", "  ```"}
-    assert {chunk.prefix for chunk in narrow} == {"", "  ```"}
-    wide = split_text(CASES["nested-list-width-6"], LIMIT, container_fences=True)
-    assert {chunk.suffix for chunk in wide} == {"", "      ```"}
-    assert {chunk.prefix for chunk in wide} == {"", "- - - ```"}
-
-
-def test_an_indent_wider_than_the_limit_falls_back_to_column_zero() -> None:
-    at_limit = " " * MAX_FENCE_INDENT
-    chunks = split_text(_document([], at_limit), LIMIT, container_fences=True)
-    assert {chunk.suffix for chunk in chunks} == {"", at_limit + "```"}
-    assert {chunk.prefix for chunk in chunks} == {"", "- " * (MAX_FENCE_INDENT // 2) + "```"}
-    assert all(utf8_size(chunk.text()) <= LIMIT for chunk in chunks)
-
-    text = _document([], " " * (MAX_FENCE_INDENT + 1))
-    chunks = split_text(text, LIMIT, container_fences=True)
-    assert {chunk.suffix for chunk in chunks} == {"", "```"}
-    assert {chunk.prefix for chunk in chunks} == {"", "```"}
-    assert rejoin(chunks) == text
-    assert all(utf8_size(chunk.text()) <= LIMIT for chunk in chunks)
+@pytest.mark.parametrize(
+    ("name", "indent"),
+    [("top-level-indent-1", " "), ("list-item-indent-2", "  "), ("list-item-indent-3", "   ")],
+)
+def test_a_closer_and_a_reopener_repeat_the_opener_indentation(name: str, indent: str) -> None:
+    chunks = split_text(CASES[name], LIMIT, container_fences=True)
+    marker = "```"
+    assert {chunk.suffix for chunk in chunks} == {"", indent + marker}
+    assert {chunk.prefix for chunk in chunks} == {"", indent + marker}
 
 
 def test_each_fence_uses_its_own_indentation() -> None:
@@ -149,6 +165,33 @@ def test_a_fence_that_is_not_cut_is_left_alone() -> None:
     chunks = split_text(text, LIMIT, container_fences=True)
     assert len(chunks) > 1 and not any(chunk.prefix or chunk.suffix for chunk in chunks)
     assert rejoin(chunks) == text
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"~~~\n{NO_BREAK_SPACE}~~~\n    ~~~\n" + "code line\n" * 60 + "    ~~~\n~~~\nafter\n",
+        f"~~~\n{NO_BREAK_SPACE}~~~\n" + "x\n" * 3 + "    ~~~\n" + "code line\n" * 60,
+    ],
+    ids=["opener-after-a-misread-closer", "opener-at-the-end"],
+)
+@pytest.mark.parametrize("container_fences", [False, True])
+def test_an_opener_the_tracker_reads_and_commonmark_does_not_cannot_swallow_the_link(
+    text: str, container_fences: bool
+) -> None:
+    # A no-break space is whitespace to the flat tracker (``\s*``) but not indentation to
+    # CommonMark. So the tracker takes the second line for the first fence's closer and the
+    # four-column line after it for a new opener, while CommonMark keeps the first fence open all
+    # along. Only a column-0 closer closes that real fence: the indented closer this splitter once
+    # wrote for the four-column opener left it open and swallowed the navigation link.
+    chunks = split_text(text, 512, container_fences=container_fences)
+    assert len(chunks) > 1 and rejoin(chunks) == text
+    assert _renders_next_link(chunks[0])
+    if container_fences:
+        legacy = split_text(text, 512)
+        assert [chunk.body for chunk in chunks] == [chunk.body for chunk in legacy]
+        for new, old in zip(chunks, legacy, strict=True):
+            assert _renders_next_link(new) or not _renders_next_link(old)
 
 
 @pytest.mark.parametrize(

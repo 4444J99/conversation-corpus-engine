@@ -211,8 +211,8 @@ def test_the_obsidian_packager_accepts_a_fence_that_crosses_a_full_profile_part(
 @pytest.mark.parametrize(
     ("head", "indent"),
     [("- item", "  "), ("1. item", "   ")],
-    # The block renderer re-fences anything indented four columns or more as literal code, so
-    # these are the list shapes whose fence reaches the splitter as a fence.
+    # A fence indented one to three spaces is closed and reopened at that indentation; openers at
+    # four columns or more keep the column-0 lines (docs/knowledge-library.md has the figures).
     ids=["bullet-item", "ordered-item"],
 )
 def test_the_obsidian_packager_accepts_a_list_item_fence_cut_by_a_full_profile_part(
@@ -269,8 +269,10 @@ def test_the_obsidian_packager_accepts_a_list_item_fence_cut_by_a_full_profile_p
 def test_the_obsidian_packager_accepts_a_fence_the_splitter_does_not_track(
     obsidian: ModuleType, tmp_path: Path, opener: str, lead: str, closer: str
 ) -> None:
-    # The splitter does not track these shapes (see its tests); the block renderer re-fences them
-    # as literal code first, so a long one still splits into notes whose links render.
+    # The splitter does not track these shapes (see its tests). In this one document the block
+    # renderer re-fences them as literal code first, so they split into notes whose links render;
+    # that is not general: other documents with a marker-line fence still fail, as the docs
+    # state (13 of 28 in a seeded run).
     code = "\n".join(lead + line for line in sentinel_lines("F", 900).splitlines())
     body = f"intro\n{opener}\n{code}\n{closer}\nafter\n"
     with Library.create(tmp_path / "library.sqlite") as library:
