@@ -56,6 +56,7 @@ MAX_URL_CHARS = 8192
 MAX_TITLE_CHARS = 512
 CHUNK = 64 * 1024
 MAX_FINDINGS = 4096
+MAX_CANDIDATES = 3
 FAILURE_CLASSES = (
     "dead_link",
     "login_wall",
@@ -88,7 +89,7 @@ REQUIRED_FIELDS = ROW_FIELDS - {"title", "tier"}
 _ID = re.compile(r"pg_[0-9a-f]{24}")
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
 _URL = re.compile(r"[hH][tT][tT][pP][sS]?://\S+")
-_STAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+_STAMP = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 _TRACKING = frozenset(
     {
         "utm_source",
@@ -188,9 +189,12 @@ def check_row(row: Any) -> dict[str, Any]:
     missing = sorted(REQUIRED_FIELDS - row.keys())
     if missing:
         raise RowRefused(f"missing field: {missing[0]}")
-    unknown = sorted(row.keys() - ROW_FIELDS)
+    unknown = row.keys() - ROW_FIELDS
     if unknown:
-        raise RowRefused(f"unexpected field: {unknown[0]}")
+        # Field names are row-supplied data and may contain captured text or secrets.
+        raise RowRefused(
+            f"row has {len(unknown)} unexpected field{'s' if len(unknown) != 1 else ''}"
+        )
     if row["schema"] != SHARD_SCHEMA:
         raise RowRefused(f"schema must be {SHARD_SCHEMA}")
     identity = row["id"]
@@ -375,6 +379,13 @@ def _rank(row: dict[str, Any], relative: str) -> tuple[bool, str, str, str, str]
     )
 
 
+def _keep(pool: list[_Candidate], candidate: _Candidate) -> None:
+    """Keep the existing winning order, plus a bounded set of alternate source rows."""
+    pool.append(candidate)
+    pool.sort(key=lambda item: item.rank, reverse=True)
+    del pool[MAX_CANDIDATES:]
+
+
 def _finding(
     report: dict[str, Any], relative: str, code: str, detail: str = "", line: int = 0
 ) -> None:
@@ -495,9 +506,9 @@ def iter_web_captures(
 
     `report` is filled as the iterator is consumed: `sources` (one entry per declared source and
     one per shard, with the shard's SHA-256), `counts` and `findings`. The pages are chosen in a
-    first pass that keeps only where each page's best row is, so memory does not grow with the
-    text; a second pass reads just those rows. A shard that changed between the passes yields a
-    finding for each page it can no longer vouch for.
+    first pass that keeps only the best three row locators per page, so memory does not grow
+    with the text; a second pass reads them best first. A shard that changed between the passes
+    yields a finding and the next retained candidate is tried. Exhaustion is explicit.
     """
     report = report if report is not None else {}
     check = check_callback or (lambda: None)
@@ -510,7 +521,7 @@ def iter_web_captures(
     counts = report.setdefault("counts", {})
     for key in ("files", "rows", "captured", "failed", "refused", "duplicates", "records"):
         counts.setdefault(key, 0)
-    best: dict[str, _Candidate] = {}
+    best: dict[str, list[_Candidate]] = {}
     seen: dict[Path, os.stat_result] = {}
     for declared in sources:
         check()
@@ -569,13 +580,14 @@ def iter_web_captures(
                         continue
                     counts["captured" if row["status"] == "captured" else "failed"] += 1
                     rank = _rank(row, relative)
-                    previous = best.get(row["id"])
-                    if previous is None and max_records is not None and len(best) >= max_records:
+                    pool = best.get(row["id"])
+                    if pool is None and max_records is not None and len(best) >= max_records:
                         raise ValueError("library record limit exceeded during web capture scan")
-                    if previous is not None:
+                    if pool is not None:
                         counts["duplicates"] += 1
-                    if previous is None or rank > previous.rank:
-                        best[row["id"]] = _Candidate(rank, path, offset, number, relative)
+                    else:
+                        pool = best[row["id"]] = []
+                    _keep(pool, _Candidate(rank, path, offset, number, relative))
                 try:
                     after = path.stat()
                 except OSError as error:
@@ -601,26 +613,43 @@ def iter_web_captures(
                 }
             )
     for identity in sorted(best):
-        check()
-        candidate = best[identity]
-        info = seen[candidate.path]
-        try:
-            handle, now = _open(candidate.path)
-            with handle:
-                if (info.st_size, info.st_mtime_ns, info.st_ino) != (
-                    now.st_size,
-                    now.st_mtime_ns,
-                    now.st_ino,
-                ):
-                    raise RowRefused("the shard changed after it was scanned")
-                handle.seek(candidate.offset)
-                row = parse_row(handle.readline(max_row_bytes + 1))
-                if row["id"] != identity or _rank(row, candidate.relative) != candidate.rank:
-                    raise RowRefused("the row changed after it was scanned")
-        except (OSError, ValueError, RecursionError) as error:
-            reason = str(error) if isinstance(error, RowRefused) else type(error).__name__
-            counts["refused"] += 1
-            _finding(report, candidate.relative, "malformed_row", reason, candidate.line)
-            continue
-        counts["records"] += 1
-        yield conversation_from_row(row, candidate.relative)
+        for candidate in best[identity]:
+            check()
+            try:
+                row = _reread(candidate, identity, seen[candidate.path], max_row_bytes)
+            except (OSError, ValueError, RecursionError) as error:
+                reason = str(error) if isinstance(error, RowRefused) else type(error).__name__
+                counts["refused"] += 1
+                _finding(report, candidate.relative, "malformed_row", reason, candidate.line)
+                continue
+            counts["records"] += 1
+            yield conversation_from_row(row, candidate.relative)
+            break
+        else:
+            first = best[identity][0]
+            _finding(
+                report,
+                first.relative,
+                "page_unavailable",
+                "no retained row of the page could be read again",
+                first.line,
+            )
+
+
+def _reread(
+    candidate: _Candidate, identity: str, scanned: os.stat_result, max_row_bytes: int
+) -> dict[str, Any]:
+    """Read a candidate only while its shard and exact ranked row match the first pass."""
+    handle, now = _open(candidate.path)
+    with handle:
+        if (scanned.st_size, scanned.st_mtime_ns, scanned.st_ino) != (
+            now.st_size,
+            now.st_mtime_ns,
+            now.st_ino,
+        ):
+            raise RowRefused("the shard changed after it was scanned")
+        handle.seek(candidate.offset)
+        row = parse_row(handle.readline(max_row_bytes + 1))
+        if row["id"] != identity or _rank(row, candidate.relative) != candidate.rank:
+            raise RowRefused("the row changed after it was scanned")
+    return row
