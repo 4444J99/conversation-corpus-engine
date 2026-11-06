@@ -43,12 +43,16 @@ def database_path(paths: ArchivePaths) -> Path:
     return paths.database
 
 
+def fts_terms(text: str) -> tuple[list[str], list[str]]:
+    """The quoted phrases (stripped) and the loose words of free text, in ``fts_query`` order."""
+    phrases = [p.strip() for p in PHRASE_RE.findall(text) if WORD_RE.search(p)]
+    return phrases, WORD_RE.findall(PHRASE_RE.sub(" ", text))
+
+
 def fts_query(text: str) -> str:
     """Turn free text into a safe FTS5 query: quoted phrases and quoted words, all ANDed."""
-    phrases = [f'"{p.strip()}"' for p in PHRASE_RE.findall(text) if WORD_RE.search(p)]
-    remainder = PHRASE_RE.sub(" ", text)
-    words = [f'"{w}"' for w in WORD_RE.findall(remainder)]
-    return " ".join([*phrases, *words])
+    phrases, words = fts_terms(text)
+    return " ".join([*(f'"{p}"' for p in phrases), *(f'"{w}"' for w in words)])
 
 
 def build_database(paths: ArchivePaths, authorization: CorpusWriteAuthorization) -> dict[str, Any]:
