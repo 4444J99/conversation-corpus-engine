@@ -11,6 +11,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import unicodedata
 import zlib
 from collections import Counter
 from pathlib import Path
@@ -50,6 +51,7 @@ from conversation_corpus_engine.attribution_rules import (
     read_ledger,
     sample_digest,
     sample_text,
+    text_key,
 )
 from conversation_corpus_engine.cli import build_parser, main
 from conversation_corpus_engine.library_store import Library
@@ -69,6 +71,7 @@ SAMPLE_KEYS = {
     "excerpted",
     "text",
     "text_sha256",
+    "text_key",
     "verdict",
     "partial",
 }
@@ -485,6 +488,7 @@ def test_fabricated_ledger_rows_count_for_nothing_in_report_and_apply(
                 stratum="S",
                 sample_digest="a" * 64,
                 text_sha256="b" * 64,
+                text_key="b" * 64,
                 drawn=100,
             )
             for index in range(100)
@@ -774,7 +778,7 @@ def sample_lines(path: Path) -> list[dict]:
 
 def sample_header(path: Path) -> dict:
     header, *_ = sample_lines(path)
-    assert header["schema"] == "cce.attribution-review-sample-header.v5"
+    assert header["schema"] == "cce.attribution-review-sample-header.v6"
     return header
 
 
@@ -848,7 +852,7 @@ def test_review_sample_streams_to_standard_output_and_reports_the_short_span_bia
     assert code == 0
     assert all(json.loads(line)["schema"] for line in out.splitlines())
     header, *body = map(json.loads, out.splitlines())
-    assert header["schema"] == "cce.attribution-review-sample-header.v5"
+    assert header["schema"] == "cce.attribution-review-sample-header.v6"
     summary = json.loads(err.strip().splitlines()[-1])
     assert summary["sampled"] == len(body) == header["rows"]
     assert summary["sample_digest"] == header["sample_digest"] and header["owner_id"] == "rob"
@@ -1243,6 +1247,7 @@ def test_review_sample_hides_only_spans_the_owner_already_reviewed(
                 stratum="S",
                 sample_digest="a" * 64,
                 text_sha256="b" * 64,
+                text_key="b" * 64,
                 drawn=50,
             )
             for index in range(50)
@@ -1776,6 +1781,7 @@ def test_answers_to_copies_of_a_text_forged_into_a_ledger_still_count_once(
             stratum=stratum,
             sample_digest="a" * 64,
             text_sha256=hashlib.sha256(text.encode()).hexdigest(),
+            text_key=text_key(text),
             drawn=50,
         )
         for text, spans in found.items()
@@ -1788,6 +1794,76 @@ def test_answers_to_copies_of_a_text_forged_into_a_ledger_still_count_once(
     short = next(item for item in report["rules"] if item["rule"] == "typed_prefix")["strata"]["S"]
     assert (short["reviewed"], short["confirmed"], short["eligible"]) == (50, 50, False)
     assert report["gate"]["duplicate_text_rows"] == 50
+
+
+SPELLED_SENTENCE = "The quiet harbour opens at dawn and the boats go out slowly."
+
+
+def spelled_apart(sentence: str, count: int) -> list[str]:
+    """`count` exact texts that all read as `sentence`: zero-width spaces at one place each."""
+    spellings = []
+    for index in range(count):
+        place, copies = index % len(sentence), 1 + index // len(sentence)
+        spellings.append(sentence[:place] + "\N{ZERO WIDTH SPACE}" * copies + sentence[place:])
+    assert len(set(spellings)) == count
+    return spellings
+
+
+def test_a_hundred_spellings_of_one_sentence_are_drawn_once_and_counted_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = twin_text_library(
+        tmp_path / "store" / "g", spelled_apart(SPELLED_SENTENCE, 100), copies=1
+    )
+    ledger = tmp_path / "ledger.jsonl"
+    first = draw_and_record(capsys, library, ledger, tmp_path, "one")
+    assert len(first) == 1 and first[0]["text_key"] == text_key(SPELLED_SENTENCE)
+    assert draw_and_record(capsys, library, ledger, tmp_path, "two") == []
+    report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
+    short = next(item for item in report["rules"] if item["rule"] == "typed_prefix")["strata"]["S"]
+    assert (short["reviewed"], short["confirmed"], short["eligible"]) == (1, 1, False)
+    assert report["profile_eligible"] == []
+
+
+def test_a_no_on_one_spelling_rejects_every_other_spelling_of_the_text(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    bad = "The caf\N{LATIN SMALL LETTER E WITH ACUTE} opens at dawn and na\N{LATIN SMALL LETTER I WITH DIAERESIS}ve boats go out."
+    spellings = [
+        bad,
+        bad.replace("opens", "opens\N{ZERO WIDTH SPACE}"),
+        bad.replace(" ", "  ", 1),
+        bad.replace("dawn and", "dawn\r\nand"),
+        unicodedata.normalize("NFD", bad),
+        "\N{WORD JOINER}" + bad,
+    ]
+    good = [
+        f"Owner sentence {index} about the garden plan number {index * 3}." for index in range(99)
+    ]
+    library = twin_text_library(tmp_path / "store" / "g", [*good, *spellings], copies=1)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    rows = [row for row in sample_rows(sample) if row["rule"] == "typed_prefix"]
+    assert len(rows) == 100  # 99 sentences and ONE row for the six spellings of the bad one
+    answers_for(
+        sample,
+        answers,
+        lambda row: (
+            None
+            if row["rule"] != "typed_prefix"
+            else "no"
+            if row["text_key"] == text_key(bad)
+            else "yes"
+        ),
+    )
+    assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
+    entries, result = apply_entries(
+        capsys, library, tmp_path / "out.json", "--ledger", ledger, "--owner-id", "rob"
+    )
+    assert result["eligible_strata"] == ["typed_prefix:S"]  # 99 of 100 texts confirmed
+    texts = eligible_owner_texts(library, entries)
+    assert sorted(texts) == sorted(good)  # no spelling of the rejected text is eligible
+    assert result["spans_withheld_as_rejected_twin"] + result["spans_withheld_by_verdict"] >= 6
 
 
 def test_review_record_needs_the_sample_it_answers(
@@ -1866,7 +1942,7 @@ def test_ledger_rows_from_the_previous_rules_version_are_reported_as_stale(
     rewritten = tmp_path / "old-ledger.jsonl"
     rewritten.write_text(
         ledger.read_text(encoding="utf-8").replace(
-            "cce.attribution-rules@5", "cce.attribution-rules@4"
+            "cce.attribution-rules@6", "cce.attribution-rules@5"
         ),
         encoding="utf-8",
     )
@@ -1878,7 +1954,7 @@ def test_ledger_rows_from_the_previous_rules_version_are_reported_as_stale(
     )
     assert result["stale_rows"] == result["ledger_rows"] > 100
     assert result["eligible_strata"] == []
-    assert result["rules_version"] == "cce.attribution-rules@5"
+    assert result["rules_version"] == "cce.attribution-rules@6"
 
 
 def test_review_record_rejects_bad_answers_before_writing_anything(
@@ -2457,7 +2533,7 @@ def test_review_record_repairs_a_torn_ledger_and_says_so(
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
     run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
     answered(sample, answers, 1)
-    ledger.write_text('{"schema": "cce.attribution-review-ledger.v5", "rul', encoding="utf-8")
+    ledger.write_text('{"schema": "cce.attribution-review-ledger.v6", "rul', encoding="utf-8")
     code, out, err = record_answers(capsys, library, ledger, sample, answers, "--json")
     assert code == 0, err
     result = json.loads(out)

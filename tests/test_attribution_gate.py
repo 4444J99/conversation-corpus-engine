@@ -54,6 +54,7 @@ from conversation_corpus_engine.attribution_rules import (
     sample_header,
     sample_text,
     stratum_of,
+    text_key,
     to_annotation,
     validate_ledger_row,
 )
@@ -92,9 +93,15 @@ def ledger_row(
     **extra,
 ) -> dict:
     """A current-schema row of a one-row-per-span sample, unless the test says otherwise."""
-    options = {"sample_digest": SAMPLE_DIGEST, "text_sha256": text_hash(span_id), "drawn": 1}
+    options = {
+        "sample_digest": SAMPLE_DIGEST,
+        "text_sha256": text_hash(span_id),
+        "drawn": 1,
+    } | extra
+    # Unless a test says otherwise a row's text key is its text hash: the text IS its hash.
+    options.setdefault("text_key", options["text_sha256"])
     return build_ledger_row(
-        span_id, rule, verdict, reviewer, reviewed_at, stratum=stratum, **(options | extra)
+        span_id, rule, verdict, reviewer, reviewed_at, stratum=stratum, **options
     )
 
 
@@ -287,15 +294,15 @@ def test_rows_from_another_rules_version_or_an_older_schema_are_ignored_not_coun
     assert summary.strata[("typed_prefix", "S")].reviewed == 0
     assert (summary.rows, summary.stale_rows) == (102, 102)
     assert eligible_strata(summary) == frozenset()
-    assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v5"
-    assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v5"
+    assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v6"
+    assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v6"
 
 
-PREVIOUS_VERSION = "cce.attribution-rules@4"
+PREVIOUS_VERSION = "cce.attribution-rules@5"
 
 
 def test_rows_written_under_the_previous_rules_version_are_stale_and_never_counted() -> None:
-    assert RULES_VERSION == "cce.attribution-rules@5"
+    assert RULES_VERSION == "cce.attribution-rules@6"
     old = verdict_rows("typed_prefix", ["yes"] * 100, version=PREVIOUS_VERSION)
     summary = summarize(old)
     assert (summary.rows, summary.stale_rows) == (100, 100)
@@ -522,19 +529,22 @@ def test_a_ledger_row_binds_the_sample_the_text_and_the_drawn_count() -> None:
         "reviewed_at",
         "sample_digest",
         "text_sha256",
+        "text_key",
         "drawn",
     }
     for bad in (
         {"sample_digest": "xyz"},
         {"sample_digest": "D" * 64},
         {"text_sha256": "1" * 63},
+        {"text_key": "1" * 63},
+        {"text_key": "A" * 64},
         {"drawn": 0},
         {"drawn": True},
         {"drawn": "5"},
     ):
         with pytest.raises(ValueError, match="ledger"):
             ledger_row("a" * 32, "quote", "yes", OWNER_ID, STAMP, stratum="S", **bad)
-    for key in ("sample_digest", "text_sha256", "drawn"):
+    for key in ("sample_digest", "text_sha256", "text_key", "drawn"):
         without = {name: value for name, value in row.items() if name != key}
         with pytest.raises(ValueError, match="keys"):
             validate_ledger_row(without)
@@ -871,7 +881,7 @@ def test_the_gate_never_counts_more_texts_than_the_ledger_holds_distinct_text_ha
 def test_the_sampler_leaves_out_texts_already_reviewed_not_only_spans() -> None:
     first = ReviewSampler(per_stratum=100)
     offer_all(first, many_quotes(5))
-    reviewed = {(row["rule"], row["stratum"], row["text_sha256"]) for row in first.rows()[:2]}
+    reviewed = {(row["rule"], row["stratum"], row["text_key"]) for row in first.rows()[:2]}
     reviewed_texts = {row["text"] for row in first.rows()[:2]}
     # The same quoted lines again, in other messages: other span ids, same texts.
     twins = [
@@ -900,30 +910,36 @@ def test_the_exclusion_digest_also_names_the_text_hashes_of_the_excluded_rows() 
     assert exclusion_digest(swapped, OWNER_ID) != digest
 
 
-def test_the_rules_version_and_schemas_are_at_version_five_and_version_four_rows_are_stale() -> (
-    None
-):
-    assert RULES_VERSION == "cce.attribution-rules@5"
-    assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v5"
-    assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v5"
-    assert SAMPLE_HEADER_SCHEMA == "cce.attribution-review-sample-header.v5"
-    assert SAMPLE_SEED == "cce-attribution-review-v5"
+def test_the_rules_version_and_schemas_are_at_version_six_and_version_five_rows_are_stale() -> None:
+    assert RULES_VERSION == "cce.attribution-rules@6"
+    assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v6"
+    assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v6"
+    assert SAMPLE_HEADER_SCHEMA == "cce.attribution-review-sample-header.v6"
+    assert SAMPLE_SEED == "cce-attribution-review-v6"
     rows = verdict_rows("typed_prefix", ["yes"] * 100)
-    v4 = [{**row, "schema": "cce.attribution-review-ledger.v4"} for row in rows]
-    assert [validate_ledger_row(row)["schema"] for row in v4] == [row["schema"] for row in v4]
-    summary = summarize(v4)
-    assert (summary.rows, summary.stale_rows) == (100, 100)
-    assert summary.strata[("typed_prefix", "S")].reviewed == 0
-    assert eligible_strata(summary) == frozenset()
-    old_version = verdict_rows("typed_prefix", ["yes"] * 100, version="cce.attribution-rules@4")
+    for older in ("v4", "v5"):
+        # A row of an earlier ledger schema is read (never refused) and never counted.
+        aged = [{**row, "schema": f"cce.attribution-review-ledger.{older}"} for row in rows]
+        aged = [{key: value for key, value in row.items() if key != "text_key"} for row in aged]
+        assert [validate_ledger_row(row)["schema"] for row in aged] == [
+            row["schema"] for row in aged
+        ]
+        summary = summarize(aged)
+        assert (summary.rows, summary.stale_rows) == (100, 100)
+        assert summary.strata[("typed_prefix", "S")].reviewed == 0
+        assert eligible_strata(summary) == frozenset()
+    old_version = verdict_rows("typed_prefix", ["yes"] * 100, version="cce.attribution-rules@5")
     assert summarize(old_version).stale_rows == 100
     header, rows_drawn = drawn_sample()
-    v4_header = {**header, "schema": "cce.attribution-review-sample-header.v4"}
-    with pytest.raises(ValueError, match="draw a new sample"):
-        parse_sample(sample_lines(v4_header, rows_drawn))
-    v4_rows = [{**row, "schema": "cce.attribution-review-sample.v4"} for row in rows_drawn]
-    with pytest.raises(ValueError, match="draw a new sample"):
-        parse_sample(sample_lines(header, v4_rows))
+    for older in ("v4", "v5"):
+        old_header = {**header, "schema": f"cce.attribution-review-sample-header.{older}"}
+        with pytest.raises(ValueError, match="draw a new sample"):
+            parse_sample(sample_lines(old_header, rows_drawn))
+        old_rows = [
+            {**row, "schema": f"cce.attribution-review-sample.{older}"} for row in rows_drawn
+        ]
+        with pytest.raises(ValueError, match="draw a new sample"):
+            parse_sample(sample_lines(header, old_rows))
 
 
 def test_ledger_is_append_only_jsonl_and_refuses_symlinks(tmp_path: Path) -> None:
@@ -1150,10 +1166,12 @@ def test_sample_rows_show_only_the_span_its_rule_and_a_blank_verdict() -> None:
         "excerpted",
         "text",
         "text_sha256",
+        "text_key",
         "verdict",
         "partial",
     }
     assert row["text_sha256"] == text_digest(row["text"])
+    assert row["text_key"] == text_key(row["text"])
     assert row["schema"] == SAMPLE_SCHEMA and row["verdict"] is None and row["partial"] is False
     assert (row["rule"], row["stratum"], row["claim"]) == ("quote", "S", "third_party")
     assert row["rule_description"] == RULE_BY_ID["quote"].description
@@ -1327,6 +1345,7 @@ def test_a_tampered_or_hand_written_sample_is_refused() -> None:
     edited_text = {**rows[0], "text": "an edited quote"}
     edited_text["length"] = len(edited_text["text"])
     edited_text["text_sha256"] = text_digest(edited_text["text"])
+    edited_text["text_key"] = text_key(edited_text["text"])
     other_id = {**rows[1], "span_id": "9" * 32}
     other_stratum = {**rows[1], "stratum": "M"}
     stale_row = {**rows[1], "rules_version": "cce.attribution-rules@2"}

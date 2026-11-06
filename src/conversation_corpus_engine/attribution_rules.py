@@ -33,6 +33,7 @@ import itertools
 import json
 import os
 import re
+import sys
 import time
 import types
 import unicodedata
@@ -48,7 +49,7 @@ from .archive_provenance import INJECTED_TAGS, classify_user_turn
 from .archive_read_library import FAMILIES
 from .attribution import ATTRIBUTION_SCHEMA, text_digest
 
-RULES_VERSION = "cce.attribution-rules@5"
+RULES_VERSION = "cce.attribution-rules@6"
 
 OWNER = "owner"
 AGENT = "agent"
@@ -788,6 +789,50 @@ def rule_log_trace(context: MessageContext) -> list[Claim]:
                 claims.append((lines[members[0]][0], lines[members[-1]][1], "timestamped-log"))
         index = stop
     return claims
+
+
+# --- the visible text of a span: one notion of "the same text" ---------------------------------
+
+
+@functools.cache
+def _invisible() -> dict[int, None]:
+    """The code points deleted before two texts are compared: every format character (Unicode
+    category Cf: the zero-width space, joiners and non-joiner, U+2060, U+FEFF, the soft hyphen
+    U+00AD, bidirectional marks, tag characters) and every control character (Cc) that is not
+    whitespace. Built once, from the Unicode data of the running interpreter."""
+    return {
+        code: None
+        for code in range(sys.maxunicode + 1)
+        if unicodedata.category(chr(code)) in ("Cf", "Cc") and not chr(code).isspace()
+    }
+
+
+def delete_invisible(text: str) -> str:
+    """`text` without its format characters and non-whitespace control characters (they are
+    deleted, not replaced by a space, so a word cut by one is whole again)."""
+    return text.translate(_invisible())
+
+
+def visible_form(text: str) -> str:
+    """The text as a reader sees it, so that two spellings of one visible sentence are one text:
+    format characters and non-whitespace control characters deleted, NFKC-normalised (so
+    composed and decomposed accents, compatibility forms and non-breaking spaces agree), every
+    run of whitespace (line breaks of any kind, tabs, no-break and other spaces) read as one space,
+    the ends stripped. Case, punctuation, wording and invisible characters outside categories Cf
+    and Cc (for example U+034F or a variation selector) are not touched. Idempotent."""
+    form = " ".join(delete_invisible(unicodedata.normalize("NFKC", delete_invisible(text))).split())
+    for _ in range(4):  # deleting a character can let its neighbours combine
+        if unicodedata.is_normalized("NFKC", form):
+            break
+        form = " ".join(delete_invisible(unicodedata.normalize("NFKC", form)).split())
+    return form
+
+
+def text_key(text: str) -> str:
+    """SHA-256 of `visible_form(text)`: what the review gate counts as one text. A ledger row
+    still binds to the exact characters (`text_digest`); this key is only the notion of "the
+    same text" for counting, for leaving a text out of a later draw and for the twin veto."""
+    return hashlib.sha256(visible_form(text).encode("utf-8", "surrogatepass")).hexdigest()
 
 
 # --- f: boilerplate (a repeated-span census over the slice being scanned) -----------------------
@@ -1663,10 +1708,11 @@ def to_annotation(
     `unsure` for this very span. `verdicts` maps span ids to the owner's counted verdict; a span
     with one carries it as `owner_verdict` (and as `owner_verdict:<verdict>` evidence, which
     survives the contract's key filtering). A confirmed span is still not eligible while its
-    stratum is closed. `rejected_texts` holds the SHA-256 of every span text the owner answered
-    `no` to: a span with such a text is never eligible, whichever message it sits in (its twin
-    would otherwise be eligible, or would be again after a re-import), and its evidence says
-    `owner_rejected_text`.
+    stratum is closed. `rejected_texts` holds the `text_key` of every span text the owner answered
+    `no` or `unsure` to: a span with such a text is never eligible, whichever message, rule or
+    stratum it sits in and however it is spelled (invisible characters, spacing, line endings and
+    Unicode form do not make a new text), so its twin would not be eligible, or again after a
+    re-import; its evidence says `owner_rejected_text`.
     """
     digest = text_digest(text)
     problems = partition_problems(text, spans, digest)
@@ -1691,7 +1737,7 @@ def to_annotation(
             rejected_texts
             and is_owner
             and (span.rule, span.stratum) in eligible
-            and text_digest(text[span.start : span.end]) in rejected_texts
+            and text_key(text[span.start : span.end]) in rejected_texts
         )
         if twin:
             evidence.append(REJECTED_TEXT_EVIDENCE)
@@ -1718,7 +1764,7 @@ def to_annotation(
 
 # --- the owner-review ledger and the precision gate ------------------------------------------
 
-LEDGER_SCHEMA = "cce.attribution-review-ledger.v5"
+LEDGER_SCHEMA = "cce.attribution-review-ledger.v6"
 # Rows of an earlier ledger schema were written under other gate rules; they are read but never
 # counted.
 LEGACY_LEDGER_SCHEMAS = frozenset(
@@ -1727,10 +1773,11 @@ LEGACY_LEDGER_SCHEMAS = frozenset(
         "cce.attribution-review-ledger.v2",
         "cce.attribution-review-ledger.v3",
         "cce.attribution-review-ledger.v4",
+        "cce.attribution-review-ledger.v5",
     }
 )
-SAMPLE_SCHEMA = "cce.attribution-review-sample.v5"
-SAMPLE_HEADER_SCHEMA = "cce.attribution-review-sample-header.v5"
+SAMPLE_SCHEMA = "cce.attribution-review-sample.v6"
+SAMPLE_HEADER_SCHEMA = "cce.attribution-review-sample-header.v6"
 VERDICTS = ("yes", "no", "unsure")
 # A (rule, stratum) may be profile-eligible only when at least this many of its spans were
 # reviewed by the owner and at least this share of them (counting unsure and no as not confirmed)
@@ -1738,7 +1785,7 @@ VERDICTS = ("yes", "no", "unsure")
 GATE_MIN_REVIEWED = 100
 GATE_MIN_PRECISION_PERCENT = 95
 SAMPLE_PER_STRATUM = 100
-SAMPLE_SEED = "cce-attribution-review-v5"
+SAMPLE_SEED = "cce-attribution-review-v6"
 # A long span is shown to the owner as a bounded excerpt plus its exact length.
 EXCERPT_HEAD = 240
 EXCERPT_TAIL = 120
@@ -1748,14 +1795,16 @@ _LEGACY_V1_KEYS = frozenset(
 )
 _LEGACY_V2_KEYS = _LEGACY_V1_KEYS | {"stratum"}
 # What a row binds itself to: the sample it answers, the full text it saw (as a digest) and how
-# many rows that sample drew for its (rule, stratum).
+# many rows that sample drew for its (rule, stratum). From v6 on a row also carries the
+# `text_key` of that text, the notion of "the same text" the gate counts.
 _LEGACY_V3_KEYS = _LEGACY_V2_KEYS | {"sample_digest", "text_sha256", "drawn"}
-_LEDGER_KEYS = _LEGACY_V3_KEYS
+_LEDGER_KEYS = _LEGACY_V3_KEYS | {"text_key"}
 _LEGACY_KEYS_BY_SCHEMA = {
     "cce.attribution-review-ledger.v1": _LEGACY_V1_KEYS,
     "cce.attribution-review-ledger.v2": _LEGACY_V2_KEYS,
     "cce.attribution-review-ledger.v3": _LEGACY_V3_KEYS,
     "cce.attribution-review-ledger.v4": _LEGACY_V3_KEYS,
+    "cce.attribution-review-ledger.v5": _LEGACY_V3_KEYS,
 }
 _SPAN_ID = re.compile(r"[0-9a-f]{32}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -1794,7 +1843,7 @@ def validate_ledger_row(row: Any) -> dict[str, Any]:
     if "stratum" in expected and row["stratum"] not in STRATA:
         raise ValueError(f"ledger row stratum must be one of {list(STRATA)}")
     if not legacy:
-        for key in ("sample_digest", "text_sha256"):
+        for key in ("sample_digest", "text_sha256", "text_key"):
             if not isinstance(row[key], str) or not _SHA256.fullmatch(row[key]):
                 raise ValueError(f"ledger row {key} must be 64 lowercase hexadecimal digits")
         drawn = row["drawn"]
@@ -1827,12 +1876,14 @@ def ledger_row(
     stratum: str,
     sample_digest: str,
     text_sha256: str,
+    text_key: str,
     drawn: int,
     rules_version: str = RULES_VERSION,
 ) -> dict[str, Any]:
     """One owner verdict on one span of one sample. The time is a parameter: no clock is read
-    here. The row names the sample (`sample_digest`), the full text the owner saw
-    (`text_sha256`) and how many rows that sample drew for the span's rule and stratum."""
+    here. The row names the sample (`sample_digest`), the exact full text the owner saw
+    (`text_sha256`), that text's `text_key` (what the gate counts as one text) and how many rows
+    that sample drew for the span's rule and stratum."""
     return validate_ledger_row(
         {
             "schema": LEDGER_SCHEMA,
@@ -1845,6 +1896,7 @@ def ledger_row(
             "reviewed_at": reviewed_at,
             "sample_digest": sample_digest,
             "text_sha256": text_sha256,
+            "text_key": text_key,
             "drawn": drawn,
         }
     )
@@ -2050,11 +2102,12 @@ class ReviewSummary:
     missing_rows: int = 0
     # Orphaned (or text-changed) spans the owner answered `no` or `unsure`: counted as errors.
     orphan_negative_rows: int = 0
-    # SHA-256 of every span text the owner answered `no` or `unsure` to, orphaned or not: no span
-    # with such a text is ever eligible (twin protection).
+    # The `text_key` of every span text the owner answered `no` or `unsure` to, orphaned or not:
+    # no span with such a text is ever eligible, however it is spelled (twin protection).
     rejected_texts: frozenset[str] = frozenset()
     # Counted spans beyond the first of a text: other copies of a text already counted. The gate
-    # counts each text once per (rule, stratum), so these add nothing to `reviewed`.
+    # counts each text (by its `text_key`) once per (rule, stratum), so these add nothing to
+    # `reviewed`.
     duplicate_text_rows: int = 0
     # Earlier answers to a span that a later row answered again (the last answer counts).
     superseded_rows: int = 0
@@ -2086,10 +2139,12 @@ def review_statistics(
     the denominator. An orphaned `yes` counts for nothing.
 
     The gate counts **texts**, not spans: the spans of one (rule, stratum) that carry the same
-    text (the SHA-256 of the span's characters) are one review, however many messages they sit in
-    and however many span ids they therefore have. A text with a `no` on any copy counts as a
-    `no`, else with an `unsure` on any copy as `unsure`, else as `yes`: one rejection rejects the
-    text everywhere.
+    text are one review, however many messages they sit in and however many span ids they
+    therefore have. "The same text" is the same `text_key` (see `visible_form`): invisible
+    characters, spacing, line endings and Unicode form do not make a new text. A row still binds
+    to the exact characters it answered (`text_sha256`), but is counted under its `text_key`. A
+    text with a `no` on any copy counts as a `no`, else with an `unsure` on any copy as `unsure`,
+    else as `yes`: one rejection rejects the text everywhere.
 
     Precision is over the rows a sample drew, not over the rows that happen to be in the ledger:
     every row carries the digest of its sample and how many rows that sample drew for its rule and
@@ -2140,14 +2195,14 @@ def review_statistics(
     in_scan: set[tuple[str, str, str]] = set()
     duplicate = orphan_negative_rows = 0
     for row in latest.values():
-        key = (row["rule"], row["stratum"], row["text_sha256"])
+        key = (row["rule"], row["stratum"], row["text_key"])
         duplicate += key in in_scan
         in_scan.add(key)
         text_verdicts.setdefault(key, set()).add(row["verdict"])
     for span, row in orphaned.items():
         if span not in latest and row["verdict"] != "yes":
             orphan_negative_rows += 1
-            key = (row["rule"], row["stratum"], row["text_sha256"])
+            key = (row["rule"], row["stratum"], row["text_key"])
             text_verdicts.setdefault(key, set()).add(row["verdict"])
     orphan_negative: dict[tuple[str, str], int] = {}
     for key, found in text_verdicts.items():
@@ -2199,7 +2254,7 @@ def review_statistics(
         missing_rows=sum(missing.values()),
         orphan_negative_rows=orphan_negative_rows,
         rejected_texts=frozenset(
-            row["text_sha256"] for row in candidates if row["verdict"] in ("no", "unsure")
+            row["text_key"] for row in candidates if row["verdict"] in ("no", "unsure")
         ),
         duplicate_text_rows=duplicate,
         superseded_rows=superseded,
@@ -2235,8 +2290,9 @@ class ReviewSampler:
     `exclude` keeps spans out that were already reviewed. A mapping from span id to
     (rule, stratum, text_sha256) excludes a span only when it is exactly that reviewed span; a
     plain collection of ids excludes those ids whatever they are. `exclude_texts` keeps out every
-    span whose (rule, stratum, text_sha256) the owner already answered, in whatever message it
-    sits, so that a text is never shown twice (the gate counts a text once).
+    span whose (rule, stratum, text_key) the owner already answered, in whatever message it sits
+    and however it is spelled, so that a text is never shown twice (the gate counts a text once).
+    Within one draw too, spans of one visible text (same `text_key`) are one candidate.
     """
 
     def __init__(
@@ -2256,34 +2312,26 @@ class ReviewSampler:
         )
         self.exclude_texts = frozenset(exclude_texts)
         self._heaps: dict[tuple[str, str], list[int]] = {}
-        self._members: dict[tuple[str, str], dict[int, tuple[str, int, str, bool, str]]] = {}
+        self._members: dict[tuple[str, str], dict[int, tuple[str, int, str, bool, str, str]]] = {}
 
-    def _already_reviewed(self, span: AttributedSpan, text: str) -> bool:
+    def _already_reviewed(self, span: AttributedSpan, text: str, key: str) -> bool:
         if span.span_id in self.exclude:
             reviewed = self.exclude[span.span_id]
             if reviewed is None or reviewed == (span.rule, span.stratum, text_digest(text)):
                 return True
-        return (
-            bool(self.exclude_texts)
-            and (
-                span.rule,
-                span.stratum,
-                text_digest(text),
-            )
-            in self.exclude_texts
-        )
+        return (span.rule, span.stratum, key) in self.exclude_texts
 
     def offer(self, span: AttributedSpan, text: str) -> None:
         """Consider one span; `text` is exactly the span's own characters."""
         if span.rule not in RULE_BY_ID or span.author == UNKNOWN or blank_text(text):
             return
         identifier = span.span_id
-        if self._already_reviewed(span, text):
+        same_text = text_key(text)
+        if self._already_reviewed(span, text, same_text):
             return
         stratum = span.stratum
-        normalized = " ".join(text.split())
         digest = hashlib.sha256(
-            f"{self.seed}\n{span.rule}\n{stratum}\n{normalized}".encode()
+            f"{self.seed}\n{span.rule}\n{stratum}\n{same_text}".encode()
         ).digest()
         key = int.from_bytes(digest[:8], "big")
         slot = (span.rule, stratum)
@@ -2291,14 +2339,18 @@ class ReviewSampler:
         members = self._members.setdefault(slot, {})
         if key in members:
             if identifier < members[key][0]:
-                members[key] = (identifier, len(text), *review_excerpt(text), text_digest(text))
+                members[key] = self._member(identifier, text, same_text)
         elif len(heap) < self.per_stratum:
             heapq.heappush(heap, -key)
-            members[key] = (identifier, len(text), *review_excerpt(text), text_digest(text))
+            members[key] = self._member(identifier, text, same_text)
         elif key < -heap[0]:
             evicted = -heapq.heapreplace(heap, -key)
             del members[evicted]
-            members[key] = (identifier, len(text), *review_excerpt(text), text_digest(text))
+            members[key] = self._member(identifier, text, same_text)
+
+    @staticmethod
+    def _member(identifier: str, text: str, same_text: str) -> tuple[str, int, str, bool, str, str]:
+        return (identifier, len(text), *review_excerpt(text), text_digest(text), same_text)
 
     def rows(self, *, partial: bool = False) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -2306,7 +2358,7 @@ class ReviewSampler:
             for stratum in STRATA:
                 members = self._members.get((rule.id, stratum), {})
                 for key in sorted(members):
-                    identifier, length, text, excerpted, full_digest = members[key]
+                    identifier, length, text, excerpted, full_digest, same_text = members[key]
                     result.append(
                         {
                             "schema": SAMPLE_SCHEMA,
@@ -2320,6 +2372,7 @@ class ReviewSampler:
                             "excerpted": excerpted,
                             "text": text,
                             "text_sha256": full_digest,
+                            "text_key": same_text,
                             "verdict": None,
                             "partial": partial,
                         }
@@ -2342,6 +2395,7 @@ _SAMPLE_ROW_KEYS = frozenset(
         "excerpted",
         "text",
         "text_sha256",
+        "text_key",
         "verdict",
         "partial",
     }
@@ -2396,12 +2450,12 @@ def drawn_counts(rows: Iterable[Mapping[str, Any]]) -> dict[str, int]:
 
 def exclusion_digest(rows: Iterable[Mapping[str, Any]], owner: str) -> str:
     """Names the ledger state a draw excludes against: SHA-256 over the sorted
-    (span id, verdict, text hash) triples of the current rows of `owner`. Rows of other
-    reviewers, of other rules versions and of older schemas hide nothing from a draw, so they are
-    not part of it. A repeated answer is part of the state, so every recording moves the digest
-    on."""
+    (span id, verdict, exact text hash, text key) entries of the current rows of `owner`. Rows of
+    other reviewers, of other rules versions and of older schemas hide nothing from a draw, so
+    they are not part of it. A repeated answer is part of the state, so every recording moves the
+    digest on."""
     pairs = sorted(
-        [row["span_id"], row["verdict"], row["text_sha256"]]
+        [row["span_id"], row["verdict"], row["text_sha256"], row["text_key"]]
         for row in rows
         if row["schema"] == LEDGER_SCHEMA
         and row["rules_version"] == RULES_VERSION
@@ -2508,6 +2562,8 @@ def _check_sample_row(row: Any, number: int) -> dict[str, Any]:
         problems.append("stratum")
     if not isinstance(row["text_sha256"], str) or not _SHA256.fullmatch(row["text_sha256"]):
         problems.append("text_sha256")
+    if not isinstance(row["text_key"], str) or not _SHA256.fullmatch(row["text_key"]):
+        problems.append("text_key")
     if not isinstance(row["text"], str) or not row["text"]:
         problems.append("text")
     length = row["length"]
@@ -2521,6 +2577,8 @@ def _check_sample_row(row: Any, number: int) -> dict[str, Any]:
         row["length"] != len(row["text"]) or text_digest(row["text"]) != row["text_sha256"]
     ):
         raise ValueError(f"sample line {number}: the text does not match its length and hash")
+    if not row["excerpted"] and text_key(row["text"]) != row["text_key"]:
+        raise ValueError(f"sample line {number}: the text does not match its text key")
     if row["excerpted"] and row["length"] <= EXCERPT_HEAD + EXCERPT_TAIL:
         raise ValueError(f"sample line {number}: an excerpt of a span that short")
     return row

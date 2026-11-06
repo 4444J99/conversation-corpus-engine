@@ -1146,9 +1146,10 @@ def library_fingerprint(library: Library) -> str:
 def _reviewed_by_owner(
     view: LedgerView, owner: str
 ) -> tuple[dict[str, tuple[str, str, str]], set[tuple[str, str, str]]]:
-    """What the owner already reviewed: the spans (by id) and the texts (by rule, stratum and
-    text hash, whichever message they sit in). Only current rows of the owner's own identity
-    count (a row of another reviewer, or of another rules version or schema, hides nothing)."""
+    """What the owner already reviewed: the spans (by id, with the exact text they answered) and
+    the texts (by rule, stratum and text key, whichever message they sit in and however they are
+    spelled). Only current rows of the owner's own identity count (a row of another reviewer, or
+    of another rules version or schema, hides nothing)."""
     current = [
         row
         for row in view.rows
@@ -1157,7 +1158,7 @@ def _reviewed_by_owner(
         and row["reviewer"] == owner
     ]
     spans = {row["span_id"]: (row["rule"], row["stratum"], row["text_sha256"]) for row in current}
-    texts = {(row["rule"], row["stratum"], row["text_sha256"]) for row in current}
+    texts = {(row["rule"], row["stratum"], row["text_key"]) for row in current}
     return spans, texts
 
 
@@ -1323,6 +1324,7 @@ def _review_record(args: argparse.Namespace) -> int:
                 stratum=row["stratum"],
                 sample_digest=header["sample_digest"],
                 text_sha256=row["text_sha256"],
+                text_key=row["text_key"],
                 drawn=header["drawn"][f"{row['rule']}:{row['stratum']}"],
                 rules_version=row["rules_version"],
             )
