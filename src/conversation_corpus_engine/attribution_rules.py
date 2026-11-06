@@ -33,7 +33,7 @@ import os
 import re
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -1004,7 +1004,14 @@ _LEDGER_KEYS = frozenset(
     {"schema", "rules_version", "span_id", "rule", "verdict", "reviewer", "reviewed_at"}
 )
 _SPAN_ID = re.compile(r"[0-9a-f]{32}")
-_UTC_STAMP = "%Y-%m-%dT%H:%M:%SZ"
+UTC_STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def utc_stamp(moment: datetime) -> str:
+    """The ledger's UTC stamp for a time the caller supplies (this module never reads the clock)."""
+    if moment.tzinfo is None:
+        raise ValueError("a review time must be timezone-aware")
+    return moment.astimezone(UTC).strftime(UTC_STAMP_FORMAT)
 
 
 def validate_ledger_row(row: Any) -> dict[str, Any]:
@@ -1036,7 +1043,7 @@ def validate_ledger_row(row: Any) -> dict[str, Any]:
     try:
         if not isinstance(stamp, str):
             raise ValueError
-        datetime.strptime(stamp, _UTC_STAMP)  # noqa: DTZ007 - validates a stamp that states Z
+        datetime.strptime(stamp, UTC_STAMP_FORMAT)  # noqa: DTZ007 - validates a stamp that states Z
     except ValueError:
         raise ValueError(
             "ledger row reviewed_at must be a UTC time like 2026-01-02T03:04:05Z"
