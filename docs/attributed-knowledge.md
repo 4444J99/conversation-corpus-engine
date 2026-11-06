@@ -420,7 +420,7 @@ published library generation. A provider's `user` role is not proof that the own
 span: injected system text, command output and tool results sit inside user turns, pasted logs,
 quotes, tables, emails and code are not the owner's prose, an assistant's answer can be pasted
 back into a turn, and AI-written skill and instruction files are filed under documents. The
-engine (`conversation_corpus_engine.attribution_rules`, version `cce.attribution-rules@9`)
+engine (`conversation_corpus_engine.attribution_rules`, version `cce.attribution-rules@10`)
 therefore labels a span `owner` only when an owner-granting rule claims it and no other rule
 does. When a rule is ambiguous the text becomes `unknown` or a non-owner class, never owner.
 **No rule is profile-eligible until the precision gate below is met**, and every span the
@@ -445,10 +445,12 @@ annotations, the census and the sample; it does not abort the run.
 
 ### Rules version
 
-The version string (`cce.attribution-rules@9`) names the rule semantics and every artifact carries
+The version string (`cce.attribution-rules@10`) names the rule semantics and every artifact carries
 it: span ids (so a span id from another version never matches), the annotation evidence
-(`cce.attribution-rules@9:rule:<id>`), the rows of review samples and the rows of the review
-ledger. When the rules or the gate change meaning the version is bumped (`@9` makes the
+(`cce.attribution-rules@10:rule:<id>`), the rows of review samples and the rows of the review
+ledger. When the rules or the gate change meaning the version is bumped (`@10` extends the
+document path conventions, see [Document path conventions](#document-path-conventions); it only
+removes owner credit; `@9` makes the
 third-party guard depend on the stripped, case-folded provider alone, including direct rule
 inputs, so kind or wing cannot bypass it; `@8` adds the explicit third-party source-family rule; `@7` retains short
 assistant replies so their whole-paragraph hits and fragments can contribute to aggregate echo
@@ -471,9 +473,9 @@ so no higher rule can lose a character to an owner claim.
 
 | # | Rule id | Class | Decides |
 |---|---------|-------|---------|
-| 0 | `third_party_origin` | third_party | every message of a record from a third-party provider: the fetched web pages of the `webcapture` family ([web captures](knowledge-library.md#web-captures)). The stripped, case-folded provider alone decides, including a directly constructed rule input; kind and wing cannot bypass it. It runs before every other rule, whatever the role, channel, typed count, URL or text, so nothing of a saved page is ever `owner` or `agent`. Current semantics are `cce.attribution-rules@9`; earlier review rows remain preserved and are reported as stale |
+| 0 | `third_party_origin` | third_party | every message of a record from a third-party provider: the fetched web pages of the `webcapture` family ([web captures](knowledge-library.md#web-captures)). The stripped, case-folded provider alone decides, including a directly constructed rule input; kind and wing cannot bypass it. It runs before every other rule, whatever the role, channel, typed count, URL or text, so nothing of a saved page is ever `owner` or `agent`. Current semantics are `cce.attribution-rules@10`; earlier review rows remain preserved and are reported as stale |
 | 1 | `agent_family` | agent | assistant, model, tool and system turns of every provider; user turns on a machine channel; provider metadata naming an agent; a coding CLI's subagent prompts and turns that `archive_provenance.classify_user_turn` calls harness text |
-| 2 | `document_origin` | agent | a record whose provenance says an agent produced it (`agent_authored`, `generated_by`, ...), the agent memory and plan families, agent instruction or skill files by file name or folder, and for documents, notes and plans a generated-by footer, co-author line or skill frontmatter anywhere in the text |
+| 2 | `document_origin` | agent | a record whose provenance says an agent produced it (`agent_authored`, `generated_by`, ...), the agent memory and plan families, agent instruction or skill files by file name or folder (base names such as `SKILL.md`, `CLAUDE.md`, `AGENTS.md`, `*.mdc`; agent dot-folders; and since `@10` a `skills` folder, `intake/memory`, `TASKS.md` and a file name that holds an AI name, see [Document path conventions](#document-path-conventions)), and for documents, notes and plans a generated-by footer, co-author line or skill frontmatter anywhere in the text |
 | 3 | `inline_injection` | agent | wrapper blocks inside a turn: the archive's injected tags (`system-reminder`, `local-command-*`, ...), `command-name`, `command-message`, `command-args`, tool-result and attachment blocks. Same-name tags nest (a depth counter), quoted attribute values may hold angle brackets, and an unclosed block runs to the end |
 | 4 | `typed_remainder` | agent | on a user turn of the `typed` channel, the text after the first `typed_chars` characters |
 | 5 | `code` | third_party | fenced code blocks and indented code (two or more indented lines after a blank line) |
@@ -482,7 +484,7 @@ so no higher rule can lose a character to an owner claim.
 | 8 | `pasted_block` | third_party | a pasted email: a `From:`, `To:`, `Subject:` or `Date:` header line that anything follows, two header lines in a row, an original-message or forward marker, or an on-date-wrote line; it runs to the end of the message because its extent cannot be proven. And a markdown table: two or more consecutive lines that each hold two or more pipes (no separator row needed), two or more consecutive lines that each hold the same number of pipes (rows without outer pipes, such as `Name | Cost`), or lines with pipes that include a separator row. Consequence: owner text written after a pasted email in the same message is third party too; put your own words before the paste or in a separate message |
 | 9 | `boilerplate` | third_party | later occurrences of a long text that repeats verbatim after whitespace normalization and with invisible characters deleted |
 | 10 | `pasted_back` | third_party | text a user turn pastes back from an earlier assistant turn of the same conversation (see below) |
-| 11 | `ambiguous` | unknown | a paragraph with an odd number of ASCII double quotes; and a note or document of the owner's own library that states an AI had a hand in it anywhere (see below) |
+| 11 | `ambiguous` | unknown | a paragraph with an odd number of ASCII double quotes; and a note or document of the owner's own library that states an AI had a hand in it anywhere (see below); and, since `@10`, a whole document whose source path is a `.github` folder, a package bundle internal or a non-prose file ([Document path conventions](#document-path-conventions)) |
 | 12 | `typed_prefix` | owner | the first `typed_chars` characters of a user turn on the `typed` channel |
 | 13 | `note_owner` | owner | the body of a note or document in an authored-library family (Apple Notes, Drive, authored documents) |
 | - | `unattributed` | unknown | everything left over |
@@ -617,6 +619,55 @@ main sequence before alternate, message index) is left to the other rules and ev
 boilerplate. A different slice, such as one cut by `--limit-records`, can therefore decide a span
 differently. The census keeps one digest per distinct long unit, never the text.
 
+### Document path conventions
+
+An agent's files are the agent's, and a file that is not prose is nobody's writing. Since `@10`
+the source path of a document, note or plan (provenance `source_file` or `source_path`, matched
+case-insensitively with `/` or `\` separators) says so before the owner-granting rules can.
+These checks only remove owner credit; none grants it, and the older checks and the text markers
+keep their place and their reason string.
+
+*Agent (rule 2, `document_origin`).* Tried after the older base-name, `*.mdc` and agent dot-folder
+conventions, in this order, so a path that matches both keeps the older reason (a `skills`
+folder inside `.claude` is `path:.claude`):
+
+| Reason | Path convention |
+|--------|-----------------|
+| `path:skills` | a folder named `skills` anywhere above the file |
+| `path:intake-memory` | a `memory` folder directly under an `intake` folder (the agent memory intake) |
+| `path:tasks.md` | the file is named exactly `TASKS.md` |
+| `path:ai-name` | the file's base name holds an AI name as a whole word |
+
+The AI-name rule drops the extension, lower-cases the rest and splits it at every run of
+characters that are not ASCII letters or digits (space, `-`, `_`, `.`, brackets). A resulting token
+matches when it is `claude`, `gemini`, `chatgpt`, `copilot`, `codex`, `opencode` or `antigravity`,
+or `gpt` with an optional glued version (`gpt`, `gpt4`, `gpt4o`; `gpt-4` is the tokens `gpt` and
+`4`). So `Untitled-1-Claude.md`, `run_gemini_notes.json` and `GPT-4 plan.md` match, while
+`claudette`, `mycopilot`, `copilots`, `geminize`, `gptq` and `chatgptish` do not. Folder names and
+extensions are not read, and CamelCase is not split. The rule is deliberately blunt: a file named
+after a person called Claude, or after the Gemini star sign, is read as agent. That errs toward
+removing owner credit, never toward granting it.
+
+*Unknown (rule 11, `ambiguous`), only if no agent convention or text marker claimed the record.*
+Everything no stronger rule took becomes `unknown` (detail `origin=path:...`), whatever the role:
+
+* `path:.github`: a `.github` folder. Workflows and community files can be hand-written, so
+  they are not called agent, and not owner either.
+* `path:pages-bundle`: anything inside a `Name.pages` bundle folder, and any file named
+  `documentidentifier`. A `.pages` file on its own is still a text document.
+* `path:non-prose:<ext>`: an extension that carries no prose by anyone: calendars and images
+  (`.ics .jpg .jpeg .png .gif .webp .heic .heif .tif .tiff .bmp .svg`), property lists, archives
+  (`.plist .zip .gz .tgz .tar`), `.pdf` (a received document whose author cannot be told from the
+  path) and the data formats `.json .jsonl .csv .xml`. The data formats are the only ones an
+  authored *notes* family (kind `note`, Apple Notes) is exempt from, because such a record can be
+  an export of the owner's own note. `.md`, `.txt`, `.docx`, `.pages` and files without an
+  extension are unchanged.
+
+The checks apply only to records of document kinds, never to chats or coding sessions that happen
+to be stored under such a path. Because unknown is decided by `ambiguous` (rule 11), quotes, code,
+logs and injected blocks inside such a record keep the stronger class of the rule that took them.
+Review rows written under `@9` or earlier are stale and are reported as `stale_rows`.
+
 ### Reports, annotations and bounds
 
 ```bash
@@ -654,7 +705,7 @@ already reads: `source` is the exact canonical reference without offsets and `at
 `cce.span-attribution.v1` annotation whose spans are the non-unknown spans (uncovered text is
 unknown by the contract). Messages whose id is empty or not unique in their sequence cannot be
 referenced exactly and are counted, not annotated. The file holds offsets, ids and evidence
-(`cce.attribution-rules@9:rule:<id>`, `stratum:<S|M|L>`, `span:<id>`, and `owner_verdict:<verdict>`
+(`cce.attribution-rules@10:rule:<id>`, `stratum:<S|M|L>`, `span:<id>`, and `owner_verdict:<verdict>`
 for a span the owner answered), no message text. A span the owner answered also carries
 `owner_verdict` as a key of its own. Owner spans carry `--owner-id` as `author_id`; without it no
 span can reach a strict profile.
