@@ -287,15 +287,15 @@ def test_rows_from_another_rules_version_or_an_older_schema_are_ignored_not_coun
     assert summary.strata[("typed_prefix", "S")].reviewed == 0
     assert (summary.rows, summary.stale_rows) == (102, 102)
     assert eligible_strata(summary) == frozenset()
-    assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v4"
-    assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v4"
+    assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v5"
+    assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v5"
 
 
-PREVIOUS_VERSION = "cce.attribution-rules@3"
+PREVIOUS_VERSION = "cce.attribution-rules@4"
 
 
 def test_rows_written_under_the_previous_rules_version_are_stale_and_never_counted() -> None:
-    assert RULES_VERSION == "cce.attribution-rules@4"
+    assert RULES_VERSION == "cce.attribution-rules@5"
     old = verdict_rows("typed_prefix", ["yes"] * 100, version=PREVIOUS_VERSION)
     summary = summarize(old)
     assert (summary.rows, summary.stale_rows) == (100, 100)
@@ -714,117 +714,216 @@ def test_the_sample_header_carries_the_ledger_state_it_was_drawn_against() -> No
             parse_sample(sample_lines({**header, "exclusion_digest": bad}, rows))
 
 
-def test_the_rules_version_and_schemas_are_at_version_four_and_older_rows_are_stale() -> None:
-    assert RULES_VERSION == "cce.attribution-rules@4"
-    assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v4"
-    assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v4"
-    assert SAMPLE_HEADER_SCHEMA == "cce.attribution-review-sample-header.v4"
-    rows = verdict_rows("typed_prefix", ["yes"] * 100)
-    v3 = [{**row, "schema": "cce.attribution-review-ledger.v3"} for row in rows]
-    assert [validate_ledger_row(row)["schema"] for row in v3] == [row["schema"] for row in v3]
-    summary = summarize(v3)
-    assert (summary.rows, summary.stale_rows) == (100, 100)
-    assert summary.strata[("typed_prefix", "S")].reviewed == 0
-    assert eligible_strata(summary) == frozenset()
-    old_version = verdict_rows("typed_prefix", ["yes"] * 100, version="cce.attribution-rules@3")
-    assert summarize(old_version).stale_rows == 100
-    header, rows_drawn = drawn_sample()
-    v3_header = {**header, "schema": "cce.attribution-review-sample-header.v3"}
-    with pytest.raises(ValueError, match="draw a new sample"):
-        parse_sample(sample_lines(v3_header, rows_drawn))
+def text_of(number: int) -> str:
+    """The text hash of the number-th distinct text of a test ledger."""
+    return hashlib.sha256(f"owner text {number}".encode()).hexdigest()
 
 
-def test_an_owner_no_whose_span_vanished_still_counts_against_its_stratum() -> None:
-    yes = verdict_rows("typed_prefix", ["yes"] * 97)
-    no = verdict_rows("typed_prefix", ["no"] * 9, start=500)
-    rows = [*yes, *no]
-    assert not gate(rows).eligible and gate(rows).reviewed == 106
-    # Six of the nine rejected texts change (a re-import): their span ids leave the scan.
-    gone = {row["span_id"] for row in no[:6]}
-    matched = {span: fact for span, fact in matched_of(rows).items() if span not in gone}
-    summary = review_statistics(rows, matched=matched, owner=OWNER_ID)
-    review = summary.strata[("typed_prefix", "S")]
-    assert (summary.orphan_rows, summary.orphan_negative_rows) == (6, 6)
-    assert (review.reviewed, review.confirmed, review.rejected) == (106, 97, 9)
-    assert review.orphan_negative == 6 and not review.eligible
-    assert set(summary.verdicts).isdisjoint(gone)
-
-
-def test_orphan_answers_count_only_when_they_are_negative_and_the_owners() -> None:
-    yes = verdict_rows("typed_prefix", ["yes"] * 100)
-    rows = list(yes)
-    assert gate(rows).eligible
-
-    def orphans(verdicts: list[str], start: int, reviewer: str = OWNER_ID, **extra) -> list[dict]:
-        return [
-            ledger_row(
-                f"{start + n:032x}", "typed_prefix", verdict, reviewer, STAMP, stratum="S", **extra
-            )
-            for n, verdict in enumerate(verdicts)
-        ]
-
-    def judged(extra_rows: list[dict]) -> ReviewSummary:
-        matched = matched_of(yes)  # the extra rows name spans the scan does not have
-        return review_statistics([*yes, *extra_rows], matched=matched, owner=OWNER_ID)
-
-    assert judged(orphans(["yes"] * 50, 900)).strata[("typed_prefix", "S")].reviewed == 100
-    assert judged(orphans(["yes"] * 50, 900)).orphan_negative_rows == 0
-    unsure = judged(orphans(["unsure"] * 6, 900))
-    assert (unsure.strata[("typed_prefix", "S")].reviewed, unsure.orphan_negative_rows) == (106, 6)
-    assert not unsure.strata[("typed_prefix", "S")].eligible
-    assert judged(orphans(["no"] * 6, 900, reviewer="someone-else")).orphan_negative_rows == 0
-    stale = orphans(["no"] * 6, 900, rules_version=PREVIOUS_VERSION)
-    assert judged(stale).strata[("typed_prefix", "S")].eligible
-    # The last answer to an orphaned span is the one that counts.
-    flipped = [*orphans(["no"] * 6, 900), *orphans(["yes"] * 6, 900)]
-    assert judged(flipped).orphan_negative_rows == 0
-    # Negative answers count in their own stratum, whatever the others do.
-    elsewhere = [
-        ledger_row(f"{700 + n:032x}", "quote", "no", OWNER_ID, STAMP, stratum="S") for n in range(3)
+def copies(verdicts: list[str], texts: list[int], *, start: int = 0) -> list[dict]:
+    """One row per span: spans `start + n` answer text `texts[n]`, so a text with two spans has
+    two span ids (the ids differ, as they do for the same text in two different messages)."""
+    return [
+        ledger_row(
+            f"{start + index:032x}",
+            "typed_prefix",
+            verdict,
+            OWNER_ID,
+            STAMP,
+            stratum="S",
+            text_sha256=text_of(texts[index]),
+        )
+        for index, verdict in enumerate(verdicts)
     ]
-    other = judged(elsewhere)
-    assert other.strata[("quote", "S")].reviewed == 3
-    assert other.strata[("typed_prefix", "S")].reviewed == 100
 
 
-def test_a_negative_answer_to_a_span_whose_text_changed_counts_too() -> None:
-    yes = verdict_rows("typed_prefix", ["yes"] * 100)
-    no = verdict_rows("typed_prefix", ["no"] * 6, start=700)
-    rows = [*yes, *no]
-    matched = matched_of(rows)
-    for row in no:  # the id still exists in the scan, but its text is not the text answered
-        matched[row["span_id"]] = ("typed_prefix", "S", "f" * 64)
-    summary = review_statistics(rows, matched=matched, owner=OWNER_ID)
-    assert summary.text_mismatch_rows == 6 and summary.orphan_negative_rows == 6
-    assert summary.strata[("typed_prefix", "S")].reviewed == 106
-    assert not summary.strata[("typed_prefix", "S")].eligible
-
-
-def test_the_summary_names_the_texts_the_owner_rejected() -> None:
-    rows = verdict_rows("typed_prefix", ["yes", "no", "unsure", "no"])
-    rows += [ledger_row("9" * 32, "typed_prefix", "no", "someone-else", STAMP, stratum="S")]
+def test_a_hundred_rows_over_fifty_distinct_texts_do_not_open_the_gate() -> None:
+    rows = copies(["yes"] * 100, [number // 2 for number in range(100)])
+    assert len({row["span_id"] for row in rows}) == 100
+    assert len({row["text_sha256"] for row in rows}) == 50
     summary = summarize(rows)
-    assert summary.rejected_texts == {text_hash(f"{1:032x}"), text_hash(f"{3:032x}")}
-    # An orphaned rejection is remembered as well: the text is what was rejected.
-    orphaned = review_statistics(rows, matched={}, owner=OWNER_ID)
-    assert orphaned.rejected_texts == summary.rejected_texts
+    review = summary.strata[("typed_prefix", "S")]
+    assert (review.reviewed, review.confirmed) == (50, 50)
+    assert not review.eligible and eligible_strata(summary) == frozenset()
+    assert summary.duplicate_text_rows == 50
+    # The same hundred rows over a hundred distinct texts do open it.
+    assert gate(copies(["yes"] * 100, list(range(100)))).eligible
 
 
-def test_a_span_with_the_text_of_a_rejected_one_is_never_eligible() -> None:
+def test_each_text_counts_once_however_many_spans_carry_it() -> None:
+    rows = copies(["yes"] * 300, [number % 100 for number in range(300)])
+    review = gate(rows)
+    assert (review.reviewed, review.confirmed) == (100, 100) and review.eligible
+    assert summarize(rows).duplicate_text_rows == 200
+    # Spans of other rules or strata with the same text are other judgments: they count there.
+    other = [
+        ledger_row(
+            f"{900 + n:032x}", "quote", "yes", OWNER_ID, STAMP, stratum="S", text_sha256=text_of(n)
+        )
+        for n in range(100)
+    ]
+    summary = summarize([*rows, *other])
+    assert summary.strata[("quote", "S")].reviewed == 100
+    assert summary.strata[("typed_prefix", "S")].reviewed == 100
+
+
+def test_a_no_or_unsure_on_any_copy_of_a_text_rejects_that_text() -> None:
+    texts = [number // 2 for number in range(200)]  # a hundred texts, two spans each
+    verdicts = ["yes"] * 200
+    verdicts[0] = "no"  # text 0: the first copy says no, the second yes
+    verdicts[5] = "unsure"  # text 2 (spans 4 and 5): the second copy is unsure
+    verdicts[7] = "unsure"  # text 3 (spans 6 and 7)
+    verdicts[9] = "no"  # text 4 (spans 8 and 9)
+    rows = copies(verdicts, texts)
+    review = gate(rows)
+    assert (review.reviewed, review.confirmed, review.rejected, review.unsure) == (100, 96, 2, 2)
+    assert review.eligible  # 96 of 100
+    verdicts[11] = "no"  # text 5: a fifth text not confirmed (95 confirmed)
+    verdicts[13] = "no"  # text 6: a sixth (94 confirmed)
+    assert not gate(copies(verdicts, texts)).eligible
+
+
+def test_orphaned_negatives_count_once_per_text_and_join_a_matched_copy_of_it() -> None:
+    yes = copies(["yes"] * 100, list(range(100)))
+    matched = matched_of(yes)
+    # Two orphaned spans of one rejected text count once; an orphaned no on a text whose other copy
+    # is a matched yes makes that text a no; orphaned yes rows count for nothing.
+    orphans = [
+        ledger_row(
+            f"{500 + n:032x}",
+            "typed_prefix",
+            verdict,
+            OWNER_ID,
+            STAMP,
+            stratum="S",
+            text_sha256=text_of(number),
+        )
+        for n, (verdict, number) in enumerate(
+            [("no", 200), ("no", 200), ("unsure", 201), ("no", 3), ("yes", 202), ("yes", 203)]
+        )
+    ]
+    summary = review_statistics([*yes, *orphans], matched=matched, owner=OWNER_ID)
+    review = summary.strata[("typed_prefix", "S")]
+    # Texts 0-99 (text 3 now a no), text 200 (no) and text 201 (unsure): 102 texts, 99 confirmed.
+    assert (review.reviewed, review.confirmed, review.rejected, review.unsure) == (102, 99, 2, 1)
+    assert summary.orphan_negative_rows == 4 and review.orphan_negative == 2
+
+
+def test_every_text_the_owner_said_no_or_unsure_to_is_a_rejected_text() -> None:
+    rows = copies(["yes", "no", "unsure", "yes"], [0, 1, 2, 3])
+    summary = summarize(rows)
+    assert summary.rejected_texts == {text_of(1), text_of(2)}
+    # Another copy of a rejected text is never eligible, whichever verdict its own row carries.
     eligible = frozenset({("typed_prefix", "S")})
     (span,) = spans_of(SHORT)
     rejected = frozenset({text_digest(SHORT)})
-    twin = to_annotation(SHORT, [span], owner_id="rob", eligible=eligible, rejected_texts=rejected)
-    (entry,) = twin["spans"]
-    assert entry["profile_eligible"] is False
-    assert "owner_rejected_text" in entry["evidence"] and "owner_verdict" not in entry
-    (checked,) = attributed_spans(SHORT, twin)
-    assert not owner_profile_eligible(checked, "rob")
-    other = to_annotation(
-        SHORT, [span], owner_id="rob", eligible=eligible, rejected_texts=frozenset({"0" * 64})
+    annotation = to_annotation(
+        SHORT, [span], owner_id="rob", eligible=eligible, rejected_texts=rejected
     )
-    assert other["spans"][0]["profile_eligible"] is True
-    assert "owner_rejected_text" not in other["spans"][0]["evidence"]
+    assert annotation["spans"][0]["profile_eligible"] is False
+
+
+def test_the_gate_never_counts_more_texts_than_the_ledger_holds_distinct_text_hashes() -> None:
+    """Property test over random ledgers: spans, copies, verdicts, strata, orphans, other
+    reviewers and stale rows all vary; the count of reviewed texts stays within the number of
+    distinct text hashes of the owner's rows, per (rule, stratum) and overall."""
+    rng = random.Random(41)
+    for trial in range(200):
+        texts = [text_of(number) for number in range(rng.randint(1, 60))]
+        spans = [f"{rng.getrandbits(128):032x}" for _ in range(rng.randint(1, 200))]
+        facts = {
+            span: (rng.choice(["typed_prefix", "quote"]), rng.choice("SM"), rng.choice(texts))
+            for span in spans
+        }
+        matched = {span: fact for span, fact in facts.items() if rng.random() < 0.8}
+        rows = []
+        for _ in range(rng.randint(0, 400)):
+            span = rng.choice(spans)
+            rule, stratum, text = facts[span]
+            if rng.random() < 0.05:
+                text = rng.choice(texts)  # a row that answers some other text
+            rows.append(
+                ledger_row(
+                    span,
+                    rule,
+                    rng.choice(["yes"] * 5 + ["no", "unsure"]),
+                    rng.choice([OWNER_ID] * 8 + ["someone-else"]),
+                    STAMP,
+                    stratum=stratum,
+                    text_sha256=text,
+                    sample_digest=rng.choice(["a", "b", "c"]) * 64,
+                    drawn=rng.randint(1, 3),
+                )
+            )
+        summary = review_statistics(rows, matched=matched, owner=OWNER_ID)
+        distinct: dict[tuple[str, str], set[str]] = {}
+        for row in rows:
+            if row["reviewer"] == OWNER_ID:
+                distinct.setdefault((row["rule"], row["stratum"]), set()).add(row["text_sha256"])
+        total = 0
+        for cell, review in summary.strata.items():
+            counted = review.reviewed - review.missing
+            assert counted <= len(distinct.get(cell, ())), (trial, cell)
+            total += counted
+        assert total <= sum(len(found) for found in distinct.values()), trial
+        assert summary.duplicate_text_rows >= 0
+
+
+def test_the_sampler_leaves_out_texts_already_reviewed_not_only_spans() -> None:
+    first = ReviewSampler(per_stratum=100)
+    offer_all(first, many_quotes(5))
+    reviewed = {(row["rule"], row["stratum"], row["text_sha256"]) for row in first.rows()[:2]}
+    reviewed_texts = {row["text"] for row in first.rows()[:2]}
+    # The same quoted lines again, in other messages: other span ids, same texts.
+    twins = [
+        f"{line}\n\nbut my own tail number {index}" for index, line in enumerate(many_quotes(5))
+    ]
+    by_id_only = ReviewSampler(
+        per_stratum=100, exclude={row["span_id"] for row in first.rows()[:2]}
+    )
+    offer_all(by_id_only, twins)
+    assert reviewed_texts <= {row["text"] for row in by_id_only.rows()}  # the old gap
+    by_text = ReviewSampler(per_stratum=100, exclude_texts=reviewed)
+    offer_all(by_text, twins)
+    shown = {row["text"] for row in by_text.rows() if row["rule"] == "quote"}
+    assert shown and shown.isdisjoint(reviewed_texts) and len(shown) == 3
+    # A text reviewed as one rule is still offered for another rule's claim.
+    other_rule = {("code", stratum, digest) for _, stratum, digest in reviewed}
+    again = ReviewSampler(per_stratum=100, exclude_texts=other_rule)
+    offer_all(again, twins)
+    assert reviewed_texts <= {row["text"] for row in again.rows()}
+
+
+def test_the_exclusion_digest_also_names_the_text_hashes_of_the_excluded_rows() -> None:
+    rows = verdict_rows("typed_prefix", ["yes", "no"])
+    digest = exclusion_digest(rows, OWNER_ID)
+    swapped = [{**rows[0], "text_sha256": "e" * 64}, rows[1]]
+    assert exclusion_digest(swapped, OWNER_ID) != digest
+
+
+def test_the_rules_version_and_schemas_are_at_version_five_and_version_four_rows_are_stale() -> (
+    None
+):
+    assert RULES_VERSION == "cce.attribution-rules@5"
+    assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v5"
+    assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v5"
+    assert SAMPLE_HEADER_SCHEMA == "cce.attribution-review-sample-header.v5"
+    assert SAMPLE_SEED == "cce-attribution-review-v5"
+    rows = verdict_rows("typed_prefix", ["yes"] * 100)
+    v4 = [{**row, "schema": "cce.attribution-review-ledger.v4"} for row in rows]
+    assert [validate_ledger_row(row)["schema"] for row in v4] == [row["schema"] for row in v4]
+    summary = summarize(v4)
+    assert (summary.rows, summary.stale_rows) == (100, 100)
+    assert summary.strata[("typed_prefix", "S")].reviewed == 0
+    assert eligible_strata(summary) == frozenset()
+    old_version = verdict_rows("typed_prefix", ["yes"] * 100, version="cce.attribution-rules@4")
+    assert summarize(old_version).stale_rows == 100
+    header, rows_drawn = drawn_sample()
+    v4_header = {**header, "schema": "cce.attribution-review-sample-header.v4"}
+    with pytest.raises(ValueError, match="draw a new sample"):
+        parse_sample(sample_lines(v4_header, rows_drawn))
+    v4_rows = [{**row, "schema": "cce.attribution-review-sample.v4"} for row in rows_drawn]
+    with pytest.raises(ValueError, match="draw a new sample"):
+        parse_sample(sample_lines(header, v4_rows))
 
 
 def test_ledger_is_append_only_jsonl_and_refuses_symlinks(tmp_path: Path) -> None:

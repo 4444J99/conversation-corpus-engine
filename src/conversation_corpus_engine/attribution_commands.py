@@ -453,6 +453,7 @@ def build_report(
             "text_mismatch_rows": summary.text_mismatch_rows,
             "missing_rows": summary.missing_rows,
             "orphan_negative_rows": summary.orphan_negative_rows,
+            "duplicate_text_rows": summary.duplicate_text_rows,
             "non_owner_rows": summary.non_owner_rows,
             "non_owner_reviewers": dict(sorted(summary.non_owner_reviewers.items())),
             "quarantined_rows": summary.quarantined_rows + malformed,
@@ -1113,6 +1114,7 @@ def _apply(args: argparse.Namespace) -> int:
         "text_mismatch_rows": summary.text_mismatch_rows,
         "missing_rows": summary.missing_rows,
         "orphan_negative_rows": summary.orphan_negative_rows,
+        "duplicate_text_rows": summary.duplicate_text_rows,
         "non_owner_rows": summary.non_owner_rows,
         "quarantined_rows": summary.quarantined_rows + view.malformed,
         "superseded_rows": summary.superseded_rows,
@@ -1141,16 +1143,22 @@ def library_fingerprint(library: Library) -> str:
     return digest.hexdigest()
 
 
-def _reviewed_by_owner(view: LedgerView, owner: str) -> dict[str, tuple[str, str, str]]:
-    """The spans the owner already reviewed: only current rows of the owner's own identity count
-    (a row of another reviewer, or of another rules version or schema, hides nothing)."""
-    return {
-        row["span_id"]: (row["rule"], row["stratum"], row["text_sha256"])
+def _reviewed_by_owner(
+    view: LedgerView, owner: str
+) -> tuple[dict[str, tuple[str, str, str]], set[tuple[str, str, str]]]:
+    """What the owner already reviewed: the spans (by id) and the texts (by rule, stratum and
+    text hash, whichever message they sit in). Only current rows of the owner's own identity
+    count (a row of another reviewer, or of another rules version or schema, hides nothing)."""
+    current = [
+        row
         for row in view.rows
         if row["rules_version"] == RULES_VERSION
         and row["schema"] == LEDGER_SCHEMA
         and row["reviewer"] == owner
-    }
+    ]
+    spans = {row["span_id"]: (row["rule"], row["stratum"], row["text_sha256"]) for row in current}
+    texts = {(row["rule"], row["stratum"], row["text_sha256"]) for row in current}
+    return spans, texts
 
 
 def _review_sample(args: argparse.Namespace) -> int:
@@ -1161,10 +1169,15 @@ def _review_sample(args: argparse.Namespace) -> int:
             "owner's reviews count toward the gate"
         )
     view = _ledger_view(args)
-    exclude = _reviewed_by_owner(view, owner)
+    exclude, exclude_texts = _reviewed_by_owner(view, owner)
     deadline = Deadline(args.deadline_seconds)
     library, database = _open_target(args)
-    sampler = ReviewSampler(per_stratum=args.per_stratum, seed=args.seed, exclude=exclude)
+    sampler = ReviewSampler(
+        per_stratum=args.per_stratum,
+        seed=args.seed,
+        exclude=exclude,
+        exclude_texts=exclude_texts,
+    )
     with library:
         out = check_output(args.out, library_roots(args, database)) if args.out else None
         fingerprint = library_fingerprint(library)

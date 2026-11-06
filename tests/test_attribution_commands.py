@@ -164,6 +164,7 @@ def test_report_has_no_eligible_rule_without_a_ledger(
         "text_mismatch_rows": 0,
         "missing_rows": 0,
         "orphan_negative_rows": 0,
+        "duplicate_text_rows": 0,
         "non_owner_rows": 0,
         "non_owner_reviewers": {},
         "quarantined_rows": 0,
@@ -773,7 +774,7 @@ def sample_lines(path: Path) -> list[dict]:
 
 def sample_header(path: Path) -> dict:
     header, *_ = sample_lines(path)
-    assert header["schema"] == "cce.attribution-review-sample-header.v4"
+    assert header["schema"] == "cce.attribution-review-sample-header.v5"
     return header
 
 
@@ -847,7 +848,7 @@ def test_review_sample_streams_to_standard_output_and_reports_the_short_span_bia
     assert code == 0
     assert all(json.loads(line)["schema"] for line in out.splitlines())
     header, *body = map(json.loads, out.splitlines())
-    assert header["schema"] == "cce.attribution-review-sample-header.v4"
+    assert header["schema"] == "cce.attribution-review-sample-header.v5"
     summary = json.loads(err.strip().splitlines()[-1])
     assert summary["sampled"] == len(body) == header["rows"]
     assert summary["sample_digest"] == header["sample_digest"] and header["owner_id"] == "rob"
@@ -1655,6 +1656,140 @@ def test_an_answers_file_with_a_header_must_carry_the_header_of_this_sample(
     assert recorded["unanswered"] == recorded["appended"] > 0
 
 
+def twin_text_library(directory: Path, texts: list[str], copies: int = 2) -> Path:
+    """Each owner text typed `copies` times, every message ending in another injected reminder:
+    the same owner span text, a different whole message, so a different span id each time."""
+    directory.mkdir(parents=True, exist_ok=True)
+    with Library.create(directory / "library.sqlite") as handle:
+        for copy in range(copies):
+            for index, text in enumerate(texts):
+                reminder = (
+                    f"<system-reminder>reminder number {copy} of text {index}</system-reminder>"
+                )
+                handle.put(
+                    Conversation(
+                        provider="chatgpt",
+                        source_id=f"c{copy}-{index:03d}",
+                        title="t",
+                        messages=[typed("m0", f"{text}\n{reminder}", typed_chars=len(text))],
+                        extra={"wing": "ai", "lane": "conversations"},
+                    )
+                )
+    return directory / "library.sqlite"
+
+
+def draw_and_record(
+    capsys: pytest.CaptureFixture[str], library: Path, ledger: Path, tmp_path: Path, name: str
+) -> list[dict]:
+    """One round: draw against the ledger, confirm every owner row, record; the rows drawn."""
+    sample, answers = tmp_path / f"{name}.jsonl", tmp_path / f"{name}-answers.jsonl"
+    extra = ("--ledger", ledger) if ledger.exists() else ()
+    code, _, err = run_cli(
+        capsys, "review-sample", "--owner-id", "rob", "--library", library, *extra, "--out", sample
+    )
+    assert code == 0, err
+    answers_for(sample, answers, lambda row: "yes" if row["claim"] == "owner" else None)
+    assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
+    return [row for row in sample_rows(sample) if row["rule"] == "typed_prefix"]
+
+
+def test_a_text_the_owner_answered_is_not_drawn_again_in_another_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    texts = [
+        f"Owner sentence {index} about the garden plan number {index * 3}." for index in range(100)
+    ]
+    library = twin_text_library(tmp_path / "store" / "g", texts)
+    ledger = tmp_path / "ledger.jsonl"
+    first = draw_and_record(capsys, library, ledger, tmp_path, "one")
+    assert {row["text"] for row in first} == set(texts)  # one row per distinct text
+    second = draw_and_record(capsys, library, ledger, tmp_path, "two")
+    assert second == []  # every text was answered, so no copy of it is shown again
+    report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
+    short = next(item for item in report["rules"] if item["rule"] == "typed_prefix")["strata"]["S"]
+    assert (short["reviewed"], short["confirmed"]) == (100, 100)
+    assert short["eligible"] is True  # a hundred distinct texts, honestly reviewed
+    assert report["gate"]["duplicate_text_rows"] == 0
+
+
+def test_a_hundred_answers_over_fifty_distinct_texts_do_not_open_the_gate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    texts = [
+        f"Owner sentence {index} about the garden plan number {index * 3}." for index in range(50)
+    ]
+    library = twin_text_library(tmp_path / "store" / "g", texts)
+    ledger = tmp_path / "ledger.jsonl"
+    first = draw_and_record(capsys, library, ledger, tmp_path, "one")
+    second = draw_and_record(capsys, library, ledger, tmp_path, "two")
+    assert len(first) == 50 and second == []
+    entries, result = apply_entries(
+        capsys, library, tmp_path / "out.json", "--ledger", ledger, "--owner-id", "rob"
+    )
+    assert result["eligible_strata"] == [] and result["profile_eligible_spans"] == 0
+    short = next(
+        item
+        for item in report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")["rules"]
+        if item["rule"] == "typed_prefix"
+    )["strata"]["S"]
+    assert (short["reviewed"], short["confirmed"], short["eligible"]) == (50, 50, False)
+
+
+def test_answers_to_copies_of_a_text_forged_into_a_ledger_still_count_once(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Even if both copies of every text were answered (by a draw from before this rule, or by
+    hand), the gate counts each text once."""
+    texts = [
+        f"Owner sentence {index} about the garden plan number {index * 3}." for index in range(50)
+    ]
+    library = twin_text_library(tmp_path / "store" / "g", texts)
+    first = tmp_path / "s1.jsonl"
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", first)
+    rows = [row for row in sample_rows(first) if row["rule"] == "typed_prefix"]
+    assert len(rows) == 50
+    ledger = tmp_path / "ledger.jsonl"
+    answers_for(first, tmp_path / "a1.jsonl", lambda row: "yes")
+    assert record_answers(capsys, library, ledger, first, tmp_path / "a1.jsonl")[0] == 0
+    # The twins of those rows, answered by hand: the other span id of every text.
+    with Library(library) as handle:
+        census = build_census(
+            handle, limit_records=None, min_chars=200, min_occurrences=3, deadline=Deadline(60)
+        )
+        found: dict[str, list] = {}
+
+        def visit(message, spans) -> None:
+            for span in spans:
+                if span.rule == "typed_prefix":
+                    text = message.text[span.start : span.end]
+                    found.setdefault(text, []).append((span.span_id, span.stratum))
+
+        scan(handle, census, limit_records=None, deadline=Deadline(60), visit=visit)
+    known = {row["span_id"] for row in rows}
+    twins = [
+        ledger_row(
+            span,
+            "typed_prefix",
+            "yes",
+            "rob",
+            STAMP,
+            stratum=stratum,
+            sample_digest="a" * 64,
+            text_sha256=hashlib.sha256(text.encode()).hexdigest(),
+            drawn=50,
+        )
+        for text, spans in found.items()
+        for span, stratum in spans
+        if span not in known
+    ]
+    assert len(twins) == 50
+    append_ledger(ledger, twins)
+    report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
+    short = next(item for item in report["rules"] if item["rule"] == "typed_prefix")["strata"]["S"]
+    assert (short["reviewed"], short["confirmed"], short["eligible"]) == (50, 50, False)
+    assert report["gate"]["duplicate_text_rows"] == 50
+
+
 def test_review_record_needs_the_sample_it_answers(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1731,7 +1866,7 @@ def test_ledger_rows_from_the_previous_rules_version_are_reported_as_stale(
     rewritten = tmp_path / "old-ledger.jsonl"
     rewritten.write_text(
         ledger.read_text(encoding="utf-8").replace(
-            "cce.attribution-rules@4", "cce.attribution-rules@3"
+            "cce.attribution-rules@5", "cce.attribution-rules@4"
         ),
         encoding="utf-8",
     )
@@ -1743,7 +1878,7 @@ def test_ledger_rows_from_the_previous_rules_version_are_reported_as_stale(
     )
     assert result["stale_rows"] == result["ledger_rows"] > 100
     assert result["eligible_strata"] == []
-    assert result["rules_version"] == "cce.attribution-rules@4"
+    assert result["rules_version"] == "cce.attribution-rules@5"
 
 
 def test_review_record_rejects_bad_answers_before_writing_anything(
@@ -2322,7 +2457,7 @@ def test_review_record_repairs_a_torn_ledger_and_says_so(
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
     run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
     answered(sample, answers, 1)
-    ledger.write_text('{"schema": "cce.attribution-review-ledger.v4", "rul', encoding="utf-8")
+    ledger.write_text('{"schema": "cce.attribution-review-ledger.v5", "rul', encoding="utf-8")
     code, out, err = record_answers(capsys, library, ledger, sample, answers, "--json")
     assert code == 0, err
     result = json.loads(out)
