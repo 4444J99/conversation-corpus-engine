@@ -1583,6 +1583,78 @@ def test_the_identical_twin_of_a_rejected_span_is_never_eligible(
     assert rejected.isdisjoint(segments) and sorted(segments) == sorted(owned)
 
 
+def fill_in_place(path: Path, decide) -> list[dict]:
+    """Fill the verdicts of a sample file in place, header untouched (what the owner does)."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    rows = [json.loads(line) for line in lines[1:]]
+    for row in rows:
+        row["verdict"] = decide(row)
+    path.write_text(
+        "\n".join([lines[0], *(json.dumps(row, sort_keys=True) for row in rows)]) + "\n",
+        encoding="utf-8",
+    )
+    return rows
+
+
+def test_the_sample_file_filled_in_can_be_passed_as_the_sample_and_as_the_answers(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=30)
+    sample, ledger = tmp_path / "sample.jsonl", tmp_path / "ledger.jsonl"
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    header_line = sample.read_text(encoding="utf-8").splitlines()[0]
+    rows = fill_in_place(sample, lambda row: "yes" if row["rule"] == "typed_prefix" else None)
+    assert sample.read_text(encoding="utf-8").splitlines()[0] == header_line
+    code, out, err = record_answers(capsys, library, ledger, sample, sample, "--json")
+    assert code == 0, err
+    recorded = json.loads(out)
+    assert recorded["appended"] == len(rows)
+    assert recorded["unanswered"] == sum(row["verdict"] is None for row in rows)
+    verdicts = {
+        row["span_id"]: row["verdict"]
+        for row in map(json.loads, ledger.read_text(encoding="utf-8").splitlines())
+    }
+    assert {verdicts[row["span_id"]] for row in rows if row["rule"] == "typed_prefix"} == {"yes"}
+    assert {verdicts[row["span_id"]] for row in rows if row["rule"] != "typed_prefix"} == {"unsure"}
+
+
+def test_an_answers_file_with_a_header_must_carry_the_header_of_this_sample(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=30)
+    first, second = tmp_path / "first.jsonl", tmp_path / "second.jsonl"
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", first)
+    run_cli(
+        capsys, "review-sample", "--owner-id", "rob", "--library", library, "--per-stratum", "3",
+        "--out", second,
+    )  # fmt: skip
+    fill_in_place(first, lambda row: "yes")
+    fill_in_place(second, lambda row: "yes")
+    mixed = tmp_path / "mixed.jsonl"
+    mixed.write_text(
+        second.read_text(encoding="utf-8").splitlines()[0]
+        + "\n"
+        + "\n".join(first.read_text(encoding="utf-8").splitlines()[1:])
+        + "\n",
+        encoding="utf-8",
+    )
+    ledger = tmp_path / "ledger.jsonl"
+    code, _, err = record_answers(capsys, library, ledger, first, mixed)
+    assert code == 2 and "header" in err and not ledger.exists()
+    edited = edit_header(first, tmp_path / "edited.jsonl", seed="another")
+    code, _, err = record_answers(capsys, library, ledger, first, edited)
+    assert code == 2 and "header" in err and not ledger.exists()
+    # Only a header and no rows: nothing was answered, so every row is recorded as unsure.
+    header_only = tmp_path / "header-only.jsonl"
+    header_only.write_text(
+        first.read_text(encoding="utf-8").splitlines()[0] + "\n", encoding="utf-8"
+    )
+    code, out, err = record_answers(capsys, library, ledger, first, header_only, "--json")
+    assert code == 0, err
+    recorded = json.loads(out)
+    assert recorded["unanswered"] == recorded["appended"] > 0
+
+
 def test_review_record_needs_the_sample_it_answers(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

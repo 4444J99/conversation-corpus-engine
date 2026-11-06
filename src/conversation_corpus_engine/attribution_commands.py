@@ -48,6 +48,7 @@ from .attribution_rules import (
     REJECTED_TEXT_EVIDENCE,
     RULES,
     RULES_VERSION,
+    SAMPLE_HEADER_SCHEMA,
     SAMPLE_PER_STRATUM,
     SAMPLE_SEED,
     STRATA,
@@ -1223,7 +1224,9 @@ def _review_sample(args: argparse.Namespace) -> int:
 
 def _answers(path: Path, sample: ReviewSample) -> dict[str, str | None]:
     """The owner's answers by span id: each must name a row of the sample (its rule, stratum,
-    rules version and, when echoed, its text hash must agree) and carry a verdict or none."""
+    rules version and, when echoed, its text hash must agree) and carry a verdict or none. The
+    answers file may be the sample file itself, filled in: a header line is ignored, but it must
+    be this sample's header."""
     by_id = {row["span_id"]: row for row in sample.rows}
     answers: dict[str, str | None] = {}
     for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), start=1):
@@ -1232,6 +1235,12 @@ def _answers(path: Path, sample: ReviewSample) -> dict[str, str | None]:
         answer = load_json_line(line, "answers", number)
         if not isinstance(answer, dict):
             raise ValueError(f"answers line {number}: must be an object")
+        if answer.get("schema") == SAMPLE_HEADER_SCHEMA:
+            if answer != sample.header:
+                raise ValueError(
+                    f"answers line {number}: the header is not the header of this sample"
+                )
+            continue
         bound = by_id.get(str(answer.get("span_id")))
         if (
             bound is None

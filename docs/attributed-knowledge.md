@@ -402,11 +402,14 @@ differently. The census keeps one digest per distinct long unit, never the text.
 ### Reports, annotations and bounds
 
 ```bash
-cce library attribute --report --library /private/store/library-all --owner-id rob [--json] [--ledger L]
+cce library attribute --report --library /private/store/library-all --owner-id rob
 cce library attribute apply --library /private/store/library-all --out /private/annotations.json \
-  --owner-id rob [--ledger L]
+  --owner-id rob
 cce library profile --store-root /private/store --persona rob --annotations /private/annotations.json
 ```
+
+Add `--json` to the report for JSON, and `--ledger /private/ledger.jsonl` (below) to either
+command to let the owner's reviews decide what is eligible. Nothing is eligible without one.
 
 `--library` accepts a `library.sqlite` file, a generation folder or a store folder; without it
 `--store-root` or the library store variable is used. Every command opens the generation
@@ -468,6 +471,12 @@ span can reach a strict profile.
   message before the census starts.
 
 ### The precision gate and owner review
+
+**Scope, plainly.** The gate protects against honest mistakes, systematic over-claiming, naive
+fabrication and sample, seed and ledger shopping. It does **not** protect against a process that
+holds the owner's permissions and deliberately writes the owner's identity: such a process can
+append ledger rows, or write a sample with a recomputed digest, under the owner's name, and
+nothing here can tell them from the owner's own. That is stated, not solved.
 
 A (rule, length stratum) is profile-eligible only when the owner-review ledger holds at least
 100 reviewed spans of that rule and stratum at the current rules version, at least 95 percent of
@@ -549,19 +558,36 @@ owner was shown) and `drawn` (rows that sample drew for the rule and stratum). I
 Appends read, check and write under one exclusive lock, taken without blocking and retried for up
 to 30 seconds; after that the append fails with `ledger is locked by another process` (exit 2) and
 writes nothing. A row that names a span one reviewer already reviewed as a different rule or
-stratum is refused with nothing written (re-answering under the same rule and stratum is
-allowed). If the ledger does not end in a newline an earlier write was cut short: the append
+stratum is refused with nothing written (the ledger keeps the last answer of a span, but a
+sample is recorded only once, so that is not how an answer is corrected). If the ledger does not end in a newline an earlier write was cut short: the append
 writes a newline first, the fragment becomes one malformed line (quarantined, never counted) and
 `review-record` reports `repaired_torn_line: true`.
 
 ```bash
+# 1. Draw the first sample (no ledger yet).
 cce library attribute review-sample --library /private/store/library-all --owner-id rob \
-  [--ledger /private/ledger.jsonl] --out /private/sample.jsonl
-# fill in "verdict": "yes" | "no" | "unsure" on each row, then
+  --out /private/sample-1.jsonl
+# 2. Fill in "verdict": "yes" | "no" | "unsure" on each row of that file, then record it. The
+#    filled-in sample file is also the answers file (the header line is ignored there).
 cce library attribute review-record --library /private/store/library-all \
-  --ledger /private/ledger.jsonl --sample /private/sample.jsonl --answers /private/sample.jsonl \
-  --reviewer rob
+  --ledger /private/ledger.jsonl --sample /private/sample-1.jsonl \
+  --answers /private/sample-1.jsonl --reviewer rob
+# 3. The next sample is drawn against the ledger as it now stands, answered and recorded the same way.
+cce library attribute review-sample --library /private/store/library-all --owner-id rob \
+  --ledger /private/ledger.jsonl --out /private/sample-2.jsonl
+# Fill in the verdicts of sample-2 as before, then:
+cce library attribute review-record --library /private/store/library-all \
+  --ledger /private/ledger.jsonl --sample /private/sample-2.jsonl \
+  --answers /private/sample-2.jsonl --reviewer rob
+# 4. Report and export with the ledger.
+cce library attribute --report --library /private/store/library-all --owner-id rob \
+  --ledger /private/ledger.jsonl
+cce library attribute apply --library /private/store/library-all \
+  --out /private/annotations-reviewed.json --owner-id rob --ledger /private/ledger.jsonl
 ```
+
+Every command line in these two blocks is run against a synthetic library by
+`tests/test_attribution_docs.py`, so a recipe that stops working fails the test suite.
 
 `review-sample` needs `--owner-id`: a sample is drawn for one owner. It draws, per rule and
 stratum, up to `--per-stratum` (alias `--per-rule`, default 100) distinct span texts, chosen by a
@@ -581,12 +607,14 @@ spans that are not in the scan hide nothing. Without `--out` the sample goes to 
 output. A sample file holds private text: keep it out of version control.
 
 `review-record` requires `--sample` (the file `review-sample` wrote), `--answers` and `--library`
-or `--store-root` (so the ledger is kept out of the store). It re-hashes the sample and refuses one
-that was edited (a changed row, or a changed header field of any kind, such as the seed, the owner,
-the library, the census settings or the ledger state, changes the digest), cut, hand-written, drawn
-from another library, drawn for another owner than
-`--reviewer` or drawn against another state of the ledger; it refuses an answer whose span id, rule and stratum are not a row of the sample, a
-span answered twice, a verdict other than `yes`, `no` or `unsure`, and a file with JSON nested too
-deeply to read (`unreadable`), all before anything is written. It stamps the current UTC time
-unless `--reviewed-at` is given. The engine's own functions take the time as a parameter and never
-read the clock.
+or `--store-root` (so the ledger is kept out of the store). `--answers` may be the very same file as
+`--sample`, filled in; a header line in the answers file is ignored, but it must be the header of
+this sample (an answers file carrying another or an edited header is refused). It checks the digest
+of the sample and refuses one that was edited (a changed row, or a changed header field of any kind,
+such as the seed, the owner, the library, the census settings or the ledger state, changes the
+digest), cut, hand-written, drawn from another library, drawn for another owner than `--reviewer`,
+drawn against another state of the ledger or already recorded; it refuses an answer whose span id,
+rule and stratum are not a row of the sample, a span answered twice, a verdict other than `yes`,
+`no` or `unsure`, and a file with JSON nested too deeply to read (`unreadable`), all before
+anything is written. It stamps the current UTC time unless `--reviewed-at` is given. The engine's
+own functions take the time as a parameter and never read the clock.
