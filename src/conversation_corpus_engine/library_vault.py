@@ -448,17 +448,6 @@ class VaultPlan:
             emit(path, text)
         return {"notes": notes, "bytes": size}
 
-    def summary(self) -> dict[str, Any]:
-        result: dict[str, Any] = {"records": self.records, "notes": self.notes}
-        if self.cards is not None:
-            result.update(
-                cards=self.cards,
-                omitted=self.omitted,
-                truncated=self.truncated,
-                limit_notes=self.limit_notes,
-            )
-        return result
-
 
 def _home(
     lines: list[str],
