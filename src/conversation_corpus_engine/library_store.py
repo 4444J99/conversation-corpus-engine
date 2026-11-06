@@ -301,6 +301,9 @@ CREATE TABLE IF NOT EXISTS relations (
     src TEXT NOT NULL, dst TEXT NOT NULL, kind TEXT NOT NULL,
     evidence TEXT NOT NULL, PRIMARY KEY(src, dst, kind)
 );
+CREATE TABLE IF NOT EXISTS captures (
+    uid TEXT PRIMARY KEY REFERENCES records(uid), summary TEXT NOT NULL
+);
 """
 
 
@@ -472,6 +475,7 @@ class Library:
         observations = [payload["provenance"], *extra.get("source_observations", [])]
         if previous is not None and previous["current_digest"] == digest:
             self._observations(uid, observations)
+            self._capture(uid, conversation.provider, payload)
             self.connection.commit()
             return {
                 "uid": uid,
@@ -568,6 +572,7 @@ class Library:
                 (uid, digest, body_status, "accepted_revision"),
             )
             self._observations(uid, observations)
+            self._capture(uid, conversation.provider, payload)
             record_rowid = self.connection.execute(
                 "SELECT rowid FROM records WHERE uid=?", (uid,)
             ).fetchone()[0]
@@ -605,6 +610,25 @@ class Library:
             "change_kind": change,
             "digest": digest,
         }
+
+    def _capture(self, uid: str, provider: str, payload: dict[str, Any]) -> None:
+        """Keep a web capture's few provenance facts beside its record, so a search hit shows them
+        without decompressing the stored page."""
+        if provider == WEB_CAPTURE_PROVIDER:
+            summary = capture_summary(payload.get("provenance") or {})
+            self.connection.execute(
+                "INSERT OR REPLACE INTO captures VALUES (?,?)", (uid, canonical_json(summary))
+            )
+
+    def capture(self, uid: str) -> dict[str, Any]:
+        """The search summary of a web capture, read from a small row and never from the page."""
+        try:
+            row = self.connection.execute(
+                "SELECT summary FROM captures WHERE uid=?", (uid,)
+            ).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        return json.loads(row[0]) if row else capture_summary({})
 
     def _observations(self, uid: str, observations: list[Any]) -> None:
         for observation in observations:
@@ -962,9 +986,7 @@ class Library:
                 if hit["provider"] == WEB_CAPTURE_PROVIDER:
                     # A saved page shows where it came from and when it was fetched; the other
                     # providers' hits keep exactly the keys they had.
-                    hit["capture"] = capture_summary(
-                        self.record(hit["uid"]).get("provenance") or {}
-                    )
+                    hit["capture"] = self.capture(hit["uid"])
                 hits.append(hit)
             return hits
 

@@ -178,6 +178,27 @@ def test_three_pages_build_search_and_show_their_source(tmp_path, capsys):
         assert hit["capture"]["content_digest"] == web_capture.text_digest(text)
 
 
+def test_a_search_hit_never_reads_the_stored_page(tmp_path, monkeypatch):
+    project, store, shards = setup(tmp_path)
+    write_shard(shards / "captures-001.jsonl", page_rows())
+    report = build_library(manifest_for(shards), project_root=project, store_root=store)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("a search read a whole stored payload")
+
+    monkeypatch.setattr(Library, "record", forbidden)
+    with Library(Path(report["generation"]) / "library.sqlite") as library:
+        found = library.search("orchard lattice", max_seconds=5)
+    (hit,) = found["hits"]
+    assert hit["capture"] == {
+        "url": PAGES[0][0],
+        "final_url": PAGES[0][0],
+        "captured_at": PAGES[0][3],
+        "content_digest": web_capture.text_digest(PAGES[0][2]),
+        "http_status": 200,
+    }
+
+
 def test_a_record_keeps_its_provenance_and_no_host_path(tmp_path):
     project, store, shards = setup(tmp_path)
     rows = page_rows()
