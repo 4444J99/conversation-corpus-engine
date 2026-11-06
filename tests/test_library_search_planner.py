@@ -620,13 +620,18 @@ def test_plans_proven_empty_after_the_budget_ran_out_give_an_exact_empty_answer(
 
 
 # After the budget runs out, the unranked page (and each probe) gets its own allowance of
-# min(max_seconds, 2) seconds. The clock jumps by ``jump`` the moment that page's statement
+# max(min(max_seconds, 2), 0.25) seconds. The clock jumps by ``jump`` the moment that page's statement
 # begins, so a jump below the allowance leaves the page whole and a jump past it cuts it.
 ALLOWANCE_CASES = [
     pytest.param(5.0, 1.9, False, id="just-inside-the-two-second-cap"),
     pytest.param(5.0, 2.1, True, id="just-past-the-two-second-cap"),
     pytest.param(1.0, 0.9, False, id="just-inside-a-one-second-budget"),
     pytest.param(1.0, 1.1, True, id="just-past-a-one-second-budget"),
+    # A tiny budget still leaves a quarter of a second to produce a page.
+    pytest.param(1e-9, 0.2, False, id="just-inside-the-quarter-second-floor"),
+    pytest.param(1e-9, 0.3, True, id="just-past-the-quarter-second-floor"),
+    pytest.param(5e-324, 0.2, False, id="smallest-budget-inside-the-floor"),
+    pytest.param(5e-324, 0.3, True, id="smallest-budget-past-the-floor"),
 ]
 
 

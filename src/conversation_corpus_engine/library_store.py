@@ -48,8 +48,11 @@ MAX_SEARCH_SECONDS = 600.0
 # The time budget applied by the command line and the MCP tool; the Python API has none unless
 # the caller passes ``max_seconds``.
 DEFAULT_SEARCH_SECONDS = 15.0
-# After the budget runs out, the unranked page that replaces the ranking gets this much more time.
+# After the budget runs out, the unranked page and each plan probe get their own allowance of at
+# most this many seconds (and at most max_seconds)...
 UNRANKED_GRACE_SECONDS = 2.0
+# ...and never less than this, so even a tiny budget leaves time to produce a page.
+MIN_UNRANKED_GRACE_SECONDS = 0.25
 # VM instructions between budget checks. SQLite computes bm25 for a long match list inside a few
 # instructions per row, so the interval stays small; a test lowers it to exercise a tiny library.
 SEARCH_PROGRESS_INSTRUCTIONS = 1000
@@ -902,7 +905,8 @@ class Library:
             return hits
 
         def grace_deadline() -> float:
-            return _clock() + min(seconds or UNRANKED_GRACE_SECONDS, UNRANKED_GRACE_SECONDS)
+            allowance = min(seconds or UNRANKED_GRACE_SECONDS, UNRANKED_GRACE_SECONDS)
+            return _clock() + max(allowance, MIN_UNRANKED_GRACE_SECONDS)
 
         def unranked(chosen: str) -> tuple[list[sqlite3.Row], bool]:
             """The first matches of a plan in index order, under a short allowance of their own.

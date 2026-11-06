@@ -6,6 +6,7 @@ import time
 import pytest
 from test_library_search_planner import legacy_search
 
+from conversation_corpus_engine import library_store
 from conversation_corpus_engine.archive_database import PHRASE_RE, WORD_RE, fts_query, fts_terms
 from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.library_store import (
@@ -217,3 +218,25 @@ def test_queries_the_base_accepted_return_the_same_hits(hardened, query):
     expected = legacy_search(hardened, query)
     got = hardened.search(query, plan="and")
     assert {k: got[k] for k in expected} == expected
+
+
+# --- a tiny budget still produces a page ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("seconds", [5e-324, 1e-300, 1e-9])
+def test_a_tiny_budget_still_returns_a_page_from_the_plan_that_matches(
+    hardened, monkeypatch, seconds
+):
+    """The budget is spent before anything runs; the quarter-second floor lets the probes and the
+    page finish, so the answer is not an empty "0+" with nowhere to go."""
+    monkeypatch.setattr(library_store, "SEARCH_PROGRESS_INSTRUCTIONS", 1)
+    result = hardened.search("omega alpha", limit=5, max_seconds=seconds)
+    assert result["partial"] is True and result["ranked"] is False
+    assert result["plan"] == "and" and len(result["hits"]) == 5
+    assert result["total_exact"] is False and result["next_offset"] == 5
+    assert result["total"] == 5 and result["total_label"] == "5+"
+
+
+def test_the_allowance_floor_and_cap_are_documented_constants():
+    assert library_store.UNRANKED_GRACE_SECONDS == 2.0
+    assert library_store.MIN_UNRANKED_GRACE_SECONDS == 0.25
