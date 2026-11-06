@@ -412,3 +412,40 @@ def test_an_oversized_query_is_bounded_and_says_so_through_the_tool(mcp):
     assert "tq" in library_mcp.COMPACT_KEYS.values()
     plain = mcp(SEARCH_TOOL, query="omega", limit=3)
     assert "terms_truncated" not in plain and "notice" not in plain
+
+
+HUGE_INT = 10**400
+
+
+@pytest.mark.parametrize("name", ["max_seconds", "limit", "offset"])
+def test_a_huge_integer_argument_is_a_clean_value_error_through_the_tool(mcp, name):
+    with pytest.raises(ValueError, match=name):
+        mcp(SEARCH_TOOL, query="lumen glyph", **{name: HUGE_INT})
+
+
+def test_a_huge_integer_over_json_rpc_is_a_tool_error_not_an_internal_error(
+    library_path, tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setattr(library_mcp, "open_library", lambda root: (tmp_path, Library(library_path)))
+    server = CceMcpServer(default_project_root=tmp_path, library_store_root=tmp_path)
+    raw = (
+        '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cce_library_search",'
+        '"arguments":{"query":"lumen glyph","max_seconds":1' + "0" * 400 + "}}}"
+    )
+    response = server.handle_request(json.loads(raw))
+    assert "error" not in response and response["result"]["isError"] is True
+    assert "max_seconds" in response["result"]["content"][0]["text"]
+    assert capsys.readouterr().err == ""
+
+
+def test_the_cli_reports_a_huge_integer_without_a_traceback(cli, tmp_path, capsys):
+    with pytest.raises(SystemExit):
+        parse("--max-seconds", "1" + "0" * 400)
+    assert BAD_BUDGET in capsys.readouterr().err
+    for flag, name in (("--limit", "limit"), ("--offset", "offset")):
+        args = build_parser().parse_args(
+            ["library", "search", "--store-root", str(tmp_path), "lumen glyph", flag, str(HUGE_INT)]
+        )
+        assert handle_library(args) == 2
+        captured = capsys.readouterr()
+        assert f"library: {name} must be" in captured.err and captured.out == ""

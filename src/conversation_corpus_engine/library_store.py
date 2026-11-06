@@ -85,14 +85,31 @@ def validate_max_seconds(value: Any) -> float | None:
     return None if value is None else validate_search_seconds(value)
 
 
+def bounded_int(value: Any, minimum: int, maximum: int) -> bool:
+    """Whether ``value`` is a real integer in [minimum, maximum]; never raises, whatever it is."""
+    try:
+        return (
+            not isinstance(value, bool) and isinstance(value, int) and minimum <= value <= maximum
+        )
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
 def validate_search_seconds(value: Any) -> float:
-    """A time budget that must be given: a finite number of seconds in (0, 600]."""
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, int | float)
-        or not math.isfinite(value)
-        or not 0 < value <= MAX_SEARCH_SECONDS
-    ):
+    """A time budget that must be given: a finite number of seconds in (0, 600].
+
+    Anything else, including an integer too large to be a float, is a ``ValueError``.
+    """
+    try:
+        valid = (
+            not isinstance(value, bool)
+            and isinstance(value, int | float)
+            and math.isfinite(value)
+            and 0 < value <= MAX_SEARCH_SECONDS
+        )
+    except (OverflowError, TypeError, ValueError):
+        valid = False
+    if not valid:
         raise ValueError(
             f"max_seconds must be a number greater than 0 and at most {MAX_SEARCH_SECONDS:g}"
         )
@@ -102,9 +119,9 @@ def validate_search_seconds(value: Any) -> float:
 def validate_count_cap(value: Any) -> int | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= MAX_COUNT_CAP:
+    if not bounded_int(value, 1, MAX_COUNT_CAP):
         raise ValueError(f"count_cap must be an integer from 1 to {MAX_COUNT_CAP}, or None")
-    return value
+    return int(value)
 
 
 _TRAILING_FRAGMENT = re.compile(r"\s\S*$")
@@ -773,9 +790,9 @@ class Library:
         beyond that many (``total_exact`` false, ``total_label`` ``"<cap>+"``); ``None`` counts
         them all. Hits and their order do not depend on the cap.
         """
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_PAGE:
+        if not bounded_int(limit, 1, MAX_PAGE):
             raise ValueError(f"limit must be an integer from 1 to {MAX_PAGE}")
-        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 1000000000:
+        if not bounded_int(offset, 0, 1000000000):
             raise ValueError("offset must be an integer from 0 to 1000000000")
         plan = validate_plan(plan)
         seconds = validate_max_seconds(max_seconds)

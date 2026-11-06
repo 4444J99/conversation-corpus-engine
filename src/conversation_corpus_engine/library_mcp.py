@@ -19,6 +19,7 @@ from .library_store import (
     MAX_SEARCH_SECONDS,
     SEARCH_PLANS,
     Library,
+    bounded_int,
     plan_locator_query,
     plan_match,
     validate_plan,
@@ -256,7 +257,7 @@ def tool_definitions() -> list[dict[str, Any]]:
 def _integer(arguments: dict[str, Any], name: str, default: int, maximum: int) -> int:
     value = arguments.get(name, default)
     minimum = 1 if name in {"limit", "message_end", "toc_limit"} else 0
-    if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+    if not bounded_int(value, minimum, maximum):
         raise ValueError(f"{name} must be an integer from {minimum} to {maximum}")
     return value
 
@@ -374,11 +375,7 @@ def _search(
     if "budget_tokens" in arguments or depth == "L0":
         maximum = L0_MAX_BUDGET if depth == "L0" else MAX_BUDGET
         budget = arguments.get("budget_tokens", L0_DEFAULT_BUDGET)
-        if (
-            isinstance(budget, bool)
-            or not isinstance(budget, int)
-            or not MIN_BUDGET <= budget <= maximum
-        ):
+        if not bounded_int(budget, MIN_BUDGET, maximum):
             raise ValueError(
                 f"budget_tokens must be an integer from {MIN_BUDGET} to {maximum}"
                 + (" at depth L0" if depth == "L0" else "")

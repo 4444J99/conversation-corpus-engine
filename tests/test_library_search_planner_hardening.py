@@ -12,6 +12,8 @@ from conversation_corpus_engine.library_store import (
     Library,
     plan_locator_query,
     plan_match,
+    validate_max_seconds,
+    validate_search_seconds,
 )
 
 
@@ -140,3 +142,23 @@ def test_a_clip_that_lands_inside_a_word_drops_that_fragment():
     assert plan_match(query, "and") == '"alpha"'
     # One giant token has no earlier boundary, so its first characters are kept (then cut again).
     assert plan_match("x" * 5000, "and") == '"' + "x" * MAX_TERM_CHARS + '"'
+
+
+# --- numeric arguments never overflow ------------------------------------------------------------
+
+HUGE_INT = 10**400
+
+
+@pytest.mark.parametrize("value", [HUGE_INT, -HUGE_INT])
+@pytest.mark.parametrize("name", ["max_seconds", "count_cap", "limit", "offset"])
+def test_a_huge_integer_is_a_value_error_for_every_numeric_argument(hardened, name, value):
+    """float() of such an integer overflows; the validators must report it as invalid input."""
+    with pytest.raises(ValueError, match=name):
+        hardened.search("alpha", **{name: value})
+
+
+@pytest.mark.parametrize("value", [HUGE_INT, -HUGE_INT])
+def test_the_budget_validators_reject_a_huge_integer_with_their_standard_message(value):
+    for validator in (validate_max_seconds, validate_search_seconds):
+        with pytest.raises(ValueError, match="max_seconds must be a number"):
+            validator(value)
