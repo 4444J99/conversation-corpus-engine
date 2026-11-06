@@ -486,6 +486,8 @@ def test_ledger_row_refuses_bad_input_and_never_reads_the_clock() -> None:
     for kwargs in (
         {"verdict": "y"},
         {"reviewer": ""},
+        {"reviewer": "\u200b"},
+        {"reviewer": "\u0301\ufeff"},
         {"reviewed_at": "yesterday"},
         {"span_id": "short"},
         {"rule": "unattributed"},

@@ -1707,7 +1707,7 @@ def validate_ledger_row(row: Any) -> dict[str, Any]:
     if row["verdict"] not in VERDICTS:
         raise ValueError(f"ledger row verdict must be one of {list(VERDICTS)}")
     reviewer = row["reviewer"]
-    if not isinstance(reviewer, str) or not reviewer.strip():
+    if not isinstance(reviewer, str) or blank_text(reviewer):
         raise ValueError("ledger row needs a reviewer")
     stamp = row["reviewed_at"]
     try:
