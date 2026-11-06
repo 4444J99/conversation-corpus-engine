@@ -223,11 +223,118 @@ def unquote_line(line):
         depth += 1
 
 
+_LIST_MARKER = re.compile(r"^ {0,3}(?:[-*+]|\d{1,9}[.)]) ")
+# Raw HTML block type 1 (CommonMark): pre, script, style, and textarea
+# end only at their matching closing tag, never at a blank line.
+_RAW_OPEN = re.compile(r"^ {0,3}<(pre|script|style|textarea)(?:[\s>]|$)", re.IGNORECASE)
+_PRE_OPEN = _RAW_OPEN
+_COMMENT_OPEN = re.compile(r"^ {0,3}<!--")
+
+
+def _strip_list_markers(line):
+    """Strip leading list markers; return (rest, content indent or None).
+
+    The content indent is the offset where the list item's content starts,
+    so a fence on a continuation line can be measured relative to it.
+    A tab immediately after a marker's space expands to the next tab
+    stop (CommonMark): "- \\t```" has content indent 4, not 2, and
+    leaving the tab in front of the fence marker hid the opener from
+    the fence regex, so the closing delimiter was misread as a new
+    opener and packaging failed closed. The tab is replaced by the
+    spaces it expands to, so every consumer of the stripped rest
+    (fence, comment, and raw-HTML matching) sees the marker.
+    """
+    indent = 0
+    while True:
+        match = _LIST_MARKER.match(line)
+        if not match:
+            return line, (indent or None)
+        indent += match.end()
+        line = line[match.end() :]
+        # Expand tabs in the separator's leading whitespace to tab
+        # stops, and measure the content indent from the expanded
+        # columns. The loop above already strips one space after the
+        # marker, so a "- \t" separator leaves the tab in front of
+        # the content; expanding only when a tab is present keeps
+        # the spaces-only behaviour (and its list_indent) unchanged.
+        run = 0
+        while run < len(line) and line[run] in " \t":
+            run += 1
+        if "\t" in line[:run]:
+            column = indent
+            expanded = []
+            for char in line[:run]:
+                if char == " ":
+                    expanded.append(" ")
+                    column += 1
+                else:
+                    spaces = 4 - (column % 4)
+                    expanded.append(" " * spaces)
+                    column += spaces
+            indent = column
+            line = "".join(expanded) + line[run:]
+
+
+def _leading_indent(line):
+    spaces = len(line) - len(line.lstrip(" "))
+    if line[spaces : spaces + 1] == "\t":
+        return spaces + 4
+    return spaces
+
+
+def _fence_column(line):
+    """Column of a fence marker after stripping its containers.
+
+    Stripping alternating list markers and blockquote prefixes leaves
+    the fence line itself; its column is the stripped length plus the
+    remaining line's own indent. For a fence opened inside nested
+    containers ("- > 10. ```") this is the item's content indent (8),
+    not the outer item's indent (2), so a closer measured from the
+    nested item's indent is recognized as a close. Tabs expand to
+    tab stops first: counting a tab as one column would put a
+    "- \\t```" fence at column 3 instead of its content indent 4,
+    and a split footer built at that column would fall outside the
+    item and open a new fence instead of closing the carried one.
+    """
+    expanded = line.expandtabs(4)
+    stripped, _ = _strip_containers(expanded, 0)
+    return (len(expanded) - len(stripped)) + (len(stripped) - len(stripped.lstrip(" ")))
+
+
+def _strip_containers(probe, depth):
+    """Strip alternating list markers and blockquote prefixes.
+
+    A fence may open inside nested containers in either order ("- > ```"
+    or "> - ```"): stripping only the outer layer leaves the inner
+    prefix in front of the fence marker, so the opener was missed and
+    its closing line was misread as a new opener.
+    """
+    while True:
+        stripped, _ = _strip_list_markers(probe)
+        if stripped != probe:
+            probe = stripped
+            continue
+        unquoted, extra = unquote_line(probe)
+        if extra:
+            probe, depth = unquoted, depth + extra
+            continue
+        return probe, depth
+
+
 def advance_fence(line, state):
     probe, depth = unquote_line(line)
     previous, previous_depth = unquote_line(state or "")
     if state and depth < previous_depth:
+        # Leaving a blockquote also leaves its fence: a fence line that
+        # follows (possibly a list item's fence opener) must be read fresh
+        # rather than missed because the old quoted state was still set.
         state = None
+    if state is None:
+        # A fence may open on a list item's own line ("- ```python"). List
+        # markers are stripped only when opening: once inside a fence, a
+        # marker-prefixed line is fence content, not a closing fence, and
+        # the close must be a plain (possibly quoted) fence line.
+        probe, depth = _strip_containers(probe, depth)
     match = FENCE.match(probe)
     if not match:
         return state
@@ -246,11 +353,359 @@ def advance_fence(line, state):
     return state
 
 
-def fence_state(text, state=None, starts_line=True):
+class _FenceTracker:
+    """Shared container-aware fence tracking for validation and rewriting.
+
+    Plain ``advance_fence`` misses fences that live inside containers: a
+    fence opened on a list item's line ("- ```python") was missed, so its
+    closing fence was misread as an opener, and a fence on a list
+    continuation line (indented to the item's content) was missed entirely.
+    Fence markers inside a raw HTML block type 1 (``<pre>``, ``<script>``,
+    ``<style>``, ``<textarea>``) are likewise not fences: such a block
+    ends only at its matching closing tag, never at a blank line, and
+    markers inside an HTML comment (``<!--`` to ``-->``) are comment
+    text, not fences. Validation (``fence_state``) already used this
+    logic while link rewriting, anchor collection, and navigation growth
+    used plain ``advance_fence``, so the two disagreed: a valid note with
+    a commented fence failed packaging, and links after a list-contained
+    fence were silently left unrewritten. All four now share this tracker,
+    so a line is literal for every consumer or for none of them.
+
+    A literal block that starts inside a list item or blockquote ends
+    when a non-blank line leaves that container (a sibling-or-outer list
+    marker, a line indented below the item's content indent, or a
+    blockquote-depth change), as well as at its closing tag. Without
+    that boundary, removing the old blank-line exit for ``<pre>`` would
+    let an unclosed block inside a list item swallow every fence and
+    link that follows the item. A blank line alone never ends a
+    literal block: it does not end its container either.
+
+    This tracker is an approximation, not a full CommonMark parser: it
+    follows one list content indent at a time, only recognizes the
+    type-1 tags above and whole-line comments (other raw HTML block
+    types, e.g. ``<div>``, are not recognized), and a segment that
+    starts inside a literal block is tracked as plain text until the
+    next container boundary, exactly as before: rendered parts carry no
+    literal opener in their header, so carrying literal state across a
+    split would disagree with the rendered part's own parse and break
+    its fence verification. Only ``list_indent`` and the fence's list
+    prefix are carried across a split, and only when the segment
+    starts inside a fence, where the part header reopens that fence
+    with its prefix.
+    """
+
+    def __init__(self, state=None, list_indent=None, fence_prefix=None, fence_content_indent=None):
+        self.state = state
+        # Only set from a carried segment when state is not None (see
+        # above): a fence-open segment's closing line is measured from
+        # its list item's content indent, not from column zero.
+        self.list_indent = list_indent
+        # List prefix of the fence open at the segment start, e.g. "-   "
+        # for a fence opened on a list item line. A split part's header
+        # reopens its carried fence with this prefix, so the part parses
+        # the content-indented closing line as a close, exactly as the
+        # source did; without it, the part's column-zero opener would
+        # leave the indented closer as code and strand the links after it.
+        self.fence_prefix = fence_prefix if state is not None else None
+        # Column of the open fence's marker (see _fence_column). A
+        # closer for a fence inside nested containers is measured
+        # from the nested item's content indent, not the outer item's.
+        self.fence_content_indent = fence_content_indent if state is not None else None
+        self.literal_tag = None  # "comment" or a type-1 tag name
+        self.literal_quote_depth = None
+        self.literal_list_indent = None
+
+    def _enter_literal(self, tag, quote_depth, content_indent):
+        self.literal_tag = tag
+        self.literal_quote_depth = quote_depth
+        self.literal_list_indent = (
+            content_indent if content_indent is not None else self.list_indent
+        )
+
+    def _literal_end_tag(self):
+        return "-->" if self.literal_tag == "comment" else f"</{self.literal_tag}>"
+
+    def advance(self, line):
+        """Advance one line; return (before, after, literal).
+
+        Also maintains ``fence_prefix``: when a fence opens, remember
+        the list prefix that opened it (reconstructed from the item's
+        content indent, so any marker type is equivalent); when it
+        closes, drop it. Callers that split text carry the prefix with
+        the fence marker so a later part can reopen the same fence.
+        """
+        before = self.state
+        result = self._advance_inner(line)
+        if self.state is None:
+            self.fence_prefix = None
+            self.fence_content_indent = None
+        elif before is None:
+            if self.fence_prefix is None:
+                # Plain fences carry no prefix; list fences carry the item
+                # prefix that makes their content-indented closer close.
+                self.fence_prefix = "-" + " " * (self.list_indent - 1) if self.list_indent else ""
+            if self.fence_content_indent is None:
+                self.fence_content_indent = _fence_column(line)
+        return result
+
+    def _advance_inner(self, line):
+        """Advance one line; return (before, after, literal).
+
+        ``literal`` means the line is inside a raw HTML block or an HTML
+        comment, so no link or heading on it may be rewritten or collected.
+        Fence lines themselves are not flagged literal: callers already
+        skip them because ``before`` or ``after`` is not None.
+        """
+        before = self.state
+        probe, quote_depth = unquote_line(line)
+        stripped, content_indent = _strip_list_markers(probe)
+        if self.literal_tag is not None:
+            if not line.strip():
+                return before, self.state, True
+            if self._literal_end_tag() in line.lower():
+                self.literal_tag = None
+                return before, self.state, True
+            # Leaving the originating container ends the literal block.
+            if quote_depth != self.literal_quote_depth:
+                self.literal_tag = None
+            elif self.literal_list_indent is not None and line.strip():
+                if content_indent is not None:
+                    if content_indent <= self.literal_list_indent:
+                        self.literal_tag = None
+                elif _leading_indent(probe) < self.literal_list_indent:
+                    self.literal_tag = None
+            if self.literal_tag is not None:
+                return before, self.state, True
+            # Fell through: this line left the container, so process it
+            # normally below (it may open a fence or a new literal block).
+        if self.state is not None and self.list_indent is not None and line.strip():
+            # A fence inside a list item ends when a later line leaves
+            # that item: an unindented paragraph after a blank line, a
+            # sibling-or-outer list marker, a fence line outside the
+            # item's content indent, or a blockquote that starts
+            # outside the item. The line is then processed normally
+            # below, in its new context. Fence lines are NOT exempt:
+            # a column-zero fence line after a list fence ends the
+            # item and opens a new fence (so the note ends open),
+            # while a marker-prefixed fence line is a sibling item
+            # whose fence then opens and closes normally. Lines in a
+            # deeper quote than the fence are left alone except when
+            # the quote itself starts before the item's content indent
+            # (an unindented "> " line is outside the item, while a
+            # quoted continuation indented into the item is not):
+            # quote-depth decreases already clear the fence, and
+            # increases inside the item are content under the
+            # existing approximation. The indent is measured in both
+            # coordinate systems the tracker already uses (raw line
+            # and quote-stripped probe), because a quoted
+            # continuation line's probe indent alone would falsely
+            # report it as leaving the item.
+            fence_depth = unquote_line(self.state)[1]
+            if quote_depth == fence_depth:
+                if content_indent is not None:
+                    if _leading_indent(probe) < self.list_indent:
+                        self.state = None
+                elif max(_leading_indent(line), _leading_indent(probe)) < self.list_indent:
+                    self.state = None
+            elif line.lstrip(" ")[:1] == ">":
+                quote_start = len(line) - len(line.lstrip(" "))
+                if quote_start < self.list_indent:
+                    self.state = None
+        if self.state is None:
+            if _COMMENT_OPEN.match(stripped):
+                # A comment closed on its opening line is not an open block;
+                # either way the line itself is comment text, not a fence.
+                if "-->" not in stripped:
+                    self._enter_literal("comment", quote_depth, content_indent)
+                return before, self.state, True
+            raw = _RAW_OPEN.match(stripped)
+            if raw:
+                # A type-1 element closed on its own opening line is not
+                # an open block.
+                tag = raw.group(1).lower()
+                if f"</{tag}>" not in stripped.lower():
+                    self._enter_literal(tag, quote_depth, content_indent)
+                return before, self.state, True
+            # A literal block may also open inside alternating
+            # containers ("- > <pre>"): stripping only the outer list
+            # marker leaves the blockquote prefix in front of the tag,
+            # so the single-layer check above misses it and its literal
+            # backticks are then misread as a fence. Strip all
+            # containers, as fence openers already do, and enter the
+            # literal in the stripped form's quote context. The
+            # list-indent exit is disabled for this shape: its
+            # continuation lines ("  > ...") measure their
+            # quote-stripped indent below the item's content indent
+            # while still being inside the blockquote, so keeping the
+            # item's indent would exit the literal on the first
+            # continuation line; the quote-depth change still ends it.
+            containers, container_depth = _strip_containers(probe, quote_depth)
+            if containers != stripped:
+                if _COMMENT_OPEN.match(containers):
+                    if "-->" not in containers:
+                        self._enter_literal("comment", container_depth, None)
+                        self.literal_list_indent = None
+                    return before, self.state, True
+                raw2 = _RAW_OPEN.match(containers)
+                if raw2:
+                    tag = raw2.group(1).lower()
+                    if f"</{tag}>" not in containers.lower():
+                        self._enter_literal(tag, container_depth, None)
+                        self.literal_list_indent = None
+                    return before, self.state, True
+            if content_indent is not None:
+                self.list_indent = content_indent
+            elif (
+                self.list_indent is not None
+                and line.strip()
+                and _leading_indent(probe) < self.list_indent
+            ):
+                self.list_indent = None
+        if content_indent is None and self.list_indent is not None and line.strip():
+            indent = _leading_indent(probe)
+            if indent < self.list_indent:
+                self.state = advance_fence(line, self.state)
+            else:
+                # Re-express the line relative to the list item's content
+                # indent, so a fence opened or closed on a continuation
+                # line is tracked and indented code (4+ past content)
+                # still is not. The quote prefix is kept: dropping it
+                # would make a quoted fence's content lines reset the
+                # state and its closing fence reopen one. Only a line
+                # that actually looks like a fence may move the state;
+                # other continuation lines inside a fence are content.
+                adjusted = " " * (indent - self.list_indent) + probe.lstrip(" \t")
+                if self.state is None and _COMMENT_OPEN.match(adjusted):
+                    if "-->" not in adjusted:
+                        self._enter_literal("comment", quote_depth, None)
+                    return before, self.state, True
+                if self.state is None:
+                    raw = _RAW_OPEN.match(adjusted)
+                    if raw:
+                        tag = raw.group(1).lower()
+                        if f"</{tag}>" not in adjusted.lower():
+                            self._enter_literal(tag, quote_depth, None)
+                        return before, self.state, True
+                if FENCE.match(adjusted):
+                    self.state = advance_fence("> " * quote_depth + adjusted, self.state)
+                elif self.state is not None and self.fence_content_indent is not None:
+                    # A closer for a fence inside nested containers
+                    # measures from the nested item's content indent,
+                    # not the outer item's: re-expressing it from the
+                    # outer indent overshoots into indented code (4+
+                    # spaces, not a fence). If its marker column sits
+                    # within three spaces of the fence's own column,
+                    # it is a closer under the same allowance the
+                    # fence regex grants; anything further out stays
+                    # indented code, as before.
+                    stripped2, _ = _strip_containers(line, 0)
+                    column = (len(line) - len(stripped2)) + (
+                        len(stripped2) - len(stripped2.lstrip(" "))
+                    )
+                    gap = column - self.fence_content_indent
+                    if 0 <= gap <= 3:
+                        adjusted2 = " " * gap + stripped2.lstrip(" \t")
+                        if FENCE.match(adjusted2):
+                            self.state = advance_fence("> " * quote_depth + adjusted2, self.state)
+            return before, self.state, False
+        self.state = advance_fence(line, self.state)
+        return before, self.state, False
+
+
+def tracker_after(
+    text,
+    state=None,
+    starts_line=True,
+    list_indent=None,
+    fence_prefix=None,
+    fence_content_indent=None,
+):
+    """Track a text run; return (marker, list indent, fence prefix, fence column).
+
+    ``list_indent``, ``fence_prefix`` and ``fence_content_indent`` are
+    honoured only when ``state`` is not None: they are the carried
+    context of a fence opened in an earlier split segment, so that
+    segment's content-indented closing line is recognized and its part
+    header can reopen the same fence. Literal state is deliberately
+    not carried (see _FenceTracker).
+    """
+    tracker = _FenceTracker(
+        state,
+        list_indent=list_indent if state is not None else None,
+        fence_prefix=fence_prefix if state is not None else None,
+        fence_content_indent=fence_content_indent if state is not None else None,
+    )
     for number, line in enumerate(text.splitlines(keepends=True)):
-        if number or starts_line:
-            state = advance_fence(line, state)
-    return state
+        if not (number or starts_line):
+            continue
+        tracker.advance(line)
+    return (
+        tracker.state,
+        tracker.list_indent,
+        tracker.fence_prefix,
+        tracker.fence_content_indent,
+    )
+
+
+def fence_state(text, state=None, starts_line=True, list_indent=None):
+    """Track fence state, including list-item and raw-HTML containers."""
+    marker, _, _, _ = tracker_after(text, state, starts_line, list_indent)
+    return marker
+
+
+def _segment_fence_opener(
+    raw, *, state, starts_line, list_indent, fence_prefix, fence_content_indent, carried
+):
+    """Container prefix of the fence open at a segment's end.
+
+    ``ranges`` carries this prefix with the fence marker so a later
+    part's header can reopen the same fence in its original nested
+    containers (``- > 10000. ``` ``), not just its outer list prefix:
+    the bare ``> - ``` `` opener sits at a shallow content indent,
+    so neither the column-11 footer nor the source's own closing
+    lines close it, and the rendered part ends inside an open fence.
+    The prefix is the opener line up to its marker column (see
+    ``_fence_column``); a fence that closes and another that opens
+    later in the same segment replaces it, and a segment that ends
+    outside any fence clears it (the caller passes that case through
+    as ``None`` by only calling this while a fence is open).
+    """
+    tracker = _FenceTracker(
+        state,
+        list_indent=list_indent if state is not None else None,
+        fence_prefix=fence_prefix if state is not None else None,
+        fence_content_indent=fence_content_indent if state is not None else None,
+    )
+    opener = carried if state is not None else None
+    for number, line in enumerate(raw.splitlines(keepends=True)):
+        if not (number or starts_line):
+            continue
+        before, after, _ = tracker.advance(line)
+        if before is None and after is not None:
+            # Slice the tab-expanded line: _fence_column counts
+            # columns, and a raw tab would shift the slice into the
+            # marker itself. The expanded prefix ("-   " for a
+            # "- \t" opener) parses identically and reconstructs
+            # the same list context in the later part's header.
+            opener = line.expandtabs(4)[: _fence_column(line)]
+    return opener
+
+
+def require_closed_fences(data: bytes, target: str) -> None:
+    """Fail closed when rendered Markdown ends inside an open fence.
+
+    Split parts are exempt by construction: their wrappers close any fence the
+    segment carries over. Anything else that ends open is a source defect the
+    package must not ship, so it fails here instead of being repaired silently.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(f"rendered Markdown is not valid UTF-8: {target}") from None
+    require(
+        fence_state(text) is None,
+        f"rendered Markdown ends inside an open fence: {target}",
+    )
 
 
 def part_path(relative, number, kind="part"):
@@ -268,15 +723,55 @@ def part_path(relative, number, kind="part"):
     return path.with_name(stem + suffix).as_posix()
 
 
-def navigation_growth(text, relative, state=None, starts_line=True):
-    """Upper bound for same-directory part names, including fragment-only links."""
+def navigation_growth(
+    text,
+    relative,
+    state=None,
+    starts_line=True,
+    list_indent=None,
+    *,
+    source=None,
+    agent_entry=None,
+    fence_content_indent=None,
+):
+    """Upper bound for same-directory part names, including fragment-only links.
+
+    Links without a fragment are not retargeted to a part, and most
+    are not rewritten at all, so they budget nothing. The two
+    fragmentless rewrites are budgeted exactly where they can occur:
+    an agent-entry note's own links are rebased (from the entry's
+    original parent into the vault) and percent-encoded when
+    rewritten, so the rebased target minus the original path length
+    bounds them; and a link in any other note that escapes the vault
+    budgets the relocated "agent-entry.md" target minus the original
+    path, but only when it actually resolves to the agent entry.
+    Without ``source``/``agent_entry`` context the old conservative
+    bounds are kept (agent-entry notes budget encoding only, escaping
+    links budget the relocation), so direct callers without that
+    context see no change. Fragment-bearing links in the agent-entry
+    note budget the same rebase on top of their fixed part-name
+    allowance when vault context is known: without it an entry under
+    a long directory is estimated far below its rewritten size.
+    Charging every fragmentless link's
+    encoding growth used to split notes that fit unsplit, and under
+    a tight output budget that split could abort packaging; charging
+    every escaping link's relocation used to do the same for links
+    that rewritten_target leaves unchanged.
+    """
     growth = 0
+    tracker = _FenceTracker(
+        state,
+        list_indent=list_indent if state is not None else None,
+        fence_content_indent=fence_content_indent if state is not None else None,
+    )
     for number, line in enumerate(text.splitlines(keepends=True)):
         before = state
+        literal = False
         if number or starts_line:
-            state = advance_fence(line, state)
+            before, state, literal = tracker.advance(line)
         if (
-            before is not None
+            literal
+            or before is not None
             or state is not None
             or unquote_line(line)[0].startswith(("    ", "\t"))
         ):
@@ -286,9 +781,104 @@ def navigation_growth(text, relative, state=None, starts_line=True):
             if any(start <= match.start() < end for start, end in literal):
                 continue
             parsed = urlsplit(match[2])
-            if parsed.scheme or parsed.netloc or not parsed.fragment:
+            if parsed.scheme or parsed.netloc:
                 continue
-            growth += (
+            if not parsed.fragment:
+                if parsed.path:
+                    if relative is None or relative == "agent-entry.md":
+                        # Agent-entry rebasing percent-encodes the path
+                        # even without a fragment; budget that expansion,
+                        # nothing more, unless the entry's vault
+                        # context is known: then also budget the
+                        # rebase itself (the entry's original parent
+                        # prepended to each same-directory link, e.g.
+                        # "agents/" for an entry inside the vault) and
+                        # the agent-entry relocation for links that
+                        # name the entry itself. (relative None keeps
+                        # the old conservative bound: the note is
+                        # unknown.)
+                        bound = max(
+                            0,
+                            len(quote(unquote(parsed.path), safe="/._-~").encode())
+                            - len(parsed.path.encode()),
+                        )
+                        if (
+                            relative == "agent-entry.md"
+                            and source is not None
+                            and agent_entry is not None
+                        ):
+                            decoded = unquote(parsed.path)
+                            source_path = Path(source)
+                            agent_path = Path(agent_entry)
+                            resolved_final = (
+                                posixpath.normpath(posixpath.join("", decoded))
+                                if decoded
+                                else relative
+                            )
+                            if decoded:
+                                candidate = Path(
+                                    posixpath.normpath(
+                                        posixpath.join(str(agent_path.parent), decoded)
+                                    )
+                                )
+                                if candidate.is_relative_to(source_path):
+                                    rebased = candidate.relative_to(source_path).as_posix()
+                                    resolved_final = rebased
+                                    bound = max(
+                                        bound,
+                                        max(
+                                            0,
+                                            len(quote(rebased, safe="/._-~").encode())
+                                            - len(parsed.path.encode()),
+                                        ),
+                                    )
+                            if (source_path / resolved_final).resolve() == agent_path:
+                                bound = max(
+                                    bound,
+                                    max(
+                                        0,
+                                        len(b"agent-entry.md") - len(parsed.path.encode()),
+                                    ),
+                                )
+                        growth += bound
+                    else:
+                        # Any other note rewrites a fragmentless link
+                        # only when it names the agent entry, which
+                        # requires escaping the vault; anything else is
+                        # left unchanged, so it budgets nothing. With
+                        # vault context, resolve the link exactly as
+                        # rewritten_target does and charge only an
+                        # exact agent-entry match; without it, keep
+                        # the old conservative escaping-link bound.
+                        decoded = unquote(parsed.path)
+                        parent = posixpath.dirname(relative)
+                        resolved = (
+                            posixpath.normpath(posixpath.join(parent, decoded))
+                            if decoded
+                            else relative
+                        )
+                        if source is not None and agent_entry is not None:
+                            # Resolve exactly as rewritten_target does:
+                            # any link that lands on the agent entry is
+                            # relocated to "agent-entry.md", whether or
+                            # not it escapes the vault, and any other
+                            # link is left unchanged and budgets nothing.
+                            if (Path(source) / resolved).resolve() == Path(agent_entry):
+                                local = posixpath.relpath("agent-entry.md", parent or ".")
+                                growth += max(
+                                    0,
+                                    len(quote(local, safe="/._-~").encode())
+                                    - len(parsed.path.encode()),
+                                )
+                        elif resolved == ".." or resolved.startswith("../"):
+                            local = posixpath.relpath("agent-entry.md", parent or ".")
+                            growth += max(
+                                0,
+                                len(quote(local, safe="/._-~").encode())
+                                - len(parsed.path.encode()),
+                            )
+                continue
+            bound = (
                 len(quote(Path(part_path(relative, 1)).name, safe="._-~"))
                 if not parsed.path
                 else 32
@@ -298,13 +888,43 @@ def navigation_growth(text, relative, state=None, starts_line=True):
                     - len(parsed.path.encode()),
                 )
             )
+            if (
+                parsed.path
+                and relative == "agent-entry.md"
+                and source is not None
+                and agent_entry is not None
+            ):
+                # Mirror the fragmentless branch: the entry's own links
+                # were written relative to its original parent, so a
+                # fragment-bearing link is rebased by that parent
+                # before any part retargeting. The fixed 32-byte
+                # allowance covers only the part-name suffix, not the
+                # rebased prefix, so without this an entry under a long
+                # directory is estimated far below its rewritten size
+                # and packaging aborts instead of splitting it.
+                decoded = unquote(parsed.path)
+                if decoded:
+                    candidate = Path(
+                        posixpath.normpath(posixpath.join(str(Path(agent_entry).parent), decoded))
+                    )
+                    if candidate.is_relative_to(Path(source)):
+                        rebased = candidate.relative_to(Path(source)).as_posix()
+                        bound += max(
+                            0,
+                            len(quote(rebased, safe="/._-~").encode()) - len(parsed.path.encode()),
+                        )
+            growth += bound
     return growth
 
 
-def ranges(data, body_limit, *, relative=None, maximum=None):
+def ranges(data, body_limit, *, relative=None, maximum=None, source=None, agent_entry=None):
     """Prefer whole lines, but bound even a single unbroken UTF-8 line."""
     offset = 0
     state = None
+    list_indent = None
+    fence_prefix = None
+    fence_content_indent = None
+    fence_opener = None
     starts_line = True
     result = []
     while offset < len(data):
@@ -321,7 +941,9 @@ def ranges(data, body_limit, *, relative=None, maximum=None):
                     end = newline + 1
             require(end > offset, "note byte limit cannot contain one UTF-8 character")
             raw = data[offset:end].decode("utf-8")
-            after = fence_state(raw, state, starts_line)
+            after, after_indent, after_prefix, after_content = tracker_after(
+                raw, state, starts_line, list_indent, fence_prefix, fence_content_indent
+            )
             if maximum is None:
                 break
             wrapper = (
@@ -331,7 +953,19 @@ def ranges(data, body_limit, *, relative=None, maximum=None):
                 + len(after or "")
             )
             if (
-                end - offset + wrapper + navigation_growth(raw, relative, state, starts_line)
+                end
+                - offset
+                + wrapper
+                + navigation_growth(
+                    raw,
+                    relative,
+                    state,
+                    starts_line,
+                    list_indent,
+                    source=source,
+                    agent_entry=agent_entry,
+                    fence_content_indent=fence_content_indent,
+                )
                 <= maximum
             ):
                 break
@@ -343,13 +977,50 @@ def ranges(data, body_limit, *, relative=None, maximum=None):
                 "end": end,
                 "before": state,
                 "after": after,
+                "list_indent_before": list_indent if state is not None else None,
+                "fence_prefix_before": fence_prefix if state is not None else None,
+                "fence_prefix_after": after_prefix if after is not None else None,
+                "fence_content_indent_before": (
+                    fence_content_indent if state is not None else None
+                ),
+                "fence_content_indent_after": (after_content if after is not None else None),
+                "fence_opener_before": fence_opener if state is not None else None,
                 "starts_line": starts_line,
             }
         )
+        if after is None:
+            fence_opener = None
+        else:
+            fence_opener = _segment_fence_opener(
+                raw,
+                state=state,
+                starts_line=starts_line,
+                list_indent=list_indent,
+                fence_prefix=fence_prefix,
+                fence_content_indent=fence_content_indent,
+                carried=fence_opener,
+            )
         starts_line = data[end - 1 : end] in {b"\n", b"\r"}
         state = after
+        list_indent = after_indent
+        fence_prefix = after_prefix
+        fence_content_indent = after_content
         offset = end
-    return result or [{"start": 0, "end": 0, "before": None, "after": None, "starts_line": True}]
+    return result or [
+        {
+            "start": 0,
+            "end": 0,
+            "before": None,
+            "after": None,
+            "list_indent_before": None,
+            "fence_prefix_before": None,
+            "fence_prefix_after": None,
+            "fence_content_indent_before": None,
+            "fence_content_indent_after": None,
+            "fence_opener_before": None,
+            "starts_line": True,
+        }
+    ]
 
 
 def heading_anchor(title):
@@ -360,13 +1031,21 @@ def heading_anchor(title):
 def populate_anchors(connection, relative, data, segments):
     for number, segment in enumerate(segments, 1):
         state = segment["before"]
+        tracker = _FenceTracker(
+            state,
+            list_indent=segment.get("list_indent_before") if state is not None else None,
+            fence_content_indent=(
+                segment.get("fence_content_indent_before") if state is not None else None
+            ),
+        )
         text = data[segment["start"] : segment["end"]].decode()
         for line_number, line in enumerate(text.splitlines(keepends=True)):
             eligible = line_number > 0 or segment["starts_line"]
             before = state
+            literal = False
             if eligible:
-                state = advance_fence(line, state)
-            if eligible and before is None and state is None:
+                before, state, literal = tracker.advance(line)
+            if eligible and before is None and state is None and not literal:
                 match = HEADING.match(line.rstrip("\r\n"))
                 if match:
                     connection.execute(
@@ -385,6 +1064,16 @@ def rewritten_target(target, relative, plans, connection, *, source, agent_entry
     current_parent = posixpath.dirname(relative)
     resolved = posixpath.normpath(posixpath.join(current_parent, decoded)) if decoded else relative
     changed = False
+    if agent_entry is not None and relative == "agent-entry.md" and decoded:
+        # The relocated entry's own links were written relative to the
+        # generation directory (the entry's original parent), not the vault
+        # root: "vault/Home.md" names Home.md, its sibling in the package.
+        # Rebase only targets that land inside the source vault; anything
+        # else falls through to the normal rules below.
+        candidate = Path(posixpath.normpath(posixpath.join(str(agent_entry.parent), decoded)))
+        if candidate.is_relative_to(source):
+            resolved = candidate.relative_to(source).as_posix()
+            changed = True
     if agent_entry and (source / resolved).resolve() == agent_entry:
         resolved = "agent-entry.md"
         changed = True
@@ -408,13 +1097,22 @@ def rewrite(raw, relative, segment, plans, connection, *, source, agent_entry):
     edits = []
     written = 0
     state = segment["before"]
+    tracker = _FenceTracker(
+        state,
+        list_indent=segment.get("list_indent_before") if state is not None else None,
+        fence_content_indent=(
+            segment.get("fence_content_indent_before") if state is not None else None
+        ),
+    )
     for number, line in enumerate(text.splitlines(keepends=True)):
         eligible = number > 0 or segment["starts_line"]
         before = state
+        literal = False
         if eligible:
-            state = advance_fence(line, state)
+            before, state, literal = tracker.advance(line)
         if (
             not eligible
+            or literal
             or before is not None
             or state is not None
             or unquote_line(line)[0].startswith(("    ", "\t"))
@@ -464,13 +1162,67 @@ def render_part(body, relative, number, count, segment):
     filename = quote(Path(relative).name, safe="._-~")
     header = f"# Part {number} of {count}\n\n[Source note index]({filename})\n\n".encode()
     if segment["before"]:
-        header += (segment["before"] + "\n").encode()
+        # Reopen a carried fence. When the fence's original opener
+        # prefix is known and carries explicit containers (a list
+        # marker or blockquote, e.g. "- > 10000. "), reuse it whole:
+        # the bare list prefix alone rebuilds only the outer item
+        # ("> - ```"), whose shallow content indent leaves the
+        # column-11 footer and the source's own closing lines unable
+        # to close it, so the part ends inside an open fence. A
+        # spaces-only prefix (a bare continuation-line fence) keeps
+        # the existing list-prefix behaviour, which recreates its
+        # list context instead.
+        opener = segment["before"]
+        carried_prefix = segment.get("fence_opener_before") or ""
+        if carried_prefix and (">" in carried_prefix or _LIST_MARKER.match(carried_prefix)):
+            marker = opener
+            while marker.startswith("> "):
+                marker = marker[2:]
+            opener = carried_prefix + marker
+        else:
+            prefix = segment.get("fence_prefix_before") or ""
+            if prefix:
+                quote_prefix = ""
+                rest = opener
+                while rest.startswith("> "):
+                    quote_prefix += "> "
+                    rest = rest[2:]
+                opener = quote_prefix + prefix + rest
+        header += (opener + "\n").encode()
     elif segment.get("inline_before"):
         header += ("Inline code continued: " + segment["inline_before"] + " ").encode()
     footer = b""
     if segment["after"]:
         separator = "" if body.endswith((b"\n", b"\r")) else "\n"
-        footer = (separator + segment["after"] + "\n").encode()
+        closer = segment["after"]
+        # The footer closes the fence the segment ENDS inside, so it
+        # uses that fence's prefix, not the prefix of the fence the
+        # segment started inside: a list-contained fence opened
+        # within this segment has no fence_prefix_before, and a
+        # column-zero footer would exit its list item and open a
+        # new, unterminated fence instead of closing it.
+        prefix = segment.get("fence_prefix_after") or segment.get("fence_prefix_before") or ""
+        content_indent = segment.get("fence_content_indent_after")
+        # A list fence's closing footer must sit at the item's
+        # content indent, not column zero: CommonMark ends the list
+        # item at an unindented closer, so the part would end inside
+        # a newly opened fence instead of closing the carried one.
+        # The fence's own column is the content indent (a "-   ```"
+        # opener sits at column 4, not at the prefix length 2, which
+        # only counts the marker plus one space); the quote prefix,
+        # if any, is kept ahead of it, mirroring the header opener.
+        # Segments built before the column was recorded fall back to
+        # the prefix length, as before.
+        quote_prefix = ""
+        rest = closer
+        while rest.startswith("> "):
+            quote_prefix += "> "
+            rest = rest[2:]
+        if content_indent is not None:
+            closer = quote_prefix + " " * max(0, content_indent - len(quote_prefix)) + rest
+        elif prefix:
+            closer = quote_prefix + " " * len(prefix) + rest
+        footer = (separator + closer + "\n").encode()
     elif segment.get("inline_after"):
         footer = inline_suffix(
             segment["inline_after"].encode(), at_line_start=body.endswith((b"\n", b"\r"))
@@ -572,6 +1324,18 @@ def verify_package(output, *, budget=None, expected=None):
         hash_file(output / META / "navigation.sqlite", budget) == manifest["navigation_sha256"],
         "navigation database digest mismatch",
     )
+    for path in output.rglob("*"):
+        if not path.is_file() or path.suffix.lower() != ".md":
+            continue
+        if path.relative_to(output).parts[0] == ".obsidian":
+            continue
+        if budget:
+            budget.check()
+        require(
+            path.stat().st_size <= manifest["max_note_bytes"],
+            "rendered Markdown exceeds note byte limit",
+        )
+        require_closed_fences(path.read_bytes(), str(path.relative_to(output)))
     total = hashlib.sha256()
     count = 0
     with ledger_path.open() as stream:
@@ -616,6 +1380,7 @@ def package(
     output,
     *,
     agent_entry=None,
+    source_generation: str,
     max_note_bytes=256 * 1024,
     max_output_bytes=12 * 1024**3,
     max_seconds=1800,
@@ -653,6 +1418,11 @@ def package(
         and max_source_bytes > 0,
         "invalid packaging limits",
     )
+    require(
+        isinstance(source_generation, str) and source_generation.strip(),
+        "source generation identity is required; pass --source-generation",
+    )
+    source_generation = source_generation.strip()
     require(output.parent.is_dir(), "output parent must exist")
     budget = Budget(output, max_output_bytes, max_seconds)
     budget.check(8192)
@@ -695,11 +1465,20 @@ def package(
                     source_bytes += len(raw)
                     needs_split = path.suffix.lower() == ".md" and (
                         len(raw) > max_note_bytes // 2
-                        or len(raw) + navigation_growth(raw.decode(), relative) > max_note_bytes
+                        or len(raw)
+                        + navigation_growth(
+                            raw.decode(), relative, source=source, agent_entry=agent_entry
+                        )
+                        > max_note_bytes
                     )
                     if needs_split:
                         segments = ranges(
-                            raw, max_note_bytes // 2, relative=relative, maximum=max_note_bytes
+                            raw,
+                            max_note_bytes // 2,
+                            relative=relative,
+                            maximum=max_note_bytes,
+                            source=source,
+                            agent_entry=agent_entry,
                         )
                         annotate_inline_boundaries(raw, segments, check=budget.check)
                         plans[relative] = segments
@@ -772,6 +1551,7 @@ def package(
                                 len(rendered) <= max_note_bytes,
                                 "rewritten Markdown exceeds note byte limit; reduce raw segment size",
                             )
+                            require_closed_fences(rendered, target)
                         entry = write(output / target, rendered, budget)
                         entry.update(
                             {
@@ -796,6 +1576,7 @@ def package(
                                 target == relative or not (source / target).exists(),
                                 "generated index collides with source path",
                             )
+                            require_closed_fences(data, target)
                             row["indexes"].append(write(output / target, data, budget))
                             output_files += 1
                             rendered_bytes += len(data)
@@ -825,6 +1606,7 @@ def package(
             result = {
                 "schema": SCHEMA,
                 "status": "verified",
+                "source_generation": source_generation,
                 "source_files": source_count,
                 "source_bytes": source_bytes,
                 "source_tree_sha256": source_digest.hexdigest(),
@@ -878,6 +1660,13 @@ def main():
     parser.add_argument("source", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--agent-entry", type=Path)
+    parser.add_argument(
+        "--source-generation",
+        required=True,
+        help="identity of the library generation the source vault came from; "
+        "recorded in META/manifest.json so a package never needs its "
+        "generation derived from content hashes after the fact",
+    )
     parser.add_argument("--max-note-bytes", type=int, default=256 * 1024)
     parser.add_argument("--max-output-bytes", type=int, default=12 * 1024**3)
     parser.add_argument("--max-source-bytes", type=int, default=128 * 1024**2)

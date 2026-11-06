@@ -79,7 +79,9 @@ def test_the_obsidian_packager_names_the_profile_when_a_generation_has_no_vault(
     with synthetic_library(tmp_path, 3) as library:
         export_library(library, tmp_path / "export", vault_profile="none")
     with pytest.raises(ValueError, match="--vault-profile") as raised:
-        obsidian.package(tmp_path / "export" / "vault", tmp_path / "derived")
+        obsidian.package(
+            tmp_path / "export" / "vault", tmp_path / "derived", source_generation="test-generation"
+        )
     assert "cce library export --vault-profile cards" in str(raised.value)
     assert "export-cards" in str(raised.value) and "rebuild" not in str(raised.value).lower()
     assert not (tmp_path / "derived").exists()
@@ -103,6 +105,8 @@ def test_the_obsidian_packager_exits_with_one_clean_line_and_code_two(
             str(tmp_path / "export" / "vault"),
             "--output",
             str(tmp_path / "derived"),
+            "--source-generation",
+            "test-generation",
         ],
     )
     assert obsidian.main() == 2
@@ -140,6 +144,7 @@ def test_the_obsidian_packager_accepts_the_vault_of_a_profile(
         tmp_path / "export" / "vault",
         tmp_path / "derived",
         agent_entry=tmp_path / "export" / "agent-entry.md",
+        source_generation="test-generation",
         max_seconds=60,
     )
     assert result["source_unchanged"] is True
