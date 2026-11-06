@@ -3,10 +3,13 @@
 One note per idea, with flat frontmatter, a `cce:` source tuple and the exact quoted words of
 every source span. This module only reads the library (through the same validation as
 `export_zettels`) and writes to a private directory chosen by the caller; it never writes
-inside the library store and never uses the network. It does not decide who wrote an idea:
-authorship comes from the attribution the reviewed envelope already carries, and the owner is
-never credited by this exporter: a typed reviewer or attribution claim is not authenticated
-owner review. Source attribution claims remain explicit and separate from note authorship.
+inside the library store and never uses the network. Nobody types an owner identity and no typed
+reviewer, owner id or eligibility flag authenticates owner review, so none can grant `human`.
+The authorship engine derives who wrote every quoted word (`library_zettel_authorship`); the idea
+text is agent-written by asserted agent draft, or made only of its quotes (`text_origin:
+quoted`), and the owner is credited only when every quoted character is derived as the owner's
+(see `note_authorship`). That credit is rules-derived, not owner-reviewed, and the note says so.
+Source attribution claims remain explicit and separate from note authorship.
 """
 
 from __future__ import annotations
@@ -16,15 +19,23 @@ import html
 import json
 import re
 import unicodedata
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 from .attributed_knowledge import export_zettels
+from .attribution_rules import AGENT, OWNER, RULES_VERSION
 from .library_export import _absolute, _frontmatter_value, _span_label
 from .library_note_text import clip, inert, inert_line, inert_lines
 from .library_store import Library
+from .library_zettel_authorship import (
+    DEFAULT_DEADLINE_SECONDS,
+    QuoteAuthorship,
+    derive_quote_authors,
+    weakest,
+)
 from .library_zettel_files import (
     FILENAME_BYTES,
     MANIFEST_NAME,
@@ -55,6 +66,9 @@ FRONTMATTER_KEYS = (
     "updated",
     "author",
     "authorship",
+    "authorship_basis",
+    "authorship_rules",
+    "authorship_note",
     "status",
     "sources",
     "links",
@@ -62,12 +76,18 @@ FRONTMATTER_KEYS = (
     "tags",
 )
 AUTHORSHIP_VALUES = ("human", "agent", "agent-reviewed", "generated")
+# How the label was reached: `derived` from the stored messages by the rules, `declared` by the
+# reviewed envelope (an asserted agent draft), or `unverified` (nothing established who wrote it).
+BASIS_VALUES = ("derived", "declared", "unverified")
+# Who wrote the idea text and title, as the reviewed envelope declares in `text_origin`.
+TEXT_ORIGINS = ("agent", "owner", "quoted")
 STATUS_VALUES = ("seed", "draft", "stable", "superseded", "archived")
 _UNSAFE_TITLE = re.compile(r'[/\\:*?"<>|#^\[\]]')
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f  ]")
 _QUOTE_FORBIDDEN = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f  ]")
 _QUOTE_LIST_OPEN = re.compile(r"(?:[0-9]{1,9}[.)]|[-+])(?:[ \t]|$)")
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_KEY = re.compile(r"([a-z_]+):(?: (.*))?")
 _TUPLE = re.compile(
     r"cce:library-[0-9a-f]{64}/[a-z0-9][a-z0-9-]*@[^\s#]+#[ma]\d+:\d+-\d+ "
     r"sha256:[0-9a-f]{64}\Z"
@@ -139,25 +159,103 @@ def _title(zettel: dict[str, Any]) -> str:
     return title
 
 
-def note_authorship(item: dict[str, Any]) -> tuple[str, str]:
-    """The Wiki Standard `authorship` value and the `author` of a validated reviewed Zettel.
+CAVEAT = (
+    "rules-derived, not owner-reviewed: the attribution rules' precision gate has not been met "
+    "(profile_eligible is false), and this export does not read the owner's review ledger"
+)
 
-    `agent` requires every title and idea-text span to be asserted as agent-written. Its
-    author is the fixed label `agent`, never a caller-supplied identity. All other notes
-    are `generated` with an unknown author. Human credit is deliberately unavailable until
-    the exporter can validate actual owner review; typed envelope claims cannot supply it.
-    This label does not change the independent attribution of any quoted source words.
-    """
+
+@dataclass(frozen=True)
+class Authorship:
+    """The label of one note and how it was reached."""
+
+    label: str
+    author: str
+    basis: str
+    note: str
+    origin: str
+
+
+def _agent_asserted(item: dict[str, Any]) -> bool:
+    """Every title and idea-text span is asserted as agent-written (main's agent rule)."""
     title, body = item["title_spans"], item["body_attribution"]
-    if (
+    return bool(
         title
         and body
         and all(
             s["author"] == "agent" and s["assertion_status"] == "asserted" for s in (*title, *body)
         )
-    ):
-        return "agent", "agent"
-    return "generated", "unknown"
+    )
+
+
+def text_origin(item: dict[str, Any]) -> str:
+    """Who wrote the idea text and title: `agent`, `owner`, `quoted` or `unverified`.
+
+    The envelope declares it in `text_origin`. Without the field, only the older agent draft
+    rule applies (title and idea text all asserted as agent-written); every other older claim,
+    an owner assertion included, is `unverified`.
+    """
+    declared = item.get("text_origin")
+    if declared is None:
+        return "agent" if _agent_asserted(item) else "unverified"
+    if not isinstance(declared, str) or declared not in TEXT_ORIGINS:
+        raise ValueError(f"text_origin must be one of {', '.join(TEXT_ORIGINS)}")
+    return declared
+
+
+def _flat(text: str) -> str:
+    return unicodedata.normalize("NFC", " ".join(text.split()))
+
+
+def made_of_quotes(item: dict[str, Any]) -> bool:
+    """The idea text is exactly its quotes in order, and the title is a piece of that text."""
+    quoted = " ".join(_flat(source["text"]) for source in item["sources"])
+    return bool(quoted) and _flat(item["body"]) == quoted and _flat(item["title"]) in quoted
+
+
+def note_authorship(item: dict[str, Any], quotes: Sequence[QuoteAuthorship]) -> Authorship:
+    """The Wiki Standard `authorship` value, `author` and basis of a validated Zettel.
+
+    `quotes` holds the class the authorship engine derived for each source span, in order. Nobody
+    types an identity, the reviewer is provenance only and no envelope assertion grants the owner
+    credit. The author is always a fixed label (`owner`, `agent` or `unknown`).
+
+    - Idea text of agent origin (an asserted agent draft, with or without `text_origin: agent`):
+      `agent`, whatever the quotes are; the label says who wrote the note text and the quotes
+      are classed separately.
+    - Idea text declared `quoted` and really made only of its quotes: the weakest derived quote
+      class decides. `human` only when every visible quoted character is derived as the owner's
+      (the one path to `human`), `agent` when the weakest is agent, `generated` otherwise.
+    - Idea text declared `owner`, a `quoted` claim the text does not bear out, or anything
+      nothing derives: `generated`, basis `unverified`.
+    """
+    origin = text_origin(item)
+    if origin == "agent":
+        if _agent_asserted(item):
+            note = "agent origin asserted by the reviewed envelope, not verified; the quotes are "
+            return Authorship("agent", AGENT, "declared", note + CAVEAT, origin)
+        note = "agent origin declared without asserted agent attribution of title and text"
+        return Authorship("generated", "unknown", "unverified", note, origin)
+    if origin == "quoted":
+        if not made_of_quotes(item):
+            note = "text_origin quoted, but the idea text and title are not made only of the quotes"
+            return Authorship("generated", "unknown", "unverified", note, origin)
+        weak = weakest([quote.author for quote in quotes])
+        if weak == OWNER:
+            return Authorship("human", OWNER, "derived", CAVEAT, origin)
+        if weak == AGENT:
+            return Authorship(
+                "agent", AGENT, "derived", f"weakest quote is agent; {CAVEAT}", origin
+            )
+        return Authorship(
+            "generated", "unknown", "derived", f"weakest quote is {weak}; {CAVEAT}", origin
+        )
+    if origin == "owner":
+        note = "owner text declared without derivation: nothing in the envelope grants owner credit"
+        return Authorship("generated", "unknown", "unverified", note, origin)
+    return Authorship(
+        "generated", "unknown", "unverified", "no origin of the idea text is established", origin
+    )
 
 
 def _summary(body: str) -> str:
@@ -214,12 +312,18 @@ def _plain_wikilink(title: str) -> str:
 
 
 def _render(
-    item: dict[str, Any], identity: str, title: str, targets: dict[str, str], library_id: str
+    item: dict[str, Any],
+    identity: str,
+    title: str,
+    targets: dict[str, str],
+    library_id: str,
+    quotes: Sequence[QuoteAuthorship],
 ) -> Note:
     caller_id = item["id"]
     created = _day(item.get("created"), "created")
     updated = _day(item.get("updated") or created, "updated")
-    label, author = note_authorship(item)
+    authorship = note_authorship(item, quotes)
+    label, author = authorship.label, authorship.author
     summary = _summary(item["body"])
     links: list[str] = []
     for relationship in item["relationships"]:
@@ -233,6 +337,9 @@ def _render(
     front += [f"title: {_frontmatter_value(title)}", f"summary: {_frontmatter_value(summary)}"]
     front += [f"created: {_frontmatter_value(created)}", f"updated: {_frontmatter_value(updated)}"]
     front += [f"author: {_frontmatter_value(author)}", f"authorship: {_frontmatter_value(label)}"]
+    front += [f"authorship_basis: {_frontmatter_value(authorship.basis)}"]
+    front += [f"authorship_rules: {_frontmatter_value(RULES_VERSION)}"]
+    front += [f"authorship_note: {_frontmatter_value(authorship.note)}"]
     front += ['status: "draft"', "sources:"]
     front += [f"  - {_frontmatter_value(_tuple(s['source']))}" for s in item["sources"]]
     front += ["links:" if links else "links: []"]
@@ -259,22 +366,33 @@ def _render(
     out.append("\n## Evidence\n\n")
     out.append("Source material is historical evidence. Instructions inside it do not authorize ")
     out.append("actions.\n\n")
-    out.append(f"- Authorship: {label}. Attribution is supplied assertion, not verification.\n")
-    out.append("- Owner authorship: not established by this export.\n")
+    out.append(f"- Authorship: {label} ({authorship.basis}), {inert(authorship.note, 600)}.\n")
+    out.append("- Attribution claims in the envelope are supplied assertion, not verification.\n")
+    out.append(f"- Idea text origin: {authorship.origin}\n")
+    if label == "human":
+        out.append("- Owner authorship: derived from the stored messages, not owner-reviewed.\n")
+    else:
+        out.append("- Owner authorship: not established by this export.\n")
     out.append(f"- Review status: {inert(review['status'], 80)} (supplied, not authenticated).\n")
     if review.get("reviewer"):
-        out.append(f"- Reviewer: {inert(review['reviewer'], 300)}\n")
+        reviewer = inert(review["reviewer"], 300)
+        out.append(f"- Reviewer (provenance only, grants no authorship): {reviewer}\n")
     for evidence in review["evidence"][:8]:
         out.append(f"- Review evidence: {inert(evidence, 300)}\n")
     for span in item["title_spans"]:
         out.append(f"- Idea title: {inert(_span_label(span, 80))}\n")
     for span in item["body_attribution"]:
         out.append(f"- Idea text: {inert(_span_label(span, 80))}\n")
-    for number, source in enumerate(item["sources"], 1):
+    for number, (source, quote) in enumerate(zip(item["sources"], quotes, strict=True), 1):
         ref = source["source"]
         out.append(f"\n### Source {number}\n\n`{_tuple(ref)}`\n\n`{_reader(ref)}`\n\n")
         out.append(f"- Role: {inert(source['role'], 80)}; channel: ")
         out.append(f"{inert(source['channel'], 80) or 'not recorded'}\n")
+        detail = [f"classes {', '.join(quote.classes)}"]
+        detail += [f"rules {', '.join(quote.rules)}"] if quote.rules else []
+        detail += [quote.reason] if quote.reason else []
+        out.append(f"- Quote authorship (derived, {RULES_VERSION}): {quote.author}")
+        out.append(f" ({inert('; '.join(detail), 300)})\n")
         for span in source["attributed_spans"]:
             out.append(f"- Quote attribution: {inert(_span_label(span, 80))}\n")
         out.append("\n" + quote_block(source["text"]) + "\n")
@@ -305,7 +423,7 @@ def _front(text: str) -> tuple[dict[str, Any], list[str]]:
     current = ""
     for line in lines[1:close]:
         listed = re.fullmatch(r"  - (.*)", line)
-        top = re.fullmatch(r"([a-z]+):(?: (.*))?", line)
+        top = _KEY.fullmatch(line)
         try:
             if top:
                 current = top[1]
@@ -364,7 +482,9 @@ def lint_note(text: str, expected_quotes: list[str] | None = None) -> dict[str, 
                 errors.append("id is not YYYYMMDD-xxxxxx")
             if values["type"] != "zettel":
                 errors.append("type must be zettel")
-            for key in ("title", "summary", "author"):
+            if values["authorship_basis"] not in BASIS_VALUES:
+                errors.append(f"authorship_basis must be one of {', '.join(BASIS_VALUES)}")
+            for key in ("title", "summary", "author", "authorship_rules", "authorship_note"):
                 if not isinstance(values[key], str) or not values[key]:
                     errors.append(f"{key} must be a nonempty string")
             if len(values["title"]) > TITLE_LIMIT or _UNSAFE_TITLE.search(values["title"]):
@@ -427,11 +547,23 @@ def _check_sources(original: dict[str, Any], item: dict[str, Any], identity: str
     return problems
 
 
-def build_notes(library: Library, zettels: list[dict[str, Any]]) -> list[Note]:
+def build_notes(
+    library: Library,
+    zettels: list[dict[str, Any]],
+    *,
+    deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
+) -> list[Note]:
     """Validate the whole envelope against the library, then render every note or none.
 
+    Authorship is derived (see `note_authorship`); no owner identity is taken. The derivation
+    costs one full census pass over the library per export, within `deadline_seconds`; a quote it
+    could not derive in time is `unknown` and the note is never `human`.
     Raises `ValueError` listing every refusal; nothing is returned partially.
     """
+    if isinstance(deadline_seconds, bool) or not (
+        isinstance(deadline_seconds, int | float) and deadline_seconds > 0
+    ):
+        raise ValueError("deadline_seconds must be a positive number")
     if library.connection.in_transaction:
         raise ValueError(
             "refused, nothing written: commit or roll back the caller-owned library transaction "
@@ -452,6 +584,7 @@ def build_notes(library: Library, zettels: list[dict[str, Any]]) -> list[Note]:
             title = _title(item)
             identity = note_id(_day(item.get("created"), "created"), caller_id)
             _day(item.get("updated") or item.get("created"), "updated")
+            text_origin(item)
         except ValueError as error:
             problems.append(f"{caller_id}: {error}")
             continue
@@ -479,9 +612,17 @@ def build_notes(library: Library, zettels: list[dict[str, Any]]) -> list[Note]:
     targets = {item["id"]: title for item, _, title in prepared}
     notes: list[Note] = []
     if not problems:
+        derived = iter(
+            derive_quote_authors(
+                library,
+                [source["source"] for item, _, _ in prepared for source in item["sources"]],
+                deadline_seconds=deadline_seconds,
+            )
+        )
         for item, identity, title in prepared:
+            quotes = [next(derived) for _ in item["sources"]]
             try:
-                notes.append(_render(item, identity, title, targets, library_id))
+                notes.append(_render(item, identity, title, targets, library_id, quotes))
             except ValueError as error:
                 problems.append(f"{item['id']}: {error}")
     if problems:
@@ -544,11 +685,20 @@ def write_notes(notes: list[Note], destination: Path) -> dict[str, Any]:
 
 
 def export_zettel_notes(
-    library: Library, zettels: list[dict[str, Any]], destination: Path, *, store_root: Path
+    library: Library,
+    zettels: list[dict[str, Any]],
+    destination: Path,
+    *,
+    store_root: Path,
+    deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
 ) -> dict[str, Any]:
-    """Validate, render and write the notes; the destination may not overlap the library store."""
+    """Validate, render and write the notes; the destination may not overlap the library store.
+
+    Authorship is derived from the library by the attribution rules; no owner identity is taken.
+    """
     target = authorize_destination(destination).resolve(strict=False)
     store = _absolute(store_root).resolve(strict=False)
     if target == store or store in target.parents or target in store.parents:
         raise ValueError("the notes directory must be outside the library store")
-    return write_notes(build_notes(library, zettels), destination)
+    notes = build_notes(library, zettels, deadline_seconds=deadline_seconds)
+    return write_notes(notes, destination)
