@@ -11,6 +11,7 @@ parts. `rejoin` puts the original text back byte for byte, which is the proof te
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -20,6 +21,11 @@ MIN_CHUNK_BYTES = 512
 # Room kept inside a chunk for the synthetic lines that close and reopen a fence.
 FENCE_SLACK = 256
 MAX_FENCE_MARKER = 100
+# Widest opener indentation that a container-aware synthetic fence line repeats. Indent plus
+# marker stays inside FENCE_SLACK for both synthetic lines; a wider opener falls back to the
+# column-0 lines.
+MAX_FENCE_INDENT = 24
+_SPACES_AND_TABS = re.compile(r"[ \t]*")
 # A first guess at how much of a block budget a piece of raw text may use; the rest is left for
 # the label, the quoting and the escaping a renderer adds. `fit_blocks` halves it until it fits.
 FIRST_GUESS = 0.7
@@ -78,8 +84,30 @@ def _split_long_line(line: str, limit: int) -> list[str]:
     return pieces
 
 
-def split_text(text: str, max_bytes: int) -> list[Chunk]:
-    """Split `text` into chunks whose rendered text is at most `max_bytes` UTF-8 bytes each."""
+def _reopen(indent: str, marker: str) -> str:
+    """A CommonMark fence line that reopens, at the top of a new part, a fence opened at `indent`.
+
+    Up to three columns a top-level fence with the same indentation strips the same leading
+    spaces from its content and is closed by the source's own indented closer. A fence at four
+    columns or more would be indented code at top level, so it is reopened inside nested list
+    items whose content indent equals the opener's column.
+    """
+    width = len(indent.expandtabs(4))
+    if width <= 3:
+        return " " * width + marker
+    return "- " * (width // 2 - 1) + ("- " if width % 2 == 0 else "-  ") + marker
+
+
+def split_text(text: str, max_bytes: int, *, container_fences: bool = False) -> list[Chunk]:
+    """Split `text` into chunks whose rendered text is at most `max_bytes` UTF-8 bytes each.
+
+    With `container_fences` (CommonMark output) a fence opened inside a list item is closed at
+    its own indentation and reopened in an equivalent container. A column-0 closer would leave
+    the item, which ends the fence, and then open a new top-level fence that swallows everything
+    after the cut, the next-part link included. The default keeps the column-0 lines that the
+    simple `FenceTracker` renderers (`render_markdown_html`) read correctly. Fences inside a
+    blockquote, or on a list marker's own line, are not tracked either way.
+    """
     if max_bytes < MIN_CHUNK_BYTES:
         raise ValueError(f"max_bytes must be at least {MIN_CHUNK_BYTES}, got {max_bytes}")
     if utf8_size(text) <= max_bytes:
@@ -91,14 +119,19 @@ def split_text(text: str, max_bytes: int) -> list[Chunk]:
     prefix = ""
     continues = False
     tracker = FenceTracker()
+    indent = ""  # the open fence's opener indentation, when it is plain spaces and tabs
 
     def cut(mid_line: bool) -> None:
         nonlocal current, used, prefix, continues
         opener = tracker.opener if 0 < len(tracker.opener) <= MAX_FENCE_MARKER else ""
+        suffix = reopen = opener
+        if opener and container_fences and len(indent.expandtabs(4)) <= MAX_FENCE_INDENT:
+            suffix = indent + opener
+            reopen = _reopen(indent, opener)
         chunks.append(
-            Chunk("\n".join(current), prefix=prefix, suffix=opener, continues_line=continues)
+            Chunk("\n".join(current), prefix=prefix, suffix=suffix, continues_line=continues)
         )
-        prefix = opener
+        prefix = reopen
         continues = mid_line
         current = []
         used = 0
@@ -111,8 +144,9 @@ def split_text(text: str, max_bytes: int) -> list[Chunk]:
                 cut(mid_line=index > 0)
             current.append(piece)
             used += piece_size
-            if index == 0:
-                tracker.feed(line)
+            if index == 0 and tracker.feed(line) == "open":
+                leading = line[: len(line) - len(line.lstrip())]
+                indent = leading if _SPACES_AND_TABS.fullmatch(leading) else ""
     if current or not chunks:
         chunks.append(Chunk("\n".join(current), prefix=prefix, continues_line=continues))
     return chunks

@@ -12,6 +12,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+from markdown_it import MarkdownIt
 from vault_support import sentinel_lines, synthetic_library
 
 from conversation_corpus_engine.archive_model import Conversation, Message
@@ -190,6 +191,94 @@ def test_the_obsidian_packager_accepts_a_fence_that_crosses_a_full_profile_part(
                 provider="chatgpt",
                 source_id="fenced",
                 title="A record with a long fenced block",
+                messages=[Message(role="user", text=body, id="m0")],
+                extra={"wing": "ai", "lane": "conversations"},
+            )
+        )
+        library.index_blocks()
+        export_library(library, tmp_path / "export", vault_profile="full")
+    assert len(list((tmp_path / "export" / "vault" / "parts").glob("*.md"))) > 1
+    result = obsidian.package(
+        tmp_path / "export" / "vault",
+        tmp_path / "derived",
+        source_generation="synthetic-generation",
+        max_seconds=60,
+    )
+    assert result["status"] == "verified"
+    assert obsidian.verify_package(tmp_path / "derived")["status"] == "verified"
+
+
+@pytest.mark.parametrize(
+    ("head", "indent"),
+    [("- item", "  "), ("1. item", "   ")],
+    # The block renderer re-fences anything indented four columns or more as literal code, so
+    # these are the list shapes whose fence reaches the splitter as a fence.
+    ids=["bullet-item", "ordered-item"],
+)
+def test_the_obsidian_packager_accepts_a_list_item_fence_cut_by_a_full_profile_part(
+    obsidian: ModuleType, tmp_path: Path, head: str, indent: str
+) -> None:
+    code = "\n".join(indent + line for line in sentinel_lines("F", 900).splitlines())
+    body = f"{head}\n{indent}```sh\n{code}\n{indent}```\nafter\n"
+    with Library.create(tmp_path / "library.sqlite") as library:
+        library.put(
+            Conversation(
+                provider="chatgpt",
+                source_id="listed",
+                title="A record with a long fenced block in a list",
+                messages=[Message(role="user", text=body, id="m0")],
+                extra={"wing": "ai", "lane": "conversations"},
+            )
+        )
+        library.index_blocks()
+        export_library(library, tmp_path / "export", vault_profile="full")
+    assert verify_export(tmp_path / "export") == []
+    parser = MarkdownIt("commonmark", {"html": True})
+    notes = sorted(
+        [
+            *(tmp_path / "export/vault/records").glob("*.md"),
+            *(tmp_path / "export/vault/parts").glob("*.md"),
+        ]
+    )
+    assert len(notes) > 2
+    for note in notes:
+        text = note.read_text(encoding="utf-8")
+        written = LINK.findall(text)
+        rendered = [
+            child.attrGet("href")
+            for token in parser.parse(text)
+            for child in token.children or []
+            if child.type == "link_open"
+        ]
+        assert sorted(written) == sorted(rendered), f"{note.name}: a link renders as code"
+    result = obsidian.package(
+        tmp_path / "export" / "vault",
+        tmp_path / "derived",
+        source_generation="synthetic-generation",
+        max_seconds=60,
+    )
+    assert result["status"] == "verified"
+    assert obsidian.verify_package(tmp_path / "derived")["status"] == "verified"
+
+
+@pytest.mark.parametrize(
+    ("opener", "lead", "closer"),
+    [("> ```sh", "> ", "> ```"), ("- ```sh", "  ", "  ```")],
+    ids=["blockquote", "list-marker-line"],
+)
+def test_the_obsidian_packager_accepts_a_fence_the_splitter_does_not_track(
+    obsidian: ModuleType, tmp_path: Path, opener: str, lead: str, closer: str
+) -> None:
+    # The splitter does not track these shapes (see its tests); the block renderer re-fences them
+    # as literal code first, so a long one still splits into notes whose links render.
+    code = "\n".join(lead + line for line in sentinel_lines("F", 900).splitlines())
+    body = f"intro\n{opener}\n{code}\n{closer}\nafter\n"
+    with Library.create(tmp_path / "library.sqlite") as library:
+        library.put(
+            Conversation(
+                provider="chatgpt",
+                source_id="quoted",
+                title="A record with a long block the splitter does not track",
                 messages=[Message(role="user", text=body, id="m0")],
                 extra={"wing": "ai", "lane": "conversations"},
             )
