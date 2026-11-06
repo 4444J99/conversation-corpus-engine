@@ -68,7 +68,7 @@ def _text(value: Any, label: str, *, empty: bool = False) -> str:
 def _timestamp(value: Any, label: str) -> str:
     value = _text(value, label)
     _require(
-        re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value) is not None,
+        re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value) is not None,
         f"{label} must be a UTC timestamp",
     )
     try:

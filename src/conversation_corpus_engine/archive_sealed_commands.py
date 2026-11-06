@@ -60,6 +60,18 @@ def configure(parser: argparse.ArgumentParser) -> None:
             child.add_argument("--selection", type=Path, required=True)
             child.add_argument("--recipient", type=Path, action="append", required=True)
             child.add_argument("--rotate", action="store_true")
+            child.add_argument(
+                "--storage-format",
+                choices=("v1", "v2"),
+                default=None,
+                help="Explicit v2 compressed packing; default preserves the vault format (new vaults use v1)",
+            )
+            child.add_argument(
+                "--max-projection-line-bytes",
+                type=int,
+                default=None,
+                help="V2 source JSONL row bound (default 64 MiB); independent of the 32 MiB packed slab",
+            )
             child.add_argument("--budget", type=int, default=512 * 1024 * 1024)
             child.add_argument(
                 "--audit-budget",
@@ -165,6 +177,8 @@ def _dispatch(args: argparse.Namespace, sealed: Any) -> dict[str, Any]:
             rotate=args.rotate,
             budget=args.budget,
             audit_budget=args.audit_budget,
+            storage_format=args.storage_format,
+            max_projection_line_bytes=args.max_projection_line_bytes,
         )
     if args.sealed_action == "verify":
         return sealed.verify(args.repo, identity, args.trust)

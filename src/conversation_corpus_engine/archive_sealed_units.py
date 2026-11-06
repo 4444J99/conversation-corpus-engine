@@ -14,7 +14,12 @@ from typing import Any
 from .archive_sealed_crypto import SealedError
 
 
-def project_units(path: Path, relative: str) -> Iterator[dict[str, Any]]:
+def project_units(
+    path: Path,
+    relative: str,
+    *,
+    max_line_bytes: int | None = None,
+) -> Iterator[dict[str, Any]]:
     # Only named normalized collections and explicit atomic exports are interpreted as JSONL.
     normalized = path.name.startswith("collection-") and path.name.endswith("-conversations.jsonl")
     normalized = normalized or bool(
@@ -23,8 +28,15 @@ def project_units(path: Path, relative: str) -> Iterator[dict[str, Any]]:
     explicit = path.name.endswith(".atoms.jsonl")
     if not normalized and not explicit:
         return
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
+    if max_line_bytes is not None and (type(max_line_bytes) is not int or max_line_bytes < 1):
+        raise SealedError("invalid-projection-bound")
+    mode = "r" if max_line_bytes is None else "rb"
+    with path.open(mode, encoding="utf-8" if max_line_bytes is None else None) as handle:
+        read_limit = 0 if max_line_bytes is None else max_line_bytes + 1
+        lines = handle if max_line_bytes is None else iter(lambda: handle.readline(read_limit), b"")
+        for line in lines:
+            if max_line_bytes is not None and len(line) > max_line_bytes:
+                raise SealedError("projection-line-too-large")
             if not line.strip():
                 continue
             row = json.loads(line)

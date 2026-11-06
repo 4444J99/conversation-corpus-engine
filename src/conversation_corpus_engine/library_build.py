@@ -582,6 +582,17 @@ def build_library(
                         accept(item)
                     report["sources"].append({"kind": "web_captures", "report": capture_report})
                     report["findings"].extend(capture_report["findings"])
+                    if capture_report.get("findings_omitted"):
+                        report["findings"].append(
+                            {
+                                "scope": "web_captures",
+                                "path": "",
+                                "line": 0,
+                                "code": "findings_truncated",
+                                "detail": "further finding details were counted but not retained",
+                                "count": capture_report["findings_omitted"],
+                            }
+                        )
                 document_report: dict[str, Any] = {}
                 for item in iter_documents(manifest.get("documents", []), report=document_report):
                     accept(item)

@@ -119,7 +119,7 @@ A capture tool that fetches saved web pages writes *shards*: JSONL files with on
 }
 ```
 
-`web_capture_max_row_bytes` is optional (default 8 MiB). A line over it is refused without being held in memory. Directory discovery, line scanning and oversized-line draining all check the build deadline. The first pass enforces the remaining record budget on distinct page identities. Finding details are capped at 4,096 entries; `findings_omitted` counts further details while the refusal totals remain complete.
+`web_capture_max_row_bytes` is optional (default 8 MiB). A line over it is refused without being held in memory. Directory discovery, line scanning, oversized-line draining and candidate fallback all check the build deadline. The first pass enforces the remaining record budget on distinct page identities. Finding details are capped at 4,096 entries; `findings_omitted` counts further details while the refusal totals remain complete. The top-level build report adds one `findings_truncated` entry with that exact omitted count.
 
 **Input format (`capture-shard.v1`).** One JSON object per line, with exactly these fields (a missing or unexpected field refuses the row):
 
@@ -133,7 +133,7 @@ A capture tool that fetches saved web pages writes *shards*: JSONL files with on
 | `status` | `captured` or `failed` |
 | `http_status` | an integer of at least 100, or null |
 | `content_digest` | `sha256:` and the SHA-256 (64 hex) of the UTF-8 `text`; null on a failed row |
-| `captured_at` | the fetch time as a UTC stamp, `2026-01-02T03:04:05Z` |
+| `captured_at` | the declared fetch time as an ASCII UTC stamp, `2026-01-02T03:04:05Z`; validity does not depend on the reader's wall clock |
 | `extractor` | an object with a nonempty `name` and `version` |
 | `text` | the extracted text; empty on a failed row |
 | `failure_class` | null on a captured row; on a failed row one of `dead_link`, `login_wall`, `paywall`, `non_html`, `rendered_empty`, `timeout`, `blocked` |
@@ -147,11 +147,11 @@ A capture tool that fetches saved web pages writes *shards*: JSONL files with on
 
 **Wikipedia articles.** The `wikipedia-article.v1` producer uses a case-sensitive `wikipedia:<language>:<requested title>` key. The reader checks the requested URL, language/API host, normalized title, page ID, content digest and text length, and retains the full metadata under `provenance.wikipedia`, including resolved title, redirect chain, revision ID/time, categories, disambiguation evidence and worker version. `fetched_at` becomes the common `captured_at` search field and `content_sha256` becomes `content_digest`; neither the body nor its hash is rewritten. Stored bodies are third-party text with the producer's CC BY-SA 4.0 rights note. A missing article becomes a metadata-only record with its reason; a refusal is a counted finding and produces no record. Neither is counted as captured article text.
 
-**Authorship.** A page is another party's text. The authorship engine labels every character of a record from the `webcapture` family `third_party` through its own first rule, whatever the role, channel or typed count says and whatever the URL or text looks like; it can never be `owner`. See [attributed knowledge](attributed-knowledge.md#rule-precedence).
+**Authorship.** A page is another party's text. The authorship engine labels every character of a record whose stripped, case-folded provider is `webcapture` as `third_party` through its own first rule. Kind, wing, role, channel and typed count cannot bypass the guard, including when a caller constructs rule inputs directly. It can never be `owner`. See [attributed knowledge](attributed-knowledge.md#rule-precedence).
 
 **Duplicates, failures and refusals.**
 
-- Several rows for one page (the same `id`, in one shard or many) keep one winner: a capture beats a failure, then the latest `captured_at`, then the larger `content_digest`. Equal-body/time ties use the normalized metadata digest and relative shard name, so the result does not depend on declared source order. The folded rows are counted as `duplicates` in the build report. The reader never edits the input shards, and previously accepted library revisions remain readable.
+- Several rows for one page (the same `id`, in one shard or many) keep the best three locators: a capture beats a failure, then the latest `captured_at`, then the larger `content_digest`. Equal-body/time ties use the normalized metadata digest and relative shard name, so the result does not depend on declared source order. The second pass selects the first candidate whose shard and exact row still match the scan. A changed or missing winner produces a finding and tries the next retained candidate; exhaustion produces `page_unavailable`. The folded rows are counted as `duplicates` in the build report. The reader never edits the input shards, and previously accepted library revisions remain readable.
 - A `failed` row is kept as a record without a body (body status `metadata_only`, `body_reason` the failure class), so a page that could not be fetched stays visible. It makes `coverage_complete` false, like any other record without a body.
 - A row that cannot be trusted is refused with a finding in the build report (`scope: web_captures`, the shard, the line number, a code and a reason that never repeats page text), and the build continues. The codes are `malformed_row` (not JSON, not an object, a field of the wrong shape, an `id` that does not follow the `key`, a `content_digest` that does not match the `text`, a captured row without text or with a failure class, a failed row with a body, text with a NUL or invalid Unicode), `row_too_large`, `symlink_not_followed`, `missing_source`, `unreadable_file` and `source_changed_during_read`.
 - The report lists every shard with its SHA-256, size and row count (`sources[].report.shards`). Raw successful/failed/refused row counts are separate from the selected record count. Resume qualification binds the declared capture sources to these receipts before copying a failed generation.
