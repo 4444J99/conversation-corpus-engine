@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import json
+import os
 import random
+import subprocess
+import sys
+import textwrap
 import time
 import unicodedata
+from array import array
+from pathlib import Path
 
 import pytest
 
+from conversation_corpus_engine import attribution_rules
 from conversation_corpus_engine.attribution import text_digest
 from conversation_corpus_engine.attribution_rules import (
     RULES,
@@ -19,6 +27,7 @@ from conversation_corpus_engine.attribution_rules import (
     RepeatCensus,
     attribute_message,
     boilerplate_ranges,
+    match_form,
     partition_problems,
     record_info,
     rule_agent_family,
@@ -932,16 +941,25 @@ PROBE_PASTED = (
 PROBE_QUESTION = "can you double check this answer you gave earlier?"
 
 
-def shared_with_answer(length: int, filler: int = 60) -> str:
-    """A 600+ character paragraph that shares exactly `length` characters with ANSWER."""
+def normalized(text: str) -> str:
+    return match_form(text)
+
+
+def shared_with_answer(length: int, filler: int = 12) -> str:
+    """A paragraph that shares exactly `length` normalized characters with ANSWER: the shared
+    stretch starts and ends inside words, with unrelated words around it."""
+    form = normalized(ANSWER)
     start = next(
         i
         for i in range(200, 400)
-        if ANSWER[i - 1] != " " and ANSWER[i] != " " and ANSWER[i + length] != " "
+        if form[i - 1] != " " and form[i] != " " and form[i + length] != " "
     )
-    middle = ANSWER[start : start + length]
     padding = " ".join(f"unrelated{i}" for i in range(filler))
-    return f"{padding} #{middle}# {padding}"
+    return f"{padding} {form[start : start + length]} {padding}"
+
+
+def covered(ranges: tuple[tuple[int, int], ...]) -> int:
+    return sum(end - start for start, end in ranges)
 
 
 def test_a_long_paragraph_pasted_back_from_an_earlier_assistant_turn_is_third_party() -> None:
@@ -971,30 +989,39 @@ def test_a_long_paragraph_pasted_back_from_an_earlier_assistant_turn_is_third_pa
     assert rule_pasted_back(ctx("abcdefgh")) == []
 
 
-def test_a_paragraph_needs_150_characters_and_100_shared_characters() -> None:
+def test_the_echo_states_its_thresholds() -> None:
+    echo = AssistantEcho()
+    assert (echo.min_paragraph, echo.min_run, echo.min_shared, echo.min_run_shared) == (
+        60,
+        300,
+        60,
+        100,
+    )
+    assert (echo.history_limit, echo.turn_limit) == (400_000, 400_000)
+
+
+def test_a_paragraph_needs_60_characters_and_60_shared_characters() -> None:
     echo = AssistantEcho()
     echo.add_assistant(ANSWER)
-    assert (echo.min_paragraph, echo.min_run, echo.min_shared) == (150, 300, 100)
-    assert echo.pasted_back(f"short:\n\n{ANSWER[:140]}") == ()
+    assert echo.pasted_back(f"short:\n\n{ANSWER[:50]}") == ()
     text = f"short:\n\n{ANSWER[:200]}"
     assert echo.pasted_back(text) == ((8, 208),)
-    shared_99 = shared_with_answer(99)
-    shared_100 = shared_with_answer(100)
-    assert len(shared_99) >= 600 and len(shared_100) >= 600
-    assert echo.pasted_back(shared_99) == ()
-    assert echo.pasted_back(shared_100) == ((0, len(shared_100)),)
+    shared_59, shared_60 = shared_with_answer(59), shared_with_answer(60)
+    assert echo.pasted_back(shared_59) == ()
+    assert echo.pasted_back(shared_60) == ((0, len(shared_60)),)
     reflowed = ANSWER.replace(". ", ".\n")
     assert echo.pasted_back(reflowed) == ((0, len(reflowed)),)
+    # A paragraph shorter than 60 characters is never a candidate alone, even if all of it shared.
+    brief = normalized(ANSWER)[200:250]
+    assert len(brief) < 60 and echo.pasted_back(brief) == ()
 
 
-def test_a_short_paragraph_that_quotes_part_of_an_answer_stays_owner() -> None:
+def test_a_short_phrase_quoted_from_an_answer_stays_owner() -> None:
     echo = AssistantEcho()
     echo.add_assistant(ANSWER)
-    quote_99 = f"I quote: {ANSWER[100:199]} end"
-    quote_105 = f"I quote: {ANSWER[100:205]}"
-    assert echo.pasted_back(quote_99) == () and echo.pasted_back(quote_105) == ()
-    owner = f"Here is what I think after reading it twice, and I disagree with {ANSWER[100:199]}."
-    assert len(owner) >= 150 and echo.pasted_back(owner) == ()
+    assert echo.pasted_back(shared_with_answer(59)) == ()
+    owner = f"Here is what I think after reading it twice, and I disagree with {ANSWER[100:150]}."
+    assert echo.pasted_back(owner) == ()
     assert echo.pasted_back("I read the answer and the parser point was about right.") == ()
 
 
@@ -1022,31 +1049,107 @@ def test_the_verifiers_cli_probe_is_carved_out_as_pasted_back() -> None:
     ]
 
 
-def test_adjacent_paragraphs_are_one_candidate_only_when_their_joined_text_is_300_characters() -> (
-    None
-):
+def variants_of(answer: str) -> dict[str, str]:
+    sentences = answer.split(". ")
+    return {
+        "verbatim": answer,
+        "lowercased": answer.lower(),
+        "uppercased": answer.upper(),
+        "rewrapped": "\n".join(textwrap.wrap(answer, 55)),
+        "doubled spaces": answer.replace(" ", "  "),
+        "no punctuation": answer.replace(".", "").replace(",", ""),
+        "bold and backticks": answer.replace("parser", "**parser**").replace("point", "`point`"),
+        "heading marks": "## " + answer.replace(". ", ".\n## "),
+        "bulleted": "\n".join(f"- {sentence}." for sentence in sentences),
+        "numbered": "\n".join(f"{n}. {sentence}." for n, sentence in enumerate(sentences, 1)),
+        "renumbered": "\n".join(f"{n + 40}) {sentence}." for n, sentence in enumerate(sentences)),
+        "smart quotes and dashes": answer.replace("assistant", "“assistant”").replace(
+            "about", "– about —"
+        ),
+        "fullwidth letters": answer.replace("Sentence", "Ｓentence"),
+        "blockquoted": "\n".join(f"> {line}" for line in textwrap.wrap(answer, 70)),
+    }
+
+
+@pytest.mark.parametrize("name", sorted(variants_of(ANSWER)))
+def test_a_pasted_answer_is_found_whatever_the_markdown_case_wrapping_or_punctuation(
+    name: str,
+) -> None:
     echo = AssistantEcho()
     echo.add_assistant(ANSWER)
-    for count, carved in ((2, False), (4, False), (5, True), (8, True)):
-        pasted = "\n\n".join(SENTENCES[:count])
-        joined = len(" ".join(SENTENCES[:count]))
-        assert (joined >= 300) is carved
+    pasted = variants_of(ANSWER)[name]
+    found = echo.pasted_back(f"look at this:\n\n{pasted}")
+    assert covered(found) >= 0.9 * len(pasted), name
+    assert found[0][0] == len("look at this:\n\n")
+
+
+def test_an_answer_pasted_back_in_rewritten_markdown_is_found_in_every_variant_pair() -> None:
+    echo = AssistantEcho()
+    echo.add_assistant(variants_of(ANSWER)["bulleted"])
+    for name, pasted in variants_of(ANSWER).items():
+        assert covered(echo.pasted_back(pasted)) >= 0.9 * len(pasted), name
+
+
+LINES = [f"Step {i}: check the parser module stage {i * 7}." for i in range(14)]
+
+
+def test_adjacent_short_paragraphs_are_one_candidate_only_when_joined_300_and_100_shared() -> None:
+    echo = AssistantEcho()
+    echo.add_assistant("\n\n".join(LINES))
+    assert max(len(line) for line in LINES) < 60
+    carved = []
+    for count in (1, 2, 5, 6, 7, 8, 10, 14):
+        pasted = "\n\n".join(LINES[:count])
+        joined = len(" ".join(LINES[:count]))
         offset = len("Mine first.\n\n")
-        expected = ((offset, offset + len(pasted)),) if carved else ()
-        assert echo.pasted_back(f"Mine first.\n\n{pasted}") == expected
+        expected = ((offset, offset + len(pasted)),) if joined >= 300 and count > 1 else ()
+        assert echo.pasted_back(f"Mine first.\n\n{pasted}") == expected, count
+        carved.append(bool(expected))
+    assert carved == [False, False, False, False, False, True, True, True]
+    assert len(" ".join(LINES[:7])) < 300 <= len(" ".join(LINES[:8]))
 
 
 def test_a_run_stops_at_an_untouched_paragraph_and_never_swallows_owner_text() -> None:
     echo = AssistantEcho()
-    echo.add_assistant(ANSWER)
+    echo.add_assistant("\n\n".join(LINES))
     own = "My own paragraph about something else entirely, long enough to matter here, " * 2
-    pasted = "\n\n".join(SENTENCES[:6])
+    pasted = "\n\n".join(LINES[:8])
     text = f"{own.strip()}\n\n{pasted}\n\n{own.strip()}"
     start = text.index(pasted)
     assert echo.pasted_back(text) == ((start, start + len(pasted)),)
     # Two separate runs, each too short alone, around an owner paragraph: nothing is carved.
-    split = "\n\n".join([*SENTENCES[:3], own.strip(), *SENTENCES[3:6]])
+    split = "\n\n".join([*LINES[:4], own.strip(), *LINES[4:8]])
     assert echo.pasted_back(split) == ()
+
+
+def test_a_fenced_code_block_between_pasted_paragraphs_does_not_break_the_run() -> None:
+    echo = AssistantEcho()
+    echo.add_assistant("\n\n".join(LINES))
+    code = (
+        "```python\nprint('not in the answer at all')\n\nprint('a second paragraph of code')\n```"
+    )
+    pasted = "\n\n".join(LINES[:4]) + f"\n\n{code}\n\n" + "\n\n".join(LINES[4:8])
+    assert len(" ".join(LINES[:4])) < 300 and len(" ".join(LINES[4:8])) < 300
+    found = echo.pasted_back(f"mine:\n\n{pasted}")
+    assert found and found[0][0] == len("mine:\n\n")
+    assert found[-1][1] == len(f"mine:\n\n{pasted}")
+    # Without the fence the halves are separated by an owner paragraph and stay owner.
+    own = "an owner paragraph that is long enough to separate the two halves of a paste, " * 2
+    owner_between = "\n\n".join(LINES[:4]) + f"\n\n{own}\n\n" + "\n\n".join(LINES[4:8])
+    assert echo.pasted_back(owner_between) == ()
+
+
+def test_consecutive_user_turns_are_matched_as_one_run() -> None:
+    echo = AssistantEcho()
+    echo.add_assistant("\n\n".join(LINES))
+    turns = ["\n\n".join(LINES[0:3]), "\n\n".join(LINES[3:6]), "\n\n".join(LINES[6:9])]
+    assert all(echo.pasted_back(turn) == () for turn in turns)
+    found = echo.pasted_back_turns(turns)
+    assert [ranges for ranges in found] == [((0, len(turn)),) for turn in turns]
+    comment = "A comment of my own, unrelated to the answer, about the weather and the walk home."
+    assert echo.pasted_back_turns([turns[0], comment, turns[1], turns[2]]) == [(), (), (), ()]
+    assert echo.pasted_back_turns([]) == []
+    assert AssistantEcho().pasted_back_turns(turns) == [(), (), ()]
 
 
 def test_only_earlier_assistant_turns_of_the_same_conversation_count() -> None:
@@ -1062,9 +1165,117 @@ def test_the_echo_remembers_a_bounded_amount_of_assistant_text() -> None:
     echo.add_assistant(ANSWER)
     echo.add_assistant(" ".join(f"Another unrelated reply sentence {i}." for i in range(30)))
     assert echo.pasted_back(ANSWER) == ()
-    for bad in ({"min_paragraph": 0}, {"min_run": 0}, {"min_shared": True}):
+    for bad in ({"min_paragraph": 0}, {"min_run": 0}, {"min_shared": True}, {"turn_limit": 0}):
         with pytest.raises(ValueError, match="positive"):
             AssistantEcho(**bad)
+    with pytest.raises(ValueError, match="min_run_shared"):
+        AssistantEcho(min_shared=80, min_run_shared=70)
+
+
+def test_the_total_history_cap_holds_for_every_turn_including_the_newest() -> None:
+    echo = AssistantEcho(history_limit=1000)
+    for length in (50, 400, 5000, 300, 20_000, 700):
+        echo.add_assistant(" ".join(f"word{index}x" for index in range(length)))
+        assert echo.indexed_characters <= 1000
+    assert echo.indexed_characters > 0
+
+
+def test_a_long_assistant_turn_is_indexed_by_its_head_only() -> None:
+    head = " ".join(f"opening{i}" for i in range(200))
+    tail = " ".join(f"closing{i}" for i in range(200))
+    echo = AssistantEcho(turn_limit=1500, history_limit=10_000)
+    echo.add_assistant(f"{head} {' '.join(f'middle{i}' for i in range(2000))} {tail}")
+    assert echo.indexed_characters <= 1500
+    assert echo.pasted_back(f"from the start:\n\n{head}") != ()
+    assert echo.pasted_back(f"from the end:\n\n{tail}") == ()
+
+
+def test_assistant_windows_are_kept_as_compact_arrays_not_text() -> None:
+    echo = AssistantEcho()
+    echo.add_assistant(ANSWER)
+    assert echo._turns
+    assert all(isinstance(windows, array) and windows.itemsize == 8 for _, windows in echo._turns)
+
+
+def test_a_ten_megabyte_assistant_turn_stays_within_a_bounded_memory_budget() -> None:
+    script = textwrap.dedent(
+        """
+        import json, resource, sys
+        from conversation_corpus_engine.attribution_rules import AssistantEcho
+        head = " ".join(f"opening{i}" for i in range(2000))
+        tail = " ".join(f"closing{i}" for i in range(500))
+        huge = head + " " + "alpha beta gamma delta " * 450_000 + tail
+        assert len(huge) > 10_000_000
+        echo = AssistantEcho()
+        echo.add_assistant(huge)
+        del huge
+        carved = 0
+        for number in range(1000):
+            carved += bool(echo.pasted_back(f"My own short question number {number} about it."))
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak_mb = peak / (1 if sys.platform == "darwin" else 1024) / 1_000_000
+        print(json.dumps({
+            "peak_mb": peak_mb,
+            "owner_turns_carved": carved,
+            "head_found": bool(echo.pasted_back("from the start:\\n\\n" + head)),
+            "tail_found": bool(echo.pasted_back("from the end:\\n\\n" + tail)),
+        }))
+        """
+    )
+    source_root = Path(attribution_rules.__file__).resolve().parents[1]
+    environment = {**os.environ, "PYTHONPATH": str(source_root)}
+    done = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=environment,
+        timeout=300,
+    )
+    result = json.loads(done.stdout)
+    assert result["peak_mb"] < 150, result
+    assert result["owner_turns_carved"] == 0
+    assert result["head_found"] is True
+    # Beyond the indexed head a paste is not recognised (documented limit).
+    assert result["tail_found"] is False
+
+
+def test_genuine_short_owner_turns_are_almost_never_carved_over_1000_generated_conversations() -> (
+    None
+):
+    rng = random.Random(2026)
+    vocabulary = [
+        "".join(rng.choice("abcdefghijklmnopqrstuvwxyz") for _ in range(rng.randint(3, 9)))
+        for _ in range(400)
+    ]
+
+    def paragraph(minimum: int) -> str:
+        text = ""
+        while len(text) < minimum:
+            words = " ".join(rng.choice(vocabulary) for _ in range(rng.randint(6, 14)))
+            text += words.capitalize() + rng.choice([".", ".", "?"]) + " "
+        return text.strip()
+
+    carved = 0
+    for _ in range(1000):
+        echo = AssistantEcho()
+        answer = "\n\n".join(paragraph(rng.randint(150, 500)) for _ in range(rng.randint(1, 4)))
+        echo.add_assistant(answer)
+        owner = paragraph(rng.randint(30, 250))
+        if rng.random() < 0.5:
+            flat = " ".join(answer.split())
+            start = rng.randint(0, len(flat) - 56)
+            owner = f'You said "{flat[start : start + rng.randint(15, 55)]}" but {owner}'
+        carved += bool(echo.pasted_back(owner))
+    assert carved / 1000 < 0.01, carved
+
+
+def test_match_form_ignores_case_markup_punctuation_numbering_and_spacing() -> None:
+    assert match_form("## **Hello**,   World!") == "hello world"
+    assert match_form("  3.  Smart “quotes” — and–dashes ") == "smart quotes and dashes"
+    assert match_form("- item one\n* item two\n• item three") == "item one item two item three"
+    assert match_form("Ｈｉ there") == "hi there"
+    assert match_form("a_b `code` > quote | cell") == "a b code quote cell"
 
 
 # --- notes: agent sections, pasted emails and tables ------------------------------------------

@@ -23,9 +23,11 @@ from attribution_support import (
     PROBE_REMINDER,
     build_library,
     conversations,
+    typed,
 )
 
 from conversation_corpus_engine import attribution_commands
+from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.attributed_knowledge import collect_owner_segments
 from conversation_corpus_engine.attribution import attributed_spans, owner_profile_eligible
 from conversation_corpus_engine.attribution_commands import (
@@ -626,6 +628,85 @@ def test_the_verifiers_probe_pasted_into_a_cli_session_is_carved_out(
     assert by_rule["pasted_back"]["text"] == PROBE_PASTED
     assert by_rule["pasted_back"]["author"] == "third_party"
     assert by_rule["inline_injection"]["text"] == PROBE_REMINDER
+
+
+ANSWER_LINES = [f"Step {i}: check the parser module stage {i * 7}." for i in range(14)]
+
+
+def build_chunked_paste_library(directory: Path) -> Path:
+    """One conversation pastes an answer back in three consecutive messages; the other has an
+    assistant turn between the same three messages."""
+
+    def chat(source_id: str, messages: list[Message]) -> Conversation:
+        return Conversation(
+            provider="chatgpt",
+            source_id=source_id,
+            title=source_id,
+            messages=messages,
+            extra={"wing": "ai", "lane": "conversations"},
+        )
+
+    def assistant(identifier: str, text: str) -> Message:
+        return Message(role="assistant", channel="reply", id=identifier, text=text)
+
+    answer = "\n\n".join(ANSWER_LINES)
+    chunks = ["\n\n".join(ANSWER_LINES[start : start + 3]) for start in (0, 3, 6)]
+    together = chat(
+        "chunked",
+        [
+            typed("u0", "Please review the repository."),
+            assistant("a0", answer),
+            *(typed(f"u{n}", chunk) for n, chunk in enumerate(chunks, start=1)),
+        ],
+    )
+    apart = chat(
+        "separated",
+        [
+            typed("u0", "Please review the repository."),
+            assistant("a0", answer),
+            typed("u1", chunks[0]),
+            assistant("a1", "An unrelated reply about the weather and the walk home."),
+            typed("u2", chunks[1]),
+            assistant("a2", "Another unrelated reply about breakfast and the garden."),
+            typed("u3", chunks[2]),
+        ],
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    with Library.create(directory / "library.sqlite") as library:
+        library.put(together)
+        library.put(apart)
+    return directory / "library.sqlite"
+
+
+def pasted_back_spans(library: Path) -> dict[str, list[tuple[int, str]]]:
+    found: dict[str, list[tuple[int, str]]] = {}
+    with Library(library) as handle:
+        deadline = Deadline(60)
+        census = build_census(
+            handle, limit_records=None, min_chars=200, min_occurrences=3, deadline=deadline
+        )
+
+        def visit(message, spans) -> None:
+            for span in spans:
+                if span.rule == "pasted_back":
+                    found.setdefault(message.uid.removeprefix("chatgpt-"), []).append(
+                        (message.index, message.text[span.start : span.end])
+                    )
+
+        scan(handle, census, limit_records=None, deadline=deadline, visit=visit)
+    return found
+
+
+def test_an_answer_pasted_back_in_consecutive_messages_is_found_as_one_stretch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_chunked_paste_library(tmp_path / "store" / "g")
+    found = pasted_back_spans(library)
+    chunks = ["\n\n".join(ANSWER_LINES[start : start + 3]) for start in (0, 3, 6)]
+    assert found == {"chunked": [(2, chunks[0]), (3, chunks[1]), (4, chunks[2])]}
+    report = report_of(capsys, library)
+    assert report["partition"]["ok"] is True
+    assert report["scan"]["messages"] == 12
 
 
 def test_a_limited_scan_counts_only_the_spans_it_saw(

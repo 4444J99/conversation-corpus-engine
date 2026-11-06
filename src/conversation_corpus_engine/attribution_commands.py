@@ -84,6 +84,8 @@ from .library_store import Library
 DEFAULT_DEADLINE_SECONDS = 900.0
 LARGEST_CATEGORIES = 5
 DEADLINE_CHECK_INTERVAL = 256
+# Consecutive user turns wait to be matched as one stretch up to this many characters.
+USER_RUN_CHARACTERS = 2_000_000
 
 
 class DeadlineReached(Exception):
@@ -275,43 +277,71 @@ def scan(
     deadline: Deadline,
     visit: Callable[[ScannedMessage, list[AttributedSpan]], None] | None = None,
 ) -> tuple[ScanStats, Tally]:
-    """Attribute every message of the slice; a deadline during this pass ends it, flagged."""
+    """Attribute every message of the slice; a deadline during this pass ends it, flagged.
+
+    Consecutive user turns of one conversation (no other turn between them) are held back and
+    matched against the earlier assistant turns as one stretch, so an answer pasted back in
+    several messages is still found; at most `USER_RUN_CHARACTERS` characters wait at a time.
+    """
     stats, tally = ScanStats(), Tally()
     echo, echo_key = AssistantEcho(), None
+    pending: list[ScannedMessage] = []
+    waiting = 0
+
+    def attribute(message: ScannedMessage, pasted: tuple[tuple[int, int], ...]) -> None:
+        stats.messages += 1
+        spans = attribute_message(
+            message.text,
+            role=message.role,
+            channel=message.channel,
+            typed_chars=message.typed_chars,
+            meta=message.meta,
+            record=message.record,
+            boilerplate=census.later_occurrences(message.text),
+            pasted_back=pasted,
+        )
+        tally.add(message.text, spans)
+        if not message.referenceable:
+            stats.unreferenceable += 1
+        if visit is not None:
+            visit(message, spans)
+
+    def release() -> None:
+        nonlocal waiting
+        if pending:
+            found = echo.pasted_back_turns([item.text for item in pending])
+            for item, pasted in zip(pending, found, strict=True):
+                attribute(item, pasted)
+            pending.clear()
+        waiting = 0
+
     try:
         for message in iter_messages(
             library, stats, limit_records=limit_records, deadline=deadline
         ):
-            stats.messages += 1
+            if (message.uid, message.sequence) != echo_key:
+                release()
+                echo, echo_key = AssistantEcho(), (message.uid, message.sequence)
             if message.unreadable:
+                release()
+                stats.messages += 1
                 stats.unreadable += 1
                 tally.add_unreadable(message.text)
                 continue
-            if (message.uid, message.sequence) != echo_key:
-                echo, echo_key = AssistantEcho(), (message.uid, message.sequence)
             role = message.role.strip().lower()
-            pasted: tuple[tuple[int, int], ...] = ()
+            if role == "user":
+                pending.append(message)
+                waiting += len(message.text)
+                if waiting > USER_RUN_CHARACTERS:
+                    release()
+                continue
+            release()
             if role in {"assistant", "model"}:
                 echo.add_assistant(message.text)
-            elif role == "user":
-                pasted = echo.pasted_back(message.text)
-            spans = attribute_message(
-                message.text,
-                role=message.role,
-                channel=message.channel,
-                typed_chars=message.typed_chars,
-                meta=message.meta,
-                record=message.record,
-                boilerplate=census.later_occurrences(message.text),
-                pasted_back=pasted,
-            )
-            tally.add(message.text, spans)
-            if not message.referenceable:
-                stats.unreferenceable += 1
-            if visit is not None:
-                visit(message, spans)
+            attribute(message, ())
     except DeadlineReached:
         stats.deadline_reached = True
+    release()
     return stats, tally
 
 

@@ -35,7 +35,8 @@ import os
 import re
 import types
 import unicodedata
-from collections import Counter
+from array import array
+from collections import Counter, deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -861,29 +862,98 @@ def rule_boilerplate(context: MessageContext) -> list[Claim]:
 
 # --- pasted-back assistant text ---------------------------------------------------------------
 
-DEFAULT_ECHO_MIN_PARAGRAPH = 150
+DEFAULT_ECHO_MIN_PARAGRAPH = 60
 DEFAULT_ECHO_MIN_RUN = 300
-DEFAULT_ECHO_MIN_SHARED = 100
+DEFAULT_ECHO_MIN_SHARED = 60
+DEFAULT_ECHO_MIN_RUN_SHARED = 100
 DEFAULT_ECHO_HISTORY = 400_000
-_TOKEN = re.compile(r"\S+")
+# Only the head of an assistant turn is indexed: a longer turn costs no more memory than this.
+DEFAULT_ECHO_TURN = 400_000
+ECHO_CHUNK = 1 << 16
+_LIST_MARKER = re.compile(
+    r"^[ \t]*(?:[-*+•·▪‣◦]|\(?\d{1,3}[.)]|\(?[a-z][.)])[ \t]+",
+    re.MULTILINE,
+)
+_NOT_TEXT = re.compile(r"[^\w\s]|_")
+_ANY_SPACE = re.compile(r"\s")
+_SPACE_RUN = re.compile(r"\s+")
+
+
+def match_form(text: str) -> str:
+    """Text as the echo compares it, so that rewrapping, case, markdown, list numbering,
+    punctuation, smart quotes and dashes, compatibility characters and spacing cannot hide a paste:
+    NFKC, case-folded, list markers and numbering dropped, every punctuation or symbol character
+    read as a space, whitespace collapsed."""
+    folded = unicodedata.normalize("NFKC", text).casefold()
+    folded = _LIST_MARKER.sub(" ", folded)
+    return " ".join(_NOT_TEXT.sub(" ", folded).split())
+
+
+def _chunks(text: str) -> Iterator[str]:
+    """Pieces of about `ECHO_CHUNK` characters that end at a line break (else at whitespace)."""
+    position, length = 0, len(text)
+    while position < length:
+        end = position + ECHO_CHUNK
+        if end >= length:
+            yield text[position:]
+            return
+        newline = text.find("\n", end, end + ECHO_CHUNK)
+        if newline != -1:
+            stop = newline + 1
+        else:
+            blank = _ANY_SPACE.search(text, end)
+            stop = blank.end() if blank else length
+        yield text[position:stop]
+        position = stop
+
+
+def _match_form_of(text: str) -> str:
+    """`match_form` of any size without a list of every word of a huge text."""
+    if len(text) <= 2 * ECHO_CHUNK:
+        return match_form(text)
+    return " ".join(piece for piece in map(match_form, _chunks(text)) if piece)
+
+
+def _match_head(text: str, limit: int) -> str:
+    """The first `limit` characters of `_match_form_of(text)`, normalizing no more than needed."""
+    if len(text) <= 2 * ECHO_CHUNK:
+        return match_form(text)[:limit]
+    pieces: list[str] = []
+    total = 0
+    for chunk in _chunks(text):
+        piece = match_form(chunk)
+        if piece:
+            pieces.append(piece)
+            total += len(piece) + 1
+            if total > limit:
+                break
+    return " ".join(pieces)[:limit]
 
 
 class AssistantEcho:
     """Finds text a user turn pastes back from an earlier assistant turn of its conversation.
 
     Feed the conversation's turns in order: `add_assistant` for each assistant reply and
-    `pasted_back` for each user turn. Whitespace is normalized, and a stretch of `min_shared`
-    characters that also occurs in an earlier assistant turn is a match (the comparison is by
-    64-bit hash; a collision would only make a paste look more pasted, never less). Two kinds of
-    candidate are returned as ranges:
+    `pasted_back` (or `pasted_back_turns`, for consecutive user turns) for the user turns. Both
+    sides are compared in their `match_form`, and a stretch of `min_shared` characters that also
+    occurs in an earlier assistant turn is a match (the comparison is by 64-bit hash; a collision
+    would only make a paste look more pasted, never less). Two kinds of candidate are returned as
+    ranges:
 
-    * a paragraph of at least `min_paragraph` characters that contains a match;
+    * a paragraph of at least `min_paragraph` characters that holds a match;
     * a run of adjacent paragraphs, each touched by a match, whose joined text is at least
-      `min_run` characters (a pasted answer is often several short paragraphs).
+      `min_run` characters and that holds a stretch of at least `min_run_shared` shared
+      characters (a pasted answer is often several short paragraphs). Fenced code blocks between
+      paragraphs do not break a run, and the consecutive user turns given to `pasted_back_turns`
+      (no assistant turn between them) are matched as one run.
 
     A paragraph that only quotes a short phrase (fewer than `min_shared` shared characters) is
-    never a candidate, and neither is a short paragraph on its own. Only the most recent
-    `history_limit` normalized characters of assistant text are remembered.
+    never a candidate, and neither is a short paragraph on its own. Memory is bounded: only the
+    first `turn_limit` normalized characters of an assistant turn are indexed (a paste of text
+    beyond that head is not recognised), the total indexed text never exceeds `history_limit`
+    (the oldest turns go first, the newest turn included in the count), and each indexed turn is
+    kept as an array of 64-bit window hashes, never as text. Matching across conversations is not
+    attempted.
     """
 
     def __init__(
@@ -892,79 +962,112 @@ class AssistantEcho:
         min_paragraph: int = DEFAULT_ECHO_MIN_PARAGRAPH,
         min_run: int = DEFAULT_ECHO_MIN_RUN,
         min_shared: int = DEFAULT_ECHO_MIN_SHARED,
+        min_run_shared: int = DEFAULT_ECHO_MIN_RUN_SHARED,
         history_limit: int = DEFAULT_ECHO_HISTORY,
+        turn_limit: int = DEFAULT_ECHO_TURN,
     ) -> None:
         for name, value in (
             ("min_paragraph", min_paragraph),
             ("min_run", min_run),
             ("min_shared", min_shared),
+            ("min_run_shared", min_run_shared),
             ("history_limit", history_limit),
+            ("turn_limit", turn_limit),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if min_run_shared < min_shared:
+            raise ValueError("min_run_shared must not be smaller than min_shared")
         self.min_paragraph = min_paragraph
         self.min_run = min_run
         self.min_shared = min_shared
+        self.min_run_shared = min_run_shared
         self.history_limit = history_limit
-        self._turns: list[str] = []
+        self.turn_limit = turn_limit
+        self._turns: deque[tuple[int, array]] = deque()
         self._size = 0
         self._index: set[int] | None = None
 
-    def _hashes(self, normalized: str) -> Iterator[int]:
+    @property
+    def indexed_characters(self) -> int:
+        """How many normalized characters of assistant text are indexed right now."""
+        return self._size
+
+    def _hashes(self, form: str) -> Iterator[int]:
         width = self.min_shared
-        return (hash(normalized[i : i + width]) for i in range(len(normalized) - width + 1))
+        return (hash(form[i : i + width]) for i in range(len(form) - width + 1))
 
     def add_assistant(self, text: str) -> None:
-        normalized = " ".join(text.split())
-        if len(normalized) < self.min_shared:
+        head = _match_head(text, min(self.turn_limit, self.history_limit))
+        if len(head) < self.min_shared:
             return
-        self._turns.append(normalized)
-        self._size += len(normalized)
+        windows = array("q", self._hashes(head))
+        self._turns.append((len(head), windows))
+        self._size += len(head)
         evicted = False
-        while self._size > self.history_limit and len(self._turns) > 1:
-            self._size -= len(self._turns.pop(0))
+        while self._size > self.history_limit and self._turns:
+            self._size -= self._turns.popleft()[0]
             evicted = True
         if evicted:
             self._index = None
         elif self._index is not None:
-            self._index.update(self._hashes(normalized))
+            self._index.update(windows)
 
     def _windows(self) -> set[int]:
         if self._index is None:
-            self._index = {h for turn in self._turns for h in self._hashes(turn)}
+            self._index = set().union(*(windows for _, windows in self._turns))
         return self._index
 
     def pasted_back(self, text: str) -> tuple[Range, ...]:
+        return self.pasted_back_turns([text])[0]
+
+    def pasted_back_turns(self, texts: Sequence[str]) -> list[tuple[Range, ...]]:
+        """The pasted-back ranges of consecutive user turns, matched as one conversation stretch;
+        one tuple of ranges (offsets into that turn) per turn."""
         if not self._turns:
-            return ()
-        paragraphs = _paragraphs(_lines(text))
-        tokens = [(match.start(), match.end()) for match in _TOKEN.finditer(text)]
+            return [() for _ in texts]
         width = self.min_shared
-        normalized = " ".join(text[start:end] for start, end in tokens)
-        if not paragraphs or len(normalized) < width:
-            return ()
+        # Every paragraph of every turn: (turn, start, end, in a fenced block, normalized range,
+        # length with whitespace collapsed).
+        paragraphs: list[tuple[int, int, int, bool, Range | None, int]] = []
+        pieces: list[str] = []
+        position = 0
+        for turn, text in enumerate(texts):
+            lines = _lines(text)
+            fenced = [(start, end) for start, end, _ in _fenced_blocks(lines)]
+            fence_starts = [start for start, _ in fenced]
+            for start, end in _paragraphs(lines):
+                found = bisect.bisect_right(fence_starts, start) - 1
+                inside = found >= 0 and end <= fenced[found][1]
+                body = text[start:end]
+                form = _match_form_of(body)
+                if form:
+                    span: Range | None = (position, position + len(form))
+                    pieces.append(form)
+                    position += len(form) + 1
+                else:
+                    span = None
+                collapsed = len(_SPACE_RUN.sub(" ", body))
+                paragraphs.append((turn, start, end, inside, span, collapsed))
+        results: list[list[Range]] = [[] for _ in texts]
+        combined = " ".join(pieces)
+        if len(combined) < width:
+            return [() for _ in texts]
         index = self._windows()
-        hits = [i for i, h in enumerate(self._hashes(normalized)) if h in index]
+        hits = [i for i, h in enumerate(self._hashes(combined)) if h in index]
         if not hits:
-            return ()
-        starts, position = [], 0
-        for start, end in tokens:
-            starts.append(position)
-            position += end - start + 1
-        # The normalized range of each paragraph, from the tokens it holds.
-        spans: list[Range | None] = []
-        cursor = 0
-        for first_char, last_char in paragraphs:
-            while cursor < len(tokens) and tokens[cursor][0] < first_char:
-                cursor += 1
-            first = cursor
-            while cursor < len(tokens) and tokens[cursor][1] <= last_char:
-                cursor += 1
-            if first == cursor:
-                spans.append(None)
+            return [() for _ in texts]
+        # Maximal stretches of consecutive matching windows, as normalized ranges.
+        stretches: list[Range] = []
+        first = last = hits[0]
+        for hit in hits[1:]:
+            if hit == last + 1:
+                last = hit
             else:
-                last = cursor - 1
-                spans.append((starts[first], starts[last] + tokens[last][1] - tokens[last][0]))
+                stretches.append((first, last + width))
+                first = last = hit
+        stretches.append((first, last + width))
+        stretch_starts = [start for start, _ in stretches]
 
         def touched(span: Range) -> bool:
             low = bisect.bisect_right(hits, span[0] - width)
@@ -974,32 +1077,69 @@ class AssistantEcho:
             low = bisect.bisect_left(hits, span[0])
             return low < len(hits) and hits[low] + width <= span[1]
 
-        def original(first: int, last: int) -> Range:
-            start, end = paragraphs[first]
-            body = text[start : paragraphs[last][1]]
-            lead = len(body) - len(body.lstrip())
-            return start + lead, start + len(body.rstrip())
+        def longest_shared(low: int, high: int) -> int:
+            best = 0
+            at = max(0, bisect.bisect_right(stretch_starts, low) - 1)
+            while at < len(stretches) and stretches[at][0] < high:
+                if stretches[at][1] > low:
+                    best = max(best, stretches[at][1] - stretches[at][0])
+                at += 1
+            return best
 
-        claimed: list[Range] = []
-        index_of = 0
-        while index_of < len(paragraphs):
-            if spans[index_of] is None or not touched(spans[index_of]):
-                index_of += 1
+        def original(turn: int, begin: int, finish: int) -> Range:
+            body = texts[turn][begin:finish]
+            lead = len(body) - len(body.lstrip())
+            return begin + lead, begin + len(body.rstrip())
+
+        at = 0
+        while at < len(paragraphs):
+            _, _, _, inside, span, _ = paragraphs[at]
+            if inside or span is None or not touched(span):
+                at += 1
                 continue
-            stop = index_of
-            while stop < len(paragraphs) and spans[stop] is not None and touched(spans[stop]):
-                stop += 1
-            joined = spans[stop - 1][1] - spans[index_of][0]
-            if stop - index_of >= 2 and joined >= self.min_run:
-                claimed.append(original(index_of, stop - 1))
-            else:
-                claimed.extend(
-                    original(p, p)
-                    for p in range(index_of, stop)
-                    if spans[p][1] - spans[p][0] >= self.min_paragraph and holds_match(spans[p])
+            # Extend the run over touched paragraphs; code blocks and marker-only paragraphs
+            # between them neither join nor break it.
+            members = [at]
+            probe = at + 1
+            while probe < len(paragraphs):
+                _, _, _, inside_probe, span_probe, _ = paragraphs[probe]
+                if inside_probe or span_probe is None:
+                    probe += 1
+                elif touched(span_probe):
+                    members.append(probe)
+                    probe += 1
+                else:
+                    break
+            spans = [paragraphs[member][4] for member in members]
+            # The joined length counts the paragraphs as written as well as normalized, so that
+            # stripping markup cannot shrink a run below the threshold.
+            joined = (
+                max(
+                    sum(item[1] - item[0] for item in spans),
+                    sum(paragraphs[member][5] for member in members),
                 )
-            index_of = stop
-        return tuple(claimed)
+                + len(members)
+                - 1
+            )
+            if (
+                len(members) >= 2
+                and joined >= self.min_run
+                and longest_shared(spans[0][0], spans[-1][1]) >= self.min_run_shared
+            ):
+                by_turn: dict[int, list[int]] = {}
+                for member in members:
+                    by_turn.setdefault(paragraphs[member][0], []).append(member)
+                for turn, group in by_turn.items():
+                    results[turn].append(
+                        original(turn, paragraphs[group[0]][1], paragraphs[group[-1]][2])
+                    )
+            else:
+                for member in members:
+                    turn, begin, finish, _, span, _ = paragraphs[member]
+                    if span[1] - span[0] >= self.min_paragraph and holds_match(span):
+                        results[turn].append(original(turn, begin, finish))
+            at = members[-1] + 1
+        return [tuple(sorted(found)) for found in results]
 
 
 def rule_pasted_back(context: MessageContext) -> list[Claim]:
