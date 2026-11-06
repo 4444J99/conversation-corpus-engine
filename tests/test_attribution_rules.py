@@ -1317,6 +1317,83 @@ def test_any_ai_marker_anywhere_in_a_note_makes_the_whole_note_not_owner(marked:
     assert all(s.author != "owner" for s in run(marked, record=NOTE))
 
 
+AI_PHRASINGS = [
+    # the verifier's variants
+    "Drafted with help from Claude.",
+    "I asked GPT-4 to write this part:",
+    "Mine.\n\n## Summary (written by ChatGPT)",
+    # asked / used / had / let / got / prompted + a name
+    "I asked ChatGPT to tidy this paragraph.",
+    "Then I used Claude for the outline.",
+    "I had Gemini rewrite the intro.",
+    "I let Copilot finish the sentence.",
+    "I got ChatGPT to summarise the minutes.",
+    "I prompted Claude with my notes.",
+    "I asked Bard for ideas.",
+    "I had Llama translate it.",
+    "I asked Mistral about it.",
+    "I asked Grok for a rhyme.",
+    "I used DeepSeek for the maths.",
+    "I asked Perplexity to look it up.",
+    # using / with / via / through / from / by / per / according to + a name
+    "Written using GPT-4o over lunch.",
+    "Done with Gemini yesterday.",
+    "Sourced via ChatGPT.",
+    "Rephrased through Claude.",
+    "Taken from Bard.",
+    "Text by Llama 3.",
+    "Per Mistral, the date is fixed.",
+    "According to Claude, the plan is sound.",
+    "According to DeepSeek the sum is eight.",
+    "Edited with GPT4.",
+    "Drafted using GPT 4o.",
+    # the same with a kind of assistant
+    "Written using a chatbot.",
+    "Checked with an LLM.",
+    "Reviewed by an AI.",
+    "Pulled from an A.I. tool.",
+    "Written via a language model.",
+    "Tidied with an assistant.",
+    "Made using an AI assistant.",
+    "Summarised by a large language model.",
+    # AI-assisted / generated / written / drafted
+    "This list is AI-assisted.",
+    "AI assisted summary below.",
+    "AI-generated text follows.",
+    "AI written, lightly edited.",
+    "AI-drafted outline.",
+    # a name followed by what it did
+    "ChatGPT said I should rest.",
+    "Claude wrote the second half.",
+    "Gemini suggested a title.",
+    "Copilot replied with a fix.",
+    "GPT-4 answered the question.",
+    "ChatGPT gave me this list.",
+    "GPT4 says it is fine.",
+    "Claude told me to wait.",
+    # a prompt followed by a code or quote block
+    "Prompt:\n```\nwrite me a poem\n```",
+    'Prompt: "write me a poem"',
+    "prompt:\n> write me a poem",
+    "Prompt: \u201cwrite me a poem\u201d",
+    # a co-author trailer
+    "Co-Authored-By: A. Person <a@example.com>",
+    "Notes\n\nco-authored-by: someone else",
+]
+
+
+@pytest.mark.parametrize("phrase", AI_PHRASINGS)
+def test_ai_authorship_phrasings_anywhere_in_a_note_make_it_not_owner(phrase: str) -> None:
+    marked = f"Mine.\n\n{phrase}\nAGENTTEXT here."
+    assert note_owner_text(marked) == []
+    assert all(s.author != "owner" for s in run(marked, record=NOTE))
+    assert rule_note_owner(ctx(marked, record=NOTE)) == []
+
+
+def test_there_are_at_least_forty_more_phrasings_than_the_verifiers_three() -> None:
+    assert len(set(AI_PHRASINGS)) >= 43
+
+
 def test_a_marker_in_one_message_of_a_note_taints_every_message_of_the_record() -> None:
     record = record_info(
         note_payload("Perfectly ordinary words of mine.", "Later: written by ChatGPT, see above.")
@@ -1334,6 +1411,15 @@ def test_a_marker_in_one_message_of_a_note_taints_every_message_of_the_record() 
         "He is an assistant manager at the shop.",
         "Generated with love and patience.",
         "The ai in rain is not a marker; neither is said.",
+        "I was prompted by the news to write this.",
+        "Prompt: be on time, every time.",
+        "We got a Gemini tattoo in Lisbon.",
+        "Taken from a friend, written by hand.",
+        "He asked the assistant manager about the rota.",
+        "Done by the end of the day via the old bridge.",
+        "A said B said C, as in the game.",
+        "The model train was assembled with a glue gun.",
+        "Per the agreement, rent is due on the first.",
     ],
 )
 def test_ordinary_authorship_words_do_not_taint_a_note(plain: str) -> None:
@@ -1354,6 +1440,10 @@ def test_ai_markers_only_taint_notes_and_documents_not_chat_turns() -> None:
         "---------- Forwarded message ---------\nEMAILBODY ok",
         "Begin forwarded message:\n\nEMAILBODY ok",
         "On Mon, Jan 2, 2026 at 3:04 PM Alice <a@example.com> wrote:\nEMAILBODY ok",
+        "From: Alice <a@example.com>\n\nEMAILBODY ok",
+        "Subject: Re: lease\nEMAILBODY ok",
+        "Date: Mon, 2 Jan 2026\n\nEMAILBODY ok",
+        "To: me\nEMAILBODY ok",
     ],
 )
 def test_a_pasted_email_block_is_third_party_to_the_end_of_the_note(mail: str) -> None:
@@ -1365,9 +1455,11 @@ def test_a_pasted_email_block_is_third_party_to_the_end_of_the_note(mail: str) -
     assert "EMAILBODY" in spans[-1][2]
 
 
-def test_a_single_header_looking_line_is_not_an_email() -> None:
+def test_a_header_looking_line_with_nothing_after_it_is_not_an_email() -> None:
     text = "Subject: my plans for the weekend are fluid."
     assert rule_pasted_block(ctx(text)) == []
+    assert rule_pasted_block(ctx("Cc: nobody\nand then some words")) == []
+    assert rule_pasted_block(ctx("Fromage: a cheese\n\nwords")) == []
 
 
 TABLE = "| Name | Cost |\n|---|---|\n| TABLEROW | 1 |"
@@ -1386,10 +1478,20 @@ def test_a_markdown_table_with_a_separator_row_is_third_party() -> None:
     assert ranges(rule_pasted_block(ctx(aligned))) == [(0, len(aligned))]
 
 
-def test_pipes_without_a_separator_row_are_not_a_table() -> None:
-    assert rule_pasted_block(ctx("a | b | c\nd | e | f")) == []
+def test_two_lines_of_two_or_more_pipes_each_are_a_table_without_a_separator_row() -> None:
+    for text in ("a | b | c\nd | e | f", "| x | y |\n| 1 | 2 |", "x | y |\n| 1 | 2"):
+        assert ranges(rule_pasted_block(ctx(text))) == [(0, len(text))], text
+    note = "Name | Cost\nRent | TBL2"
+    assert rule_pasted_block(ctx(note)) == []  # one pipe a line and no separator row
+    inside = "Mine.\n\n| a | b |\n| c | d |\n\nMine again."
+    assert view(inside, run(inside, record=NOTE))[2][:2] == ("pasted_block", "third_party")
+
+
+def test_pipes_that_are_not_a_table_stay_text() -> None:
     assert rule_pasted_block(ctx("one line | with a pipe")) == []
     assert rule_pasted_block(ctx("|---|---|")) == []
+    assert rule_pasted_block(ctx("only one | of these | lines has pipes\nplain words")) == []
+    assert rule_pasted_block(ctx("a | b\nplain words\nc | d")) == []
 
 
 # --- g: notes default ------------------------------------------------------------------------

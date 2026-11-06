@@ -350,25 +350,42 @@ def _text_marker(text: str) -> str:
     return _frontmatter_marker(text)
 
 
+# Names of AI assistants (case-insensitive; "GPT" with or without a version, "ChatGPT").
+_AI_NAME = (
+    r"(?:chat[-\s]?gpt|gpt(?:[-\s]?\d[\w.]*|s)?|claude|gemini|copilot|codex|bard|llama(?:[-\s]?\d[\w.]*)?"
+    r"|mistral|grok|deepseek|perplexity|openai|anthropic)"
+)
+# "an LLM", "an AI", "an A.I.", "a chatbot", "a language model", "an assistant", "an AI assistant".
+_AI_KIND = (
+    r"an?\s+(?:llm|ai|a\.i\.|chat\s?bot|(?:large\s+)?language\s+model"
+    r"|(?:ai\s+|a\.i\.\s+)?assistant)"
+)
 _AGENT_NOUN = (
-    r"(?:an?\s+)?(?:ai|a\.i\.|llm|large\s+language\s+model|language\s+model|chat\s?bot"
-    r"|chatgpt|gpt[-\w.]*|claude|gemini|copilot|codex|openai|anthropic|assistant|bard|grok"
-    r"|perplexity|mistral|deepseek)"
+    rf"(?:{_AI_NAME}|(?:an?\s+)?(?:ai|a\.i\.|llm|large\s+language\s+model|language\s+model"
+    r"|chat\s?bot|assistant|ai\s+assistant))"
 )
 _AI_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "ai-authorship",
         re.compile(
             r"\b(?:generated|written|drafted|composed|authored|created|produced|summari[sz]ed"
-            r"|translated|rewritten|edited|suggested|answered)\s+(?:by|using|with|via)\s+"
-            rf"(?:the\s+help\s+of\s+)?{_AGENT_NOUN}\b",
+            r"|translated|rewritten|edited|suggested|answered|polished|proofread|rephrased)\s+"
+            rf"(?:by|using|with|via|through)\s+(?:the\s+help\s+of\s+)?{_AGENT_NOUN}(?!\w)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "used-an-ai",
+        re.compile(
+            r"\b(?:asked|used|had|let|got|prompted|using|with|via|through|from|by|per"
+            rf"|according\s+to)\s+(?:{_AI_NAME}|{_AI_KIND})(?!\w)",
             re.IGNORECASE,
         ),
     ),
     (
         "with-help-of-ai",
         re.compile(
-            rf"\bwith\s+(?:the\s+)?(?:help|assistance|aid)\s+(?:of|from)\s+{_AGENT_NOUN}\b",
+            rf"\bwith\s+(?:the\s+)?(?:help|assistance|aid)\s+(?:of|from)\s+{_AGENT_NOUN}(?!\w)",
             re.IGNORECASE,
         ),
     ),
@@ -376,10 +393,24 @@ _AI_MARKERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "ai-generated",
         re.compile(
-            r"\b(?:ai|a\.i\.|llm|machine)[-\s]+(?:generated|written|authored|produced|assisted)\b",
+            r"\b(?:ai|a\.i\.|llm|machine)[-\s]+(?:generated|written|authored|produced|assisted"
+            r"|drafted|composed)\b",
             re.IGNORECASE,
         ),
     ),
+    (
+        "ai-said",
+        re.compile(
+            rf"\b{_AI_NAME}\s+(?:said|says|wrote|writes|suggested|replied|answered|responded"
+            r"|recommended|generated|gave\s+me|told\s+me)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "prompt-block",
+        re.compile(r"\bprompt\s*:[ \t]*(?:\n\s*)*(?:```|~~~|>|[\"\u201c'])", re.IGNORECASE),
+    ),
+    ("co-authored-by", re.compile(r"\bco-authored-by\s*:", re.IGNORECASE)),
 )
 
 
@@ -1177,6 +1208,8 @@ def rule_ambiguous(context: MessageContext) -> list[Claim]:
 # --- pasted blocks: emails, forwards and tables ------------------------------------------------
 
 _MAIL_HEADER = re.compile(r"^(?:From|To|Cc|Bcc|Subject|Date|Sent|Reply-To):[ \t]*\S", re.IGNORECASE)
+# One of these four, followed by anything (a blank line or the body), starts a pasted email.
+_FIRST_MAIL_HEADER = re.compile(r"^(?:From|To|Subject|Date):[ \t]*\S", re.IGNORECASE)
 _MAIL_MARKERS = (
     re.compile(r"^-{2,}\s*Original Message\s*-{2,}\s*$", re.IGNORECASE),
     re.compile(r"^-{2,}\s*Forwarded message\s*-{2,}\s*$", re.IGNORECASE),
@@ -1187,8 +1220,11 @@ _TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$")
 
 
 def rule_pasted_block(context: MessageContext) -> list[Claim]:
-    """A pasted email or forward and a markdown table are third-party text. Where an email starts
-    its extent cannot be proven, so it runs to the end of the message."""
+    """A pasted email or forward and a markdown table are third-party text. A From, To, Subject
+    or Date header line that something follows, or two header lines in a row, or a forward marker
+    starts an email; where it starts its extent cannot be proven, so it runs to the end of the
+    message. A table is two or more lines in a row that each hold two or more pipes, or lines
+    with pipes that include a separator row."""
     lines = _lines(context.text)
     claims: list[Claim] = []
     for index, (start, _, content) in enumerate(lines):
@@ -1198,7 +1234,7 @@ def rule_pasted_block(context: MessageContext) -> list[Claim]:
             and index + 1 < len(lines)
             and _MAIL_HEADER.match(lines[index + 1][2])
             and (index == 0 or not _MAIL_HEADER.match(lines[index - 1][2]))
-        )
+        ) or (_FIRST_MAIL_HEADER.match(content) and index + 1 < len(lines))
         if marker or header_run:
             claims.append((start, len(context.text), "email" if header_run else "forward"))
             break
@@ -1214,6 +1250,18 @@ def rule_pasted_block(context: MessageContext) -> list[Claim]:
             _TABLE_SEPARATOR.match(lines[i][2]) for i in range(index, stop)
         ):
             claims.append((lines[index][0], lines[stop - 1][1], "markdown-table"))
+        index = stop
+    index = 0
+    while index < len(lines):
+        if lines[index][2].count("|") < 2:
+            index += 1
+            continue
+        stop = index
+        while stop < len(lines) and lines[stop][2].count("|") >= 2:
+            stop += 1
+        table = (lines[index][0], lines[stop - 1][1], "markdown-table")
+        if stop - index >= 2 and table not in claims:
+            claims.append(table)
         index = stop
     return claims
 
