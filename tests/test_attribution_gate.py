@@ -314,9 +314,8 @@ def test_a_row_carries_its_stratum_and_refuses_unknown_ones() -> None:
         validate_ledger_row(missing)
 
 
-def test_ledger_rows_are_validated_strictly_with_line_numbers() -> None:
+def test_malformed_ledger_lines_are_quarantined_with_their_line_numbers_not_raised() -> None:
     good = json.dumps(ledger_row("b" * 32, "quote", "yes", OWNER_ID, STAMP, stratum="S"))
-    assert len(parse_ledger([good, "", "   ", good])) == 2
     base = json.loads(good)
     bad = {
         "not json": "{oops",
@@ -329,18 +328,81 @@ def test_ledger_rows_are_validated_strictly_with_line_numbers() -> None:
         "unknown rule": json.dumps({**base, "rule": "nope"}),
         "extra": json.dumps({**base, "note": "x"}),
     }
+    clean = parse_ledger([good, "", "   ", good])
+    assert len(clean.rows) == 2 and clean.quarantined == []
     for name, line in bad.items():
-        with pytest.raises(ValueError, match=r"ledger line 3"):
-            parse_ledger([good, "", line])
-        assert name
+        contents = parse_ledger([good, "", line, good])
+        assert len(contents.rows) == 2, name
+        assert [number for number, _ in contents.quarantined] == [3], name
+        assert contents.quarantined[0][1], name
 
 
-def test_a_span_cannot_be_reviewed_under_two_different_rules_or_strata() -> None:
-    first = json.dumps(ledger_row("c" * 32, "quote", "yes", OWNER_ID, STAMP, stratum="S"))
+def test_conflicting_rows_of_one_reviewer_are_quarantined_and_never_counted() -> None:
+    rows = verdict_rows("typed_prefix", ["yes"] * 100)
+    clash = ledger_row(rows[0]["span_id"], "code", "yes", OWNER_ID, STAMP, stratum="S")
+    other_stratum = ledger_row(
+        rows[1]["span_id"], "typed_prefix", "yes", OWNER_ID, STAMP, stratum="M"
+    )
+    summary = summarize([*rows, clash, other_stratum], matched=matched_of(rows))
+    assert summary.quarantined_rows == 4
+    assert summary.strata[("typed_prefix", "S")].reviewed == 98
+    assert not summary.strata[("typed_prefix", "S")].eligible
+    assert not any(review.reviewed for key, review in summary.strata.items() if key[0] == "code")
+
+
+def test_a_conflicting_row_from_a_non_owner_cannot_poison_the_owners_reviews() -> None:
+    rows = verdict_rows("typed_prefix", ["yes"] * 100)
+    planted = ledger_row(rows[0]["span_id"], "code", "no", "agent:codex", STAMP, stratum="S")
+    summary = summarize([*rows, planted], matched=matched_of(rows))
+    assert summary.quarantined_rows == 0 and summary.non_owner_rows == 1
+    assert summary.strata[("typed_prefix", "S")].eligible
+
+
+def test_answering_a_span_again_under_the_same_rule_supersedes_the_earlier_answer() -> None:
+    rows = verdict_rows("typed_prefix", ["no"] * 3)
+    again = [ledger_row(rows[0]["span_id"], "typed_prefix", "yes", OWNER_ID, STAMP, stratum="S")]
+    summary = summarize([*rows, *again])
+    review = summary.strata[("typed_prefix", "S")]
+    assert (review.reviewed, review.confirmed, review.rejected) == (3, 1, 2)
+    assert summary.superseded_rows == 1 and summary.quarantined_rows == 0
+
+
+def test_a_span_cannot_be_appended_under_two_different_rules_or_strata(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    first = ledger_row("c" * 32, "quote", "yes", OWNER_ID, STAMP, stratum="S")
+    append_ledger(ledger, [first])
+    before = ledger.read_bytes()
     for rule, stratum in (("code", "S"), ("quote", "M")):
-        second = json.dumps(ledger_row("c" * 32, rule, "yes", OWNER_ID, STAMP, stratum=stratum))
-        with pytest.raises(ValueError, match="ledger line 2"):
-            parse_ledger([first, second])
+        second = ledger_row("c" * 32, rule, "yes", OWNER_ID, STAMP, stratum=stratum)
+        with pytest.raises(ValueError, match="conflict"):
+            append_ledger(ledger, [second])
+        assert ledger.read_bytes() == before
+    batch = [
+        ledger_row("d" * 32, "quote", "yes", OWNER_ID, STAMP, stratum="S"),
+        ledger_row("d" * 32, "code", "yes", OWNER_ID, STAMP, stratum="S"),
+    ]
+    with pytest.raises(ValueError, match="conflict"):
+        append_ledger(tmp_path / "other.jsonl", batch)
+    assert not (tmp_path / "other.jsonl").exists()
+    same_again = ledger_row("c" * 32, "quote", "no", OWNER_ID, STAMP, stratum="S")
+    assert append_ledger(ledger, [same_again]) == 1
+    elsewhere = ledger_row("c" * 32, "code", "yes", "agent:codex", STAMP, stratum="S")
+    assert append_ledger(ledger, [elsewhere]) == 1
+
+
+def test_a_ledger_with_malformed_or_conflicting_lines_can_still_be_appended_to(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    good = json.dumps(ledger_row("e" * 32, "quote", "yes", OWNER_ID, STAMP, stratum="S"))
+    clash = json.dumps(ledger_row("e" * 32, "code", "yes", OWNER_ID, STAMP, stratum="S"))
+    ledger.write_text(f"{good}\n{{garbage\n{clash}\n", encoding="utf-8")
+    fresh = ledger_row("f" * 32, "quote", "yes", OWNER_ID, STAMP, stratum="S")
+    assert append_ledger(ledger, [fresh]) == 1
+    contents = read_ledger(ledger)
+    assert len(contents.rows) == 3 and [n for n, _ in contents.quarantined] == [2]
+    summary = summarize(contents.rows)
+    assert summary.quarantined_rows == 2
 
 
 def test_ledger_row_refuses_bad_input_and_never_reads_the_clock() -> None:
@@ -374,7 +436,7 @@ def test_ledger_is_append_only_jsonl_and_refuses_symlinks(tmp_path: Path) -> Non
         f"{1:032x}",
         f"{5:032x}",
     ]
-    assert read_ledger(path)[:2] == first
+    assert read_ledger(path).rows[:2] == first
     before = path.read_bytes()
     with pytest.raises(ValueError, match="ledger"):
         append_ledger(path, [{**first[0], "verdict": "bogus"}])

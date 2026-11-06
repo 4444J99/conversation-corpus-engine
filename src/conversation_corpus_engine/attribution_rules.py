@@ -24,6 +24,7 @@ module reads the clock or the filesystem except the explicit ledger helpers.
 
 from __future__ import annotations
 
+import fcntl
 import functools
 import hashlib
 import heapq
@@ -1115,52 +1116,103 @@ def ledger_row(
     )
 
 
-def parse_ledger(lines: Iterable[str]) -> list[dict[str, Any]]:
-    """Rows of a JSONL ledger; blank lines are ignored, anything else malformed raises."""
+@dataclass(frozen=True)
+class LedgerContents:
+    """What a ledger file holds: its valid rows, and the lines that could not be read."""
+
+    rows: list[dict[str, Any]]
+    quarantined: list[tuple[int, str]]
+
+
+def parse_ledger(lines: Iterable[str]) -> LedgerContents:
+    """Rows of a JSONL ledger. Blank lines are ignored; a malformed line is quarantined with its
+    line number and reason, never counted for the gate, and never allowed to break a read."""
     rows: list[dict[str, Any]] = []
-    kind_of: dict[tuple[str, str], tuple[str, str | None]] = {}
+    quarantined: list[tuple[int, str]] = []
     for number, line in enumerate(lines, start=1):
         if not line.strip():
             continue
         try:
-            row = validate_ledger_row(json.loads(line))
+            rows.append(validate_ledger_row(json.loads(line)))
         except (ValueError, RecursionError) as error:
-            detail = str(error).removeprefix("ledger row: ")
-            raise ValueError(f"ledger line {number}: {detail}") from error
-        key = (row["rules_version"], row["span_id"])
-        kind = (row["rule"], row.get("stratum"))
-        if kind_of.setdefault(key, kind) != kind:
-            raise ValueError(
-                f"ledger line {number}: span {row['span_id']} was reviewed as {kind_of[key]} "
-                f"and cannot also be reviewed as {kind}"
-            )
-        rows.append(row)
-    return rows
+            quarantined.append((number, str(error).removeprefix("ledger row: ")))
+    return LedgerContents(rows=rows, quarantined=quarantined)
 
 
-def read_ledger(path: Path) -> list[dict[str, Any]]:
+def _decode(data: bytes) -> list[str]:
+    return data.decode("utf-8", errors="replace").split("\n")
+
+
+def read_ledger(path: Path) -> LedgerContents:
     if path.is_symlink():
         raise ValueError("ledger path must not be a symlink")
-    return parse_ledger(path.read_text(encoding="utf-8").split("\n"))
+    return parse_ledger(_decode(path.read_bytes()))
+
+
+def _kind_conflict(
+    existing: Iterable[dict[str, Any]], incoming: Sequence[dict[str, Any]]
+) -> str | None:
+    """A message naming a span, among those the incoming rows touch, that one reviewer reviewed
+    as a different rule or stratum."""
+
+    def key_of(row: dict[str, Any]) -> tuple[str, str, str]:
+        return (row["rules_version"], row["reviewer"], row["span_id"])
+
+    touched = {key_of(row) for row in incoming if row["schema"] == LEDGER_SCHEMA}
+    kinds: dict[tuple[str, str, str], tuple[str, str]] = {}
+    for row in [*existing, *incoming]:
+        if row["schema"] != LEDGER_SCHEMA or key_of(row) not in touched:
+            continue
+        kind = (row["rule"], row["stratum"])
+        if kinds.setdefault(key_of(row), kind) != kind:
+            return (
+                f"span {row['span_id']} is already reviewed by {row['reviewer']} as "
+                f"{kinds[key_of(row)]} and cannot also be reviewed as {kind}"
+            )
+    return None
+
+
+def _read_all(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while chunk := os.read(descriptor, 1 << 20):
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def append_ledger(path: Path, rows: Sequence[dict[str, Any]]) -> int:
-    """Append validated rows to an append-only JSONL ledger; nothing is written on any error."""
+    """Append validated rows to an append-only JSONL ledger.
+
+    Nothing is written when any row is malformed or names a span one reviewer already reviewed
+    as a different rule or stratum (re-answering a span under the same rule and stratum is fine:
+    the last answer wins). Reading, checking and writing happen under one exclusive lock, in one
+    write, and a ledger created here is private (mode 0600).
+    """
     valid = [validate_ledger_row(row) for row in rows]
     if path.is_symlink():
         raise ValueError("ledger path must not be a symlink")
-    if path.exists() and path.stat().st_size:
-        with path.open("rb") as handle:
-            handle.seek(-1, os.SEEK_END)
-            if handle.read(1) != b"\n":
-                raise ValueError(
-                    "ledger does not end with a newline; an earlier write was cut short"
-                )
+    conflict = _kind_conflict([], valid)
+    if conflict:
+        raise ValueError(f"ledger conflict: {conflict}; nothing was written")
     payload = "".join(json.dumps(row, sort_keys=True, ensure_ascii=True) + "\n" for row in valid)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
+    flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        existing = _read_all(descriptor)
+        if existing and not existing.endswith(b"\n"):
+            raise ValueError("ledger does not end with a newline; an earlier write was cut short")
+        if not existing:
+            os.fchmod(descriptor, 0o600)
+        conflict = _kind_conflict(parse_ledger(_decode(existing)).rows, valid)
+        if conflict:
+            raise ValueError(f"ledger conflict: {conflict}; nothing was written")
+        data = payload.encode("utf-8")
+        while data:
+            data = data[os.write(descriptor, data) :]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
     return len(valid)
 
 
@@ -1189,6 +1241,10 @@ class ReviewSummary:
     non_owner_reviewers: dict[str, int] = field(default_factory=dict)
     # Rows whose span id does not exist in the scan under the same rule and stratum.
     orphan_rows: int = 0
+    # Rows of one reviewer that name the same span as different rules or strata: not counted.
+    quarantined_rows: int = 0
+    # Earlier answers to a span that a later row answered again (the last answer counts).
+    superseded_rows: int = 0
 
     def for_rule(self, rule: str) -> list[StratumReview]:
         return [self.strata[(rule, stratum)] for stratum in STRATA]
@@ -1209,23 +1265,31 @@ def review_statistics(
     stratum. A span counts once, by its last verdict in file order. `unsure` and `no` both count
     as reviewed and not confirmed. The precision test is integer arithmetic.
     """
-    latest: dict[str, dict[str, Any]] = {}
-    total = stale = non_owner = orphan = 0
+    candidates: list[dict[str, Any]] = []
+    total = stale = non_owner = orphan = quarantined = superseded = 0
     reviewers: dict[str, int] = {}
     for raw in rows:
         row = validate_ledger_row(raw)
         total += 1
         if row["rules_version"] != rules_version or row["schema"] != LEDGER_SCHEMA:
             stale += 1
-            continue
-        if owner is None or row["reviewer"] != owner:
+        elif owner is None or row["reviewer"] != owner:
             non_owner += 1
             reviewers[row["reviewer"]] = reviewers.get(row["reviewer"], 0) + 1
-            continue
-        if matched.get(row["span_id"]) != (row["rule"], row["stratum"]):
+        else:
+            candidates.append(row)
+    kinds: dict[str, set[tuple[str, str]]] = {}
+    for row in candidates:
+        kinds.setdefault(row["span_id"], set()).add((row["rule"], row["stratum"]))
+    latest: dict[str, dict[str, Any]] = {}
+    for row in candidates:
+        if len(kinds[row["span_id"]]) > 1:
+            quarantined += 1
+        elif matched.get(row["span_id"]) != (row["rule"], row["stratum"]):
             orphan += 1
-            continue
-        latest[row["span_id"]] = row
+        else:
+            superseded += row["span_id"] in latest
+            latest[row["span_id"]] = row
     counts = {
         (rule.id, stratum): {verdict: 0 for verdict in VERDICTS}
         for rule in RULES
@@ -1255,6 +1319,8 @@ def review_statistics(
         non_owner_rows=non_owner,
         non_owner_reviewers=reviewers,
         orphan_rows=orphan,
+        quarantined_rows=quarantined,
+        superseded_rows=superseded,
     )
 
 

@@ -135,6 +135,8 @@ def test_report_has_no_eligible_rule_without_a_ledger(
         "orphan_rows": 0,
         "non_owner_rows": 0,
         "non_owner_reviewers": {},
+        "quarantined_rows": 0,
+        "superseded_rows": 0,
     }
 
 
@@ -476,6 +478,51 @@ def test_editing_the_text_of_a_message_orphans_every_review_of_it(
     row = next(item for item in report["rules"] if item["rule"] == "typed_prefix")
     assert report["gate"]["orphan_rows"] >= 90
     assert row["strata"]["S"]["reviewed"] + report["gate"]["orphan_rows"] == 100
+
+
+def test_a_conflicting_answer_is_refused_and_cannot_brick_the_ledger(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "g", typed_records=3)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    real = next(row for row in sample_rows(sample) if row["rule"] == "typed_prefix")
+    answers.write_text(json.dumps({**real, "verdict": "yes"}) + "\n", encoding="utf-8")
+    assert record_answers(capsys, ledger, sample, answers)[0] == 0
+    before = ledger.read_bytes()
+
+    # A second sample file that names the same span as another rule (a forged or edited one).
+    forged_sample = tmp_path / "forged-sample.jsonl"
+    forged_sample.write_text(json.dumps({**real, "rule": "note_owner"}) + "\n", encoding="utf-8")
+    answers.write_text(
+        json.dumps({**real, "rule": "note_owner", "verdict": "yes"}) + "\n", encoding="utf-8"
+    )
+    code, _, err = record_answers(capsys, ledger, forged_sample, answers)
+    assert code == 2 and "conflict" in err and "nothing was written" in err
+    assert ledger.read_bytes() == before
+
+    answers.write_text(json.dumps({**real, "verdict": "no"}) + "\n", encoding="utf-8")
+    assert record_answers(capsys, ledger, sample, answers)[0] == 0
+    report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
+    assert report["gate"]["superseded_rows"] == 1 and report["gate"]["quarantined_rows"] == 0
+
+
+def test_a_hand_damaged_ledger_is_reported_not_fatal(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "g", typed_records=110)
+    ledger = approve(capsys, library, tmp_path)
+    first = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
+    clash = {**first, "rule": "note_owner"}
+    with ledger.open("a", encoding="utf-8") as handle:
+        handle.write("{truncated\n" + json.dumps(clash) + "\n")
+    report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
+    assert report["gate"]["quarantined_rows"] == 3
+    row = next(item for item in report["rules"] if item["rule"] == "typed_prefix")
+    assert row["strata"]["S"]["reviewed"] == 99
+    assert report["profile_eligible"] == []
+    code, _, err = run_cli(capsys, "--report", "--library", library, "--ledger", ledger)
+    assert code == 0, err
 
 
 def test_a_limited_scan_counts_only_the_spans_it_saw(

@@ -276,6 +276,7 @@ def build_report(
     summary: ReviewSummary,
     *,
     ledger: Path | None,
+    malformed: int = 0,
     min_chars: int,
     min_occurrences: int,
 ) -> dict[str, Any]:
@@ -363,6 +364,8 @@ def build_report(
             "orphan_rows": summary.orphan_rows,
             "non_owner_rows": summary.non_owner_rows,
             "non_owner_reviewers": dict(sorted(summary.non_owner_reviewers.items())),
+            "quarantined_rows": summary.quarantined_rows + malformed,
+            "superseded_rows": summary.superseded_rows,
         },
         "profile_eligible": sorted(
             f"{rule}:{stratum}" for rule, stratum in eligible_strata(summary)
@@ -637,14 +640,16 @@ class LedgerView:
     path: Path | None
     rows: list[dict[str, Any]]
     wanted: set[str]
+    # Lines of the file that could not be read: quarantined, never counted.
+    malformed: int = 0
 
 
 def _ledger_view(args: argparse.Namespace) -> LedgerView:
     if args.ledger is None:
         return LedgerView(None, [], set())
-    rows = read_ledger(args.ledger)
-    wanted = {row["span_id"] for row in rows if row["rules_version"] == RULES_VERSION}
-    return LedgerView(args.ledger, rows, wanted)
+    contents = read_ledger(args.ledger)
+    wanted = {row["span_id"] for row in contents.rows if row["rules_version"] == RULES_VERSION}
+    return LedgerView(args.ledger, contents.rows, wanted, len(contents.quarantined))
 
 
 class MatchRecorder:
@@ -701,6 +706,7 @@ def _report(args: argparse.Namespace) -> int:
         tally,
         summary,
         ledger=view.path,
+        malformed=view.malformed,
         min_chars=args.repeat_min_chars,
         min_occurrences=args.repeat_min_occurrences,
     )
@@ -786,6 +792,8 @@ def _apply(args: argparse.Namespace) -> int:
         "stale_rows": summary.stale_rows,
         "orphan_rows": summary.orphan_rows,
         "non_owner_rows": summary.non_owner_rows,
+        "quarantined_rows": summary.quarantined_rows + view.malformed,
+        "superseded_rows": summary.superseded_rows,
     }
     text = (
         f"wrote {writer.count} annotations for {tally.messages} messages to {written}"
@@ -803,13 +811,7 @@ def _apply(args: argparse.Namespace) -> int:
 
 
 def _review_sample(args: argparse.Namespace) -> int:
-    exclude: set[str] = set()
-    if args.ledger is not None:
-        exclude = {
-            row["span_id"]
-            for row in read_ledger(args.ledger)
-            if row["rules_version"] == RULES_VERSION
-        }
+    exclude = _ledger_view(args).wanted
     deadline = Deadline(args.deadline_seconds)
     library, _ = _open_target(args)
     sampler = ReviewSampler(per_stratum=args.per_stratum, seed=args.seed, exclude=exclude)
