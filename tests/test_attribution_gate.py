@@ -298,12 +298,15 @@ def test_rows_from_another_rules_version_or_an_older_schema_are_ignored_not_coun
     assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v6"
 
 
-PREVIOUS_VERSION = "cce.attribution-rules@6"
+PREVIOUS_VERSION = "cce.attribution-rules@7"
 
 
-def test_rows_written_under_the_previous_rules_version_are_stale_and_never_counted() -> None:
-    assert RULES_VERSION == "cce.attribution-rules@7"
-    old = verdict_rows("typed_prefix", ["yes"] * 100, version=PREVIOUS_VERSION)
+@pytest.mark.parametrize("previous_version", ["cce.attribution-rules@6", PREVIOUS_VERSION])
+def test_rows_written_under_the_previous_rules_version_are_stale_and_never_counted(
+    previous_version: str,
+) -> None:
+    assert RULES_VERSION == "cce.attribution-rules@8"
+    old = verdict_rows("typed_prefix", ["yes"] * 100, version=previous_version)
     summary = summarize(old)
     assert (summary.rows, summary.stale_rows) == (100, 100)
     assert summary.strata[("typed_prefix", "S")].reviewed == 0
@@ -924,7 +927,7 @@ def test_the_exclusion_digest_also_names_the_text_hashes_of_the_excluded_rows() 
 
 
 def test_current_rules_keep_v6_schemas_and_reject_older_evidence() -> None:
-    assert RULES_VERSION == "cce.attribution-rules@7"
+    assert RULES_VERSION == "cce.attribution-rules@8"
     assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v6"
     assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v6"
     assert SAMPLE_HEADER_SCHEMA == "cce.attribution-review-sample-header.v6"
@@ -941,8 +944,9 @@ def test_current_rules_keep_v6_schemas_and_reject_older_evidence() -> None:
         assert (summary.rows, summary.stale_rows) == (100, 100)
         assert summary.strata[("typed_prefix", "S")].reviewed == 0
         assert eligible_strata(summary) == frozenset()
-    old_version = verdict_rows("typed_prefix", ["yes"] * 100, version=PREVIOUS_VERSION)
-    assert summarize(old_version).stale_rows == 100
+    for previous_version in ("cce.attribution-rules@6", PREVIOUS_VERSION):
+        old_version = verdict_rows("typed_prefix", ["yes"] * 100, version=previous_version)
+        assert summarize(old_version).stale_rows == 100
     header, rows_drawn = drawn_sample()
     for older in ("v4", "v5"):
         old_header = {**header, "schema": f"cce.attribution-review-sample-header.{older}"}

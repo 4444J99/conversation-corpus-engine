@@ -7,13 +7,18 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import html
 import json
+import os
 import re
 import subprocess
+import sys
+import unicodedata
 from pathlib import Path
 from typing import Any
 
 import pytest
+from test_web_capture import manifest_for, page_rows, setup, write_shard
 
 from conversation_corpus_engine import library_commands, library_zettel_files
 from conversation_corpus_engine.archive_model import Conversation, Message
@@ -22,8 +27,10 @@ from conversation_corpus_engine.attributed_knowledge import (
     export_zettels,
     zettel_atoms,
 )
+from conversation_corpus_engine.attribution_rules import attribute_message, record_info
 from conversation_corpus_engine.cli import build_parser
 from conversation_corpus_engine.corpus_store import CorpusStoreError
+from conversation_corpus_engine.library_build import build_library
 from conversation_corpus_engine.library_commands import handle_library, read_record
 from conversation_corpus_engine.library_store import Library
 from conversation_corpus_engine.library_zettel_notes import (
@@ -136,14 +143,16 @@ def source(library: Library, reference: dict, author: str = "agent", **extra: An
 
 def zettel(library: Library, number: int, sources: list[dict], **changes: Any) -> dict:
     body = f"Invented idea number {number} about keeping a careful record."
+    title = changes.get("title", f"Careful records beat memory {number}")
     return {
         "id": f"idea-{number:03d}",
-        "title": f"Careful records beat memory {number}",
+        "title": title,
         "body": body,
         "created": "2026-03-04",
         "review": {"status": "reviewed", "reviewer": "rev", "evidence": ["synthetic check"]},
         "relationships": [],
         "attribution": annotation(body, "agent", "model"),
+        "title_attribution": annotation(title, "agent", "model"),
         "sources": sources,
         **changes,
     }
@@ -281,7 +290,7 @@ def test_each_note_passes_the_wiki_caps_and_has_flat_required_frontmatter(world,
         assert all(meta[key] for key in REQUIRED)
         assert re.fullmatch(r"20260304-[0-9a-f]{6}", meta["id"])
         assert meta["type"] == "zettel" and meta["status"] == "draft"
-        assert meta["authorship"] == "agent" and meta["author"] == "model"
+        assert meta["authorship"] == "agent" and meta["author"] == "agent"
         assert len(meta["summary"]) <= 200 and len(meta["title"]) <= 100
         assert meta["created"] == meta["updated"] == "2026-03-04"
         assert meta["sources"] and "\r" not in note.read_text(encoding="utf-8")
@@ -448,6 +457,7 @@ def test_typed_owner_claims_and_reviewer_strings_never_establish_owner_authorshi
         entry = zettel(library, 1, [source(library, ref(library, "kiln", 1), "owner")])
         entry["review"]["reviewer"] = "rob"
         entry["attribution"] = annotation(entry["body"], "owner", "rob")
+        entry["title_attribution"] = annotation(entry["title"], "owner", "rob")
         (note,) = build_notes(library, [entry])
         meta, _ = parse_text(note.text)
         assert (meta["authorship"], meta["author"], meta["status"]) == (
@@ -593,7 +603,7 @@ def test_top_level_authorship_and_status_in_the_envelope_are_ignored(tmp_path):
         )
         (note,) = build_notes(library, [entry])
         meta, _ = parse_text(note.text)
-        assert (meta["authorship"], meta["status"], meta["author"]) == ("agent", "draft", "model")
+        assert (meta["authorship"], meta["status"], meta["author"]) == ("agent", "draft", "agent")
 
 
 def test_a_directory_inside_the_library_store_is_refused(world, capsys):
@@ -665,6 +675,9 @@ def test_case_only_title_rename_refuses_without_duplicate_id(world, capsys):
     assert run(out, store, path, capsys)[0] == 0
     before = snapshot(out)
     payload["zettels"][0]["title"] = payload["zettels"][0]["title"].lower()
+    payload["zettels"][0]["title_attribution"] = annotation(
+        payload["zettels"][0]["title"], "agent", "model"
+    )
     path.write_text(json.dumps(payload))
     code, _, error = run(out, store, path, capsys)
     assert code == 2 and "keep its title" in error
@@ -674,6 +687,9 @@ def test_case_only_title_rename_refuses_without_duplicate_id(world, capsys):
 def test_utf8_filename_limit_is_checked_before_any_output(world, capsys):
     _library, payload, path, store, out = world
     payload["zettels"][-1]["title"] = "界" * 90
+    payload["zettels"][-1]["title_attribution"] = annotation(
+        payload["zettels"][-1]["title"], "agent", "model"
+    )
     path.write_text(json.dumps(payload))
     code, _, error = run(out, store, path, capsys)
     assert code == 2 and "filename" in error
@@ -748,6 +764,113 @@ def test_agent_note_does_not_promote_unknown_quote_authorship(tmp_path):
         attribution = [line for line in note.text.splitlines() if "Quote attribution:" in line]
         assert len(attribution) == 1 and "unknown" in attribution[0]
         assert "unattributed" in attribution[0]
+
+
+def test_unicode_title_forms_have_one_canonical_filename_and_cannot_collide(tmp_path):
+    composed = "Café notes"
+    decomposed = unicodedata.normalize("NFD", composed)
+    with make_library(tmp_path) as library:
+        first = zettel(library, 1, [source(library, ref(library, "kiln", 1))], title=composed)
+        second = zettel(library, 2, [source(library, ref(library, "kiln", 2))], title=decomposed)
+        assert build_notes(library, [second])[0].filename == composed + ".md"
+        with pytest.raises(ValueError, match="duplicate title"):
+            build_notes(library, [first, second])
+
+
+@pytest.mark.parametrize("claimed", ["rob", "Some Person", "model"])
+def test_agent_note_author_is_a_fixed_label_not_an_envelope_identity(tmp_path, claimed):
+    with make_library(tmp_path) as library:
+        entry = zettel(library, 1, [source(library, ref(library, "kiln", 1))])
+        entry["attribution"] = annotation(entry["body"], "agent", claimed)
+        entry["title_attribution"] = annotation(entry["title"], "agent", claimed)
+        metadata, _ = parse_text(build_notes(library, [entry])[0].text)
+        assert (metadata["authorship"], metadata["author"]) == ("agent", "agent")
+
+
+@pytest.mark.parametrize("kind", ["missing", "third_party", "owner", "disputed", "partial"])
+def test_nonagent_or_unattributed_title_keeps_the_note_generated(tmp_path, kind):
+    with make_library(tmp_path) as library:
+        entry = zettel(library, 1, [source(library, ref(library, "kiln", 1))])
+        entry["review"] = {"status": "draft"}
+        if kind == "missing":
+            entry.pop("title_attribution", None)
+        else:
+            entry["title_attribution"] = annotation(
+                entry["title"], kind if kind in ("owner", "third_party") else "agent", "model"
+            )
+            if kind == "disputed":
+                entry["title_attribution"]["spans"][0]["assertion_status"] = "disputed"
+            elif kind == "partial":
+                entry["title_attribution"]["spans"][0]["start"] = 1
+        metadata, _ = parse_text(build_notes(library, [entry])[0].text)
+        assert (metadata["authorship"], metadata["author"], metadata["status"]) == (
+            "generated",
+            "unknown",
+            "draft",
+        )
+
+
+def test_captured_third_party_page_becomes_an_exact_agent_draft_quote(tmp_path):
+    project, store, shards = setup(tmp_path)
+    row = page_rows()[0]
+    write_shard(shards / "synthetic.jsonl", [row])
+    built = build_library(manifest_for(shards), project_root=project, store_root=store)
+    assert built["coverage_complete"] and built["status"]["records"] == 1
+    with Library(Path(built["generation"]) / "library.sqlite") as library:
+        uid = next(library.rows())["uid"]
+        history = library.history(uid)[-1]
+        payload = library.record(uid, version=history["version"])
+        message = payload["messages"][0]
+        claims = attribute_message(
+            message["text"],
+            role=message["role"],
+            channel=message["channel"],
+            typed_chars=0,
+            record=record_info(payload),
+        )
+        assert {span.author for span in claims} == {"third_party"}
+        reference = {
+            "uid": uid,
+            "version": history["version"],
+            "revision_digest": history["digest"],
+            "sequence": "main",
+            "message": 0,
+            "message_id": message["id"],
+            "text_digest": sha(message["text"]),
+            "start": 4,
+            "end": len(message["text"]),
+        }
+        exact = message["text"][reference["start"] : reference["end"]]
+        entry = zettel(
+            library,
+            1,
+            [
+                {
+                    "source": reference,
+                    "quote": exact,
+                    "attribution": annotation(message["text"], "third_party", "example.com"),
+                }
+            ],
+        )
+        entry["title_attribution"] = annotation(entry["title"], "agent", "model")
+        entry["review"] = {"status": "draft"}
+        out = tmp_path / "wiki"
+        report = export_zettel_notes(library, [entry], out, store_root=store)
+        metadata, body = parse(out / report["notes"][0]["path"])
+        assert (metadata["authorship"], metadata["author"], metadata["status"]) == (
+            "agent",
+            "agent",
+            "draft",
+        )
+        assert quotes(body) == [exact]
+        assert metadata["sources"] == [
+            f"cce:library-{library.evidence_fingerprint()}/{uid}@{history['version']}"
+            f"#m0:4-{len(message['text'])} sha256:{sha(message['text'])}"
+        ]
+        assert "Quote attribution: third_party" in html.unescape(body)
+        assert "Owner authorship: not established" in body
+        assert len((out / report["notes"][0]["path"]).read_bytes()) < 16 * 1024
+        assert export_zettel_notes(library, [entry], out, store_root=store)["written"] == 0
 
 
 def test_library_identity_is_snapshot_bound_and_survives_copying(tmp_path):
@@ -826,13 +949,13 @@ def test_interrupted_writes_keep_ownership_and_resume_without_adopting_other_fil
     atomic = library_zettel_files._atomic_write
     writes = 0
 
-    def interrupted(destination, data):
+    def interrupted(destination, data, **kwargs):
         nonlocal writes
         if destination.suffix == ".md":
             writes += 1
             if writes == 2:
                 raise OSError("synthetic interrupted write")
-        atomic(destination, data)
+        atomic(destination, data, **kwargs)
 
     with monkeypatch.context() as patch:
         patch.setattr(library_zettel_files, "_atomic_write", interrupted)
@@ -864,13 +987,13 @@ def test_different_batch_after_interruption_retains_the_previous_recorded_bytes(
     atomic = library_zettel_files._atomic_write
     writes = 0
 
-    def interrupted(destination, data):
+    def interrupted(destination, data, **kwargs):
         nonlocal writes
         if destination.suffix == ".md":
             writes += 1
             if writes == 2:
                 raise OSError("synthetic interrupted update")
-        atomic(destination, data)
+        atomic(destination, data, **kwargs)
 
     with monkeypatch.context() as patch:
         patch.setattr(library_zettel_files, "_atomic_write", interrupted)
@@ -919,3 +1042,55 @@ def test_invalid_ownership_manifest_never_authorizes_overwriting_notes(world, ca
     code, _, error = run(out, store, path, capsys)
     assert code == 2 and "ownership manifest" in error
     assert snapshot(out) == before
+
+
+def test_file_created_by_an_editor_after_preflight_is_never_overwritten(world, capsys, monkeypatch):
+    _library, _payload, path, store, out = world
+    atomic = library_zettel_files._atomic_write
+    foreign = b"Independent editor text that the exporter does not own.\n"
+    raced = []
+
+    def editor_wins(destination, data, **kwargs):
+        if destination.suffix == ".md" and not raced:
+            destination.write_bytes(foreign)
+            raced.append(destination)
+        return atomic(destination, data, **kwargs)
+
+    monkeypatch.setattr(library_zettel_files, "_atomic_write", editor_wins)
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "appeared during export" in error
+    assert len(raced) == 1 and raced[0].read_bytes() == foreign
+    assert list((out / "notes/zettel").glob("*.md")) == raced
+
+
+@pytest.mark.parametrize("with_reader", [False, True])
+def test_fifo_at_the_export_lock_path_is_refused_without_blocking(tmp_path, with_reader):
+    root = tmp_path / "wiki"
+    root.mkdir()
+    lock_path = root / library_zettel_files.LOCK_NAME
+    os.mkfifo(lock_path, 0o600)
+    reader = os.open(lock_path, os.O_RDONLY | os.O_NONBLOCK) if with_reader else None
+    script = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "from conversation_corpus_engine.library_zettel_files import write_owned_notes\n"
+        "try:\n"
+        "    write_owned_notes(Path(sys.argv[1]), {}, max_entries=1000)\n"
+        "except ValueError as error:\n"
+        "    print(error)\n"
+        "else:\n"
+        "    raise SystemExit('FIFO was accepted as an export lock')\n"
+    )
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", script, str(root)],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    finally:
+        if reader is not None:
+            os.close(reader)
+    assert done.returncode == 0 and "lock" in done.stdout
+    assert list(root.iterdir()) == [lock_path]

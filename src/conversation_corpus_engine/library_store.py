@@ -27,6 +27,8 @@ from .archive_database import WORD_RE, fts_terms
 from .archive_model import Conversation, stable_uid
 from .library_blocks import split_blocks
 from .library_passages import PASSAGE_LIMIT, PASSAGE_SCHEMA_SQL, index_passages, verify_passages
+from .web_capture import PROVIDER as WEB_CAPTURE_PROVIDER
+from .web_capture import capture_summary
 
 LIBRARY_SCHEMA = "cce.knowledge-library.v2"
 LEGACY_LIBRARY_SCHEMA = "cce.knowledge-library.v1"
@@ -552,6 +554,7 @@ class Library:
         previous = self.connection.execute("SELECT * FROM records WHERE uid=?", (uid,)).fetchone()
         observations = [payload["provenance"], *extra.get("source_observations", [])]
         if previous is not None and previous["current_digest"] == digest:
+            self._store_capture_summary(payload, digest)
             self._observations(uid, observations)
             self.connection.commit()
             return {
@@ -649,6 +652,7 @@ class Library:
                 (uid, digest, body_status, "accepted_revision"),
             )
             self._observations(uid, observations)
+            self._store_capture_summary(payload, digest)
             record_rowid = self.connection.execute(
                 "SELECT rowid FROM records WHERE uid=?", (uid,)
             ).fetchone()[0]
@@ -686,6 +690,21 @@ class Library:
             "change_kind": change,
             "digest": digest,
         }
+
+    def _store_capture_summary(self, payload: dict[str, Any], digest: str) -> None:
+        if payload["provider"] == WEB_CAPTURE_PROVIDER:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES (?,?)",
+                ("web_capture:" + digest, canonical_json(capture_summary(payload["provenance"]))),
+            )
+
+    def _capture_summary(self, digest: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT value FROM meta WHERE key=?", ("web_capture:" + digest,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("web capture search provenance is missing; rebuild the candidate")
+        return json.loads(row[0])
 
     def _observations(self, uid: str, observations: list[Any]) -> None:
         for observation in observations:
@@ -1046,7 +1065,7 @@ class Library:
             )
             return self.connection.execute(
                 "SELECT r.uid,r.title,r.provider,r.kind,r.wing,r.lane,r.current_version AS version,"
-                "r.body_status,r.message_count,r.source_ref,"
+                "r.body_status,r.message_count,r.source_ref,r.current_digest AS capture_digest,"
                 + extra
                 + f"snippet({table},-1,'[',']','...',28) AS excerpt "
                 + text
@@ -1095,7 +1114,7 @@ class Library:
                     for row in self.connection.execute(
                         f"SELECT {table}.rowid AS key,r.uid,r.title,r.provider,r.kind,r.wing,"
                         "r.lane,r.current_version AS version,r.body_status,r.message_count,"
-                        "r.source_ref,"
+                        "r.source_ref,r.current_digest AS capture_digest,"
                         + extra
                         + f"snippet({table},-1,'[',']','...',28) AS excerpt "
                         + text
@@ -1113,12 +1132,17 @@ class Library:
             for row in rows[:limit]:
                 hit = dict(row)
                 hit.pop("key", None)
+                capture_digest = hit.pop("capture_digest")
                 hit["title"] = hit["title"][:512]
                 hit["source_ref"] = hit["source_ref"][:2048]
                 for key in ("kind", "lane"):
                     hit[key] = hit[key][:128]
                 hit["excerpt"] = hit["excerpt"][:360]
                 hit["path"] = f"vault/records/{hit['uid']}.md"
+                if hit["provider"] == WEB_CAPTURE_PROVIDER:
+                    # A saved page shows where it came from and when it was fetched; the other
+                    # providers' hits keep exactly the keys they had.
+                    hit["capture"] = self._capture_summary(capture_digest)
                 if selected_unit == "passage":
                     message, start, end, digest = (
                         hit.pop("passage_" + key) for key in ("message", "start", "end", "digest")
@@ -1371,6 +1395,21 @@ class Library:
                 )
             )
         if full:
+            for row in self.connection.execute(
+                "SELECT uid,current_digest FROM records WHERE provider=?", (WEB_CAPTURE_PROVIDER,)
+            ):
+                if check_callback:
+                    check_callback()
+                expected = capture_summary(self.record(row["uid"])["provenance"])
+                try:
+                    if self._capture_summary(row["current_digest"]) != expected:
+                        problems.append(
+                            "web capture search provenance differs from source: " + row["uid"]
+                        )
+                except ValueError:
+                    problems.append(
+                        "web capture search provenance is missing or invalid: " + row["uid"]
+                    )
             for row in self.connection.execute("SELECT digest,payload,raw_bytes FROM objects"):
                 if check_callback:
                     check_callback()

@@ -31,7 +31,7 @@ _ID = re.compile(r"\d{8}-[0-9a-f]{6}\Z")
 
 
 def folded(name: str) -> str:
-    return unicodedata.normalize("NFC", name).casefold()
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).casefold())
 
 
 def authorize_destination(destination: Path) -> Path:
@@ -174,7 +174,7 @@ def _bytes(manifest: dict[str, Any]) -> bytes:
     return data
 
 
-def _atomic_write(path: Path, data: bytes) -> None:
+def _atomic_write(path: Path, data: bytes, *, exclusive: bool = False) -> None:
     _no_symlinks(path)
     descriptor, temporary = tempfile.mkstemp(prefix=".cce-zettel-", dir=path.parent)
     temporary_path = Path(temporary)
@@ -183,7 +183,17 @@ def _atomic_write(path: Path, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        temporary_path.replace(path)
+        if exclusive:
+            try:
+                # Linking the completed temporary file creates the new name atomically
+                # and refuses an editor's file that appeared after the ownership check.
+                os.link(temporary_path, path, follow_symlinks=False)
+            except FileExistsError:
+                raise ValueError(
+                    f"{path.name} appeared during export; preserving the file"
+                ) from None
+        else:
+            temporary_path.replace(path)
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -201,7 +211,12 @@ def write_owned_notes(
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_path = root / LOCK_NAME
     _no_symlinks(lock_path)
-    descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        descriptor = os.open(
+            lock_path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600
+        )
+    except OSError as error:
+        raise ValueError("cannot safely open the Zettel export lock") from error
     with os.fdopen(descriptor, "wb") as lock:
         lock_stat = os.fstat(lock.fileno())
         if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_size:
@@ -230,7 +245,9 @@ def write_owned_notes(
             for name in changed:
                 if _digest(folder / name) != observed[name]:
                     raise ValueError(f"{name} changed during export; refusing overwrite")
-                _atomic_write(folder / name, planned[name]["data"])
+                _atomic_write(
+                    folder / name, planned[name]["data"], exclusive=observed[name] is None
+                )
         if previous != complete or changed or not (root / MANIFEST_NAME).exists():
             _atomic_write(root / MANIFEST_NAME, final_bytes)
         return {"written": len(changed), "unchanged": len(planned) - len(changed), "entries": count}

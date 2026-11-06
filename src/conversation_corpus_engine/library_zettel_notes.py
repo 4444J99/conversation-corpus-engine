@@ -15,6 +15,7 @@ import hashlib
 import html
 import json
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -114,7 +115,7 @@ def note_id(created: str, caller_id: str) -> str:
 
 
 def _title(zettel: dict[str, Any]) -> str:
-    title = " ".join(str(zettel["title"]).split())
+    title = unicodedata.normalize("NFC", " ".join(str(zettel["title"]).split()))
     if not title or len(title) > TITLE_LIMIT:
         raise ValueError(f"title must be 1 to {TITLE_LIMIT} characters")
     if _UNSAFE_TITLE.search(title) or _CONTROL.search(title) or title[0] == "." or title[-1] == ".":
@@ -129,15 +130,21 @@ def _title(zettel: dict[str, Any]) -> str:
 def note_authorship(item: dict[str, Any]) -> tuple[str, str]:
     """The Wiki Standard `authorship` value and the `author` of a validated reviewed Zettel.
 
-    `agent` requires every idea-text span to be asserted as agent-written. All other bodies
+    `agent` requires every title and idea-text span to be asserted as agent-written. Its
+    author is the fixed label `agent`, never a caller-supplied identity. All other notes
     are `generated` with an unknown author. Human credit is deliberately unavailable until
     the exporter can validate actual owner review; typed envelope claims cannot supply it.
     This label does not change the independent attribution of any quoted source words.
     """
-    body = item["body_attribution"]
-    if body and all(s["author"] == "agent" and s["assertion_status"] == "asserted" for s in body):
-        ids = {s["author_id"] for s in body}
-        return "agent", (ids.pop() if len(ids) == 1 and None not in ids else "agent")
+    title, body = item["title_spans"], item["body_attribution"]
+    if (
+        title
+        and body
+        and all(
+            s["author"] == "agent" and s["assertion_status"] == "asserted" for s in (*title, *body)
+        )
+    ):
+        return "agent", "agent"
     return "generated", "unknown"
 
 
@@ -234,6 +241,8 @@ def _render(
         out.append(f"- Reviewer: {inert(review['reviewer'], 300)}\n")
     for evidence in review["evidence"][:8]:
         out.append(f"- Review evidence: {inert(evidence, 300)}\n")
+    for span in item["title_spans"][:12]:
+        out.append(f"- Idea title: {inert(_span_label(span, 80))}\n")
     for span in item["body_attribution"][:12]:
         out.append(f"- Idea text: {inert(_span_label(span, 80))}\n")
     for number, source in enumerate(item["sources"], 1):
@@ -422,7 +431,7 @@ def build_notes(library: Library, zettels: list[dict[str, Any]]) -> list[Note]:
                 problems.append(f"{item['id']}: {error}")
     if problems:
         raise ValueError("refused, nothing written:\n  " + "\n  ".join(problems))
-    return sorted(notes, key=lambda note: (note.title.casefold(), note.id))
+    return sorted(notes, key=lambda note: (folded(note.title), note.id))
 
 
 def write_notes(notes: list[Note], destination: Path) -> dict[str, Any]:

@@ -187,6 +187,7 @@ source family), a source id, an ordinal and a timestamp, sharded and bounded the
 | `documents` | library generation (authored files) | every turn (`written`) | — |
 | `agentmemory` `agentplans` | library generation (agent memory trees, plans, Codex outputs) | — | every turn |
 | `copilotreports` | the `.docx`/`.txt` reports saved beside Copilot pages | — | every turn |
+| `webcapture` | library generation (fetched web pages, see [knowledge library](knowledge-library.md#web-captures)) | — | every turn (the text of a page is another party's, never the person's) |
 | `localmemory` | the local-session memory folders | — | every record (conversation payloads are folded into their provider, account files excluded) |
 
 **The library bridge.** `cce library build` is the capture pipeline: it reads the coding CLIs'
@@ -430,7 +431,7 @@ it. The conversation name is `conversation-` plus today's `stable_uid`, so exist
 reproduced byte for byte. One disclosed deviation from "`stable_uid` is frozen": a vendor id that
 is valid for `stable_uid` but that the contract cannot express as a name (an edge or doubled
 hyphen, or a name over 80 characters) is replaced by a derived id, with the original kept in
-`extra.vendor_id`, and the manifest counts it in `unnameable_ids`. `NAMING_VERSION` is recorded in every receipt; adding a kind or widening one bumps it (1: the first table; 2: the `manifest` kind accepts an optional subject; 3: the kinds `shard`, `part`, `day`, `bucket` and `container`, and the structural folder word `undated`; 4: the provider words of the families that are not web chat exports: `claudecode`, `codex`, `opencode`, `antigravity`, `geminicli`, `copilotcli`, `applenotes`, `googledrive`, `documents`, `agentmemory`, `agentplans`, `copilotreports`, `localmemory`), and names minted under an earlier version stay valid.
+`extra.vendor_id`, and the manifest counts it in `unnameable_ids`. `NAMING_VERSION` is recorded in every receipt; adding a kind or widening one bumps it (1: the first table; 2: the `manifest` kind accepts an optional subject; 3: the kinds `shard`, `part`, `day`, `bucket` and `container`, and the structural folder word `undated`; 4: the provider words of the families that are not web chat exports: `claudecode`, `codex`, `opencode`, `antigravity`, `geminicli`, `copilotcli`, `applenotes`, `googledrive`, `documents`, `agentmemory`, `agentplans`, `copilotreports`, `localmemory`; 5: the provider word `webcapture`), and names minted under an earlier version stay valid.
 `cce archive names --json` prints the full table and `cce archive verify-names` checks a tree. Only
 four plain folder words are outside the grammar (`conversations`, `hubs`, `meta`, `undated`); everything
 else a build writes is a minted name, which `verify-names` confirms on a whole archive folder.

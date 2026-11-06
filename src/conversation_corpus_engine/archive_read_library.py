@@ -64,6 +64,9 @@ class Family:
     cli: bool = False
     # The text is the person's own writing (channel `written`).
     authored: bool = False
+    # The text is another party's, kept as a source (a captured web page): the authorship engine
+    # labels all of it `third_party` from the provider alone, never `owner`.
+    third_party: bool = False
 
     def selects(self, row: dict[str, Any]) -> bool:
         if row["provider"] != self.library_provider:
@@ -106,6 +109,16 @@ FAMILIES: tuple[Family, ...] = (
         "Agent plans",
         wing="ai",
         kinds=frozenset({"plan", "artifact"}),
+    ),
+    # Pages a capture tool fetched (see `web_capture`): third-party text, never the person's own.
+    Family(
+        "webcapture",
+        "webcapture",
+        "Web captures",
+        wing="ai",
+        kinds=frozenset({"page"}),
+        kind="page",
+        third_party=True,
     ),
 )
 # The ChatGPT pages the library holds beyond the account export: not a provider of their own.
