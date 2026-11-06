@@ -488,7 +488,11 @@ def test_without_a_budget_a_slow_search_is_never_cut_short(many, monkeypatch):
     assert result["elapsed_s"] == 100.0 and "notice" not in result
 
 
-def test_a_budget_already_spent_before_the_first_plan_still_returns_a_page(many, monkeypatch):
+def test_a_budget_already_spent_before_the_first_plan_falls_through_to_the_plan_that_matches(
+    many, monkeypatch
+):
+    """Running out of time before the phrase plan is known to be empty says nothing about AND."""
+
     class Spent(FakeClock):
         def __call__(self) -> float:
             self.reads += 1
@@ -499,12 +503,17 @@ def test_a_budget_already_spent_before_the_first_plan_still_returns_a_page(many,
     monkeypatch.setattr(library_store, "_clock", clock)
     result = many.search("alpha beta", limit=3, max_seconds=1.0)
     assert result["partial"] is True and result["ranked"] is False
-    assert result["plan"] == "phrase"
-    assert result["hits"] == [] and result["total"] == 0 and result["total_exact"] is False
-    assert "phrase plan" in result["notice"]
+    # The words are never adjacent, so the phrase plan is proven empty by its bounded probe and
+    # the page comes from the AND plan, whose matches are shown in index order.
+    assert result["plan"] == "and"
+    assert uids(result) == [conv(f"m{n:03d}", "x").uid for n in range(3)]
+    assert result["total"] == 3 and result["total_exact"] is False
+    assert result["total_label"] == "3+" and result["next_offset"] == 3
+    assert "phrase plan" in result["notice"] and "and plan" in result["notice"]
+    assert "index order" in result["notice"] and "not by relevance" in result["notice"]
 
 
-def test_an_expired_budget_in_a_later_plan_names_that_plan(many, monkeypatch):
+def test_an_expired_budget_in_a_later_plan_answers_from_that_plan(many, monkeypatch):
     clock = FakeClock()
     monkeypatch.setattr(library_store, "_clock", clock)
 
@@ -521,6 +530,93 @@ def test_an_expired_budget_in_a_later_plan_names_that_plan(many, monkeypatch):
     result = many.search("alpha beta", limit=2, max_seconds=1.0)
     assert len(counts) == 2
     assert result["plan"] == "and" and result["partial"] is True and result["ranked"] is False
+    assert uids(result) == [conv(f"m{n:03d}", "x").uid for n in range(2)]
+    assert "and plan" in result["notice"]
+
+
+@pytest.fixture
+def filler(tmp_path, monkeypatch):
+    """Thirty records "red filler N blue": the words are never adjacent."""
+    path = tmp_path / "filler.sqlite"
+    with Library.create(path) as library:
+        for number in range(30):
+            library.put(conv(f"e{number:02d}", f"red filler {number} blue"))
+    monkeypatch.setattr(library_store, "SEARCH_PROGRESS_INSTRUCTIONS", 1)
+    with Library(path) as library:
+        yield library
+
+
+def expire_at_the_first_count(library: Library, clock: FakeClock) -> None:
+    def trace(statement: str) -> None:
+        if "COUNT(*)" in statement and clock.now == 0.0:
+            clock.now = 100.0
+
+    library.connection.set_trace_callback(trace)
+
+
+def test_expiry_while_probing_the_phrase_plan_falls_through_to_the_plan_that_matches(
+    filler, monkeypatch
+):
+    """The slow case the budget exists for: the phrase plan is not known to be empty when time
+    runs out, but the AND plan has matches, so the page must come from the AND plan."""
+    clock = FakeClock()
+    monkeypatch.setattr(library_store, "_clock", clock)
+    expire_at_the_first_count(filler, clock)
+    first = filler.search("red blue", max_seconds=1.0, limit=5)
+    assert first["plan"] == "and" and first["partial"] is True and first["ranked"] is False
+    assert uids(first) == [conv(f"e{n:02d}", "x").uid for n in range(5)]
+    assert first["total"] == 5 and first["total_exact"] is False and first["total_label"] == "5+"
+    assert first["next_offset"] == 5
+    # A pager can continue: the next page is answered by the same plan, still in index order.
+    clock.now = 0.0
+    second = filler.search("red blue", max_seconds=1.0, limit=5, offset=first["next_offset"])
+    assert second["plan"] == "and" and second["partial"] is True
+    assert uids(second) == [conv(f"e{n:02d}", "x").uid for n in range(5, 10)]
+
+
+def test_a_page_cut_before_any_row_arrives_lets_the_pager_continue(many, monkeypatch):
+    """The allowance for the unranked page ran out before its first row: the plan is proven
+    non-empty (the count finished), so the empty page must not look like the end of the results."""
+    monkeypatch.setattr(library_store, "SEARCH_PROGRESS_INSTRUCTIONS", 1)
+    clock = FakeClock()
+    monkeypatch.setattr(library_store, "_clock", clock)
+
+    def trace(statement: str) -> None:
+        if "bm25" in statement:
+            clock.now = 100.0
+        elif "ORDER BY record_fts.rowid" in statement:
+            clock.now = 200.0  # past the allowance of the unranked page
+
+    many.connection.set_trace_callback(trace)
+    result = many.search("alpha beta", limit=5, offset=10, max_seconds=1.0)
+    assert result["partial"] is True and result["plan"] == "and"
+    assert result["hits"] == [] and result["total"] == 300 and result["total_exact"] is True
+    assert result["next_offset"] == 10
+    assert "retry" in result["notice"] and "next_offset" in result["notice"]
+
+
+def test_when_no_plan_can_be_probed_in_time_the_first_unproven_plan_is_reported(many, monkeypatch):
+    monkeypatch.setattr(library_store, "SEARCH_PROGRESS_INSTRUCTIONS", 1)
+    clock = FakeClock()
+    monkeypatch.setattr(library_store, "_clock", clock)
+    many.connection.set_trace_callback(lambda statement: setattr(clock, "now", clock.now + 1000.0))
+    result = many.search("alpha beta", limit=5, offset=2, max_seconds=1.0)
+    assert result["partial"] is True and result["ranked"] is False and result["plan"] == "phrase"
+    assert result["hits"] == [] and result["total"] == 2 and result["total_exact"] is False
+    assert result["total_label"] == "2+" and result["next_offset"] == 2
+    assert "does not mean" in result["notice"] and "retry" in result["notice"]
+
+
+def test_plans_proven_empty_after_the_budget_ran_out_give_an_exact_empty_answer(many, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(library_store, "_clock", clock)
+    expire_at_the_first_count(many, clock)
+    result = many.search("zzzz yyyy", limit=5, max_seconds=1.0)
+    # Every plan finished its bounded probe and found nothing: the answer is complete, not partial.
+    assert result["plan"] == "or" and result["total"] == 0 and result["hits"] == []
+    assert result["total_exact"] is True and result["partial"] is False
+    assert result["ranked"] is True and result["next_offset"] is None
+    assert "notice" not in result
 
 
 def test_the_budget_composes_with_an_enclosing_progress_scope(many):

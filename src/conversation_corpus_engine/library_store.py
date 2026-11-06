@@ -48,6 +48,14 @@ UNRANKED_GRACE_SECONDS = 2.0
 # instructions per row, so the interval stays small; a test lowers it to exercise a tiny library.
 SEARCH_PROGRESS_INSTRUCTIONS = 1000
 BROAD_QUERY_HINT = "quote a phrase or add terms for a faster, more precise search"
+_UNRANKED_STUCK_TAIL = (
+    " No hit arrived before the allowance for this page ran out and the plan is not proven "
+    "empty, so next_offset repeats this offset: retry it, or narrow the query."
+)
+_UNPROVEN_TAIL = (
+    " No plan could be searched in time, so having no hits does not mean there are none: "
+    "retry with next_offset (the same offset), a narrower query or a larger max_seconds."
+)
 # The time source of the search budget; a test substitutes a controllable clock.
 _clock = time.monotonic
 
@@ -706,8 +714,10 @@ class Library:
             hits: list[dict[str, Any]],
             next_offset: int | None,
             *,
-            partial: bool = False,
+            expired_in: str | None = None,
+            tail: str = "",
         ) -> dict[str, Any]:
+            partial = expired_in is not None
             result: dict[str, Any] = {
                 "query": query,
                 "total": total,
@@ -724,8 +734,8 @@ class Library:
             }
             if partial:
                 result["notice"] = (
-                    f"the {seconds:g} s time budget ran out during the {name} plan; ranking was "
-                    "not completed, so these hits are in index order, not by relevance"
+                    f"the {seconds:g} s time budget ran out while running the {expired_in} plan; "
+                    f"the {name} plan's matches are shown in index order, not by relevance." + tail
                 )
             if partial or (name == "or" and not exact):
                 result["hint"] = BROAD_QUERY_HINT
@@ -791,38 +801,94 @@ class Library:
                 hits.append(hit)
             return hits
 
+        def grace_deadline() -> float:
+            return _clock() + min(seconds or UNRANKED_GRACE_SECONDS, UNRANKED_GRACE_SECONDS)
+
+        def unranked(chosen: str) -> tuple[list[sqlite3.Row], bool]:
+            """The first matches of a plan in index order, under a short allowance of their own.
+            The flag says that allowance cut the page short."""
+            rows: list[sqlite3.Row] = []
+            try:
+                with self._budget_scope(grace_deadline()):
+                    rows.extend(page(chosen, " ORDER BY record_fts.rowid"))
+            except _BudgetExpired:
+                return rows, True
+            return rows, False
+
+        def probe(chosen: str) -> bool | None:
+            """Whether a plan matches anything; None when its short allowance ran out first."""
+            text, params = source(chosen)
+            try:
+                with self._budget_scope(grace_deadline()):
+                    found = self.connection.execute("SELECT 1 " + text + " LIMIT 1", params)
+                    return found.fetchone() is not None
+            except _BudgetExpired:
+                return None
+
+        def partial_page(
+            chosen: str, expired_in: str, rows: list[sqlite3.Row], cut: bool, total: int | None
+        ) -> dict[str, Any]:
+            """A page of unranked matches. A page cut before its first row is not the end of the
+            results, so it repeats its offset for the pager to retry."""
+            hits = shape(rows)
+            stuck = cut and not hits
+            more = bool(hits) and (len(rows) > limit or cut)
+            next_offset = offset + len(hits) if more else (offset if stuck else None)
+            counted = total is not None
+            return finish(
+                chosen,
+                total if counted else offset + len(hits),
+                counted and exact,
+                hits,
+                next_offset,
+                expired_in=expired_in,
+                tail=_UNRANKED_STUCK_TAIL if stuck else "",
+            )
+
+        index, total, exact = 0, 0, True
         name, match = steps[-1]
-        total, exact = 0, True
         try:
-            for step in steps:
-                name, match = step
+            while index < len(steps):
+                name, match = steps[index]
                 check()
                 with self._budget_scope(deadline):
                     total, exact = count(match)
                 if total:
                     break
+                index += 1
             rows: list[sqlite3.Row] = []
             if total:
                 check()
                 with self._budget_scope(deadline):
                     rows = page(match, " ORDER BY bm25(record_fts,0,5,1),r.uid").fetchall()
         except _BudgetExpired:
-            # Ranking (or counting) did not finish in time: answer with the first matches in index
-            # order, under a short further allowance of its own.
-            rows, cut = [], False
-            grace = _clock() + min(seconds or UNRANKED_GRACE_SECONDS, UNRANKED_GRACE_SECONDS)
-            try:
-                with self._budget_scope(grace):
-                    rows.extend(page(match, " ORDER BY record_fts.rowid"))
-            except _BudgetExpired:
-                cut = True
-            hits = shape(rows)
-            if not total:
-                total, exact = offset + len(hits), False
-            more = bool(hits) and (len(rows) > limit or cut)
-            return finish(
-                name, total, exact, hits, offset + len(hits) if more else None, partial=True
-            )
+            expired_in = steps[index][0]
+            if total:
+                # The count finished, so the plan has matches; only its ranking ran out of time.
+                unranked_rows, cut = unranked(match)
+                return partial_page(name, expired_in, unranked_rows, cut, total)
+            # The budget ran out before this plan was known to be empty, which says nothing about
+            # the plans after it: take the first plan that a short probe shows to match.
+            unproven: str | None = None
+            for later_name, later_match in steps[index:]:
+                found = probe(later_match)
+                if found:
+                    unranked_rows, cut = unranked(later_match)
+                    return partial_page(later_name, expired_in, unranked_rows, cut, None)
+                if found is None and unproven is None:
+                    unproven = later_name
+            if unproven is not None:
+                return finish(
+                    unproven,
+                    offset,
+                    False,
+                    [],
+                    offset,
+                    expired_in=expired_in,
+                    tail=_UNPROVEN_TAIL,
+                )
+            # Every plan finished its probe and found nothing: the empty answer is complete.
+            return finish(steps[-1][0], 0, True, [], None)
         hits = shape(rows)
         return finish(name, total, exact, hits, offset + len(hits) if len(rows) > limit else None)
 
