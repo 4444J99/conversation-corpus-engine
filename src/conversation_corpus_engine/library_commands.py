@@ -23,6 +23,7 @@ from .library_build import (
 )
 from .library_cards import export_cards, is_card_folder, verify_cards
 from .library_export import EXPORT_PROFILES, LEGACY_PROFILE, export_library, verify_export
+from .library_read_metadata import MAX_ATTACHMENTS, message_metadata, sequence_attachment_count
 from .library_store import (
     BROAD_QUERY_HINT,
     DEFAULT_SEARCH_SECONDS,
@@ -50,9 +51,31 @@ def configured_store(explicit: Path | None = None) -> Path:
     return path
 
 
+def _require_available_store(store_root: Path) -> None:
+    try:
+        # Opening the directory catches unreadable stores as well as missing mounts. Do not
+        # enumerate it, create a replacement, or use exists(), which can suppress OS errors.
+        with os.scandir(store_root):
+            pass
+    except NotADirectoryError as error:
+        raise ValueError(f"library store is not a directory: {store_root}") from error
+    except OSError as error:
+        raise ValueError(
+            f"library store unavailable: {store_root}; check the path, permissions and drive mount"
+        ) from error
+
+
 def open_library(store_root: Path) -> tuple[Path, Library]:
-    generation = current_generation(store_root)
+    _require_available_store(store_root)
+    try:
+        generation = current_generation(store_root)
+    except OSError as error:
+        raise ValueError(
+            f"library store unavailable: {store_root}; check the path, permissions and drive mount"
+        ) from error
     if generation is None:
+        # The mount may have disappeared after the first probe, during pointer lookup.
+        _require_available_store(store_root)
         raise ValueError("no library generation has been published")
     return generation, Library(generation / "library.sqlite")
 
@@ -189,6 +212,9 @@ def _record_header(
         "main_message_count": len(payload["messages"]),
         "alternate_message_count": len(alternates),
         "body_status": payload["extra"].get("body_status", "full" if messages else "metadata_only"),
+        "attachment_count_observed": sequence_attachment_count(messages),
+        "attachment_notice": "Counts describe observed normalized messages; sources may omit "
+        "attachments. Metadata does not establish that attachment bytes were retained.",
         "provenance": {
             key[:128]: value
             if len(json.dumps(value, ensure_ascii=False)) <= 2048
@@ -275,6 +301,7 @@ def read_record(
         channel=item.get("channel", "")[:128],
         message_id=item.get("id", "")[:512],
         total_characters=len(text),
+        **message_metadata(item),
     )
     if end < len(text):
         result["next_offset"] = end
@@ -301,6 +328,7 @@ def _read_range(
     end = min(message_end, message + MAX_RANGE_MESSAGES, len(messages))
     capped = end < min(message_end, len(messages))
     budget, index, start = limit, message, offset
+    attachment_budget = MAX_ATTACHMENTS
     while index < end:
         if budget <= 0:
             result.update(next_message=index, next_offset=0)
@@ -310,6 +338,8 @@ def _read_range(
         if start > len(text):
             raise ValueError("text offset is outside the message")
         stop = min(len(text), start + budget)
+        metadata = message_metadata(item, max_attachments=attachment_budget)
+        attachment_budget -= len(metadata["attachments"])
         result["messages"].append(
             {
                 "message": index,
@@ -319,6 +349,7 @@ def _read_range(
                 "offset": start,
                 "text": text[start:stop],
                 "total_characters": len(text),
+                **metadata,
             }
         )
         budget -= stop - start
