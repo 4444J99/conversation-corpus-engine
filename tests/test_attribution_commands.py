@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
+import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
 
 import pytest
-from attribution_support import ECHO_ANSWER, ECHO_QUESTION, build_library
+from attribution_support import ECHO_ANSWER, ECHO_QUESTION, build_library, conversations
 
 from conversation_corpus_engine import attribution_commands
 from conversation_corpus_engine.attributed_knowledge import collect_owner_segments
@@ -340,7 +343,12 @@ def apply_entries(
         capsys, "apply", "--library", library, "--out", out, "--json", *extra
     )
     assert code == 0, err
-    return json.loads(out.read_text(encoding="utf-8")), json.loads(stdout)
+    result = json.loads(stdout)
+    # A slice that was cut short keeps the .partial name; a complete export has the requested one.
+    assert Path(result["out"]) == (
+        out if result["complete"] else out.with_name(out.name + ".partial")
+    )
+    return json.loads(Path(result["out"]).read_text(encoding="utf-8")), result
 
 
 def test_apply_writes_valid_digest_bound_annotations_in_the_profile_input_form(
@@ -489,7 +497,7 @@ def test_a_conflicting_answer_is_refused_and_cannot_brick_the_ledger(
     run_cli(capsys, "review-sample", "--library", library, "--out", sample)
     real = next(row for row in sample_rows(sample) if row["rule"] == "typed_prefix")
     answers.write_text(json.dumps({**real, "verdict": "yes"}) + "\n", encoding="utf-8")
-    assert record_answers(capsys, ledger, sample, answers)[0] == 0
+    assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
     before = ledger.read_bytes()
 
     # A second sample file that names the same span as another rule (a forged or edited one).
@@ -498,12 +506,12 @@ def test_a_conflicting_answer_is_refused_and_cannot_brick_the_ledger(
     answers.write_text(
         json.dumps({**real, "rule": "note_owner", "verdict": "yes"}) + "\n", encoding="utf-8"
     )
-    code, _, err = record_answers(capsys, ledger, forged_sample, answers)
+    code, _, err = record_answers(capsys, library, ledger, forged_sample, answers)
     assert code == 2 and "conflict" in err and "nothing was written" in err
     assert ledger.read_bytes() == before
 
     answers.write_text(json.dumps({**real, "verdict": "no"}) + "\n", encoding="utf-8")
-    assert record_answers(capsys, ledger, sample, answers)[0] == 0
+    assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
     report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
     assert report["gate"]["superseded_rows"] == 1 and report["gate"]["quarantined_rows"] == 0
 
@@ -581,7 +589,8 @@ def test_apply_limit_records_flags_the_slice(
 ) -> None:
     _, result = apply_entries(capsys, library_path, tmp_path / "slice.json", "--limit-records", "2")
     assert result["records_scanned"] == 2 and result["limited"] is True
-    assert result["complete"] is False
+    assert result["complete"] is False and result["partial"] is True
+    assert not (tmp_path / "slice.json").exists()
 
 
 # --- review sample, record and the gate ------------------------------------------------------
@@ -642,6 +651,7 @@ def answered(sample: Path, target: Path, yes: int, stratum: str = "S") -> None:
 
 def record_answers(
     capsys: pytest.CaptureFixture[str],
+    library: Path,
     ledger: Path,
     sample: Path,
     answers: Path,
@@ -651,6 +661,8 @@ def record_answers(
     return run_cli(
         capsys,
         "review-record",
+        "--library",
+        library,
         "--ledger",
         ledger,
         "--sample",
@@ -678,7 +690,7 @@ def approve(
     sample, answers, ledger = (tmp_path / f"{name}-{kind}.jsonl" for kind in ("s", "a", "l"))
     assert run_cli(capsys, "review-sample", "--library", library, "--out", sample)[0] == 0
     answered(sample, answers, yes)
-    code, _, err = record_answers(capsys, ledger, sample, answers, reviewer=reviewer)
+    code, _, err = record_answers(capsys, library, ledger, sample, answers, reviewer=reviewer)
     assert code == 0, err
     return ledger
 
@@ -691,7 +703,7 @@ def test_sampling_answering_and_reporting_close_the_gate_loop(
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
     run_cli(capsys, "review-sample", "--library", library, "--out", sample)
     answered(sample, answers, yes)
-    code, out, err = record_answers(capsys, ledger, sample, answers, "--json")
+    code, out, err = record_answers(capsys, library, ledger, sample, answers, "--json")
     assert code == 0, err
     recorded = json.loads(out)
     assert recorded["appended"] == 100 and recorded["unanswered"] > 0
@@ -739,7 +751,7 @@ def test_a_long_pasted_answer_is_not_eligible_until_its_own_stratum_passes(
 
     short_answers = tmp_path / "short.jsonl"
     answered(sample, short_answers, 100, stratum="S")
-    assert record_answers(capsys, ledger, sample, short_answers)[0] == 0
+    assert record_answers(capsys, library, ledger, sample, short_answers)[0] == 0
     entries, result = apply_entries(
         capsys, library, tmp_path / "one.json", "--ledger", ledger, "--owner-id", "rob"
     )
@@ -750,7 +762,7 @@ def test_a_long_pasted_answer_is_not_eligible_until_its_own_stratum_passes(
 
     medium_answers = tmp_path / "medium.jsonl"
     answered(sample, medium_answers, 100, stratum="M")
-    assert record_answers(capsys, ledger, sample, medium_answers)[0] == 0
+    assert record_answers(capsys, library, ledger, sample, medium_answers)[0] == 0
     entries, result = apply_entries(
         capsys, library, tmp_path / "two.json", "--ledger", ledger, "--owner-id", "rob"
     )
@@ -799,11 +811,11 @@ def test_review_record_refuses_answers_that_are_not_in_the_sample(
     }
     for name, forged in forgeries.items():
         answers.write_text(json.dumps(real) + "\n" + json.dumps(forged) + "\n", encoding="utf-8")
-        code, _, err = record_answers(capsys, ledger, sample, answers)
+        code, _, err = record_answers(capsys, library, ledger, sample, answers)
         assert code == 2 and "answers line 2" in err and "sample" in err, name
         assert not ledger.exists(), name
     answers.write_text(json.dumps(real) + "\n", encoding="utf-8")
-    assert record_answers(capsys, ledger, sample, answers)[0] == 0
+    assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
 
 
 def test_review_record_rejects_bad_answers_before_writing_anything(
@@ -817,11 +829,11 @@ def test_review_record_rejects_bad_answers_before_writing_anything(
     answers.write_text(
         json.dumps(good) + "\n" + json.dumps({**good, "verdict": "maybe"}) + "\n", encoding="utf-8"
     )
-    code, _, err = record_answers(capsys, ledger, sample, answers)
+    code, _, err = record_answers(capsys, library, ledger, sample, answers)
     assert code == 2 and "answers line 2" in err
     assert not ledger.exists()
     answers.write_text("{bad\n", encoding="utf-8")
-    code, _, err = record_answers(capsys, ledger, sample, answers)
+    code, _, err = record_answers(capsys, library, ledger, sample, answers)
     assert code == 2 and "answers line 1" in err and not ledger.exists()
 
 
@@ -836,6 +848,8 @@ def test_review_record_stamps_the_current_utc_time_only_when_none_is_given(
     code, _, _ = run_cli(
         capsys,
         "review-record",
+        "--library",
+        library,
         "--ledger",
         ledger,
         "--sample",
@@ -849,6 +863,273 @@ def test_review_record_stamps_the_current_utc_time_only_when_none_is_given(
     recorded = json.loads(ledger.read_text(encoding="utf-8"))
     assert recorded["verdict"] == "yes" and recorded["reviewer"] == "rob"
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", recorded["reviewed_at"])
+
+
+# --- where the writers may write --------------------------------------------------------------
+
+
+def mode(path: Path) -> int:
+    return stat.S_IMODE(path.stat().st_mode)
+
+
+def real_store(tmp_path: Path) -> tuple[Path, Path]:
+    """A library at the layout the builder publishes: store/library-all/generations/<name>."""
+    store = tmp_path / "store"
+    generation = store / "library-all" / "generations" / "20260101T000000Z"
+    generation.mkdir(parents=True)
+    with Library.create(generation / "library.sqlite") as library:
+        for conversation in conversations(typed_records=3):
+            library.put(conversation)
+    return store, generation / "library.sqlite"
+
+
+def sample_and_answers(
+    capsys: pytest.CaptureFixture[str], library: Path, tmp_path: Path
+) -> tuple[Path, Path]:
+    sample, answers = tmp_path / "s.jsonl", tmp_path / "a.jsonl"
+    assert run_cli(capsys, "review-sample", "--library", library, "--out", sample)[0] == 0
+    row = next(item for item in sample_rows(sample) if item["rule"] == "typed_prefix")
+    answers.write_text(json.dumps({**row, "verdict": "yes"}) + "\n", encoding="utf-8")
+    return sample, answers
+
+
+def test_no_writer_may_write_inside_the_generation_or_anywhere_in_the_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store, library = real_store(tmp_path)
+    sample, answers = sample_and_answers(capsys, library, tmp_path)
+    targets = {
+        "generation": library.parent / "x.out",
+        "generations folder": library.parent.parent / "x.out",
+        "store root": store / "x.out",
+        "elsewhere in the store": store / "notes" / "x.out",
+    }
+    for name, target in targets.items():
+        for argv in (
+            ("apply", "--library", library, "--out", target),
+            ("review-sample", "--library", library, "--out", target),
+            (
+                "review-record",
+                "--library",
+                library,
+                "--ledger",
+                target,
+                "--sample",
+                sample,
+                "--answers",
+                answers,
+                "--reviewer",
+                "rob",
+            ),
+        ):
+            code, _, err = run_cli(capsys, *argv)
+            assert code == 2 and "library store" in err, (name, argv[0])
+            assert not target.exists(), (name, argv[0])
+    assert not (store / "notes").exists()
+
+
+def test_a_bare_generation_protects_its_folder_and_its_parent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store")
+    for target in (library.parent / "x.json", library.parent.parent / "x.json"):
+        code, _, err = run_cli(capsys, "apply", "--library", library, "--out", target)
+        assert code == 2 and "library store" in err and not target.exists()
+    ok = tmp_path / "outside.json"
+    assert run_cli(capsys, "apply", "--library", library, "--out", ok)[0] == 0
+
+
+def test_an_explicit_store_root_is_protected_too(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "somewhere" / "lib")
+    configured = tmp_path / "configured-store"
+    configured.mkdir()
+    target = configured / "x.json"
+    code, _, err = run_cli(
+        capsys, "apply", "--library", library, "--store-root", configured, "--out", target
+    )
+    assert code == 2 and "library store" in err and not target.exists()
+
+
+def test_a_git_visible_destination_is_refused_before_anything_is_written(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store")
+    sample, answers = sample_and_answers(capsys, library, tmp_path)
+    repo = tmp_path / "repo"
+    (repo / "visible").mkdir(parents=True)
+    (repo / "private").mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / ".gitignore").write_text("private/\n", encoding="utf-8")
+    for argv in (
+        ("apply", "--library", library, "--out", repo / "visible" / "a.json"),
+        ("review-sample", "--library", library, "--out", repo / "visible" / "s.jsonl"),
+        (
+            "review-record",
+            "--library",
+            library,
+            "--ledger",
+            repo / "visible" / "l.jsonl",
+            "--sample",
+            sample,
+            "--answers",
+            answers,
+            "--reviewer",
+            "rob",
+        ),
+    ):
+        code, _, err = run_cli(capsys, *argv)
+        assert code == 2 and "Git-visible" in err, argv[0]
+    assert sorted(p.name for p in (repo / "visible").iterdir()) == []
+    ok = repo / "private" / "a.json"
+    assert run_cli(capsys, "apply", "--library", library, "--out", ok)[0] == 0
+    assert ok.exists()
+
+
+def test_every_output_is_private_and_new_directories_are_0700(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store")
+    sample = tmp_path / "fresh" / "nested" / "s.jsonl"
+    old = os.umask(0)
+    try:
+        assert run_cli(capsys, "review-sample", "--library", library, "--out", sample)[0] == 0
+        assert mode(sample) == 0o600
+        assert mode(sample.parent) == 0o700 and mode(sample.parent.parent) == 0o700
+        out = tmp_path / "other" / "a.json"
+        assert run_cli(capsys, "apply", "--library", library, "--out", out)[0] == 0
+        assert mode(out) == 0o600 and mode(out.parent) == 0o700
+        row = next(item for item in sample_rows(sample) if item["rule"] == "typed_prefix")
+        answers = tmp_path / "a.jsonl"
+        answers.write_text(json.dumps({**row, "verdict": "yes"}) + "\n", encoding="utf-8")
+        ledger = tmp_path / "ledgers" / "l.jsonl"
+        assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
+        assert mode(ledger) == 0o600 and mode(ledger.parent) == 0o700
+        partial = tmp_path / "p" / "cut.json"
+        assert (
+            run_cli(
+                capsys, "apply", "--library", library, "--out", partial, "--limit-records", "2"
+            )[0]
+            == 0
+        )
+        assert mode(partial.with_name("cut.json.partial")) == 0o600
+    finally:
+        os.umask(old)
+
+
+def test_a_slice_or_deadline_cut_output_is_written_under_the_partial_name(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    library = build_library(tmp_path / "store")
+    out = tmp_path / "a.json"
+    code, out_text, _ = run_cli(
+        capsys, "apply", "--library", library, "--out", out, "--limit-records", "2", "--json"
+    )
+    result = json.loads(out_text)
+    assert code == 0 and result["partial"] is True and result["limited"] is True
+    assert not out.exists() and Path(result["out"]) == out.with_name("a.json.partial")
+    assert isinstance(json.loads(Path(result["out"]).read_text(encoding="utf-8")), list)
+
+    sample = tmp_path / "s.jsonl"
+    code, out_text, _ = run_cli(
+        capsys,
+        "review-sample",
+        "--library",
+        library,
+        "--out",
+        sample,
+        "--limit-records",
+        "2",
+        "--json",
+    )
+    assert code == 0 and json.loads(out_text)["partial"] is True
+    assert not sample.exists()
+    rows = sample_rows(sample.with_name("s.jsonl.partial"))
+    assert rows and all(row["partial"] is True for row in rows)
+
+    readings = {"count": 0}
+
+    def counting() -> float:
+        readings["count"] += 1
+        return 0.0
+
+    with Library(library) as handle:
+        build_census(
+            handle,
+            limit_records=None,
+            min_chars=200,
+            min_occurrences=3,
+            deadline=Deadline(10.0, clock=counting),
+        )
+    allowed = readings["count"] + 3
+    seen = {"count": 0}
+
+    def clock() -> float:
+        seen["count"] += 1
+        return 0.0 if seen["count"] <= allowed else 1e6
+
+    monkeypatch.setattr(
+        attribution_commands, "Deadline", lambda seconds: Deadline(seconds, clock=clock)
+    )
+    cut = tmp_path / "cut.jsonl"
+    code, out_text, err = run_cli(
+        capsys, "review-sample", "--library", library, "--out", cut, "--json"
+    )
+    assert code == 3 and "partial" in err
+    assert json.loads(out_text)["partial"] is True and not cut.exists()
+    assert all(row["partial"] is True for row in sample_rows(cut.with_name("cut.jsonl.partial")))
+
+
+def test_a_complete_scan_leaves_no_partial_marker(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store")
+    sample = tmp_path / "s.jsonl"
+    code, out_text, _ = run_cli(
+        capsys, "review-sample", "--library", library, "--out", sample, "--json"
+    )
+    assert code == 0 and json.loads(out_text)["partial"] is False
+    assert sample.exists() and not sample.with_name("s.jsonl.partial").exists()
+    assert all(row["partial"] is False for row in sample_rows(sample))
+
+
+def test_a_leftover_partial_file_is_refused_before_any_work_starts(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    library = build_library(tmp_path / "store")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("the census must not start")
+
+    monkeypatch.setattr(attribution_commands, "build_census", forbidden)
+    for command, name in (("apply", "a.json"), ("review-sample", "s.jsonl")):
+        out = tmp_path / name
+        out.with_name(name + ".partial").write_text("old", encoding="utf-8")
+        code, _, err = run_cli(capsys, command, "--library", library, "--out", out)
+        assert code == 2 and "leftover" in err and ".partial" in err
+        assert len(err.strip().splitlines()) == 1
+        assert out.with_name(name + ".partial").read_text(encoding="utf-8") == "old"
+
+
+def test_an_existing_output_is_refused_for_every_writer(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store")
+    out = tmp_path / "taken.out"
+    out.write_text("keep", encoding="utf-8")
+    for command in ("apply", "review-sample"):
+        code, _, err = run_cli(capsys, command, "--library", library, "--out", out)
+        assert code == 2 and "already exists" in err
+    link = tmp_path / "link.out"
+    link.symlink_to(tmp_path / "target.out")
+    assert run_cli(capsys, "apply", "--library", library, "--out", link)[0] == 2
+    assert not (tmp_path / "target.out").exists()
+    assert out.read_text(encoding="utf-8") == "keep"
 
 
 # --- registration ----------------------------------------------------------------------------

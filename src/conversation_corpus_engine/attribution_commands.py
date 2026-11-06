@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import time
@@ -30,7 +31,7 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from .archive_read_library import locate
 from .attribution import attributed_spans, text_digest
@@ -66,8 +67,9 @@ from .attribution_rules import (
     to_annotation,
     utc_stamp,
 )
-from .corpus_store import CorpusStoreError
-from .library_commands import configured_store, open_library
+from .corpus_store import CorpusStoreError, require_git_private
+from .library_build import DIRECTORY, current_generation
+from .library_commands import STORE_ENV, configured_store, open_library
 from .library_store import Library
 
 DEFAULT_DEADLINE_SECONDS = 900.0
@@ -440,27 +442,52 @@ def render_report(report: dict[str, Any]) -> str:
 # --- annotation export -----------------------------------------------------------------------
 
 
-class AnnotationWriter:
-    """Streams a JSON list to a temporary file and renames it into place on commit."""
+PARTIAL_SUFFIX = ".partial"
+
+
+def _partial_path(path: Path) -> Path:
+    return path.with_name(path.name + PARTIAL_SUFFIX)
+
+
+def private_directories(directory: Path) -> None:
+    """Create the missing directories of a path, each private (mode 0700). Existing ones are
+    left as they are."""
+    missing: list[Path] = []
+    current = directory
+    while not current.exists():
+        missing.append(current)
+        current = current.parent
+    for folder in reversed(missing):
+        try:
+            folder.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        folder.chmod(0o700)
+
+
+def _open_private(path: Path) -> TextIO:
+    """A new text file, created exclusively with mode 0600 and never through a symlink."""
+    descriptor = os.open(
+        path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600
+    )
+    os.fchmod(descriptor, 0o600)
+    return os.fdopen(descriptor, "w", encoding="utf-8")
+
+
+class PrivateOutput:
+    """A new private file written under its `.partial` name and renamed into place on commit.
+
+    A complete output takes the requested name; one whose scan was cut short (a record limit or
+    the deadline) keeps the `.partial` name, so it cannot pass for a whole export.
+    """
 
     def __init__(self, out: Path) -> None:
-        if out.exists() or out.is_symlink():
-            raise ValueError(f"output already exists: {out}")
+        private_directories(out.parent)
         self.out = out
-        self.temp = out.with_name(out.name + ".partial")
-        self.handle = self.temp.open("x", encoding="utf-8")
-        self.handle.write("[")
-        self.count = 0
-
-    def write(self, entry: dict[str, Any]) -> None:
-        separator = "," if self.count else ""
-        self.handle.write(separator + "\n" + json.dumps(entry, sort_keys=True, ensure_ascii=True))
-        self.count += 1
+        self.temp = _partial_path(out)
+        self.handle = _open_private(self.temp)
 
     def commit(self, *, partial: bool = False) -> Path:
-        """Close the JSON list. A complete file takes the requested name; a partial one (the
-        scan was cut short) keeps the `.partial` name so it cannot pass for a whole export."""
-        self.handle.write("\n]\n")
         self.handle.close()
         if partial:
             return self.temp
@@ -470,6 +497,79 @@ class AnnotationWriter:
     def abort(self) -> None:
         self.handle.close()
         self.temp.unlink(missing_ok=True)
+
+
+class AnnotationWriter(PrivateOutput):
+    """Streams the annotation entries as one JSON list."""
+
+    def __init__(self, out: Path) -> None:
+        super().__init__(out)
+        self.handle.write("[")
+        self.count = 0
+
+    def write(self, entry: dict[str, Any]) -> None:
+        separator = "," if self.count else ""
+        self.handle.write(separator + "\n" + json.dumps(entry, sort_keys=True, ensure_ascii=True))
+        self.count += 1
+
+    def commit(self, *, partial: bool = False) -> Path:
+        self.handle.write("\n]\n")
+        return super().commit(partial=partial)
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    return path == folder or folder in path.parents
+
+
+def library_roots(args: argparse.Namespace, database: Path) -> list[Path]:
+    """Every place a writer must stay out of: the generation, its parent, the store the library
+    sits in (found through the builder's `library-all` folder, a store folder given as the
+    library, `--store-root` or the configured store)."""
+    resolved = database.resolve()
+    roots = [resolved.parent, resolved.parent.parent]
+    roots.extend(ancestor.parent for ancestor in resolved.parents if ancestor.name == DIRECTORY)
+    configured = [
+        args.store_root,
+        os.environ.get(STORE_ENV),
+        os.environ.get("CCE_CORPUS_STORE_ROOT"),
+        args.library if args.library is not None and args.library.is_dir() else None,
+    ]
+    roots.extend(Path(item).expanduser().resolve() for item in configured if item)
+    return roots
+
+
+def _refuse_store(path: Path, roots: list[Path]) -> Path:
+    out = path.expanduser().absolute()
+    resolved = out.parent.resolve() / out.name
+    for root in roots:
+        if _inside(resolved, root):
+            raise ValueError(f"output must be outside the library store ({root}): {out}")
+    if out.is_symlink():
+        raise ValueError(f"output must not be a symlink: {out}")
+    return out
+
+
+def check_output(path: Path, roots: list[Path]) -> Path:
+    """Authorise a new output file before anything is written or any scan starts: outside the
+    library store, not existing, no leftover `.partial` from an earlier run, and in a directory
+    Git cannot see."""
+    out = _refuse_store(path, roots)
+    if out.exists():
+        raise ValueError(f"output already exists: {out}")
+    leftover = _partial_path(out)
+    if leftover.exists() or leftover.is_symlink():
+        raise ValueError(
+            f"leftover partial output from an earlier run: {leftover} (remove or rename it)"
+        )
+    require_git_private(out.parent)
+    return out
+
+
+def check_ledger_path(path: Path, roots: list[Path]) -> Path:
+    """The same custody for the append-only ledger, which may already exist."""
+    ledger = _refuse_store(path, roots)
+    require_git_private(ledger.parent)
+    return ledger
 
 
 def message_entry(
@@ -620,6 +720,19 @@ def add_attribute_parser(library_actions: Any) -> None:
     record = sub.add_parser(
         "review-record", help="Append the owner's verdicts on a sample to the review ledger"
     )
+    record.add_argument(
+        "--library",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="The library the sample came from, so the ledger can be kept out of its store",
+    )
+    record.add_argument(
+        "--store-root",
+        "--corpus-store-root",
+        dest="store_root",
+        type=Path,
+        default=argparse.SUPPRESS,
+    )
     record.add_argument("--ledger", type=Path, required=True)
     record.add_argument(
         "--sample", type=Path, required=True, help="The review-sample file the answers belong to"
@@ -635,10 +748,20 @@ def add_attribute_parser(library_actions: Any) -> None:
 # --- command handlers ------------------------------------------------------------------------
 
 
-def _open_target(args: argparse.Namespace) -> tuple[Library, Path]:
+def _database_path(args: argparse.Namespace) -> Path:
+    """Where the library database is, without opening it."""
     if args.library is not None:
         path = args.library.expanduser()
-        database = path if path.is_file() else locate(path)[0]
+        return path if path.is_file() else locate(path)[0]
+    generation = current_generation(configured_store(args.store_root))
+    if generation is None:
+        raise ValueError("no library generation has been published")
+    return generation / "library.sqlite"
+
+
+def _open_target(args: argparse.Namespace) -> tuple[Library, Path]:
+    if args.library is not None:
+        database = _database_path(args)
         return Library(database), database
     generation, library = open_library(configured_store(args.store_root))
     return library, generation / "library.sqlite"
@@ -728,20 +851,12 @@ def _report(args: argparse.Namespace) -> int:
     return 0 if report["partition"]["ok"] else 1
 
 
-def _inside(path: Path, folder: Path) -> bool:
-    return path == folder or folder in path.parents
-
-
 def _apply(args: argparse.Namespace) -> int:
     view, owner = _ledger_view(args), _owner(args)
     deadline = Deadline(args.deadline_seconds)
     library, database = _open_target(args)
     with library:
-        out = args.out.expanduser().absolute()
-        if _inside(out.parent.resolve() / out.name, database.parent.resolve()):
-            raise ValueError("--out must be outside the library generation (it is read-only)")
-        if out.exists() or out.is_symlink():
-            raise ValueError(f"output already exists: {out}")
+        out = check_output(args.out, library_roots(args, database))
         census = _census(library, args, deadline)
         recorder = MatchRecorder(view.wanted)
         if view.wanted:
@@ -778,13 +893,13 @@ def _apply(args: argparse.Namespace) -> int:
             stats, tally = scan(
                 library, census, limit_records=args.limit_records, deadline=deadline, visit=visit
             )
-            written = writer.commit(partial=stats.deadline_reached)
+            written = writer.commit(partial=not stats.complete)
         except BaseException:
             writer.abort()
             raise
     result = {
         "out": str(written),
-        "partial": stats.deadline_reached,
+        "partial": not stats.complete,
         "rules_version": RULES_VERSION,
         "entries": writer.count,
         "messages_scanned": tally.messages,
@@ -824,9 +939,10 @@ def _apply(args: argparse.Namespace) -> int:
 def _review_sample(args: argparse.Namespace) -> int:
     exclude = _ledger_view(args).wanted
     deadline = Deadline(args.deadline_seconds)
-    library, _ = _open_target(args)
+    library, database = _open_target(args)
     sampler = ReviewSampler(per_stratum=args.per_stratum, seed=args.seed, exclude=exclude)
     with library:
+        out = check_output(args.out, library_roots(args, database)) if args.out else None
         census = _census(library, args, deadline)
         stats, _ = scan(
             library,
@@ -837,23 +953,30 @@ def _review_sample(args: argparse.Namespace) -> int:
                 sampler.offer(span, message.text[span.start : span.end]) for span in spans
             ],
         )
-    rows = sampler.rows()
+    partial = not stats.complete
+    rows = sampler.rows(partial=partial)
     payload = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows)
     summary = {
         "rules_version": RULES_VERSION,
         "sampled": len(rows),
         "per_stratum": dict(Counter(f"{row['rule']}:{row['stratum']}" for row in rows)),
         "complete": stats.complete,
+        "partial": partial,
     }
-    if args.out is None:
+    if out is None:
         sys.stdout.write(payload)
         print(json.dumps(summary, sort_keys=True), file=sys.stderr)
     else:
-        with args.out.expanduser().open("x", encoding="utf-8") as handle:
-            handle.write(payload)
+        writer = PrivateOutput(out)
+        try:
+            writer.handle.write(payload)
+            written = writer.commit(partial=partial)
+        except BaseException:
+            writer.abort()
+            raise
         _emit(
-            summary | {"out": str(args.out)},
-            f"wrote {len(rows)} sample spans to {args.out}",
+            summary | {"out": str(written)},
+            f"wrote {len(rows)} sample spans to {written}",
             args.json,
         )
     if stats.deadline_reached:
@@ -888,6 +1011,7 @@ def _load_sample(path: Path) -> dict[str, dict[str, Any]]:
 def _review_record(args: argparse.Namespace) -> int:
     # The one place a clock is read, at the command boundary; the ledger helpers take the time.
     reviewed_at = args.reviewed_at or utc_stamp(datetime.now(UTC))
+    ledger = check_ledger_path(args.ledger, library_roots(args, _database_path(args)))
     sample = _load_sample(args.sample)
     rows: list[dict[str, Any]] = []
     skipped = 0
@@ -932,7 +1056,8 @@ def _review_record(args: argparse.Namespace) -> int:
             )
         except ValueError as error:
             raise ValueError(f"answers line {number}: {error}") from error
-    appended = append_ledger(args.ledger, rows)
+    private_directories(ledger.parent)
+    appended = append_ledger(ledger, rows)
     counts = Counter(f"{row['rule']}:{row['stratum']}" for row in rows)
     result = {
         "ledger": str(args.ledger),
