@@ -26,16 +26,20 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import heapq
 import itertools
+import json
+import os
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from pathlib import PurePosixPath
+from datetime import datetime
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .archive_provenance import INJECTED_TAGS, classify_user_turn
 from .archive_read_library import FAMILIES
-from .attribution import text_digest
+from .attribution import ATTRIBUTION_SCHEMA, text_digest
 
 RULES_VERSION = "cce.attribution-rules@1"
 
@@ -939,3 +943,319 @@ def attribute_message(
     if any(problems.values()):
         raise RuntimeError(f"attribution partition invariant violated: {problems}")
     return spans
+
+
+# --- annotations in the existing cce.span-attribution.v1 form ---------------------------------
+
+
+def to_annotation(
+    text: str,
+    spans: Sequence[AttributedSpan],
+    *,
+    owner_id: str | None = None,
+    eligible: Collection[str] = frozenset(),
+) -> dict[str, Any]:
+    """The `cce.span-attribution.v1` annotation of one message (see `attribution.py`).
+
+    Unknown spans are left out (the contract fills uncovered text as unknown). Evidence names the
+    rules version, the deciding rule and the span id. `profile_eligible` is False unless the span
+    is the owner's, its rule passed the precision gate (`eligible`) and an `owner_id` binds it.
+    """
+    digest = text_digest(text)
+    problems = partition_problems(text, spans, digest)
+    if any(problems.values()):
+        raise ValueError(f"attribution partition does not match the exact text: {problems}")
+    entries: list[dict[str, Any]] = []
+    for span in spans:
+        if span.author == UNKNOWN:
+            continue
+        is_owner = span.author == OWNER
+        evidence = [f"{RULES_VERSION}:rule:{span.rule}", f"span:{span.span_id}"]
+        if span.detail:
+            evidence.append(f"detail:{span.detail}")
+        entries.append(
+            {
+                "start": span.start,
+                "end": span.end,
+                "author": span.author,
+                "author_id": owner_id if is_owner else None,
+                "evidence": evidence,
+                "assertion_status": "asserted",
+                "profile_eligible": bool(is_owner and owner_id and span.rule in eligible),
+            }
+        )
+    return {"schema": ATTRIBUTION_SCHEMA, "text_digest": digest, "spans": entries}
+
+
+# --- the owner-review ledger and the precision gate ------------------------------------------
+
+LEDGER_SCHEMA = "cce.attribution-review-ledger.v1"
+SAMPLE_SCHEMA = "cce.attribution-review-sample.v1"
+VERDICTS = ("yes", "no", "unsure")
+# A rule may be profile-eligible only when at least this many of its spans were reviewed by the
+# owner and at least this share of them (counting unsure and no as not confirmed) was confirmed.
+GATE_MIN_REVIEWED = 100
+GATE_MIN_PRECISION_PERCENT = 95
+SAMPLE_PER_RULE = 100
+SAMPLE_MAX_CHARS = 240
+SAMPLE_SEED = "cce-attribution-review-v1"
+
+_LEDGER_KEYS = frozenset(
+    {"schema", "rules_version", "span_id", "rule", "verdict", "reviewer", "reviewed_at"}
+)
+_SPAN_ID = re.compile(r"[0-9a-f]{32}")
+_UTC_STAMP = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def validate_ledger_row(row: Any) -> dict[str, Any]:
+    """A copy of a ledger row, or ValueError: nothing malformed is ever skipped silently."""
+    if not isinstance(row, dict):
+        raise ValueError("ledger row must be an object")
+    if set(row) != _LEDGER_KEYS:
+        raise ValueError(f"ledger row keys must be exactly {sorted(_LEDGER_KEYS)}")
+    if row["schema"] != LEDGER_SCHEMA:
+        raise ValueError(f"ledger row schema must be {LEDGER_SCHEMA}")
+    version = row["rules_version"]
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("ledger row needs a rules_version")
+    if not isinstance(row["span_id"], str) or not _SPAN_ID.fullmatch(row["span_id"]):
+        raise ValueError("ledger row span_id must be 32 lowercase hexadecimal digits")
+    rule = row["rule"]
+    if (
+        not isinstance(rule, str)
+        or not rule
+        or (version == RULES_VERSION and rule not in RULE_BY_ID)
+    ):
+        raise ValueError(f"ledger row names an unknown rule: {rule!r}")
+    if row["verdict"] not in VERDICTS:
+        raise ValueError(f"ledger row verdict must be one of {list(VERDICTS)}")
+    reviewer = row["reviewer"]
+    if not isinstance(reviewer, str) or not reviewer.strip():
+        raise ValueError("ledger row needs a reviewer")
+    stamp = row["reviewed_at"]
+    try:
+        if not isinstance(stamp, str):
+            raise ValueError
+        datetime.strptime(stamp, _UTC_STAMP)  # noqa: DTZ007 - validates a stamp that states Z
+    except ValueError:
+        raise ValueError(
+            "ledger row reviewed_at must be a UTC time like 2026-01-02T03:04:05Z"
+        ) from None
+    return dict(row)
+
+
+def ledger_row(
+    span_id: str,
+    rule: str,
+    verdict: str,
+    reviewer: str,
+    reviewed_at: str,
+    *,
+    rules_version: str = RULES_VERSION,
+) -> dict[str, Any]:
+    """One owner verdict on one span. The time is a parameter: no clock is read here."""
+    return validate_ledger_row(
+        {
+            "schema": LEDGER_SCHEMA,
+            "rules_version": rules_version,
+            "span_id": span_id,
+            "rule": rule,
+            "verdict": verdict,
+            "reviewer": reviewer,
+            "reviewed_at": reviewed_at,
+        }
+    )
+
+
+def parse_ledger(lines: Iterable[str]) -> list[dict[str, Any]]:
+    """Rows of a JSONL ledger; blank lines are ignored, anything else malformed raises."""
+    rows: list[dict[str, Any]] = []
+    rule_of: dict[tuple[str, str], str] = {}
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            row = validate_ledger_row(json.loads(line))
+        except (ValueError, RecursionError) as error:
+            detail = str(error).removeprefix("ledger row: ")
+            raise ValueError(f"ledger line {number}: {detail}") from error
+        key = (row["rules_version"], row["span_id"])
+        if rule_of.setdefault(key, row["rule"]) != row["rule"]:
+            raise ValueError(
+                f"ledger line {number}: span {row['span_id']} was reviewed under rule "
+                f"{rule_of[key]} and cannot also be reviewed under {row['rule']}"
+            )
+        rows.append(row)
+    return rows
+
+
+def read_ledger(path: Path) -> list[dict[str, Any]]:
+    if path.is_symlink():
+        raise ValueError("ledger path must not be a symlink")
+    return parse_ledger(path.read_text(encoding="utf-8").split("\n"))
+
+
+def append_ledger(path: Path, rows: Sequence[dict[str, Any]]) -> int:
+    """Append validated rows to an append-only JSONL ledger; nothing is written on any error."""
+    valid = [validate_ledger_row(row) for row in rows]
+    if path.is_symlink():
+        raise ValueError("ledger path must not be a symlink")
+    if path.exists() and path.stat().st_size:
+        with path.open("rb") as handle:
+            handle.seek(-1, os.SEEK_END)
+            if handle.read(1) != b"\n":
+                raise ValueError(
+                    "ledger does not end with a newline; an earlier write was cut short"
+                )
+    payload = "".join(json.dumps(row, sort_keys=True, ensure_ascii=True) + "\n" for row in valid)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(payload)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return len(valid)
+
+
+@dataclass(frozen=True)
+class RuleReview:
+    """What the ledger says about one rule at the current rules version."""
+
+    rule: str
+    reviewed: int
+    confirmed: int
+    rejected: int
+    unsure: int
+    precision: float | None
+    eligible: bool
+
+
+@dataclass(frozen=True)
+class ReviewSummary:
+    rules: dict[str, RuleReview]
+    rows: int
+    stale_rows: int
+
+
+def review_statistics(
+    rows: Iterable[dict[str, Any]], *, rules_version: str = RULES_VERSION
+) -> ReviewSummary:
+    """Per-rule review counts and eligibility from ledger rows.
+
+    A span counts once, by its last verdict in file order. Only rows of `rules_version` count;
+    rows of any other version are reported as stale and ignored. `unsure` and `no` both count as
+    reviewed and not confirmed. The precision test is integer arithmetic.
+    """
+    latest: dict[str, dict[str, Any]] = {}
+    total = stale = 0
+    for raw in rows:
+        row = validate_ledger_row(raw)
+        total += 1
+        if row["rules_version"] != rules_version:
+            stale += 1
+            continue
+        latest[row["span_id"]] = row
+    counts = {rule.id: {verdict: 0 for verdict in VERDICTS} for rule in RULES}
+    for row in latest.values():
+        counts[row["rule"]][row["verdict"]] += 1
+    reviews: dict[str, RuleReview] = {}
+    for rule_id, tally in counts.items():
+        reviewed = sum(tally.values())
+        confirmed = tally["yes"]
+        reviews[rule_id] = RuleReview(
+            rule=rule_id,
+            reviewed=reviewed,
+            confirmed=confirmed,
+            rejected=tally["no"],
+            unsure=tally["unsure"],
+            precision=(confirmed / reviewed) if reviewed else None,
+            eligible=reviewed >= GATE_MIN_REVIEWED
+            and confirmed * 100 >= GATE_MIN_PRECISION_PERCENT * reviewed,
+        )
+    return ReviewSummary(rules=reviews, rows=total, stale_rows=stale)
+
+
+def eligible_rules(summary: ReviewSummary) -> frozenset[str]:
+    return frozenset(rule for rule, review in summary.rules.items() if review.eligible)
+
+
+# --- the review sample -----------------------------------------------------------------------
+
+
+class ReviewSampler:
+    """A deterministic stratified sample of short spans for the owner to confirm or reject.
+
+    One stratum per rule. Within a rule the sample is the `per_rule` distinct span texts with the
+    smallest seeded hash, so it does not depend on the order spans are offered. A span longer than
+    `max_chars` is never offered for review (it is counted, not truncated), so the measured
+    precision describes short spans only. Rows show the span text, its rule and the claim, nothing
+    about the record it came from.
+    """
+
+    def __init__(
+        self,
+        *,
+        per_rule: int = SAMPLE_PER_RULE,
+        max_chars: int = SAMPLE_MAX_CHARS,
+        seed: str = SAMPLE_SEED,
+        exclude: Collection[str] = (),
+    ) -> None:
+        if isinstance(per_rule, bool) or not isinstance(per_rule, int) or per_rule < 1:
+            raise ValueError("per_rule must be a positive integer")
+        if (
+            isinstance(max_chars, bool)
+            or not isinstance(max_chars, int)
+            or not 1 <= max_chars <= SAMPLE_MAX_CHARS
+        ):
+            raise ValueError(f"max_chars must be an integer from 1 to {SAMPLE_MAX_CHARS}")
+        self.per_rule = per_rule
+        self.max_chars = max_chars
+        self.seed = seed
+        self.exclude = frozenset(exclude)
+        self.skipped_long = 0
+        self._heaps: dict[str, list[int]] = {}
+        self._members: dict[str, dict[int, tuple[str, str]]] = {}
+
+    def offer(self, span: AttributedSpan, text: str) -> None:
+        """Consider one span; `text` is exactly the span's own characters."""
+        if span.rule not in RULE_BY_ID or span.author == UNKNOWN or not text.strip():
+            return
+        if len(text) > self.max_chars:
+            self.skipped_long += 1
+            return
+        identifier = span.span_id
+        if identifier in self.exclude:
+            return
+        normalized = " ".join(text.split())
+        digest = hashlib.sha256(f"{self.seed}\n{span.rule}\n{normalized}".encode()).digest()
+        key = int.from_bytes(digest[:8], "big")
+        heap = self._heaps.setdefault(span.rule, [])
+        members = self._members.setdefault(span.rule, {})
+        if key in members:
+            if identifier < members[key][0]:
+                members[key] = (identifier, text)
+        elif len(heap) < self.per_rule:
+            heapq.heappush(heap, -key)
+            members[key] = (identifier, text)
+        elif key < -heap[0]:
+            evicted = -heapq.heapreplace(heap, -key)
+            del members[evicted]
+            members[key] = (identifier, text)
+
+    def rows(self) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        for rule in RULES:
+            members = self._members.get(rule.id, {})
+            for key in sorted(members):
+                identifier, text = members[key]
+                result.append(
+                    {
+                        "schema": SAMPLE_SCHEMA,
+                        "rules_version": RULES_VERSION,
+                        "span_id": identifier,
+                        "rule": rule.id,
+                        "claim": rule.author,
+                        "rule_description": rule.description,
+                        "text": text,
+                        "verdict": None,
+                    }
+                )
+        return result

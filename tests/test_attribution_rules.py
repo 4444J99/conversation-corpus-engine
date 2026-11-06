@@ -2,22 +2,43 @@
 
 from __future__ import annotations
 
+import json
 import random
+from pathlib import Path
 
 import pytest
 
-from conversation_corpus_engine.attribution import text_digest
+from conversation_corpus_engine.attribution import (
+    ATTRIBUTION_SCHEMA,
+    attributed_spans,
+    owner_profile_eligible,
+    text_digest,
+)
 from conversation_corpus_engine.attribution_rules import (
+    GATE_MIN_PRECISION_PERCENT,
+    GATE_MIN_REVIEWED,
+    RULE_BY_ID,
     RULES,
     RULES_VERSION,
+    SAMPLE_MAX_CHARS,
+    SAMPLE_PER_RULE,
+    SAMPLE_SCHEMA,
     AttributedSpan,
     MessageContext,
     RecordInfo,
     RepeatCensus,
+    ReviewSampler,
+    RuleReview,
+    append_ledger,
     attribute_message,
     boilerplate_ranges,
+    eligible_rules,
+    ledger_row,
+    parse_ledger,
     partition_problems,
+    read_ledger,
     record_info,
+    review_statistics,
     rule_agent_family,
     rule_boilerplate,
     rule_code,
@@ -28,6 +49,7 @@ from conversation_corpus_engine.attribution_rules import (
     rule_quote,
     rule_typed_prefix,
     rule_typed_remainder,
+    to_annotation,
 )
 
 CHAT = RecordInfo(provider="chatgpt", kind="chat", wing="ai")
@@ -950,3 +972,327 @@ def test_partition_covers_every_character_once_and_owner_never_outranks_a_higher
     # The generator must exercise both sides, or the property would pass vacuously.
     assert owner_spans >= 30
     assert other_spans >= 100
+
+
+# --- the precision gate and the owner-review ledger -------------------------------------------
+
+STAMP = "2026-01-02T03:04:05Z"
+
+
+def verdict_rows(
+    rule: str, verdicts: list[str], *, start: int = 0, version: str = RULES_VERSION
+) -> list[dict]:
+    return [
+        ledger_row(
+            f"{start + index:032x}", rule, verdict, "reviewer-a", STAMP, rules_version=version
+        )
+        for index, verdict in enumerate(verdicts)
+    ]
+
+
+def gate(rows: list[dict], rule: str = "typed_prefix") -> RuleReview:
+    return review_statistics(rows).rules[rule]
+
+
+def test_gate_constants_state_the_documented_thresholds() -> None:
+    assert GATE_MIN_REVIEWED == 100
+    assert GATE_MIN_PRECISION_PERCENT == 95
+
+
+def test_no_rule_is_eligible_without_a_ledger() -> None:
+    summary = review_statistics([])
+    assert set(summary.rules) == {rule.id for rule in RULES}
+    assert all(not review.eligible and review.reviewed == 0 for review in summary.rules.values())
+    assert eligible_rules(summary) == frozenset()
+
+
+def test_one_hundred_identical_yes_rows_for_one_span_are_one_review() -> None:
+    rows = [ledger_row("a" * 32, "typed_prefix", "yes", "r", STAMP) for _ in range(100)]
+    review = gate(rows)
+    assert review.reviewed == 1 and review.confirmed == 1
+    assert not review.eligible
+
+
+@pytest.mark.parametrize(
+    ("yes", "no", "unsure", "eligible"),
+    [
+        (99, 0, 0, False),
+        (100, 0, 0, True),
+        (95, 5, 0, True),
+        (94, 6, 0, False),
+        (95, 0, 5, True),
+        (94, 0, 6, False),
+        (95, 0, 1, False),
+        (181, 9, 0, True),
+        (180, 10, 0, False),
+        (0, 100, 0, False),
+    ],
+)
+def test_gate_needs_one_hundred_reviewed_spans_and_ninety_five_percent_confirmed(
+    yes: int, no: int, unsure: int, eligible: bool
+) -> None:
+    rows = verdict_rows("typed_prefix", ["yes"] * yes + ["no"] * no + ["unsure"] * unsure)
+    review = gate(rows)
+    assert review.reviewed == yes + no + unsure
+    assert (review.confirmed, review.rejected, review.unsure) == (yes, no, unsure)
+    assert review.eligible is eligible
+    assert review.precision == pytest.approx(yes / (yes + no + unsure))
+
+
+def test_the_last_verdict_for_a_span_wins_and_rules_are_judged_separately() -> None:
+    rows = verdict_rows("typed_prefix", ["yes"] * 100)
+    rows += [ledger_row(f"{0:032x}", "typed_prefix", "no", "r", STAMP)]
+    review = gate(rows)
+    assert (review.reviewed, review.confirmed, review.rejected) == (100, 99, 1)
+    assert review.eligible
+    rows += [ledger_row(f"{index:032x}", "typed_prefix", "no", "r", STAMP) for index in range(1, 6)]
+    assert (gate(rows).confirmed, gate(rows).rejected) == (94, 6)
+    assert not gate(rows).eligible
+    assert not gate(rows, "note_owner").eligible
+    recovered = [*rows, ledger_row(f"{1:032x}", "typed_prefix", "yes", "r", STAMP)]
+    assert (gate(recovered).confirmed, gate(recovered).rejected) == (95, 5)
+    assert gate(recovered).eligible
+
+
+def test_rows_from_another_rules_version_are_ignored_not_counted() -> None:
+    rows = verdict_rows("typed_prefix", ["yes"] * 100, version="cce.attribution-rules@0")
+    summary = review_statistics(rows)
+    assert summary.rules["typed_prefix"].reviewed == 0
+    assert (summary.rows, summary.stale_rows) == (100, 100)
+    assert eligible_rules(summary) == frozenset()
+
+
+def test_eligible_rules_lists_only_rules_that_pass() -> None:
+    rows = verdict_rows("typed_prefix", ["yes"] * 100) + verdict_rows(
+        "note_owner", ["yes"] * 90 + ["no"] * 10, start=1000
+    )
+    assert eligible_rules(review_statistics(rows)) == frozenset({"typed_prefix"})
+
+
+def test_ledger_rows_are_validated_strictly_with_line_numbers() -> None:
+    good = json.dumps(ledger_row("b" * 32, "quote", "yes", "r", STAMP))
+    assert len(parse_ledger([good, "", "   ", good])) == 2
+    bad = {
+        "not json": "{oops",
+        "not an object": "[1]",
+        "schema": json.dumps({**json.loads(good), "schema": "x"}),
+        "verdict": json.dumps({**json.loads(good), "verdict": "maybe"}),
+        "reviewer": json.dumps({**json.loads(good), "reviewer": " "}),
+        "time": json.dumps({**json.loads(good), "reviewed_at": "2026-01-02 03:04:05"}),
+        "span id": json.dumps({**json.loads(good), "span_id": "xyz"}),
+        "unknown rule": json.dumps({**json.loads(good), "rule": "nope"}),
+        "extra": json.dumps({**json.loads(good), "note": "x"}),
+    }
+    for name, line in bad.items():
+        with pytest.raises(ValueError, match=r"ledger line 3"):
+            parse_ledger([good, "", line])
+        assert name
+
+
+def test_a_span_cannot_be_reviewed_under_two_different_rules() -> None:
+    lines = [
+        json.dumps(ledger_row("c" * 32, "quote", "yes", "r", STAMP)),
+        json.dumps(ledger_row("c" * 32, "code", "yes", "r", STAMP)),
+    ]
+    with pytest.raises(ValueError, match="ledger line 2"):
+        parse_ledger(lines)
+
+
+def test_ledger_row_refuses_bad_input_and_never_reads_the_clock() -> None:
+    for kwargs in (
+        {"verdict": "y"},
+        {"reviewer": ""},
+        {"reviewed_at": "yesterday"},
+        {"span_id": "short"},
+        {"rule": "unattributed"},
+    ):
+        arguments = {
+            "span_id": "d" * 32,
+            "rule": "quote",
+            "verdict": "yes",
+            "reviewer": "r",
+            "reviewed_at": STAMP,
+        } | kwargs
+        with pytest.raises(ValueError, match="ledger"):
+            ledger_row(**arguments)
+
+
+def test_ledger_is_append_only_jsonl_and_refuses_symlinks(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.jsonl"
+    first = verdict_rows("quote", ["yes", "no"])
+    assert append_ledger(path, first) == 2
+    assert append_ledger(path, verdict_rows("quote", ["yes"], start=5)) == 1
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert [json.loads(line)["span_id"] for line in lines] == [
+        f"{0:032x}",
+        f"{1:032x}",
+        f"{5:032x}",
+    ]
+    assert read_ledger(path)[:2] == first
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="ledger"):
+        append_ledger(path, [{**first[0], "verdict": "bogus"}])
+    assert path.read_bytes() == before
+    link = tmp_path / "link.jsonl"
+    link.symlink_to(path)
+    with pytest.raises(ValueError, match="symlink"):
+        append_ledger(link, first)
+    with pytest.raises(ValueError, match="symlink"):
+        read_ledger(link)
+    with pytest.raises(FileNotFoundError):
+        read_ledger(tmp_path / "missing.jsonl")
+
+
+# --- annotations in the existing cce.span-attribution.v1 form ---------------------------------
+
+
+def annotate(text: str, **kwargs) -> tuple[list[AttributedSpan], dict]:
+    spans = run(text, **{k: v for k, v in kwargs.items() if k in {"record", "typed", "channel"}})
+    annotation = to_annotation(
+        text,
+        spans,
+        owner_id=kwargs.get("owner_id"),
+        eligible=kwargs.get("eligible", frozenset()),
+    )
+    return spans, annotation
+
+
+MIXED = "My own words.\n\n> a quoted line\n\n<system-reminder>x</system-reminder> and more of mine."
+
+
+def test_annotation_validates_against_the_existing_contract_and_is_never_eligible_by_default() -> (
+    None
+):
+    spans, annotation = annotate(MIXED, owner_id="rob")
+    assert annotation["schema"] == ATTRIBUTION_SCHEMA
+    assert annotation["text_digest"] == text_digest(MIXED)
+    checked = attributed_spans(MIXED, annotation)
+    assert [(s["start"], s["end"], s["author"]) for s in checked if s["author"] != "unknown"] == [
+        (span.start, span.end, span.author) for span in spans if span.author != "unknown"
+    ]
+    assert all(span["profile_eligible"] is False for span in checked)
+    assert not any(owner_profile_eligible(span, "rob") for span in checked)
+    owner = next(span for span in checked if span["author"] == "owner")
+    assert owner["author_id"] == "rob" and owner["assertion_status"] == "asserted"
+    assert any(item.startswith(f"{RULES_VERSION}:rule:typed_prefix") for item in owner["evidence"])
+    assert any(item.startswith("span:") for item in owner["evidence"])
+    assert all(span["author_id"] is None for span in checked if span["author"] != "owner")
+
+
+def test_unknown_spans_are_left_to_the_contract_to_fill() -> None:
+    _, annotation = annotate(MIXED, owner_id="rob")
+    assert all(span["author"] != "unknown" for span in annotation["spans"])
+    covered = sum(span["end"] - span["start"] for span in annotation["spans"])
+    assert covered < len(MIXED)
+    assert sum(len(s["text"]) for s in attributed_spans(MIXED, annotation)) == len(MIXED)
+
+
+def test_only_owner_spans_of_a_gate_passing_rule_with_an_owner_id_become_eligible() -> None:
+    _, annotation = annotate(MIXED, owner_id="rob", eligible=frozenset({"typed_prefix", "quote"}))
+    checked = attributed_spans(MIXED, annotation)
+    flagged = {
+        span["evidence"][0].split(":rule:")[1]: span["profile_eligible"]
+        for span in checked
+        if span["author"] != "unknown"
+    }
+    assert flagged["typed_prefix"] is True
+    assert flagged["quote"] is False
+    assert flagged["inline_injection"] is False
+    assert {span["text"] for span in checked if owner_profile_eligible(span, "rob")} == {
+        "My own words.",
+        "and more of mine.",
+    }
+    _, anonymous = annotate(MIXED, eligible=frozenset({"typed_prefix"}))
+    assert not any(span["profile_eligible"] for span in anonymous["spans"])
+    _, other_rule = annotate(MIXED, owner_id="rob", eligible=frozenset({"note_owner"}))
+    assert not any(span["profile_eligible"] for span in other_rule["spans"])
+
+
+def test_annotation_refuses_spans_of_a_different_text() -> None:
+    spans = run("some words")
+    with pytest.raises(ValueError, match="partition"):
+        to_annotation("other words", spans)
+
+
+# --- the review sample -----------------------------------------------------------------------
+
+
+def offer_all(sampler: ReviewSampler, texts: list[str], **kwargs) -> None:
+    for text in texts:
+        for span in run(text, **kwargs):
+            sampler.offer(span, text[span.start : span.end])
+
+
+def many_quotes(count: int) -> list[str]:
+    return [f"> quoted line number {index} from elsewhere" for index in range(count)]
+
+
+def test_sample_draws_up_to_n_short_distinct_spans_per_rule() -> None:
+    sampler = ReviewSampler(per_rule=10)
+    long_quote = "> " + "x" * 300
+    offer_all(sampler, [*many_quotes(50), long_quote, *many_quotes(5)])
+    offer_all(sampler, [f"owner sentence number {index}" for index in range(40)])
+    rows = sampler.rows()
+    by_rule = {
+        rule: [row for row in rows if row["rule"] == rule] for rule in {r["rule"] for r in rows}
+    }
+    assert set(by_rule) == {"quote", "typed_prefix"}
+    assert len(by_rule["quote"]) == len(by_rule["typed_prefix"]) == 10
+    assert all(len(row["text"]) <= SAMPLE_MAX_CHARS for row in rows)
+    assert len({row["text"] for row in rows}) == len(rows)
+    assert sampler.skipped_long == 1
+
+
+def test_sample_rows_show_only_the_span_its_rule_and_a_blank_verdict() -> None:
+    sampler = ReviewSampler(per_rule=3)
+    offer_all(sampler, many_quotes(3))
+    (row, *_) = sampler.rows()
+    assert set(row) == {
+        "schema",
+        "rules_version",
+        "span_id",
+        "rule",
+        "claim",
+        "rule_description",
+        "text",
+        "verdict",
+    }
+    assert row["schema"] == SAMPLE_SCHEMA and row["verdict"] is None
+    assert (row["rule"], row["claim"]) == ("quote", "third_party")
+    assert row["rule_description"] == RULE_BY_ID["quote"].description
+    assert row["text"].startswith("> quoted line number")
+
+
+def test_sample_is_deterministic_and_independent_of_offer_order() -> None:
+    texts = many_quotes(60) + [f"I typed sentence {index} myself" for index in range(60)]
+    first = ReviewSampler(per_rule=7)
+    offer_all(first, texts)
+    shuffled = list(texts)
+    random.Random(7).shuffle(shuffled)
+    second = ReviewSampler(per_rule=7)
+    offer_all(second, shuffled)
+    assert first.rows() == second.rows()
+    different = ReviewSampler(per_rule=7, seed="another-seed")
+    offer_all(different, texts)
+    assert different.rows() != first.rows()
+    assert [row["rule"] for row in first.rows()] == ["quote"] * 7 + ["typed_prefix"] * 7
+
+
+def test_sample_skips_already_reviewed_spans_and_whitespace_and_unknown_spans() -> None:
+    sampler = ReviewSampler(per_rule=100)
+    offer_all(sampler, many_quotes(5))
+    reviewed = {row["span_id"] for row in sampler.rows()[:2]}
+    again = ReviewSampler(per_rule=100, exclude=reviewed)
+    offer_all(again, many_quotes(5))
+    assert {row["span_id"] for row in again.rows()}.isdisjoint(reviewed)
+    assert len(again.rows()) == 3
+    empty = ReviewSampler()
+    offer_all(empty, ["   \n\n  ", "plain words on an unclaimed channel"], channel="project")
+    assert empty.rows() == []
+
+
+def test_sampler_validates_its_parameters() -> None:
+    for kwargs in ({"per_rule": 0}, {"per_rule": True}, {"max_chars": 0}, {"max_chars": 241}):
+        with pytest.raises(ValueError, match="per_rule|max_chars"):
+            ReviewSampler(**kwargs)
+    assert SAMPLE_PER_RULE == 100 and SAMPLE_MAX_CHARS == 240
