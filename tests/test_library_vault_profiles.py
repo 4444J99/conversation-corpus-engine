@@ -15,6 +15,7 @@ from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.attributed_knowledge import ZETTEL_SCHEMA
 from conversation_corpus_engine.library_export import export_library, verify_export
 from conversation_corpus_engine.library_store import Library
+from conversation_corpus_engine.library_vault import _href as vault_href
 from conversation_corpus_engine.library_vault_gate import VaultCaps, measure_vault
 
 KIB = 1024
@@ -101,6 +102,24 @@ def test_full_drops_block_notes_shards_folders_and_caps_hubs(tmp_path: Path) -> 
             assert set(archive.namelist()) == set(manifest["notion_members"])
             assert "vault/Home.md" in archive.namelist()
         assert verify_export(destination) == []
+
+
+@pytest.mark.parametrize(
+    ("source", "target", "expected"),
+    [
+        ("vault/Home.md", "vault/hubs/a.md", "hubs/a.md"),
+        ("vault/hubs/a.md", "vault/Home.md", "../Home.md"),
+        ("vault/records/b1/x.md", "vault/hubs/b2/y.md", "../../hubs/b2/y.md"),
+        ("vault/records/x.md", "agent-entry.md", "../../agent-entry.md"),
+        ("Home.md", "cards/a.md", "cards/a.md"),
+        ("cards/a.md", "Home.md", "../Home.md"),
+        ("vault/a.md", "vault/a.md", "a.md"),
+    ],
+)
+def test_note_links_are_relative_paths_between_two_places_below_one_root(
+    source: str, target: str, expected: str
+) -> None:
+    assert vault_href(source, target) == expected
 
 
 def test_a_small_full_vault_keeps_flat_record_paths(tmp_path: Path) -> None:

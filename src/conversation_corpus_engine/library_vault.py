@@ -21,10 +21,10 @@ line, and every hub is paginated at the hub entry cap. Nothing here writes a fil
 
 from __future__ import annotations
 
-import posixpath
 from collections import defaultdict
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +48,6 @@ PROFILE_NONE = "none"
 PROFILE_CARDS = "cards"
 PROFILE_FULL = "full"
 VAULT_PROFILES = (PROFILE_NONE, PROFILE_CARDS, PROFILE_FULL)
-DEFAULT_CARD_NOTES = DEFAULT_CAPS.vault_notes_warn
 INDEXED_FACETS = ("lane", "kind", "provider")
 # Home, the two wing hubs and the three facet index hubs exist even for an empty library.
 HUB_FLOOR = 1 + len(WINGS) + len(INDEXED_FACETS)
@@ -84,8 +83,22 @@ def _join(*parts: str) -> str:
 
 
 def _href(source: str, target: str) -> str:
-    """Relative link from the note at ``source`` to the file at ``target`` (both from one root)."""
-    return posixpath.relpath(target, posixpath.dirname(source) or ".")
+    """Relative link from the note at ``source`` to the file at ``target`` (both from one root).
+
+    Purely lexical: both paths are relative to the vault's output root and contain no ``..``.
+    """
+    start = source.split("/")[:-1]
+    parts = target.split("/")
+    shared = 0
+    while shared < min(len(start), len(parts) - 1) and start[shared] == parts[shared]:
+        shared += 1
+    return "/".join([".."] * (len(start) - shared) + parts[shared:])
+
+
+@lru_cache(maxsize=65536)
+def _row_label(title: str) -> str:
+    """The inert, clipped link text for a record title (repeated for every facet it is in)."""
+    return plain(clip(" ".join(title.split()), LABEL_CHARS)[0]) or "Untitled"
 
 
 @dataclass(frozen=True)
@@ -135,7 +148,7 @@ def _hubs(
         label = WINGS[value] if facet == "wing" else value
         items = [
             _Item(
-                plain(clip(" ".join(str(row["title"]).split()), LABEL_CHARS)[0]) or "Untitled",
+                _row_label(str(row["title"])),
                 note_path(row),
                 f"{row['uid']} - {plain(row['body_status'])}",
             )
@@ -584,7 +597,8 @@ def _plan_cards(
     limit_notes: int | None,
     check_callback: Callable[..., Any] | None,
 ) -> VaultPlan:
-    limit = DEFAULT_CARD_NOTES if limit_notes is None else limit_notes
+    # By default a card vault stays under the standard's warning line, so it is also clean.
+    limit = caps.vault_notes_warn if limit_notes is None else limit_notes
     if isinstance(limit, bool) or not isinstance(limit, int):
         raise VaultRefused("limit_notes must be an integer number of notes")
     if limit > caps.vault_notes_fail:

@@ -33,6 +33,7 @@ def synthetic_library(
     *,
     lines: Callable[[int], int] = lambda number: 4,
     name: str = "library.sqlite",
+    index: bool = True,
 ) -> Library:
     """``count`` records over three providers and both wings; later numbers are newer."""
     library = Library.create(tmp_path / name)
@@ -46,7 +47,7 @@ def synthetic_library(
                 title=f"Record {number:05d} about lattices",
                 kind=kind,
                 created="2026-01-01T00:00:00Z",
-                updated=f"2026-01-01T00:{number // 60:02d}:{number % 60:02d}Z",
+                updated=f"2026-01-01T{number:07d}",
                 messages=[
                     Message(
                         role="user",
@@ -58,5 +59,6 @@ def synthetic_library(
                 extra={"wing": wing, "lane": lane},
             )
         )
-    library.index_blocks()
+    if index:
+        library.index_blocks()
     return library
