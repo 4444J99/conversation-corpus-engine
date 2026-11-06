@@ -24,7 +24,9 @@ from .library_documents import iter_documents
 from .library_native import iter_estate
 from .library_resume import DISK_FLOOR, copy_qualified_database, prepare_resume
 from .library_store import LIBRARY_SCHEMA, SCHEMA_SQL, Library, digest_json
+from .library_vault import PROFILE_NONE, VAULT_PROFILES
 
+DEFAULT_VAULT_PROFILE = PROFILE_NONE
 SOURCES_SCHEMA = "cce.library-sources.v1"
 REPORT_SCHEMA = "cce.library-build.v1"
 DIRECTORY = "library-all"
@@ -170,8 +172,19 @@ def build_library(
     project_root: Path,
     store_root: Path,
     progress: Any = None,
+    vault_profile: str = DEFAULT_VAULT_PROFILE,
 ) -> dict[str, Any]:
-    """Build a private immutable candidate; publication is a separate explicit operation."""
+    """Build a private immutable candidate; publication is a separate explicit operation.
+
+    ``vault_profile`` chooses the reading vault written beside the database: ``none`` (the
+    default) writes no vault at all, ``cards`` a small capped card vault and ``full`` whole
+    records split into capped linked parts. The index, graph, CSV and entry note are written
+    under every profile, and the profile is recorded in the report and the export manifest.
+    """
+    if vault_profile not in VAULT_PROFILES:
+        raise ValueError(
+            f"unknown vault profile {vault_profile!r}; choose one of {', '.join(VAULT_PROFILES)}"
+        )
     limits = _validate_manifest(manifest)
     resume_mode = manifest.get("resume_mode", "ingested")
     reuse_index = resume_mode in {"export", "indexed"}
@@ -255,6 +268,7 @@ def build_library(
         "generation": str(destination),
         "source_manifest_hash": digest_json(manifest),
         "base_pointer": previous_pointer,
+        "vault_profile": vault_profile,
         "findings": [],
         "sources": [],
         "accepted_observations": 0,
@@ -578,7 +592,7 @@ def build_library(
             emit({"stage": "export", "records": report["status"]["records"]})
             report["phase"] = "exporting"
             report["exports"] = library_export.export_library(
-                library, destination, check_callback=check_bound
+                library, destination, check_callback=check_bound, vault_profile=vault_profile
             )
         check_bound()
         emit(
