@@ -229,6 +229,34 @@ def test_the_key_may_follow_the_final_url():
     assert web_capture.check_row(row, now=NOW) is row
 
 
+@pytest.mark.parametrize(
+    ("url", "key"),
+    [
+        # The capture tool's normalized key drops a leading "www." and lowercases the rest.
+        (
+            "https://www.example.com/Articles/Orchard/?utm=1#top",
+            "https://example.com/articles/orchard",
+        ),
+        ("https://www.example.com", "https://example.com/"),
+        ("http://WWW.Example.com:80/a/", "http://example.com:80/a"),
+    ],
+)
+def test_a_www_page_keeps_its_row_when_the_key_drops_www(url, key):
+    row = make_row(url, "text", "2026-03-01T00:00:00Z", key=key)
+    assert web_capture.check_row(row, now=NOW) is row
+
+
+def test_dropping_www_does_not_make_another_host_match():
+    row = make_row("https://www.example.com/a", "text", "2026-03-01T00:00:00Z")
+    forged = {
+        **row,
+        "key": "https://example.org/a",
+        "id": web_capture.page_id("https://example.org/a"),
+    }
+    with pytest.raises(web_capture.RowRefused, match="key does not match"):
+        web_capture.check_row(forged, now=NOW)
+
+
 def test_a_stamp_from_the_future_is_refused_beyond_a_small_skew():
     base = make_row(*PAGES[0][:1], PAGES[0][2], "2099-01-01T00:00:00Z")
     with pytest.raises(web_capture.RowRefused, match="in the future"):

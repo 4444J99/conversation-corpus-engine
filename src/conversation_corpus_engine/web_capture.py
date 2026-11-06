@@ -143,6 +143,8 @@ def _locator(url: str) -> tuple[str, str] | None:
     if scheme not in ("http", "https") or not parts.hostname:
         return None
     host = parts.hostname.lower()
+    if host.startswith("www."):  # the capture tool's normalized key drops it too
+        host = host[4:]
     if port is not None and port != (443 if scheme == "https" else 80):
         host = f"{host}:{port}"
     return host, parts.path.lower().rstrip("/")
