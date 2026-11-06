@@ -28,6 +28,15 @@ ECHO_ANSWER = " ".join(
     for i in range(12)
 )
 ECHO_QUESTION = "Can you double check this answer you gave earlier?"
+PROBE_PASTED = (
+    "Here's what I found after reviewing the repository.\n\n"
+    "The parser module handles three cases. First, it tokenizes the input stream. "
+    "Second, it builds an AST. Third, it validates the result against the schema.\n\n"
+    "I'd recommend splitting the validator into its own module. "
+    "Let me know if you want me to proceed."
+)
+PROBE_QUESTION = "can you double check this answer you gave earlier?"
+PROBE_REMINDER = "<system-reminder>The user opened file x.py</system-reminder>"
 CLI_TURN = "Rename the parser module.\n\nHarness appended context nobody typed."
 CLI_TYPED = len("Rename the parser module.")
 NOTE_TURN = "My thoughts.\n\n> pasted from a website\n\nMore thoughts."
@@ -110,6 +119,18 @@ def conversations(
                 typed("e0", "Review the repository."),
                 Message(role="assistant", channel="reply", id="e1", text=ECHO_ANSWER),
                 typed("e2", f"{ECHO_QUESTION}\n\n{ECHO_ANSWER}"),
+            ],
+            extra={"wing": "ai", "lane": "coding", "session_kind": "main"},
+        ),
+        Conversation(
+            provider="claudecode",
+            source_id="cli-probe",
+            title="CLI probe",
+            kind="session",
+            messages=[
+                typed("p0", "Review the repository."),
+                Message(role="assistant", channel="reply", id="p1", text=PROBE_PASTED),
+                typed("p2", f"{PROBE_QUESTION}\n\n{PROBE_PASTED}\n\n{PROBE_REMINDER}"),
             ],
             extra={"wing": "ai", "lane": "coding", "session_kind": "main"},
         ),

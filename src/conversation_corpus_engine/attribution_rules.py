@@ -24,6 +24,7 @@ module reads the clock or the filesystem except the explicit ledger helpers.
 
 from __future__ import annotations
 
+import bisect
 import fcntl
 import functools
 import hashlib
@@ -858,42 +859,58 @@ def rule_boilerplate(context: MessageContext) -> list[Claim]:
 
 # --- pasted-back assistant text ---------------------------------------------------------------
 
-DEFAULT_ECHO_MIN_PARAGRAPH = 600
+DEFAULT_ECHO_MIN_PARAGRAPH = 150
+DEFAULT_ECHO_MIN_RUN = 300
 DEFAULT_ECHO_MIN_SHARED = 100
 DEFAULT_ECHO_HISTORY = 400_000
+_TOKEN = re.compile(r"\S+")
 
 
 class AssistantEcho:
     """Finds text a user turn pastes back from an earlier assistant turn of its conversation.
 
     Feed the conversation's turns in order: `add_assistant` for each assistant reply and
-    `pasted_back` for each user turn. A paragraph of the user turn that is at least
-    `min_paragraph` characters long and shares at least `min_shared` characters (after
-    whitespace normalization) with an earlier assistant turn is returned as a range. Only the
-    most recent `history_limit` normalized characters of assistant text are remembered, and the
-    index is built only when a user turn has a paragraph long enough to need it.
+    `pasted_back` for each user turn. Whitespace is normalized, and a stretch of `min_shared`
+    characters that also occurs in an earlier assistant turn is a match (the comparison is by
+    64-bit hash; a collision would only make a paste look more pasted, never less). Two kinds of
+    candidate are returned as ranges:
+
+    * a paragraph of at least `min_paragraph` characters that contains a match;
+    * a run of adjacent paragraphs, each touched by a match, whose joined text is at least
+      `min_run` characters (a pasted answer is often several short paragraphs).
+
+    A paragraph that only quotes a short phrase (fewer than `min_shared` shared characters) is
+    never a candidate, and neither is a short paragraph on its own. Only the most recent
+    `history_limit` normalized characters of assistant text are remembered.
     """
 
     def __init__(
         self,
         *,
         min_paragraph: int = DEFAULT_ECHO_MIN_PARAGRAPH,
+        min_run: int = DEFAULT_ECHO_MIN_RUN,
         min_shared: int = DEFAULT_ECHO_MIN_SHARED,
         history_limit: int = DEFAULT_ECHO_HISTORY,
     ) -> None:
         for name, value in (
             ("min_paragraph", min_paragraph),
+            ("min_run", min_run),
             ("min_shared", min_shared),
             ("history_limit", history_limit),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
         self.min_paragraph = min_paragraph
+        self.min_run = min_run
         self.min_shared = min_shared
         self.history_limit = history_limit
         self._turns: list[str] = []
         self._size = 0
         self._index: set[int] | None = None
+
+    def _hashes(self, normalized: str) -> Iterator[int]:
+        width = self.min_shared
+        return (hash(normalized[i : i + width]) for i in range(len(normalized) - width + 1))
 
     def add_assistant(self, text: str) -> None:
         normalized = " ".join(text.split())
@@ -901,49 +918,91 @@ class AssistantEcho:
             return
         self._turns.append(normalized)
         self._size += len(normalized)
+        evicted = False
         while self._size > self.history_limit and len(self._turns) > 1:
             self._size -= len(self._turns.pop(0))
-        self._index = None
+            evicted = True
+        if evicted:
+            self._index = None
+        elif self._index is not None:
+            self._index.update(self._hashes(normalized))
 
     def _windows(self) -> set[int]:
         if self._index is None:
-            width = self.min_shared
-            self._index = {
-                hash(turn[i : i + width])
-                for turn in self._turns
-                for i in range(len(turn) - width + 1)
-            }
+            self._index = {h for turn in self._turns for h in self._hashes(turn)}
         return self._index
 
-    def _shares(self, normalized: str) -> bool:
-        width = self.min_shared
-        if not self._turns or len(normalized) < width:
-            return False
-        index = self._windows()
-        for i in range(len(normalized) - width + 1):
-            window = normalized[i : i + width]
-            if hash(window) in index and any(window in turn for turn in self._turns):
-                return True
-        return False
-
     def pasted_back(self, text: str) -> tuple[Range, ...]:
-        claimed: list[Range] = []
         if not self._turns:
             return ()
-        for start, end in _paragraphs(_lines(text)):
-            piece = text[start:end]
-            stripped = piece.strip()
-            if len(stripped) < self.min_paragraph:
+        paragraphs = _paragraphs(_lines(text))
+        tokens = [(match.start(), match.end()) for match in _TOKEN.finditer(text)]
+        width = self.min_shared
+        normalized = " ".join(text[start:end] for start, end in tokens)
+        if not paragraphs or len(normalized) < width:
+            return ()
+        index = self._windows()
+        hits = [i for i, h in enumerate(self._hashes(normalized)) if h in index]
+        if not hits:
+            return ()
+        starts, position = [], 0
+        for start, end in tokens:
+            starts.append(position)
+            position += end - start + 1
+        # The normalized range of each paragraph, from the tokens it holds.
+        spans: list[Range | None] = []
+        cursor = 0
+        for first_char, last_char in paragraphs:
+            while cursor < len(tokens) and tokens[cursor][0] < first_char:
+                cursor += 1
+            first = cursor
+            while cursor < len(tokens) and tokens[cursor][1] <= last_char:
+                cursor += 1
+            if first == cursor:
+                spans.append(None)
+            else:
+                last = cursor - 1
+                spans.append((starts[first], starts[last] + tokens[last][1] - tokens[last][0]))
+
+        def touched(span: Range) -> bool:
+            low = bisect.bisect_right(hits, span[0] - width)
+            return low < len(hits) and hits[low] < span[1]
+
+        def holds_match(span: Range) -> bool:
+            low = bisect.bisect_left(hits, span[0])
+            return low < len(hits) and hits[low] + width <= span[1]
+
+        def original(first: int, last: int) -> Range:
+            start, end = paragraphs[first]
+            body = text[start : paragraphs[last][1]]
+            lead = len(body) - len(body.lstrip())
+            return start + lead, start + len(body.rstrip())
+
+        claimed: list[Range] = []
+        index_of = 0
+        while index_of < len(paragraphs):
+            if spans[index_of] is None or not touched(spans[index_of]):
+                index_of += 1
                 continue
-            if self._shares(" ".join(stripped.split())):
-                lead = len(piece) - len(piece.lstrip())
-                claimed.append((start + lead, start + lead + len(stripped)))
+            stop = index_of
+            while stop < len(paragraphs) and spans[stop] is not None and touched(spans[stop]):
+                stop += 1
+            joined = spans[stop - 1][1] - spans[index_of][0]
+            if stop - index_of >= 2 and joined >= self.min_run:
+                claimed.append(original(index_of, stop - 1))
+            else:
+                claimed.extend(
+                    original(p, p)
+                    for p in range(index_of, stop)
+                    if spans[p][1] - spans[p][0] >= self.min_paragraph and holds_match(spans[p])
+                )
+            index_of = stop
         return tuple(claimed)
 
 
 def rule_pasted_back(context: MessageContext) -> list[Claim]:
-    """A long paragraph a user turn pastes back from an earlier assistant turn was written by the
-    assistant, not by the person."""
+    """Text a user turn pastes back from an earlier assistant turn was written by the assistant,
+    not by the person."""
     return [(start, end, "pasted-back") for start, end in context.pasted_back]
 
 

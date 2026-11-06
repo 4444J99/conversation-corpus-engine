@@ -310,7 +310,7 @@ so no higher rule can lose a character to an owner claim.
 | 7 | `log_trace` | agent | timestamped log lines, Python tracebacks, stack traces (an exception header with its frame, or two frames, even at two lines) and runs of three or more tool-output shaped lines |
 | 8 | `pasted_block` | third_party | a pasted email (header run, original-message or forward marker, on-date-wrote line), to the end of the message because its extent cannot be proven, and markdown tables with a separator row |
 | 9 | `boilerplate` | third_party | later occurrences of a long text that repeats verbatim after whitespace normalization |
-| 10 | `pasted_back` | third_party | a paragraph of 600 or more characters that shares 100 or more characters (after whitespace normalization) with an earlier assistant turn of the same conversation |
+| 10 | `pasted_back` | third_party | text a user turn pastes back from an earlier assistant turn of the same conversation: a paragraph of 150 or more characters that shares 100 or more characters (after whitespace normalization) with it, or a run of adjacent paragraphs, each touched by such a match, whose joined text is 300 or more characters |
 | 11 | `ambiguous` | unknown | a paragraph with an odd number of ASCII double quotes; and a note or document of the owner's own library that states an AI had a hand in it anywhere (generated, written, drafted, summarised or edited by or with an AI or a named assistant; with the help of; as an AI; AI-generated) |
 | 12 | `typed_prefix` | owner | the first `typed_chars` characters of a user turn on the `typed` channel |
 | 13 | `note_owner` | owner | the body of a note or document in an authored-library family (Apple Notes, Drive, authored documents) |
@@ -323,8 +323,9 @@ message of a note makes every message of that record unknown, because section bo
 be proven; there is no window, the whole text is searched. Two consequences differ from the
 archive's own author column, which is looser: the slash-command wrapper blocks are machine here
 although the person typed the command, and a CLI turn that begins with an injected tag is machine
-as a whole. Rule 10 is paragraph based: a long answer pasted back as several short paragraphs is
-not caught by it and is contained by the length strata below.
+as a whole. Rule 10 never fires on a paragraph that merely quotes a short phrase (fewer than 100
+shared characters), nor on a short paragraph on its own; its thresholds are parameters of
+`AssistantEcho`. The length strata below stay as defence in depth for anything it misses.
 
 Boilerplate is decided by a census over the slice that is scanned. A paragraph, or a whole
 multi-paragraph message, of at least 200 characters (`--repeat-min-chars`) that occurs at least

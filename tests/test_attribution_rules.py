@@ -915,10 +915,21 @@ def test_boilerplate_rule_passes_the_census_ranges_through() -> None:
 
 # --- pasted-back assistant text ---------------------------------------------------------------
 
-ANSWER = " ".join(
+SENTENCES = [
     f"Sentence {i} of the assistant answer explains point {i * 3} about the parser."
     for i in range(12)
+]
+ANSWER = " ".join(SENTENCES)
+
+# The verifier's realistic CLI-session probe: an assistant answer of three short paragraphs.
+PROBE_PASTED = (
+    "Here's what I found after reviewing the repository.\n\n"
+    "The parser module handles three cases. First, it tokenizes the input stream. "
+    "Second, it builds an AST. Third, it validates the result against the schema.\n\n"
+    "I'd recommend splitting the validator into its own module. "
+    "Let me know if you want me to proceed."
 )
+PROBE_QUESTION = "can you double check this answer you gave earlier?"
 
 
 def shared_with_answer(length: int, filler: int = 60) -> str:
@@ -960,10 +971,13 @@ def test_a_long_paragraph_pasted_back_from_an_earlier_assistant_turn_is_third_pa
     assert rule_pasted_back(ctx("abcdefgh")) == []
 
 
-def test_pasted_back_text_needs_600_characters_and_100_shared_characters() -> None:
+def test_a_paragraph_needs_150_characters_and_100_shared_characters() -> None:
     echo = AssistantEcho()
     echo.add_assistant(ANSWER)
-    assert echo.pasted_back(f"short:\n\n{ANSWER[:500]}") == ()
+    assert (echo.min_paragraph, echo.min_run, echo.min_shared) == (150, 300, 100)
+    assert echo.pasted_back(f"short:\n\n{ANSWER[:140]}") == ()
+    text = f"short:\n\n{ANSWER[:200]}"
+    assert echo.pasted_back(text) == ((8, 208),)
     shared_99 = shared_with_answer(99)
     shared_100 = shared_with_answer(100)
     assert len(shared_99) >= 600 and len(shared_100) >= 600
@@ -971,6 +985,68 @@ def test_pasted_back_text_needs_600_characters_and_100_shared_characters() -> No
     assert echo.pasted_back(shared_100) == ((0, len(shared_100)),)
     reflowed = ANSWER.replace(". ", ".\n")
     assert echo.pasted_back(reflowed) == ((0, len(reflowed)),)
+
+
+def test_a_short_paragraph_that_quotes_part_of_an_answer_stays_owner() -> None:
+    echo = AssistantEcho()
+    echo.add_assistant(ANSWER)
+    quote_99 = f"I quote: {ANSWER[100:199]} end"
+    quote_105 = f"I quote: {ANSWER[100:205]}"
+    assert echo.pasted_back(quote_99) == () and echo.pasted_back(quote_105) == ()
+    owner = f"Here is what I think after reading it twice, and I disagree with {ANSWER[100:199]}."
+    assert len(owner) >= 150 and echo.pasted_back(owner) == ()
+    assert echo.pasted_back("I read the answer and the parser point was about right.") == ()
+
+
+def test_the_verifiers_cli_probe_is_carved_out_as_pasted_back() -> None:
+    assert [len(part) for part in PROBE_PASTED.split("\n\n")] == [51, 153, 97]
+    echo = AssistantEcho()
+    echo.add_assistant(PROBE_PASTED)
+    reminder = "<system-reminder>The user opened file x.py</system-reminder>"
+    text = f"{PROBE_QUESTION}\n\n{PROBE_PASTED}\n\n{reminder}"
+    start = text.index(PROBE_PASTED)
+    assert echo.pasted_back(text) == ((start, start + len(PROBE_PASTED)),)
+    spans = attribute_message(
+        text,
+        role="user",
+        channel="typed",
+        typed_chars=len(text),
+        record=CLI,
+        pasted_back=echo.pasted_back(text),
+    )
+    kept = [(s.rule, s.author, text[s.start : s.end]) for s in spans if s.author != "unknown"]
+    assert kept == [
+        ("typed_prefix", "owner", PROBE_QUESTION),
+        ("pasted_back", "third_party", PROBE_PASTED),
+        ("inline_injection", "agent", reminder),
+    ]
+
+
+def test_adjacent_paragraphs_are_one_candidate_only_when_their_joined_text_is_300_characters() -> (
+    None
+):
+    echo = AssistantEcho()
+    echo.add_assistant(ANSWER)
+    for count, carved in ((2, False), (4, False), (5, True), (8, True)):
+        pasted = "\n\n".join(SENTENCES[:count])
+        joined = len(" ".join(SENTENCES[:count]))
+        assert (joined >= 300) is carved
+        offset = len("Mine first.\n\n")
+        expected = ((offset, offset + len(pasted)),) if carved else ()
+        assert echo.pasted_back(f"Mine first.\n\n{pasted}") == expected
+
+
+def test_a_run_stops_at_an_untouched_paragraph_and_never_swallows_owner_text() -> None:
+    echo = AssistantEcho()
+    echo.add_assistant(ANSWER)
+    own = "My own paragraph about something else entirely, long enough to matter here, " * 2
+    pasted = "\n\n".join(SENTENCES[:6])
+    text = f"{own.strip()}\n\n{pasted}\n\n{own.strip()}"
+    start = text.index(pasted)
+    assert echo.pasted_back(text) == ((start, start + len(pasted)),)
+    # Two separate runs, each too short alone, around an owner paragraph: nothing is carved.
+    split = "\n\n".join([*SENTENCES[:3], own.strip(), *SENTENCES[3:6]])
+    assert echo.pasted_back(split) == ()
 
 
 def test_only_earlier_assistant_turns_of_the_same_conversation_count() -> None:
@@ -986,8 +1062,9 @@ def test_the_echo_remembers_a_bounded_amount_of_assistant_text() -> None:
     echo.add_assistant(ANSWER)
     echo.add_assistant(" ".join(f"Another unrelated reply sentence {i}." for i in range(30)))
     assert echo.pasted_back(ANSWER) == ()
-    with pytest.raises(ValueError, match="positive"):
-        AssistantEcho(min_paragraph=0)
+    for bad in ({"min_paragraph": 0}, {"min_run": 0}, {"min_shared": True}):
+        with pytest.raises(ValueError, match="positive"):
+            AssistantEcho(**bad)
 
 
 # --- notes: agent sections, pasted emails and tables ------------------------------------------

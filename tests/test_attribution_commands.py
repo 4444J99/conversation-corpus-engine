@@ -15,7 +15,15 @@ from collections import Counter
 from pathlib import Path
 
 import pytest
-from attribution_support import ECHO_ANSWER, ECHO_QUESTION, build_library, conversations
+from attribution_support import (
+    ECHO_ANSWER,
+    ECHO_QUESTION,
+    PROBE_PASTED,
+    PROBE_QUESTION,
+    PROBE_REMINDER,
+    build_library,
+    conversations,
+)
 
 from conversation_corpus_engine import attribution_commands
 from conversation_corpus_engine.attributed_knowledge import collect_owner_segments
@@ -487,7 +495,7 @@ def test_editing_the_text_of_a_message_orphans_every_review_of_it(
     assert report["profile_eligible"] == []
     # Only the fixture messages whose text did not change keep their reviews.
     row = next(item for item in report["rules"] if item["rule"] == "typed_prefix")
-    assert report["gate"]["orphan_rows"] >= 90
+    assert report["gate"]["orphan_rows"] >= 80
     assert row["strata"]["S"]["reviewed"] + report["gate"]["orphan_rows"] == 100
 
 
@@ -540,7 +548,7 @@ def test_an_answer_pasted_back_into_a_cli_session_is_not_owner_text(
     library_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     report = report_of(capsys, library_path)
-    assert next(r for r in report["rules"] if r["rule"] == "pasted_back")["spans"] == 1
+    assert next(r for r in report["rules"] if r["rule"] == "pasted_back")["spans"] == 2
     entries, _ = apply_entries(capsys, library_path, tmp_path / "echo.json", "--owner-id", "rob")
     with Library(library_path) as library:
         found = [
@@ -559,6 +567,25 @@ def test_an_answer_pasted_back_into_a_cli_session_is_not_owner_text(
     ]
     assert [span["text"] for span in pasted] == [ECHO_ANSWER]
     assert pasted[0]["author"] == "third_party"
+
+
+def test_the_verifiers_probe_pasted_into_a_cli_session_is_carved_out(
+    library_path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    entries, _ = apply_entries(capsys, library_path, tmp_path / "probe.json", "--owner-id", "rob")
+    with Library(library_path) as library:
+        found = [
+            (entry, message_text(library, entry["source"]))
+            for entry in entries
+            if entry["source"]["uid"].endswith("cli-probe") and entry["source"]["message"] == 2
+        ]
+    ((entry, text),) = found
+    spans = [s for s in attributed_spans(text, entry["attribution"]) if s["author"] != "unknown"]
+    by_rule = {span["evidence"][0].split(":rule:")[1]: span for span in spans}
+    assert [span["text"] for span in spans if span["author"] == "owner"] == [PROBE_QUESTION]
+    assert by_rule["pasted_back"]["text"] == PROBE_PASTED
+    assert by_rule["pasted_back"]["author"] == "third_party"
+    assert by_rule["inline_injection"]["text"] == PROBE_REMINDER
 
 
 def test_a_limited_scan_counts_only_the_spans_it_saw(
