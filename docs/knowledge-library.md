@@ -12,8 +12,8 @@ Web archives + native inventory + document manifest
                          |
              +-----------+-----------+
              |           |           |
-         FTS search   block graph   Markdown vault
-                                     |
+         FTS search   block graph   Markdown vault (opt-in:
+                                     |   --vault-profile cards|full)
                                 Notion ZIP / CSV
 ```
 
@@ -23,6 +23,8 @@ Register a private store through the existing `cce corpus-store register` interf
 
 ```sh
 cce library build --manifest /private/library-sources.json --project-root /private/project --store-root /private/store --publish
+cce library build --manifest /private/library-sources.json --project-root /private/project --store-root /private/store --vault-profile cards
+cce library export-cards --store-root /private/store --out /private/reading/cards --limit-notes 10000
 cce library status --store-root /private/store
 cce library search lattice --store-root /private/store --limit 20 --offset 0
 cce library read RECORD_UID --store-root /private/store --message 0 --offset 0 --limit 12000
@@ -34,7 +36,7 @@ cce library analyze lattice --output /private/store/derived/analysis/lattice --p
 cce library verify --store-root /private/store
 ```
 
-`CCE_LIBRARY_STORE_ROOT` supplies the store when a command omits it; the existing `CCE_CORPUS_STORE_ROOT` is a fallback. Search returns an exact total, bounded excerpts, stable record identities, vault paths and the next offset. Read retrieves one message span and reports main/alternate sequence counts; use `--sequence alternate` (MCP `sequence: "alternate"`) to page retained conversation branches. History and digest selection also expose retained snapshots that were not selected as the current body. `cce-mcp --library-store-root /private/store` adds three read-only tools: `cce_library_search`, `cce_library_read`, and `cce_library_history`. Clients cannot choose arbitrary filesystem paths through these tools.
+`CCE_LIBRARY_STORE_ROOT` supplies the store when a command omits it; the existing `CCE_CORPUS_STORE_ROOT` is a fallback. Search returns an exact total, bounded excerpts, stable record identities, a `path` hint and the next offset. The `path` is the note path of the legacy export layout (`vault/records/UID.md`); under the `none`, `cards` and `full` profiles the note for a record is named by the `path` of its `library-index.jsonl` row (null when it has none), and `cce library read UID` is the authoritative way to open a record under every layout. Read retrieves one message span and reports main/alternate sequence counts; use `--sequence alternate` (MCP `sequence: "alternate"`) to page retained conversation branches. History and digest selection also expose retained snapshots that were not selected as the current body. `cce-mcp --library-store-root /private/store` adds three read-only tools: `cce_library_search`, `cce_library_read`, and `cce_library_history`. Clients cannot choose arbitrary filesystem paths through these tools.
 
 ## Source manifest
 
@@ -73,9 +75,57 @@ Condensation replaces repeated eligible prose blocks with a shared passage and b
 
 ## Reading surfaces and consumers
 
-Each generation contains `vault/Home.md`, per-record notes, facet hubs, shared passages, `graph.jsonl`, `library-index.jsonl`, `records.csv`, `notion-import.zip`, and a small `agent-entry.md`. Keep personal annotations in a separate reading folder rather than the immutable generation. Large transcript notes can crash a native Markdown indexer even when the complete library passes its data-integrity checks: an observed Obsidian 1.14.5 crash was reproduced with one unchanged 47 MB note.
+Each generation contains `graph.jsonl`, `library-index.jsonl`, `records.csv` and a small `agent-entry.md`. Whether it also contains a Markdown reading vault (`vault/Home.md`, notes and hubs) and `notion-import.zip` depends on the vault profile below. Keep personal annotations in a separate reading folder rather than the immutable generation. Large transcript notes can crash a native Markdown indexer even when the complete library passes its data-integrity checks: an observed Obsidian 1.14.5 crash was reproduced with one unchanged 47 MB note, and a vault of hundreds of thousands of notes with almost all of them in one folder cannot be opened at all.
 
-For large Obsidian libraries, use `scripts/package-obsidian-vault.py` to create a fresh reading folder with bounded pages, repaired navigation and a reversible byte ledger. Supply the generation's `vault/` as its source and its `agent-entry.md` through `--agent-entry`; open the resulting folder as a vault, then open `Home.md`. Every original file can be reconstructed and hash-checked, while its original note path remains available as a page index. See [bounded Obsidian packaging](obsidian-vault.md) for the command and verification contract. Native application acceptance remains a separate observation from packaging.
+### Vault profiles
+
+`cce library build --vault-profile {none,cards,full}` chooses the reading vault written into the generation. The default, `none`, writes no vault and no Notion ZIP. The database, the receipts and publication are unchanged, but the artifacts that point at notes change with the vault, deliberately: `export-manifest.json` is `cce.library-export.v2` with a `profile` field; `library-index.jsonl` is `cce.library-index.v2` and its `path` is null, so the `path` column of `records.csv` is empty; the record nodes of `graph.jsonl` lose their `path` (and `block:` nodes have none); `agent-entry.md` has profile-specific text and no longer links `vault/Home.md`; and there is no `notion-import.zip`. The profile is recorded in the build report (`vault_profile`) and in the manifest (`profile`).
+
+| Profile | What it writes | Use it for |
+|---|---|---|
+| `none` (default) | No `vault/` and no `notion-import.zip`. | Every build. Search, read and history work on the database. |
+| `cards` | `vault/Home.md`, one card per record in `vault/cards/`, paginated hubs in `vault/hubs/`, a Notion ZIP of that tree. A card holds the title, facets, metadata, a bounded excerpt of the first message (400 characters) and the exact `cce library read` command; it never copies the body. Cards are chosen most recently updated first until the note budget (10,000 notes, counting cards, hub pages and Home) is full; `Home.md` states how many records have no card and how to reach them. | A small reading vault of a large library. |
+| `full` | Every record whole, in `vault/records/` (first part) and `vault/parts/` (continuations of about 12 KiB, cut at message boundaries and, inside a long message, at line boundaries; a code fence is closed at the end of a piece and reopened at the start of the next, and a single line longer than a part is cut mid-line on a character boundary), paginated hubs, a Notion ZIP. No per-block notes. | A small library, or a selection, that must be readable in full. A record's header lists its first 20 parents and counts the rest. It renders every note in memory, measures them against every hard cap and refuses before writing anything (see below). |
+
+`cce library export-cards --out DIR [--limit-notes N]` writes the `cards` profile on demand for the current generation. It reads the library and never writes inside the library store. DIR may be empty or an earlier card vault (it carries the `.cce-cards-vault` marker); any other non-empty DIR is refused. It records exactly what it wrote in `.cce-cards-manifest.json` (path, size, SHA-256) and a later run replaces and deletes only files that manifest lists. It refuses, before changing anything, when a listed file was edited or when a file it did not write already sits where a card would go, so annotations are never overwritten; an identical file is adopted, which makes an interrupted run safe to repeat. `--limit-notes` is at most 20,000 (the hard cap). The cards, hubs and Home it would write are measured against every hard cap before anything is written, deleted or listed; a breach refuses with nothing changed. The manifest is rewritten last, only after every write succeeded. If the files you keep in DIR crowd a folder past a cap, the run still completes (the vault it generated fits) and warns on stderr and in the result (`warnings`; `generated_caps` is the verdict on the generated set, `vault_caps` on the whole folder), because those files are yours to move.
+
+Publication compares source evidence, not reading derivatives: rebuilding unchanged sources under another profile makes `publish` report `changed: false` and leave the current generation in place, so use `export-cards` for a vault on demand. A `full` build that would pass a hard cap fails at its export stage, after ingestion; repeat it with `"resume_mode": "export"` (see the output budget notes) and another profile.
+
+The caps are the Wiki Standard v1 policy defaults, enforced by `library_vault_gate` (note count, total bytes, largest note, widest folder, hub entries; one `warn` or `fail` finding per breach, the warn finding reporting the true largest value of its own tier). The profiles stay inside them by construction. Before any directory exists, planning renders every note of a `cards` or `full` vault in memory and `measure_planned` measures that set against all of the hard caps (note size, folder entries, hub page entries, note count, total bytes); a breach refuses with nothing written. `measure_vault` checks the written tree again after writing, and `verify-export` checks it later:
+
+| Measure | Aim | Warn above | Fail above |
+|---|---|---|---|
+| Note | 4 KiB | 16 KiB | 64 KiB |
+| Folder entries | | 200 | 1,000 |
+| Vault notes | | 10,000 | 20,000 |
+| Vault bytes | | 50 MiB | 100 MiB |
+| Hub page entries | | | 100 |
+
+Folders are planned with the archive's deterministic hash-bucket plan (`bucket-all-bNNN` folders appear once a folder would pass 200 entries) and hubs are paginated at 100 entries and the page byte budget. Nothing is truncated silently: a vault that would pass a hard cap is refused with a message that names `--vault-profile cards`, and a card vault that cannot hold every record says so on its Home note.
+
+**Breaking layout change (`full`).** The `full` profile replaces the legacy bulk layout and differs from it: there is no `vault/blocks/` (a repeated passage is shown inline in each record and stays in the database; `graph.jsonl` still has its `block:` nodes and `reference` edges, without a `path`); records live in `vault/records/` (flat up to 200 records, otherwise in hash-bucket folders; the first part only) with continuations in `vault/parts/`; each hub is `vault/hubs/FACET-SLUG-HASH.md` with `-pNNN` continuation pages and a `FACET-index` hub per open facet; reviewed Zettel pages are not rendered. The export manifest is `cce.library-export.v2` and `library-index.jsonl` rows are `cce.library-index.v2`, where `path` is the record's note (the first part) or null. A v1 reader refuses these files instead of misreading them.
+
+`cce library export` and `verify-export` are unchanged for the legacy layout: the default `--vault-profile legacy` produces the same bytes as before (a test pins them) and verification of existing exports is unchanged. The legacy layout is the one that can exceed the caps, so `export` prints a warning on stderr when the vault it just wrote does; pass `--vault-profile cards|full|none` for the capped layouts. Reviewed Zettel pages (`--zettels`) exist only in the legacy layout and are refused with any other profile.
+
+Consumers of the old layout, and what happens to each:
+
+| Consumer | Under the profiles |
+|---|---|
+| `library_export.export_library` / `verify_export` | `export_library` takes `vault_profile`; the default (`legacy`) is byte-identical (a test pins it) and `verify_export` verifies existing v1 exports unchanged. It also understands the v2 profiles: `none` (no vault is valid), `cards` and `full` (the caps are checked). |
+| `library_build.build_library` | Takes `vault_profile` (default `none`) and always writes through `export_library`; the profile is recorded in the report. |
+| `library_commands` (`build`, `export`, `export-cards`, `verify-export`) | `build --vault-profile`, `export --vault-profile` (default `legacy`, warning on stderr when the legacy vault breaks the caps), the new `export-cards`; `verify-export` unchanged for v1. |
+| `scripts/package-obsidian-vault.py` | Works on the `vault/` of `cards` and `full` (tested). Without a vault it exits with code 2 and a one-line message naming `--vault-profile`, `cce library export --vault-profile cards` and `export-cards` (the routes that work for an already-published generation). It is still the tool for a legacy bulk vault. |
+| `scripts/repair-obsidian-inline.py` | Unaffected: it repairs the output of the Obsidian packager through that packager's own ledger and never reads the library layout. |
+| `scripts/package-notion-batches.py` | Works on the ZIP of `cards` and `full` (tested). With no ZIP (`none`) it exits with code 2 and a one-line message naming `--vault-profile` and `cce library export --vault-profile cards`. |
+| `library-index.jsonl` and `records.csv` (LingFrame and other index readers) | Same fields; schema `cce.library-index.v2` for the profiles, `path` is the note or null (empty in the CSV). |
+| `graph.jsonl` | Record nodes carry `path` only when the record has a note; `block:` nodes never do under a profile. |
+| `agent-entry.md` | Rewritten per profile (it no longer links `vault/Home.md` when there is no vault). Legacy text unchanged. |
+| Reviewed Zettel export (`export --zettels`) | Legacy layout only; refused with any profile, because the pages cite `vault/records/UID.md#message-N`. |
+| My Knowledge Base federation provider (`legacy/my-knowledge-base/src/federation/cce-library-provider.ts`) | It indexes the legacy `vault/records/UID.md` and `vault/blocks/DIGEST.md` notes as documents (shared passages are documents of their own), a real dependency on the layout the profiles drop, so it accepts only a v1 manifest and index. A generation built with any profile, the default included, is refused with a message naming `--vault-profile`; earlier generations still scan. |
+| `cce library search` hit `path`, MCP field `pa` | Unchanged hint (see above); use `read` by UID or the index. |
+| `archive_read_library`, `archive_commands.library_source_folder`, `library_resume` | Unaffected: they read only `current.json`, `library.sqlite` and the build report, never the vault. |
+
+For large Obsidian libraries built with the legacy layout, use `scripts/package-obsidian-vault.py` to create a fresh reading folder with bounded pages, repaired navigation and a reversible byte ledger. Supply the generation's `vault/` as its source and its `agent-entry.md` through `--agent-entry`; open the resulting folder as a vault, then open `Home.md`. Every original file can be reconstructed and hash-checked, while its original note path remains available as a page index. See [bounded Obsidian packaging](obsidian-vault.md) for the command and verification contract. Native application acceptance remains a separate observation from packaging.
 
 The full ZIP is a lossless import source. For large libraries, use smaller Notion batches: the official [import guidance](https://www.notion.com/help/import-data-into-notion) warns that ZIPs with 10,000 or more files can fail or partially import, even below the 5 GB ZIP limit. It also documents per-file limits of 5 MB on Free and 50 MB on paid plans. Local ZIP parity does not establish successful Notion import, cross-batch links or heading-anchor behavior; verify those in the account. Neither application becomes a new identity authority.
 

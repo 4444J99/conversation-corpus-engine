@@ -13,6 +13,8 @@ uv run --extra obsidian python scripts/package-obsidian-vault.py /private/librar
   --max-seconds 1800
 ```
 
+A generation built with the default `--vault-profile none` has no `vault/` to package; the script then fails naming `--vault-profile`. Write one from the published generation with `cce library export --vault-profile cards --out DIR` (one capped card per record; `full` keeps whole records in linked parts) and package `DIR/vault`, or write a card folder with `cce library export-cards --out DIR`. Building again with another profile does not help while the sources are unchanged, because publication ignores the profile. Those layouts already keep every note under 64 KiB, every folder under 200 entries and every hub under 100 entries, so this packager is mainly for a legacy bulk vault (see [vault profiles](knowledge-library.md#vault-profiles)); it still accepts a profile vault.
+
 The `obsidian` extra installs the required `markdown-it-py==4.2.0`; the boundary mapper refuses other parser versions. The development extra includes the same pin for tests.
 
 The output parent must already exist and the output itself must not exist. Existing outputs are never replaced. A failed attempt remains available for inspection; use a new destination for a subsequent attempt. Source/output overlap and output anywhere within a recognized canonical `library-all/generations/` generation are refused. So is an output that Git can see (inside a work tree and not ignored by it), before the source is read: the derivative holds the library as plaintext. `scripts/repair-obsidian-inline.py` applies the same rule to its `--output`.
