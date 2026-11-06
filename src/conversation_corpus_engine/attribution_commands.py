@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -746,8 +747,8 @@ def _positive_float(value: str) -> float:
         number = float(value)
     except ValueError:
         raise argparse.ArgumentTypeError("must be a positive number") from None
-    if not number > 0:
-        raise argparse.ArgumentTypeError("must be a positive number")
+    if not (number > 0 and math.isfinite(number)):
+        raise argparse.ArgumentTypeError("must be a positive, finite number")
     return number
 
 

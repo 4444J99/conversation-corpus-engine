@@ -2063,6 +2063,29 @@ def test_people_and_prefixed_agent_identities_are_still_accepted(
         assert code == 0, (identity, err)
 
 
+@pytest.mark.parametrize(
+    "value", ["inf", "-inf", "Infinity", "nan", "-1", "0", "-0.5", "1e999", "soon", ""]
+)
+def test_a_deadline_must_be_a_positive_finite_number(
+    capsys: pytest.CaptureFixture[str], value: str
+) -> None:
+    for argv in (
+        ["library", "attribute", "--report", f"--deadline-seconds={value}"],
+        ["library", "attribute", "apply", "--out", "o.json", f"--deadline-seconds={value}"],
+    ):
+        with pytest.raises(SystemExit) as stopped:
+            build_parser().parse_args(argv)
+        assert stopped.value.code == 2
+        assert "positive" in capsys.readouterr().err
+
+
+def test_a_finite_deadline_is_accepted() -> None:
+    args = build_parser().parse_args(
+        ["library", "attribute", "--report", "--deadline-seconds", "0.5"]
+    )
+    assert args.deadline_seconds == 0.5
+
+
 def test_an_existing_output_is_refused_for_every_writer(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
