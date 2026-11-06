@@ -115,7 +115,7 @@ Condensation replaces repeated eligible prose blocks with a shared passage and b
 
 ## Reading surfaces and consumers
 
-Each generation contains `graph.jsonl`, `library-index.jsonl`, `records.csv` and a small `agent-entry.md`. Whether it also contains a Markdown reading vault (`vault/Home.md`, notes and hubs) and `notion-import.zip` depends on the vault profile below. Keep personal annotations in a separate reading folder rather than the immutable generation. Large transcript notes can crash a native Markdown indexer even when the complete library passes its data-integrity checks: an observed Obsidian 1.14.5 crash was reproduced with one unchanged 47 MB note, and a vault of hundreds of thousands of notes with almost all of them in one folder cannot be opened at all.
+Each generation contains `graph.jsonl`, `library-index.jsonl`, `records.csv` and a small `agent-entry.md`. Whether it also contains a Markdown reading vault (`vault/Home.md`, notes and hubs) and `notion-import.zip` depends on the vault profile below. Keep personal annotations in a separate reading folder rather than the immutable generation. Large transcript notes and heavily populated folders can prevent a native Markdown indexer from opening a vault even when the library passes its data-integrity checks. Bounded notes and folders address those reading constraints; each generated vault still needs its own native acceptance check. Private reproduction measurements and receipts are retained separately from this public guide.
 
 ### Vault profiles
 
