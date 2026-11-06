@@ -910,30 +910,40 @@ class Library:
             """The ranked page, in two steps. SQLite computes every selected column of every
             match before it sorts, so selecting the excerpt in the ranking statement ran
             ``snippet`` over thousands of stored bodies to keep nine. Step one ranks and pages
-            on row numbers alone; step two reads the excerpts of just those rows."""
+            on row numbers alone; step two reads the excerpts of just those rows. Both steps
+            read one snapshot: a writer that commits between two separate statements would
+            otherwise drop a ranked row from the page."""
             text, params = source(match)
-            keys = [
-                row[0]
-                for row in self.connection.execute(
-                    "SELECT record_fts.rowid " + text + " ORDER BY bm25(record_fts,0,5,1),r.uid"
-                    " LIMIT ? OFFSET ?",
-                    [*params, limit + 1, offset],
-                )
-            ]
-            if not keys:
-                return []
-            marks = ",".join("?" for _ in keys)
-            by_key = {
-                row["key"]: row
-                for row in self.connection.execute(
-                    "SELECT record_fts.rowid AS key,r.uid,r.title,r.provider,r.kind,r.wing,r.lane,"
-                    "r.current_version AS version,r.body_status,r.message_count,r.source_ref,"
-                    "snippet(record_fts,-1,'[',']','...',28) AS excerpt "
-                    "FROM record_fts JOIN records r ON r.rowid=record_fts.rowid "
-                    f"WHERE record_fts MATCH ? AND record_fts.rowid IN ({marks})",
-                    [match, *keys],
-                )
-            }
+            own_snapshot = not self.connection.in_transaction
+            if own_snapshot:
+                self.connection.execute("BEGIN")
+            try:
+                keys = [
+                    row[0]
+                    for row in self.connection.execute(
+                        "SELECT record_fts.rowid "
+                        + text
+                        + " ORDER BY bm25(record_fts,0,5,1),r.uid LIMIT ? OFFSET ?",
+                        [*params, limit + 1, offset],
+                    )
+                ]
+                if not keys:
+                    return []
+                marks = ",".join("?" for _ in keys)
+                by_key = {
+                    row["key"]: row
+                    for row in self.connection.execute(
+                        "SELECT record_fts.rowid AS key,r.uid,r.title,r.provider,r.kind,r.wing,"
+                        "r.lane,r.current_version AS version,r.body_status,r.message_count,"
+                        "r.source_ref,snippet(record_fts,-1,'[',']','...',28) AS excerpt "
+                        "FROM record_fts JOIN records r ON r.rowid=record_fts.rowid "
+                        f"WHERE record_fts MATCH ? AND record_fts.rowid IN ({marks})",
+                        [match, *keys],
+                    )
+                }
+            finally:
+                if own_snapshot and self.connection.in_transaction:
+                    self.connection.execute("ROLLBACK")
             return [by_key[key] for key in keys if key in by_key]
 
         def shape(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
