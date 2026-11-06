@@ -965,6 +965,8 @@ DEFAULT_ECHO_MIN_SHARED = 60
 DEFAULT_ECHO_MIN_RUN_SHARED = 100
 DEFAULT_ECHO_MIN_HIT = 20
 DEFAULT_ECHO_MIN_HIT_TOTAL = 100
+DEFAULT_ECHO_MIN_FRAGMENT = 30
+DEFAULT_ECHO_MIN_FRAGMENT_TOTAL = 100
 DEFAULT_ECHO_HISTORY = 400_000
 # Only the head of an assistant turn is indexed: a longer turn costs no more memory than this.
 DEFAULT_ECHO_TURN = 400_000
@@ -1053,7 +1055,13 @@ class AssistantEcho:
       the stretch total at least `min_hit_total` characters all of them are returned, whatever
       sits between them (code fences, owner one-liners, other paragraphs, other user turns of the
       stretch). Pasting an answer as short paragraphs with something between them therefore
-      does not earn owner credit.
+      does not earn owner credit;
+    * a prose paragraph (not inside a fenced block) whose **fragments** add up: the stretches of
+      at least `min_fragment` normalized characters it shares with one earlier assistant turn
+      (each character counted once) total at least `min_fragment_total`. A mosaic, verbatim pieces
+      of an answer joined by the owner's own words in one paragraph, shares no stretch of
+      `min_shared` characters and is whole in no assistant turn, but its fragments stack. The
+      paragraph is returned whole, the glue words with it.
 
     A paragraph that only quotes a short phrase (fewer than `min_shared` shared characters, and
     not echo hits that add up) is never a candidate, and neither is a short paragraph on its own.
@@ -1074,6 +1082,8 @@ class AssistantEcho:
         min_run_shared: int = DEFAULT_ECHO_MIN_RUN_SHARED,
         min_hit: int = DEFAULT_ECHO_MIN_HIT,
         min_hit_total: int = DEFAULT_ECHO_MIN_HIT_TOTAL,
+        min_fragment: int = DEFAULT_ECHO_MIN_FRAGMENT,
+        min_fragment_total: int = DEFAULT_ECHO_MIN_FRAGMENT_TOTAL,
         history_limit: int = DEFAULT_ECHO_HISTORY,
         turn_limit: int = DEFAULT_ECHO_TURN,
     ) -> None:
@@ -1084,6 +1094,8 @@ class AssistantEcho:
             ("min_run_shared", min_run_shared),
             ("min_hit", min_hit),
             ("min_hit_total", min_hit_total),
+            ("min_fragment", min_fragment),
+            ("min_fragment_total", min_fragment_total),
             ("history_limit", history_limit),
             ("turn_limit", turn_limit),
         ):
@@ -1091,25 +1103,30 @@ class AssistantEcho:
                 raise ValueError(f"{name} must be a positive integer")
         if min_run_shared < min_shared:
             raise ValueError("min_run_shared must not be smaller than min_shared")
+        if min_fragment > min_shared:
+            raise ValueError("min_fragment must not be larger than min_shared")
         self.min_paragraph = min_paragraph
         self.min_run = min_run
         self.min_shared = min_shared
         self.min_run_shared = min_run_shared
         self.min_hit = min_hit
         self.min_hit_total = min_hit_total
+        self.min_fragment = min_fragment
+        self.min_fragment_total = min_fragment_total
         self.history_limit = history_limit
         self.turn_limit = turn_limit
         self._turns: deque[tuple[int, array, str]] = deque()
         self._size = 0
         self._index: set[int] | None = None
+        self._fragment_index: set[int] | None = None
 
     @property
     def indexed_characters(self) -> int:
         """How many normalized characters of assistant text are indexed right now."""
         return self._size
 
-    def _hashes(self, form: str) -> Iterator[int]:
-        width = self.min_shared
+    def _hashes(self, form: str, width: int | None = None) -> Iterator[int]:
+        width = self.min_shared if width is None else width
         return (hash(form[i : i + width]) for i in range(len(form) - width + 1))
 
     def add_assistant(self, text: str) -> None:
@@ -1125,13 +1142,36 @@ class AssistantEcho:
             evicted = True
         if evicted:
             self._index = None
-        elif self._index is not None:
-            self._index.update(windows)
+            self._fragment_index = None
+        else:
+            if self._index is not None:
+                self._index.update(windows)
+            if self._fragment_index is not None:
+                self._fragment_index.update(self._hashes(head, self.min_fragment))
 
     def _windows(self) -> set[int]:
         if self._index is None:
             self._index = set().union(*(windows for _, windows, _ in self._turns))
         return self._index
+
+    def _fragment_windows(self) -> set[int]:
+        """The `min_fragment`-character window hashes of every indexed turn, built from the kept
+        heads the first time a paragraph is long enough to need them (many conversations never do)."""
+        if self._fragment_index is None:
+            self._fragment_index = set().union(
+                *(self._hashes(head, self.min_fragment) for _, _, head in self._turns)
+            )
+        return self._fragment_index
+
+    def _shared_fragments(self, form: str, known: set[int]) -> int:
+        """How many characters of the normalized paragraph lie in a stretch of at least
+        `min_fragment` characters that an earlier assistant turn also holds (each counted once)."""
+        width, covered, reach = self.min_fragment, 0, 0
+        for start, window in enumerate(self._hashes(form, width)):
+            if window in known:
+                covered += start + width - max(start, reach)
+                reach = start + width
+        return covered
 
     def pasted_back(self, text: str) -> tuple[Range, ...]:
         return self.pasted_back_turns([text])[0]
@@ -1185,6 +1225,16 @@ class AssistantEcho:
         ]
         if sum(len(item[6]) for item in hits_here) >= self.min_hit_total:
             for turn, begin, finish, *_ in hits_here:
+                results[turn].append(original(turn, begin, finish))
+        # Fragments that stack inside one prose paragraph: a mosaic of pieces of an answer.
+        smallest = max(self.min_fragment, self.min_fragment_total)
+        for turn, begin, finish, inside, _, _, form in paragraphs:
+            if (
+                not inside
+                and len(form) >= smallest
+                and self._shared_fragments(form, self._fragment_windows())
+                >= self.min_fragment_total
+            ):
                 results[turn].append(original(turn, begin, finish))
         combined = " ".join(pieces)
         if len(combined) >= self.min_shared:

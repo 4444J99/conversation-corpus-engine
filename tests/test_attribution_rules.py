@@ -1050,6 +1050,7 @@ def test_the_echo_states_its_thresholds() -> None:
         100,
     )
     assert (echo.history_limit, echo.turn_limit) == (400_000, 400_000)
+    assert (echo.min_fragment, echo.min_fragment_total) == (30, 100)
 
 
 def test_a_paragraph_needs_60_characters_and_60_shared_characters() -> None:
@@ -1256,26 +1257,73 @@ def test_one_paragraph_per_user_turn_counts_across_consecutive_turns() -> None:
     assert echo.pasted_back_turns(turns[:2]) + echo.pasted_back_turns(turns[2:]) != []
 
 
-def test_a_mosaic_of_short_fragments_in_one_paragraph_is_the_documented_limit() -> None:
-    """Verbatim fragments shorter than the 60-character window, joined by the owner's own words
-    inside one paragraph, share no 60-character stretch and are not whole paragraphs, so they are
-    not carved however many there are. The documented boundary (docs, "The boundary, exactly")
-    is the window: the same fragments at 60 or more characters are carved."""
+def fragments_of(form: str, low: int, high: int, count: int) -> list[str]:
+    """`count` verbatim pieces of `form`, each of whole words and `low` to `high` characters,
+    taken far apart from one another."""
+    words = form.split()
+    pieces = []
+    for index in range(count):
+        position, piece = index * 14, ""
+        while len(piece) < low:
+            piece = f"{piece} {words[position]}".strip()
+            position += 1
+        assert low <= len(piece) <= high
+        pieces.append(piece)
+    return pieces
+
+
+def test_verbatim_fragments_of_30_or_more_characters_stack_to_100_inside_one_paragraph() -> None:
+    """A mosaic, fragments of an answer joined by the owner's own words in one paragraph, shares
+    no 60-character stretch; stretches of 30 or more characters that add up to 100 are carved."""
     echo = AssistantEcho()
     echo.add_assistant(ANSWER)
     form = normalized(ANSWER)
 
-    def mosaic(size: int, count: int) -> str:
-        pieces = [form[10 + 110 * index : 10 + 110 * index + size] for index in range(count)]
-        return " and then ".join(piece.strip() for piece in pieces) + "."
+    def mosaic(low: int, high: int, count: int) -> str:
+        return " and then ".join(fragments_of(form, low, high, count)) + "."
 
-    for size in (30, 40, 55):  # (56 to 59 can run into the glue's first letters: partly carved)
-        text = mosaic(size, 6)
-        assert len(match_form(text)) > 200
-        assert echo.pasted_back(text) == (), size
-    for size in (60, 70):
-        text = mosaic(size, 6)
-        assert echo.pasted_back(text) == ((0, len(text)),), size
+    for low, high in ((30, 39), (40, 49), (50, 59)):
+        text = mosaic(low, high, 6)
+        assert echo.pasted_back(text) == ((0, len(text)),), (low, high)
+    # The stretches must add up: two of 40 characters are 80, three are 120.
+    assert echo.pasted_back(mosaic(40, 49, 2)) == ()
+    two_of_fifty = mosaic(50, 59, 2)
+    assert echo.pasted_back(two_of_fifty) == ((0, len(two_of_fifty)),)
+    three = mosaic(40, 49, 3)
+    assert echo.pasted_back(three) == ((0, len(three)),)
+    # Below 30 characters nothing stacks, however many fragments there are.
+    for low, high in ((15, 24), (20, 29)):
+        assert echo.pasted_back(mosaic(low, high, 8)) == (), (low, high)
+    # The owner's words around the fragments are carved with their paragraph, the other
+    # paragraphs of the turn are not.
+    text = f"Mine first.\n\n{mosaic(30, 39, 6)}\n\nMine last, and quite unrelated."
+    start = text.index("\n\n") + 2
+    assert echo.pasted_back(text) == ((start, start + len(mosaic(30, 39, 6))),)
+
+
+def test_stacked_fragments_do_not_carve_unrelated_prose_or_fenced_code_or_one_quote() -> None:
+    echo = AssistantEcho()
+    echo.add_assistant(ANSWER)
+    form = normalized(ANSWER)
+    pieces = fragments_of(form, 30, 39, 6)
+    unrelated = " and then ".join(f"my own words number {n} about something else" for n in range(8))
+    assert echo.pasted_back(unrelated) == ()
+    assert echo.pasted_back(f'You said "{pieces[0]}" but I disagree with that.') == ()
+    fenced = "```\n" + " and then ".join(pieces) + "\n```"
+    assert echo.pasted_back(fenced) == ()
+
+
+def test_the_fragment_stacking_is_bounded_with_the_history_and_validated() -> None:
+    echo = AssistantEcho(history_limit=1000)
+    echo.add_assistant(ANSWER)
+    form = normalized(ANSWER)
+    mosaic = " and then ".join(fragments_of(form, 30, 39, 6)) + "."
+    assert echo.pasted_back(mosaic) != ()
+    echo.add_assistant(" ".join(f"Another unrelated reply sentence {i}." for i in range(30)))
+    assert echo.pasted_back(mosaic) == ()  # the first turn was evicted, its fragments with it
+    for bad in ({"min_fragment": 0}, {"min_fragment_total": 0}, {"min_fragment": True}):
+        with pytest.raises(ValueError, match="positive"):
+            AssistantEcho(**bad)
 
 
 def test_a_fenced_code_block_between_pasted_paragraphs_does_not_break_the_run() -> None:

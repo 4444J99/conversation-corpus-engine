@@ -301,7 +301,9 @@ The version string (`cce.attribution-rules@6`) names the rule semantics and ever
 it: span ids (so a span id from another version never matches), the annotation evidence
 (`cce.attribution-rules@6:rule:<id>`), the rows of review samples and the rows of the review
 ledger. When the rules or the gate change meaning the version is bumped (`@6` made "the same
-text" the text as a reader sees it, one `text_key` for the gate, the draw and the twin veto; `@5`
+text" the text as a reader sees it, one `text_key` for the gate, the draw and the twin veto, made
+the echo and the repeated-text census ignore invisible characters and made the echo stack short
+verbatim fragments; `@5`
 made the gate count distinct texts instead of span ids; `@4` bound a sample to the ledger state it
 was drawn against; `@3` replaced the 150-character pasted-back threshold, the row-level gate and
 the sample format of `@2`). Ledger rows of any other version, and rows of an older ledger schema
@@ -360,7 +362,7 @@ as the zero-width space and joiners, the word joiner U+2060 and the soft hyphen,
 characters deleted, not read as spaces; NFKC, case-folded, list markers and numbering, emphasis,
 headings, backticks, punctuation, smart quotes and dashes dropped, whitespace collapsed), so
 re-casing, rewrapping, bulleting, renumbering, stripping markup or sprinkling invisible characters
-through the text does not hide a paste. Three things are pasted back:
+through the text does not hide a paste. Four things are pasted back:
 
 - a paragraph of at least 60 match-form characters that holds a stretch of 60 or more characters
   shared with an assistant turn;
@@ -376,43 +378,58 @@ through the text does not hide a paste. Three things are pasted back:
   match-form characters, all of them are pasted back, whatever sits between them: code fences,
   owner one-liners, other paragraphs, other user turns of the stretch. Pasting an answer as short
   paragraphs, with a code block or a "right, carry on" between them, therefore earns no owner
-  credit. The owner's own paragraphs around the hits stay the owner's.
+  credit. The owner's own paragraphs around the hits stay the owner's;
+- a prose paragraph (not inside a fenced block) whose **fragments** stack: the stretches of 30 or
+  more match-form characters that it shares with one earlier assistant message of the
+  conversation, each character counted once, total at least 100. A **mosaic**, verbatim pieces of
+  an answer joined by the owner's own words inside one paragraph, shares no 60-character stretch
+  and is whole in no assistant message, but its pieces stack; the paragraph is carved whole, the
+  owner's glue words with it. The 30-character windows are built from the kept heads of the
+  assistant turns the first time a user paragraph of 100 or more characters needs them.
 
-A paragraph that quotes a shorter phrase (59 shared characters or fewer) is never a candidate on
-its own, nor is a short paragraph on its own; the thresholds are parameters of `AssistantEcho`.
+A paragraph that quotes a shorter phrase (59 shared characters or fewer, and fewer than 100 in
+stretches of 30 or more) is never a candidate on its own, nor is a short paragraph on its own; the
+thresholds are parameters of `AssistantEcho`.
 **Measured cost, on generated conversations (1,000 each):** owner prose that shares no 60 verbatim
 characters with the answer is never carved (0.0 percent); a verbatim quote of 20 to 59 characters
 inline in a sentence is carved in 0.4 percent, one of 60 to 95 characters in 99 percent, and the
 verifier's 20-to-95 shape in 50 percent; one quote of 20 to 95 characters as its own paragraph in
 46 percent; two such paragraphs in 73 percent; three quotes of 20 to 59 characters as separate
 paragraphs, which stack to the 100-character total, in 77 percent (0 percent before the echo-hit
-rule). **The boundary, exactly:** text is carved when it holds a verbatim stretch of 60 or more
-match-form characters shared with an earlier assistant turn of the conversation, or when it is made
-of whole paragraphs, of 20 or more match-form characters each, that are pieces of one earlier
-assistant turn and add up to 100 or more; what that costs is recall, never precision. Verbatim
-text below those sizes is not carved (see the mosaic, below). **Invisible characters,
+rule). Stacking short fragments inside a paragraph adds two rows to that table, which the
+fragment rule moves (generated, 1,000 each): two verbatim inline quotes of 30 to 59 characters in
+one sentence are carved in 19 percent (1 percent before), three in 96 percent (1 percent before);
+the rows above do not move. **The boundary, exactly:** text is carved when it holds a verbatim
+stretch of 60 or more match-form characters shared with an earlier assistant turn of the
+conversation; or when it is made of whole paragraphs, of 20 or more match-form characters each,
+that are pieces of one earlier assistant turn and add up to 100 or more; or when one paragraph
+holds stretches of 30 or more characters shared with one earlier assistant turn that add up to
+100 or more. What that costs is recall, never precision. Verbatim text below those sizes is not
+carved (see the limits, below). **Invisible characters,
 measured (300 generated pastes per shape: an assistant answer of five paragraphs of about 1,500
 characters, or of eight paragraphs of 20 to 59 characters, pasted back into one turn):** with U+2060 every 7 characters, U+200B or U+00AD every 15, or U+200B every 40, the
 paste was fully carved in 0, 0, 0 and 56 percent of the long-paragraph pastes and in 0, 0, 0 and
 11 percent of the short-paragraph pastes before the match form deleted such characters, and in
 100 percent of both after, the same as the unmarked paste; three copies of a 350-character
 paragraph with the later copies marked differently were found as boilerplate in 0 percent before
-and 100 percent after, and the carve table above is unchanged. **Known limits, measured
-on 300 generated cases each, none of them solved:** a **mosaic**, verbatim fragments of an answer
-each shorter than 60 match-form characters joined by the owner's own words inside one paragraph,
-is not carved however many fragments there are, because no 60-character stretch is shared and the
-100-character total counts whole paragraphs only (6 to 10 fragments of 20 to 29, 30 to 39 and 40
-to 55 characters: carved in 0 percent of the pastes; of 56 to 59 characters: 33 percent; of 60 to
-70 characters: 100 percent). A stacking rule over fragments of 30 characters or more was
-considered and not built: a window that short also matches stock phrases that people and
-assistants both write, and what carving them costs can only be measured on real text, not on
-generated text. Eight short pieces (20 to 59 characters) of an answer pasted in turns with an
+and 100 percent after, and the carve table above is unchanged. **The mosaic, measured (300
+generated mosaics of 6 to 10 verbatim fragments joined by glue words in one paragraph):**
+fragments of 30 to 39, 40 to 55 and 56 to 59 characters were carved in 0, 0 and 33 percent of the
+pastes before the fragment rule and in 100 percent after; of 60 to 70 characters in 100 percent
+both times. **Known limits, measured on 300 generated cases each, none of them solved:**
+fragments shorter than 30 characters do not stack however many there are (6 to 10 fragments of 20
+to 29 characters: carved in 0 percent). What the fragment rule costs on real prose is not
+measured: a 30-character window can also match a stock phrase that people and assistants both
+write, and the generated prose of the table above, whose vocabulary is random, never repeats a
+30-character phrase by chance, so its 0.0 percent row cannot show that cost (it can only cost
+recall: a paragraph with stretches that add up to 100 characters is carved). Eight short pieces (20 to 59 characters) of an answer pasted in turns with an
 assistant reply between each (a stretch ends at an assistant turn, so a "noted" between two pastes
 starts a new stretch), or pasted from another conversation, are credited to the owner in 100
 percent of the cases (0 percent when the same pieces are consecutive turns). Pastes of text
 beyond the indexed head are not recognised either. The length strata and the owner's review stay
-as defence in depth for what slips through: a mosaic typed as one turn is a `typed_prefix` span
-that the owner is shown in a sample and rejects, and one rejection rejects the text everywhere. Only the first 400,000 match-form characters of an assistant turn are
+as defence in depth for what slips through: a paste that was not carved and is typed as one turn
+is a `typed_prefix` span that the owner is shown in a sample and rejects, and one rejection
+rejects the text everywhere. Only the first 400,000 match-form characters of an assistant turn are
 indexed, at most 400,000 characters of assistant text are indexed per conversation (the oldest
 turns go first, the newest included in the count), and each indexed turn is kept as an array of
 64-bit window hashes and its normalized head, never its full text.
