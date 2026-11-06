@@ -454,7 +454,7 @@ format characters or lone combining marks is refused, and so is the bare name of
 `agent`, `system`, `bot`, in any case), with exit status 2.
 
 `--report` prints, per rule and length stratum, spans, characters, share of all characters,
-reviewed spans, precision and eligibility; the partition check (characters covered, overlaps,
+reviewed texts, precision and eligibility; the partition check (characters covered, overlaps,
 gaps); the five largest categories (rules, by characters); the ledger accounting; and the
 (rule, stratum) pairs that passed the gate. `--json` prints the same as JSON. `apply` writes a
 JSON list of `{source, attribution}` entries in the form `cce library profile --annotations`
@@ -503,9 +503,11 @@ fabrication and sample, seed and ledger shopping. It does **not** protect agains
 holds the owner's permissions and deliberately writes the owner's identity: such a process can
 append ledger rows under the owner's name, and nothing here can tell them from the owner's own.
 The same goes for rows `review-record` cannot write: one span reviewed as two rules or strata
-(the ledger quarantines them, and `append_rows` already refuses to append them) or a `drawn`
-count that does not match its sample; they need a direct write to the ledger file and are outside
-the guarantee. That is stated, not solved.
+(the ledger quarantines them, and `append_rows` already refuses to append them), a `drawn`
+count that does not match its sample, or a `text_key` that is not the key of the text the row
+answered (the gate recomputes the key from the scan for every span it finds, but a draw that
+leaves texts out cannot); they need a direct write to the ledger file and are outside the
+guarantee. That is stated, not solved.
 
 A (rule, length stratum) is profile-eligible only when the owner-review ledger holds at least
 100 reviewed **texts** of that rule and stratum at the current rules version, at least 95 percent

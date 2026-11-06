@@ -14,7 +14,7 @@ of a repeated text counts as the first, depends on the slice that was scanned.
 * `review-sample` draws the deterministic sample the owner confirms or rejects, and
   `review-record` appends the owner's answers to the append-only review ledger.
 
-No rule is profile-eligible until the ledger holds 100 owner-reviewed spans for it at 95 percent
+No rule is profile-eligible until the ledger holds 100 owner-reviewed texts for it at 95 percent
 precision, and the ledger is only ever read here (`review-record` appends to it).
 """
 
@@ -78,6 +78,7 @@ from .attribution_rules import (
     sample_header,
     sample_text,
     stratum_of,
+    text_key,
     to_annotation,
     utc_stamp,
 )
@@ -517,7 +518,7 @@ def render_report(report: dict[str, Any]) -> str:
     eligible = report["profile_eligible"]
     lines.append(
         f"gate: a rule and length stratum (S up to 240 characters, M up to 2000, L more) needs "
-        f"{gate['min_reviewed']} owner-reviewed spans at {gate['min_precision_percent']}% "
+        f"{gate['min_reviewed']} owner-reviewed texts at {gate['min_precision_percent']}% "
         "precision; profile-eligible: " + (", ".join(eligible) if eligible else "none")
     )
     return "\n".join(lines)
@@ -940,19 +941,21 @@ def _ledger_view(args: argparse.Namespace) -> LedgerView:
 
 class MatchRecorder:
     """Notes which ledger span ids exist in the scan, under which rule and stratum and with which
-    exact text (the SHA-256 of the span's characters)."""
+    exact text (the SHA-256 of the span's characters) and text key (what the gate counts)."""
 
     def __init__(self, wanted: set[str]) -> None:
         self.wanted = wanted
-        self.matched: dict[str, tuple[str, str, str]] = {}
+        self.matched: dict[str, tuple[str, str, str, str]] = {}
 
     def visit(self, message: ScannedMessage, spans: list[AttributedSpan]) -> None:
         for span in spans:
             if span.span_id in self.wanted:
+                found = message.text[span.start : span.end]
                 self.matched[span.span_id] = (
                     span.rule,
                     span.stratum,
-                    text_digest(message.text[span.start : span.end]),
+                    text_digest(found),
+                    text_key(found),
                 )
 
 

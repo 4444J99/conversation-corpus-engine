@@ -436,3 +436,39 @@ def test_rows_of_the_previous_rules_version_and_ledger_schema_are_stale() -> Non
     summary = rules.review_statistics(old_schema, matched=matched, owner=OWNER_ID)
     assert (summary.rows, summary.stale_rows) == (100, 100)
     assert rules.eligible_strata(summary) == frozenset()
+
+
+def test_a_claimed_text_key_is_ignored_for_a_span_the_scan_found() -> None:
+    """The scan computes the key of the text it finds; a row's own claim only matters when its
+    span is gone. A hundred rows over fifty texts do not open the gate however the keys are
+    forged."""
+    rows, matched = [], {}
+    for index in range(100):
+        sentence = f"{SENTENCE} Number {index // 2}."
+        row = row_of(sentence, index)
+        forged = {**row, "text_key": f"{index:064x}"}  # a different made-up key on every row
+        rows.append(forged)
+        matched[row["span_id"]] = (
+            row["rule"],
+            row["stratum"],
+            row["text_sha256"],
+            rules.text_key(sentence),
+        )
+    summary = rules.review_statistics(rows, matched=matched, owner=OWNER_ID)
+    review = summary.strata[("typed_prefix", "S")]
+    assert (review.reviewed, review.confirmed, review.eligible) == (50, 50, False)
+    assert summary.duplicate_text_rows == 50
+    # The veto uses the scan's key too: a made-up key on a rejected span rejects the real text.
+    rejected = [
+        {**row_of(SENTENCE, 500, "no"), "text_key": "e" * 64},
+        *rows,
+    ]
+    matched[rejected[0]["span_id"]] = (
+        "typed_prefix",
+        "S",
+        text_digest(SENTENCE),
+        rules.text_key(SENTENCE),
+    )
+    summary = rules.review_statistics(rejected, matched=matched, owner=OWNER_ID)
+    assert rules.text_key(SENTENCE) in summary.rejected_texts
+    assert "e" * 64 not in summary.rejected_texts

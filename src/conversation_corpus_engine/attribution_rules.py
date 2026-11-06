@@ -1783,8 +1783,8 @@ LEGACY_LEDGER_SCHEMAS = frozenset(
 SAMPLE_SCHEMA = "cce.attribution-review-sample.v6"
 SAMPLE_HEADER_SCHEMA = "cce.attribution-review-sample-header.v6"
 VERDICTS = ("yes", "no", "unsure")
-# A (rule, stratum) may be profile-eligible only when at least this many of its spans were
-# reviewed by the owner and at least this share of them (counting unsure and no as not confirmed)
+# A (rule, stratum) may be profile-eligible only when at least this many of its distinct texts
+# (by text key) were reviewed by the owner and at least this share of them (counting unsure and no as not confirmed)
 # was confirmed.
 GATE_MIN_REVIEWED = 100
 GATE_MIN_PRECISION_PERCENT = 95
@@ -1816,7 +1816,7 @@ UTC_STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 def utc_stamp(moment: datetime) -> str:
-    """The ledger's UTC stamp for a time the caller supplies (this module never reads the clock)."""
+    """The ledger's UTC stamp for a time the caller supplies (no wall clock is read here)."""
     if moment.tzinfo is None:
         raise ValueError("a review time must be timezone-aware")
     return moment.astimezone(UTC).strftime(UTC_STAMP_FORMAT)
@@ -2127,7 +2127,7 @@ class ReviewSummary:
 def review_statistics(
     rows: Iterable[dict[str, Any]],
     *,
-    matched: Mapping[str, tuple[str, str, str]],
+    matched: Mapping[str, tuple[str, ...]],
     owner: str | None,
     rules_version: str = RULES_VERSION,
 ) -> ReviewSummary:
@@ -2135,8 +2135,8 @@ def review_statistics(
 
     A row counts only when all of these hold: it is current (this `rules_version`, the current
     schema); its reviewer equals `owner` (None identifies nobody, so nothing counts); and its span
-    exists in the scan (`matched` maps span id to (rule, stratum, text_sha256)) under the same rule
-    and stratum with the very text the row answered. A span counts once, by its last verdict in
+    exists in the scan (`matched` maps span id to (rule, stratum, text_sha256, text_key)) under
+    the same rule and stratum with the very text the row answered. A span counts once, by its last verdict in
     file order. `unsure` and `no` both count as reviewed and not confirmed. An owner `no` or
     `unsure` whose span (or whose text) is gone from the scan still counts, as an error in its own
     (rule, stratum): rejecting a text and then re-importing it must not take the rejection out of
@@ -2146,8 +2146,10 @@ def review_statistics(
     text are one review, however many messages they sit in and however many span ids they
     therefore have. "The same text" is the same `text_key` (see `visible_form`): invisible
     characters, spacing, line endings and Unicode form do not make a new text. A row still binds
-    to the exact characters it answered (`text_sha256`), but is counted under its `text_key`. A
-    text with a `no` on any copy counts as a `no`, else with an `unsure` on any copy as `unsure`,
+    to the exact characters it answered (`text_sha256`), but is counted under its `text_key`: the
+    key the scan computed for that span when it found it (the fourth item of its `matched` entry),
+    since a row's own claim of a key is only a claim; the row's key is used for an orphaned row,
+    whose span the scan cannot check. A text with a `no` on any copy counts as a `no`, else with an `unsure` on any copy as `unsure`,
     else as `yes`: one rejection rejects the text everywhere.
 
     Precision is over the rows a sample drew, not over the rows that happen to be in the ledger:
@@ -2170,6 +2172,14 @@ def review_statistics(
     kinds: dict[str, set[tuple[str, str]]] = {}
     for row in candidates:
         kinds.setdefault(row["span_id"], set()).add((row["rule"], row["stratum"]))
+
+    def key_of(row: dict[str, Any]) -> str:
+        """The text key of what a row answered: the scan's, when the scan found that very text."""
+        fact = matched.get(row["span_id"])
+        if fact is not None and len(fact) > 3 and fact[2] == row["text_sha256"]:
+            return fact[3]
+        return row["text_key"]
+
     latest: dict[str, dict[str, Any]] = {}
     orphaned: dict[str, dict[str, Any]] = {}
     held_back: set[str] = set()
@@ -2199,14 +2209,14 @@ def review_statistics(
     in_scan: set[tuple[str, str, str]] = set()
     duplicate = orphan_negative_rows = 0
     for row in latest.values():
-        key = (row["rule"], row["stratum"], row["text_key"])
+        key = (row["rule"], row["stratum"], key_of(row))
         duplicate += key in in_scan
         in_scan.add(key)
         text_verdicts.setdefault(key, set()).add(row["verdict"])
     for span, row in orphaned.items():
         if span not in latest and row["verdict"] != "yes":
             orphan_negative_rows += 1
-            key = (row["rule"], row["stratum"], row["text_key"])
+            key = (row["rule"], row["stratum"], key_of(row))
             text_verdicts.setdefault(key, set()).add(row["verdict"])
     orphan_negative: dict[tuple[str, str], int] = {}
     for key, found in text_verdicts.items():
@@ -2258,7 +2268,7 @@ def review_statistics(
         missing_rows=sum(missing.values()),
         orphan_negative_rows=orphan_negative_rows,
         rejected_texts=frozenset(
-            row["text_key"] for row in candidates if row["verdict"] in ("no", "unsure")
+            key_of(row) for row in candidates if row["verdict"] in ("no", "unsure")
         ),
         duplicate_text_rows=duplicate,
         superseded_rows=superseded,

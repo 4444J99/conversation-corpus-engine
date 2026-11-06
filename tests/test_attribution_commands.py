@@ -1856,11 +1856,13 @@ def test_a_hundred_answers_over_fifty_distinct_texts_do_not_open_the_gate(
     assert (short["reviewed"], short["confirmed"], short["eligible"]) == (50, 50, False)
 
 
+@pytest.mark.parametrize("forged_key", ["true", "invented"])
 def test_answers_to_copies_of_a_text_forged_into_a_ledger_still_count_once(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], forged_key: str
 ) -> None:
     """Even if both copies of every text were answered (by a draw from before this rule, or by
-    hand), the gate counts each text once."""
+    hand), the gate counts each text once; and a row that claims a made-up `text_key` for a span
+    the scan finds is counted under the text key the scan computes, not the one it claims."""
     texts = [
         f"Owner sentence {index} about the garden plan number {index * 3}." for index in range(50)
     ]
@@ -1887,6 +1889,12 @@ def test_answers_to_copies_of_a_text_forged_into_a_ledger_still_count_once(
 
         scan(handle, census, limit_records=None, deadline=Deadline(60), visit=visit)
     known = {row["span_id"] for row in rows}
+    pairs = [
+        (text, span, stratum)
+        for text, spans in found.items()
+        for span, stratum in spans
+        if span not in known
+    ]
     twins = [
         ledger_row(
             span,
@@ -1897,12 +1905,10 @@ def test_answers_to_copies_of_a_text_forged_into_a_ledger_still_count_once(
             stratum=stratum,
             sample_digest="a" * 64,
             text_sha256=hashlib.sha256(text.encode()).hexdigest(),
-            text_key=text_key(text),
+            text_key=text_key(text) if forged_key == "true" else f"{number:064x}",
             drawn=50,
         )
-        for text, spans in found.items()
-        for span, stratum in spans
-        if span not in known
+        for number, (text, span, stratum) in enumerate(pairs)
     ]
     assert len(twins) == 50
     append_ledger(ledger, twins)
