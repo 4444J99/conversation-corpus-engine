@@ -17,6 +17,7 @@ import time
 import zlib
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,11 @@ SEARCH_PLANS = ("auto", "phrase", "and", "or")
 CONCRETE_PLANS = SEARCH_PLANS[1:]
 # Totals are counted only up to this many matches, so a huge match set is never counted in full.
 DEFAULT_COUNT_CAP = 1000
+# Every plan runs on at most this much of the query: the first MAX_QUERY_CHARS characters, at most
+# MAX_QUERY_TERMS distinct terms, each cut to MAX_TERM_CHARS characters.
+MAX_QUERY_CHARS = 1000
+MAX_QUERY_TERMS = 32
+MAX_TERM_CHARS = 64
 MAX_COUNT_CAP = 1_000_000_000
 MAX_SEARCH_SECONDS = 600.0
 # The time budget applied by the command line and the MCP tool; the Python API has none unless
@@ -48,6 +54,10 @@ UNRANKED_GRACE_SECONDS = 2.0
 # instructions per row, so the interval stays small; a test lowers it to exercise a tiny library.
 SEARCH_PROGRESS_INSTRUCTIONS = 1000
 BROAD_QUERY_HINT = "quote a phrase or add terms for a faster, more precise search"
+_TERMS_TRUNCATED_NOTICE = (
+    f"the query was shortened to its limits ({MAX_QUERY_TERMS} distinct terms, {MAX_TERM_CHARS} "
+    f"characters per term, the first {MAX_QUERY_CHARS} characters) and the search ran on what is left."
+)
 _UNRANKED_STUCK_TAIL = (
     " No hit arrived before the allowance for this page ran out and the plan is not proven "
     "empty, so next_offset repeats this offset: retry it, or narrow the query."
@@ -97,6 +107,76 @@ def validate_count_cap(value: Any) -> int | None:
     return value
 
 
+_TRAILING_FRAGMENT = re.compile(r"\s\S*$")
+
+
+@dataclass(frozen=True)
+class QueryTerms:
+    """The bounded terms of a query: what the search actually runs on.
+
+    Every plan sees at most ``MAX_QUERY_TERMS`` distinct terms (compared case-insensitively) of
+    at most ``MAX_TERM_CHARS`` characters, taken from the first ``MAX_QUERY_CHARS`` characters,
+    so a hostile or machine-made query cannot make SQLite build thousands of phrases.
+    """
+
+    phrases: tuple[str, ...]
+    words: tuple[str, ...]
+    # The words in query order, repeats kept, for the adjacent-phrase plan.
+    sequence: tuple[str, ...]
+    clipped: bool
+    shortened: bool
+    terms_cut: bool
+    sequence_cut: bool
+
+    def lost(self, plan: str) -> bool:
+        """Whether the bounds dropped anything that could change what ``plan`` matches."""
+        cut = self.sequence_cut if plan == "phrase" else self.terms_cut
+        return self.clipped or self.shortened or cut
+
+
+def query_terms(query: str) -> QueryTerms:
+    examined = query[:MAX_QUERY_CHARS]
+    if len(query) > MAX_QUERY_CHARS and not query[MAX_QUERY_CHARS].isspace():
+        # The cut fell inside a token: drop that fragment, which would be a term nobody wrote.
+        fragment = _TRAILING_FRAGMENT.search(examined)
+        if fragment:
+            examined = examined[: fragment.start()]
+    raw_phrases, raw_words = fts_terms(examined)
+    shortened = terms_cut = False
+    seen: set[str] = set()
+    kept: tuple[list[str], list[str]] = ([], [])
+    for target, raw in zip(kept, (raw_phrases, raw_words), strict=True):
+        for term in raw:
+            text = term[:MAX_TERM_CHARS].strip()
+            shortened = shortened or len(term) > MAX_TERM_CHARS
+            key = " ".join(text.split()).casefold()
+            if key in seen:
+                continue
+            if len(seen) >= MAX_QUERY_TERMS:
+                terms_cut = True
+                continue
+            seen.add(key)
+            target.append(text)
+    ordered = WORD_RE.findall(examined.replace('"', " "))
+    shortened = shortened or any(len(word) > MAX_TERM_CHARS for word in ordered[:MAX_QUERY_TERMS])
+    return QueryTerms(
+        phrases=tuple(kept[0]),
+        words=tuple(kept[1]),
+        sequence=tuple(word[:MAX_TERM_CHARS] for word in ordered[:MAX_QUERY_TERMS]),
+        clipped=len(query) > MAX_QUERY_CHARS,
+        shortened=shortened,
+        terms_cut=terms_cut,
+        sequence_cut=len(ordered) > MAX_QUERY_TERMS,
+    )
+
+
+def _match(terms: QueryTerms, plan: str) -> str:
+    if plan == "phrase":
+        return '"' + " ".join(terms.sequence) + '"' if terms.sequence else ""
+    units = [*(f'"{phrase}"' for phrase in terms.phrases), *(f'"{word}"' for word in terms.words)]
+    return (" OR " if plan == "or" else " ").join(units)
+
+
 def plan_match(query: str, plan: str) -> str:
     """The FTS5 MATCH expression of one concrete plan; empty when the query has no terms.
 
@@ -105,35 +185,32 @@ def plan_match(query: str, plan: str) -> str:
     """
     if plan not in CONCRETE_PLANS:
         raise ValueError("plan must be one of: " + ", ".join(CONCRETE_PLANS))
-    phrases, words = fts_terms(query)
-    units = [*(f'"{phrase}"' for phrase in phrases), *(f'"{word}"' for word in words)]
-    if not units:
-        return ""
-    if plan == "and":
-        return " ".join(units)
-    if plan == "or":
-        return " OR ".join(units)
-    return '"' + " ".join(WORD_RE.findall(query.replace('"', " "))) + '"'
+    return _match(query_terms(query), plan)
 
 
 def plan_locator_query(query: str, plan: str) -> str:
     """The query text that best locates a hit's passage when ``plan`` answered it."""
-    if plan != "phrase":
-        return query
-    match = plan_match(query, "phrase")
-    return match if match else query
+    terms = query_terms(query)
+    if plan == "phrase" and terms.sequence:
+        return _match(terms, "phrase")
+    return " ".join([*(f'"{phrase}"' for phrase in terms.phrases), *terms.words])
 
 
-def _plan_steps(query: str, plan: str) -> list[tuple[str, str]]:
-    """The (plan, MATCH expression) steps to try in order; empty when the query has no terms."""
+def _plan_steps(query: str, plan: str) -> tuple[list[tuple[str, str]], QueryTerms]:
+    """The (plan, MATCH expression) steps to try in order, empty when the query has no terms."""
+    terms = query_terms(query)
     if plan == "auto":
-        phrases, words = fts_terms(query)
         # A single term, or a query that already quotes a phrase, is searched as written.
-        names = CONCRETE_PLANS if not phrases and len(words) > 1 else ("and",)
+        names = CONCRETE_PLANS if not terms.phrases and len(terms.sequence) > 1 else ("and",)
     else:
         names = (plan,)
-    steps = [(name, plan_match(query, name)) for name in names]
-    return [step for step in steps if step[1]]
+    steps: list[tuple[str, str]] = []
+    for name in names:
+        match = _match(terms, name)
+        # A plan whose expression repeats an earlier one (one distinct term) adds nothing.
+        if match and all(match != earlier for _, earlier in steps):
+            steps.append((name, match))
+    return steps, terms
 
 
 def _bounded_sql(method: Any) -> Any:
@@ -705,7 +782,7 @@ class Library:
         cap = validate_count_cap(count_cap)
         started = _clock()
         deadline = None if seconds is None else started + seconds
-        steps = _plan_steps(query, plan)
+        steps, terms = _plan_steps(query, plan)
 
         def finish(
             name: str,
@@ -732,11 +809,17 @@ class Library:
                 "ranked": not partial,
                 "elapsed_s": round(_clock() - started, 3),
             }
+            notices = []
+            if terms.lost(name):
+                result["terms_truncated"] = True
+                notices.append(_TERMS_TRUNCATED_NOTICE)
             if partial:
-                result["notice"] = (
+                notices.append(
                     f"the {seconds:g} s time budget ran out while running the {expired_in} plan; "
                     f"the {name} plan's matches are shown in index order, not by relevance." + tail
                 )
+            if notices:
+                result["notice"] = " ".join(notices)
             if partial or (name == "or" and not exact):
                 result["hint"] = BROAD_QUERY_HINT
             return result

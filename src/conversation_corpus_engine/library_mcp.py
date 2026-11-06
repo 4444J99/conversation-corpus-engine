@@ -58,6 +58,7 @@ COMPACT_KEYS = {
     "elapsed_s": "es",
     "hint": "ht",
     "notice": "nt",
+    "terms_truncated": "tq",
     "offset": "o",
     "limit": "l",
     "returned": "c",
@@ -179,7 +180,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "type": "boolean",
                     "description": "Short keys: n total, nx total exact, o offset, c returned, "
                     "no next offset, h hits, tr truncated, tk estimated tokens, pn plan, "
-                    "pt partial, rk ranked, es elapsed seconds, ht hint, nt notice, i uid, "
+                    "pt partial, rk ranked, es elapsed seconds, tq terms truncated, ht hint, nt notice, i uid, "
                     "t title, s score, r read locator (m message, o offset, l limit, sq sequence, "
                     "lc located, le locator error).",
                 },
@@ -409,7 +410,7 @@ def _search(
     total = found["total"]
     planned = {
         key: found[key]
-        for key in ("plan", "partial", "ranked", "elapsed_s", "notice", "hint")
+        for key in ("plan", "partial", "ranked", "elapsed_s", "terms_truncated", "notice", "hint")
         if key in found
     }
 

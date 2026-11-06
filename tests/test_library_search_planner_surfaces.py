@@ -2,6 +2,7 @@
 
 import json
 import math
+import time
 
 import pytest
 
@@ -396,3 +397,18 @@ def test_cli_uses_the_default_budget_when_none_is_given(cli, tmp_path, capsys, m
     monkeypatch.setattr(Library, "search", spy)
     run_search(tmp_path, capsys, "lumen glyph")
     assert seen[0]["max_seconds"] == DEFAULT_SEARCH_SECONDS and seen[0]["plan"] == "auto"
+
+
+def test_an_oversized_query_is_bounded_and_says_so_through_the_tool(mcp):
+    huge = ("omega " * 17000)[:100000]
+    started = time.monotonic()
+    result = mcp(SEARCH_TOOL, query=huge, limit=3, max_seconds=2)
+    assert time.monotonic() - started < 2.0
+    assert result["terms_truncated"] is True and "shortened" in result["notice"]
+    assert result["plan"] == "and" and result["total"] == 1000 and len(result["hits"]) == 3
+    assert all(hit["read"]["limit"] for hit in result["hits"])
+    compact = mcp(SEARCH_TOOL, query=huge, limit=3, depth="L0", compact=True)
+    assert compact["tq"] is True and "nt" in compact and "terms_truncated" not in compact
+    assert "tq" in library_mcp.COMPACT_KEYS.values()
+    plain = mcp(SEARCH_TOOL, query="omega", limit=3)
+    assert "terms_truncated" not in plain and "notice" not in plain
