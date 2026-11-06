@@ -294,6 +294,13 @@ def require_git_private(directory: Path) -> Path:
     Git runs without the variables that relocate or hide a repository (`GIT_LOCATION_VARIABLES`),
     and its "not a git repository" counts as "outside every work tree" only when no `.git` exists
     at or above the path. Any other failure to run or understand git is an error, never a pass.
+
+    This says whether the text would be visible to Git, not that it is secret. It does not stop
+    `git add -f`, a hook or tool that bypasses ignore rules, or a backup or sync client; it does
+    not look at a repository's tracked files outside the directory; and a directory that ignores
+    its own contents through an inner `.gitignore` of `*` is refused, because that file does not
+    ignore the directory itself. See "Where private text may be written" in
+    docs/knowledge-library.md.
     """
     resolved = _absolute_path(directory).resolve(strict=False)
     probe = resolved
