@@ -239,8 +239,8 @@ def test_an_interrupt_after_the_head_landed_keeps_the_objects_it_names(vault, mo
     _, repo, owner, trust = vault
     real = sealed._write
 
-    def interrupted_after_head(path, data, *, exclusive=False):
-        real(path, data, exclusive=exclusive)
+    def interrupted_after_head(path, data, *, exclusive=False, **kwargs):
+        real(path, data, exclusive=exclusive, **kwargs)
         if path.name == "HEAD.cce":
             raise KeyboardInterrupt
 
@@ -257,3 +257,92 @@ def test_an_interrupt_after_the_head_landed_keeps_the_objects_it_names(vault, mo
         )["files"]
         == 1
     )
+
+
+# --- the cleanup of a failed publication fails closed --------------------------------------------
+
+
+class _HeadReadFails:
+    """Make reading HEAD.cce raise OSError once armed, as a failing disk would."""
+
+    def __init__(self, monkeypatch):
+        self.armed = False
+        real = sealed.Path.read_bytes
+
+        def read_bytes(path):
+            if self.armed and path.name == "HEAD.cce":
+                raise OSError(errno.EIO, "Input/output error")
+            return real(path)
+
+        monkeypatch.setattr(sealed.Path, "read_bytes", read_bytes)
+
+
+def _interrupt_after_head(monkeypatch, failing_read, *, report_landing):
+    """Interrupt just after the head's atomic replace; optionally hide that it landed."""
+    real = sealed._write
+
+    def interrupted(path, data, *, exclusive=False, **kwargs):
+        real(path, data, exclusive=exclusive, **(kwargs if report_landing else {}))
+        if path.name == "HEAD.cce":
+            failing_read.armed = True
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(sealed, "_write", interrupted)
+
+
+def test_a_head_that_landed_keeps_its_objects_even_if_the_head_cannot_be_reread(vault, monkeypatch):
+    _, repo, owner, trust = vault
+    failing_read = _HeadReadFails(monkeypatch)
+    _interrupt_after_head(monkeypatch, failing_read, report_landing=True)
+    with pytest.raises(KeyboardInterrupt):
+        sealed.publish(*_args(vault))
+    monkeypatch.undo()
+    assert sealed.verify(repo, owner, trust)["files"] == 1
+    sealed.restore(repo, vault[0].parent / "restored", owner, trust)
+    assert (vault[0].parent / "restored" / "big").read_bytes() == (vault[0] / "big").read_bytes()
+
+
+def test_an_unreadable_head_means_the_cleanup_is_skipped_and_says_so(vault, monkeypatch):
+    """Even when nothing tells the publisher the head landed, a head it cannot read is not a head
+    that is missing: no object is deleted, and the error it re-raises carries the reason."""
+    _, repo, owner, trust = vault
+    failing_read = _HeadReadFails(monkeypatch)
+    _interrupt_after_head(monkeypatch, failing_read, report_landing=False)
+    with pytest.raises(KeyboardInterrupt) as raised:
+        sealed.publish(*_args(vault))
+    monkeypatch.undo()
+    notes = " ".join(getattr(raised.value, "__notes__", []))
+    assert "cleanup" in notes and "skipped" in notes and "HEAD.cce" in notes
+    assert sealed.verify(repo, owner, trust)["files"] == 1
+    sealed.restore(repo, vault[0].parent / "restored", owner, trust)
+    assert (vault[0].parent / "restored" / "big").read_bytes() == (vault[0] / "big").read_bytes()
+
+
+def test_a_failed_second_publish_with_an_unreadable_head_leaves_the_first_generation_whole(
+    vault, tmp_path, monkeypatch
+):
+    source, repo, owner, trust = vault
+    sealed.publish(*_args(vault))
+    kept = _tree_files(repo)
+    (source / "big").write_bytes(b"M" * sealed.CHUNK + b"N" * sealed.CHUNK + b"O" * sealed.CHUNK)
+    failing_read = _HeadReadFails(monkeypatch)
+    real = sealed._write
+    writes = []
+
+    def failing(path, data, *, exclusive=False, **kwargs):
+        writes.append(path.name)
+        if len(writes) == 2:  # the second new object: the disk fails, and then cannot read HEAD
+            failing_read.armed = True
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real(path, data, exclusive=exclusive, **kwargs)
+
+    monkeypatch.setattr(sealed, "_write", failing)
+    with pytest.raises(OSError, match="No space") as raised:
+        sealed.publish(*_args(vault))
+    monkeypatch.undo()
+    notes = " ".join(getattr(raised.value, "__notes__", []))
+    assert "skipped" in notes and "HEAD.cce" in notes
+    assert set(kept) <= set(_tree_files(repo)), "nothing the first generation needs is removed"
+    assert sealed.verify(repo, owner, trust)["generation"] == 1
+    assert sealed.publish(*_args(vault))["generation"] == 2, "the retry reuses what was left"
+    _restored_matches(vault, tmp_path)

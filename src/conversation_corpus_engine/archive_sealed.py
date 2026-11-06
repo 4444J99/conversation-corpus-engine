@@ -13,7 +13,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -119,8 +119,18 @@ def _make_private_dirs(directory: Path) -> None:
         created.chmod(0o700)
 
 
-def _write(path: Path, data: bytes, *, exclusive: bool = False) -> None:
-    """Write via a same-directory temp file, fsync, then rename/link; remove the temp on failure."""
+def _write(
+    path: Path,
+    data: bytes,
+    *,
+    exclusive: bool = False,
+    on_published: Callable[[], None] | None = None,
+) -> None:
+    """Write via a same-directory temp file, fsync, then rename/link; remove the temp on failure.
+
+    `on_published` runs the moment the file is in place, before anything that can still fail
+    (the directory sync), so a caller can tell a write that landed from one that did not.
+    """
     safe_path(path)
     _make_private_dirs(path.parent)
     fd, name = tempfile.mkstemp(prefix=".cce-", dir=path.parent)
@@ -134,6 +144,8 @@ def _write(path: Path, data: bytes, *, exclusive: bool = False) -> None:
             _publish_exclusive(temp, path)
         else:
             temp.replace(path)
+        if on_published is not None:
+            on_published()
         _sync_directory(path.parent)
     finally:
         temp.unlink(missing_ok=True)
@@ -439,23 +451,41 @@ def publish(
         )
 
 
-def _discard_unreferenced(repo: Path, created: list[Path], head: bytes) -> None:
+def _discard_unreferenced(
+    repo: Path, created: list[Path], head: bytes, *, head_replaced: bool
+) -> str | None:
     """Remove the objects a publication wrote before it failed, unless its head took effect.
 
     The head is replaced atomically and names every object of the new generation, so until it is
     in place the objects this attempt created are referenced by nothing. Left behind they count
     against the storage budget of every retry (and, when the retry draws a fresh secret, they can
     never be reused), so a publication that was planned to fit would no longer fit. Objects that
-    already existed are never in `created`. Best effort: the failure being reported stays the
-    failure reported.
+    already existed are never in `created`.
+
+    It fails closed. Nothing is removed once the replace has returned (`head_replaced`), and
+    nothing is removed when the head cannot be read to tell whether it landed: an object left
+    behind costs space, an object removed under a head that names it costs the archive. A head
+    that does not exist (a first publication that never got that far) or is another one is the
+    only thing that clears the way. Returns the reason the cleanup was skipped, for the caller to
+    attach to the error it is re-raising, or None.
     """
-    with suppress(OSError):
+    if head_replaced or not created:
+        return None
+    try:
         if (repo / "HEAD.cce").read_bytes() == head:
-            return  # the head landed (an interrupt after the replace): its objects are in use
+            return None  # the head landed after all: its objects are in use
+    except FileNotFoundError:
+        pass  # no head yet: a first publication that failed before writing it
+    except OSError as error:
+        return (
+            f"cleanup of {len(created)} unreferenced object(s) skipped because HEAD.cce could "
+            f"not be read to confirm the new head had not landed ({error})"
+        )
     for path in created:
         with suppress(OSError):
             path.unlink(missing_ok=True)
             path.parent.rmdir()  # only when it is now empty
+    return None
 
 
 def _publish(
@@ -596,6 +626,7 @@ def _publish(
     if not capacity["fits"]:
         raise SealedError("storage-budget-exceeded")
     created: list[Path] = []
+    landed = {"head": False}
     try:
         for oid, data in pending.items():
             path = _object(repo, oid)
@@ -605,9 +636,11 @@ def _publish(
             else:
                 _write(path, data, exclusive=True)
                 created.append(path)
-        _write(repo / "HEAD.cce", encoded)
-    except BaseException:
-        _discard_unreferenced(repo, created, encoded)
+        _write(repo / "HEAD.cce", encoded, on_published=lambda: landed.update(head=True))
+    except BaseException as error:
+        skipped = _discard_unreferenced(repo, created, encoded, head_replaced=landed["head"])
+        if skipped:
+            error.add_note(skipped)
         raise
     _accept(trust_path, trust, head)
     return {
