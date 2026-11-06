@@ -14,9 +14,18 @@ from .archive_database import PHRASE_RE, WORD_RE
 from .attributed_knowledge import ZETTEL_SCHEMA, export_zettels, zettel_atoms
 from .corpus_store import CorpusStoreError
 from .library_analysis import AnalysisLimits, export_analysis
-from .library_build import build_library, current_generation, publish_library, verify_candidate
-from .library_export import export_library, verify_export
+from .library_build import (
+    DEFAULT_VAULT_PROFILE,
+    build_library,
+    current_generation,
+    publish_library,
+    verify_candidate,
+)
+from .library_cards import export_cards
+from .library_export import EXPORT_PROFILES, LEGACY_PROFILE, export_library, verify_export
 from .library_store import Library
+from .library_vault import VAULT_PROFILES
+from .library_vault_gate import measure_vault
 from .paths import default_project_root
 from .persona_extract import extract_persona_lexicon
 
@@ -406,6 +415,13 @@ def add_library_parser(subparsers: Any) -> None:
     common(build)
     build.add_argument("--manifest", type=Path, required=True)
     build.add_argument("--publish", action="store_true", help="Publish only after verification")
+    build.add_argument(
+        "--vault-profile",
+        choices=VAULT_PROFILES,
+        default=DEFAULT_VAULT_PROFILE,
+        help="Reading vault written into the generation: none (default, no vault), cards "
+        "(one capped card per record) or full (whole records in capped linked parts)",
+    )
     publish = sub.add_parser("publish", help="Verify and atomically publish an existing candidate")
     common(publish)
     publish.add_argument("generation", type=Path)
@@ -429,6 +445,30 @@ def add_library_parser(subparsers: Any) -> None:
     export.add_argument("--out", type=Path, required=True, help="New export directory")
     export.add_argument(
         "--zettels", type=Path, help="Private reviewed-Zettels JSON envelope to render as pages"
+    )
+    export.add_argument(
+        "--vault-profile",
+        choices=EXPORT_PROFILES,
+        default=LEGACY_PROFILE,
+        help="legacy (default) is the original layout, one flat note per record and per repeated "
+        "passage, which a reading app may be unable to open at scale; none, cards and full are "
+        "the capped layouts of `library build`",
+    )
+    cards = sub.add_parser(
+        "export-cards",
+        help="Write a small capped card vault (one card per record) for a reading app",
+    )
+    common(cards)
+    cards.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="Vault folder: empty, or an earlier card vault (never inside the library store)",
+    )
+    cards.add_argument(
+        "--limit-notes",
+        type=int,
+        help="Most notes (cards, hubs and Home) the vault may hold; default 10000, at most 20000",
     )
     verify_export = sub.add_parser(
         "verify-export", help="Verify an export directory, including its Zettel pages and anchors"
@@ -499,6 +539,22 @@ def _load_zettel_envelope(path: Path) -> dict[str, Any]:
     return envelope
 
 
+def _warn_over_caps(out: Path) -> None:
+    """Say, on stderr, when the legacy layout just written is one a reading app may not open."""
+    findings = measure_vault(Path(out) / "vault")["findings"]
+    if findings:
+        kinds = "; ".join(
+            f"{item['severity']} {item['code']} ({item['worst']} past {item['limit']})"
+            for item in findings
+        )
+        print(
+            f"library: warning: the legacy export layout is outside the vault caps ({kinds}). "
+            "A reading app may be unable to open it. Use --vault-profile cards or full, or "
+            "`cce library export-cards --out DIR`, for a vault that fits.",
+            file=sys.stderr,
+        )
+
+
 def _verify_export_command(args: argparse.Namespace) -> int:
     reviewed = None
     if args.zettels is not None:
@@ -533,7 +589,11 @@ def handle_library(args: argparse.Namespace) -> int:
         if args.action == "build":
             manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
             report = build_library(
-                manifest, project_root=args.project_root, store_root=store, progress=_progress
+                manifest,
+                project_root=args.project_root,
+                store_root=store,
+                progress=_progress,
+                vault_profile=args.vault_profile,
             )
             result = {
                 key: report[key]
@@ -544,6 +604,7 @@ def handle_library(args: argparse.Namespace) -> int:
                     "coverage_complete",
                     "artifact_bytes",
                     "elapsed_seconds",
+                    "vault_profile",
                 )
             }
             result["findings_count"] = len(report["findings"])
@@ -561,7 +622,15 @@ def handle_library(args: argparse.Namespace) -> int:
             with library:
                 if args.action == "export":
                     envelope = _load_zettel_envelope(args.zettels) if args.zettels else None
-                    result = export_library(library, args.out, zettels=envelope)
+                    result = export_library(
+                        library, args.out, zettels=envelope, vault_profile=args.vault_profile
+                    )
+                    if args.vault_profile == LEGACY_PROFILE:
+                        _warn_over_caps(args.out)
+                elif args.action == "export-cards":
+                    result = export_cards(
+                        library, args.out, store_root=store, limit_notes=args.limit_notes
+                    )
                 elif args.action == "zettels":
                     envelope = _load_zettel_envelope(args.input)
                     exporter = zettel_atoms if args.format == "atoms-jsonl" else export_zettels
