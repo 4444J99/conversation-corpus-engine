@@ -513,6 +513,28 @@ moves an existing conversation page URL.
   an ingest of unchanged sources without adding a generation; if the sources changed meanwhile,
   the next generation lists every conversation as added.
 
+  A crash only ever leaves a pending file the last row describes (finished by the next ingest)
+  or one it does not (discarded). What a crash cannot leave is a digest file that the last row's
+  `baseline` hash does not match with no pending file that does: the pending file was deleted or
+  edited after the row was written, or the digest file was replaced or restored from another
+  time. The next generation would be diffed against a stale baseline and the same generation
+  recorded twice, so an ingest refuses before it reads anything (exit 2, "lineage baseline
+  diverged from the ledger"; an edited pending file is left in place as evidence) and `verify`
+  fails with the same words (`lineage` status `baseline-diverged`). A ledger with an unreadable
+  line (a write cut short) is refused the same way and reported as `damaged`, naming the file
+  rather than a JSON error. A row without a `baseline` hash (written before rows carried it) has
+  nothing to compare. `verify` also lists any other `index-all-digests.jsonl.pending*` file as
+  stray: an ingest settles only its own pending file and never adopts another.
+
+  The remedy is explicit: `cce archive ingest|build --rebuild-lineage` digests the current
+  sources again (a provider this call did not read is digested from its stored shards),
+  replaces the baseline and appends exactly one row flagged `"rebuilt": true`. That row lists no
+  added, changed or removed uid, because the baseline that would say what changed is the one
+  that cannot be trusted. No ledger row is deleted: a damaged ledger keeps every readable row
+  and a copy of the damaged file is saved beside it as `index-all-lineage.jsonl.damaged`. Not
+  detectable: a ledger and a digest file both rolled back together to an earlier consistent
+  state.
+
 `cce archive verify` (and the verify that closes `build`) reports a `wiki` block (pages,
 messages and messages anchored, pages with a table of contents, backlink and history pages,
 turns by author, topic pages against topic hubs, generations, the `lineage` status and its note,

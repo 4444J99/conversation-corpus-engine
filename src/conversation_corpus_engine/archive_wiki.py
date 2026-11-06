@@ -9,6 +9,7 @@ changes) add their own keys to the same report.
 
 from __future__ import annotations
 
+import glob
 import re
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -20,7 +21,14 @@ from . import archive_layout as layout
 from .archive_author import AUTHORS
 from .archive_ingest import ArchivePaths, load_index, load_manifest
 from .archive_layout import CONVERSATION_PREFIX
-from .archive_lineage import CHANGE_KINDS, history_by_uid, load_lineage
+from .archive_lineage import (
+    CHANGE_KINDS,
+    LineageError,
+    baseline_state,
+    diverged_message,
+    history_by_uid,
+    load_lineage,
+)
 from .archive_naming import InvalidName, conversation_uid, parse_name
 from .archive_vault import incoming_links, part_owners
 
@@ -404,9 +412,17 @@ def _lineage_problems(
     beside it (its digest baseline is lost), digests with no ledger, or a ledger file that holds
     no generation, is a broken lineage and fails.
     """
-    ledger = load_lineage(paths)
-    report["generations"] = len(ledger)
     problems = []
+    try:
+        ledger = load_lineage(paths)
+        damage = ""
+    except LineageError as exc:
+        ledger, damage = [], str(exc)
+    report["generations"] = len(ledger)
+    if damage:
+        # Every other check would compare the site with a ledger of no generation and say so.
+        report["lineage"] = {"status": "damaged", "note": ""}
+        return [damage]
     if ledger:
         report["lineage"] = {"status": "recorded", "note": ""}
         if not paths.digests.exists():
@@ -418,6 +434,11 @@ def _lineage_problems(
                 f"digest baseline missing: the ledger records {len(ledger)} generation(s) but "
                 "its digest file is absent; run `cce archive ingest`"
             )
+        elif baseline_state(paths, ledger) == "diverged":
+            # The last row vouches for a baseline this file is not, and no pending file explains
+            # it: an ingest would refuse (a crash leaves a pending file, never this).
+            report["lineage"]["status"] = "baseline-diverged"
+            problems.append(diverged_message(paths, ledger))
     elif paths.lineage.exists():
         report["lineage"]["status"] = "empty"
         problems.append("generation lineage holds no generation: run `cce archive ingest`")
@@ -434,6 +455,16 @@ def _lineage_problems(
             f"interrupted lineage commit: {paths.digests_pending.name} is left over from an "
             "ingest that stopped between its steps; run `cce archive ingest` to finish or "
             "discard it"
+        )
+    strays = sorted(
+        path.name
+        for path in paths.digests.parent.glob(f"{glob.escape(paths.digests.name)}.pending*")
+        if path != paths.digests_pending
+    )
+    if strays:
+        problems.append(
+            f"stray pending baseline file(s) beside {paths.digests.name}: {', '.join(strays)}; "
+            "an ingest settles only its own pending file and never adopts these, so remove them"
         )
     for index, record in enumerate(ledger, 1):
         parent = ledger[index - 2]["fingerprint"] if index > 1 else ""

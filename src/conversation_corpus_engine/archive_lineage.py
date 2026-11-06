@@ -13,6 +13,12 @@ the archive folder beside the manifest:
 A generation is named by its fingerprint and the data's own latest day, never by a clock, so two
 runs over the same sources write the same ledger. Re-ingesting unchanged sources adds nothing.
 Recent changes and per-page history on the site are read from the ledger, not by diffing pages.
+
+The ledger and the digest file vouch for each other: a row carries the sha256 of the baseline it
+describes. When the two disagree and nothing explains it (no pending baseline that the row
+describes), the baseline has been altered, deleted or restored from elsewhere, and a new
+generation diffed against it would be wrong; that is `LineageError`, never a silent repair.
+`cce archive build --rebuild-lineage` is the explicit remedy.
 """
 
 from __future__ import annotations
@@ -32,13 +38,53 @@ if TYPE_CHECKING:
 
 # What a generation can do to a conversation, in the order a ledger row lists them.
 CHANGE_KINDS = ("added", "changed", "removed")
+# The words verify and the ingest refusal share, so one search finds either.
+BASELINE_DIVERGED = "lineage baseline diverged from the ledger"
+REBUILD_REMEDY = "cce archive build --rebuild-lineage"
+
+
+class LineageError(ValueError):
+    """The lineage cannot be trusted or read: a damaged ledger, or a baseline the ledger does not
+    describe. Nothing has been changed when this is raised."""
+
+
+def read_ledger(paths: ArchivePaths) -> tuple[list[dict[str, Any]], str]:
+    """The ledger rows that can be read, and why the rest cannot ("" when all of it can).
+
+    A line that is not a JSON object (a write cut short leaves one at the end) ends the readable
+    rows: it and everything after it is the unreadable remainder.
+    """
+    if not paths.lineage.is_file():
+        return [], ""
+    rows: list[dict[str, Any]] = []
+    for number, raw in enumerate(paths.lineage.read_bytes().splitlines(), 1):
+        if not raw.strip():
+            continue
+        try:
+            row = json.loads(raw.decode("utf-8"))
+        except ValueError:  # includes UnicodeDecodeError and json.JSONDecodeError
+            return rows, f"line {number} is not JSON (the file may have been cut short)"
+        if not isinstance(row, dict):
+            return rows, f"line {number} is not a generation row"
+        rows.append(row)
+    return rows, ""
 
 
 def load_lineage(paths: ArchivePaths) -> list[dict[str, Any]]:
-    """The generations recorded so far, oldest first (an archive with none has an empty list)."""
-    if not paths.lineage.is_file():
-        return []
-    return list(iter_jsonl(paths.lineage))
+    """The generations recorded so far, oldest first (an archive with none has an empty list).
+
+    A ledger with an unreadable line raises `LineageError` naming the file and the remedy: the
+    rows after it would be guesses, and a bare JSON error says nothing about what to do.
+    """
+    rows, damage = read_ledger(paths)
+    if damage:
+        raise LineageError(
+            f"{paths.lineage.name} is damaged: {damage}, after {len(rows)} readable "
+            f"generation(s). Restore it from a copy, or run `{REBUILD_REMEDY}`: that keeps "
+            f"every readable row, saves a copy of the damaged file as {paths.lineage.name}.damaged "
+            f"and records one generation flagged rebuilt"
+        )
+    return rows
 
 
 def load_digests(paths: ArchivePaths) -> dict[str, dict[str, str]]:
@@ -84,24 +130,88 @@ def _file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def finish_interrupted_commit(paths: ArchivePaths, ledger: list[dict[str, Any]]) -> str:
+def baseline_state(paths: ArchivePaths, ledger: list[dict[str, Any]]) -> str:
+    """How the digest file and its pending file stand against what the last ledger row says.
+
+    * `none`: the row carries no baseline hash (an empty ledger, or one written before rows
+      carried it): there is nothing to compare;
+    * `finish`: the pending file is exactly what the row describes, so only the rename is missing;
+    * `agree`: the digest file is what the row describes (a pending file beside it is stale);
+    * `missing`: there is no digest file and no pending file the row describes;
+    * `diverged`: the digest file is not what the row describes and no pending file is either.
+      A crash cannot leave this behind (it leaves `finish` or `agree`); a deleted or edited
+      file does, and so does a digest file restored from another time.
+    """
+    expected = ledger[-1].get("baseline") if ledger else None
+    if not expected:
+        return "none"
+    pending = paths.digests_pending
+    if pending.is_file() and _file_digest(pending) == expected:
+        return "finish"
+    if not paths.digests.is_file():
+        return "missing"
+    return "agree" if _file_digest(paths.digests) == expected else "diverged"
+
+
+def diverged_message(paths: ArchivePaths, ledger: list[dict[str, Any]]) -> str:
+    return (
+        f"{BASELINE_DIVERGED}: {paths.digests.name} is not the baseline that generation "
+        f"{ledger[-1].get('generation', len(ledger))} of {paths.lineage.name} records, and no "
+        f"{paths.digests_pending.name} describes it either, so the file was altered, deleted or "
+        "restored from another time. A new generation would be diffed against a stale baseline "
+        f"and repeat what the ledger already holds. If the ledger is right, restore "
+        f"{paths.digests.name}; otherwise run `{REBUILD_REMEDY}`, which re-baselines from the "
+        "current sources and appends one generation flagged rebuilt (it deletes no ledger row)"
+    )
+
+
+def check_lineage(paths: ArchivePaths) -> None:
+    """Raise `LineageError` if the lineage cannot be trusted, before an ingest reads anything."""
+    ledger = load_lineage(paths)
+    if baseline_state(paths, ledger) == "diverged":
+        raise LineageError(diverged_message(paths, ledger))
+
+
+def finish_interrupted_commit(
+    paths: ArchivePaths, ledger: list[dict[str, Any]], *, rebuild: bool = False
+) -> str:
     """Settle a generation whose commit was cut short, before any diff is computed.
 
     A commit writes the new baseline to `<baseline>.pending`, appends the ledger row (which carries
     the sha256 of that file) and renames the pending file over the baseline. If the pending file is
     what the last row says it is, the row was written and only the rename is missing: finish it.
-    Otherwise no row describes it (the crash came first, or the file is partial), and it is
-    discarded. Either way the baseline and the ledger agree afterwards, whatever the sources hold
-    now. Returns "" (nothing was pending), "finished" or "discarded".
+    If it is not and the baseline is what the row describes, no row describes the pending file
+    (the crash came first, or the file is partial) and it is discarded. Either way the baseline and
+    the ledger agree afterwards, whatever the sources hold now.
+
+    If neither the baseline nor a pending file is what the last row describes (`diverged`), the
+    ledger holds a generation whose baseline is gone: that is `LineageError`, and the pending file
+    is left where it is as evidence. `rebuild` accepts it and discards the pending file, because
+    the baseline is about to be written again from the current sources. Returns "" (nothing was
+    pending), "finished" or "discarded".
     """
+    state = baseline_state(paths, ledger)
+    if state == "diverged" and not rebuild:
+        raise LineageError(diverged_message(paths, ledger))
     pending = paths.digests_pending
     if not pending.is_file():
         return ""
-    if ledger and ledger[-1].get("baseline") == _file_digest(pending):
+    if state == "finish":
         _commit_baseline(pending, paths.digests)
         return "finished"
     pending.unlink(missing_ok=True)
     return "discarded"
+
+
+def _save_damaged_ledger(paths: ArchivePaths) -> None:
+    """Keep a copy of a damaged ledger before a rebuild rewrites it; an earlier copy stays."""
+    data = paths.lineage.read_bytes()
+    target = paths.lineage.with_name(paths.lineage.name + ".damaged")
+    number = 1
+    while target.exists():
+        number += 1
+        target = paths.lineage.with_name(f"{paths.lineage.name}.damaged-{number}")
+    target.write_bytes(data)
 
 
 def record_generation(
@@ -112,6 +222,7 @@ def record_generation(
     read: Iterable[str],
     day: str = "",
     digest_store: Callable[[str], dict[str, str]] | None = None,
+    rebuild: bool = False,
 ) -> dict[str, Any] | None:
     """Record the generation `manifest` is, against the one before; return its ledger row.
 
@@ -137,11 +248,26 @@ def record_generation(
     file either): it is rewritten from the current content, without a new generation, only when
     the sources are those of the last row (same fingerprint). Otherwise the next generation lists
     every conversation as added.
+
+    A baseline that exists but is not the one the last row describes, with no pending file that
+    is, raises `LineageError` (see `baseline_state`): recording on top of it would diff the
+    sources against a stale baseline and write the same generation twice. So does a damaged
+    ledger. `rebuild` is the explicit remedy and appends exactly one row, flagged
+    `"rebuilt": true`: every readable row stays, a damaged ledger is first copied to
+    `<ledger>.damaged`, the baseline is digested again from the current sources (the stale one is
+    not trusted, so a provider this ingest did not read is digested from its stored shards), and
+    the row lists no change, because the baseline that would say what changed is the one that
+    cannot be trusted.
     """
-    ledger = load_lineage(paths)
-    finish_interrupted_commit(paths, ledger)
+    if rebuild:
+        ledger, damage = read_ledger(paths)
+        if damage:
+            _save_damaged_ledger(paths)
+    else:
+        ledger = load_lineage(paths)
+    finish_interrupted_commit(paths, ledger, rebuild=rebuild)
     baseline_present = paths.digests.is_file()
-    previous = load_digests(paths)
+    previous = {} if rebuild else load_digests(paths)
     read_now = set(read)
     current: dict[str, dict[str, str]] = {}
     for name, info in manifest["providers"].items():
@@ -152,8 +278,12 @@ def record_generation(
                 current[name] = previous[name]
             elif digest_store is not None:
                 current[name] = digest_store(name)
-    before = {uid: digest for rows in previous.values() for uid, digest in rows.items()}
     after = {uid: digest for rows in current.values() for uid, digest in rows.items()}
+    before = (
+        after
+        if rebuild
+        else {uid: digest for rows in previous.values() for uid, digest in rows.items()}
+    )
     added = sorted(after.keys() - before.keys())
     removed = sorted(before.keys() - after.keys())
     changed = sorted(uid for uid in after.keys() & before.keys() if after[uid] != before[uid])
@@ -168,8 +298,10 @@ def record_generation(
         "changed": changed,
         "removed": removed,
     }
+    if rebuild:
+        record["rebuilt"] = True
     same_sources = bool(ledger) and ledger[-1]["fingerprint"] == fingerprint
-    if same_sources and (not (added or changed or removed) or not baseline_present):
+    if not rebuild and same_sources and (not (added or changed or removed) or not baseline_present):
         record = None
 
     def baseline_rows() -> Iterable[dict[str, Any]]:
