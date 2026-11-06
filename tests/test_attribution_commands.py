@@ -239,6 +239,48 @@ def test_a_deadline_during_the_census_stops_the_command_and_writes_nothing(
     assert code == 3 and "deadline" in err
 
 
+def test_apply_cut_short_by_the_deadline_keeps_its_file_under_the_partial_name(
+    library_path: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    readings = {"census": 0}
+
+    def counting() -> float:
+        readings["census"] += 1
+        return 0.0
+
+    with Library(library_path) as library:
+        build_census(
+            library,
+            limit_records=None,
+            min_chars=200,
+            min_occurrences=3,
+            deadline=Deadline(10.0, clock=counting),
+        )
+    allowed = readings["census"] + 3
+    seen = {"count": 0}
+
+    def clock() -> float:
+        seen["count"] += 1
+        return 0.0 if seen["count"] <= allowed else 1e6
+
+    monkeypatch.setattr(
+        attribution_commands, "Deadline", lambda seconds: Deadline(seconds, clock=clock)
+    )
+    out = tmp_path / "annotations.json"
+    code, stdout, err = run_cli(capsys, "apply", "--library", library_path, "--out", out, "--json")
+    assert code == 3 and "partial" in err
+    result = json.loads(stdout)
+    partial = out.with_name("annotations.json.partial")
+    assert result["deadline_reached"] is True and result["complete"] is False
+    assert result["partial"] is True and result["out"] == str(partial)
+    assert not out.exists()
+    entries = json.loads(partial.read_text(encoding="utf-8"))
+    assert isinstance(entries, list) and len(entries) == result["entries"] > 0
+
+
 def test_a_deadline_during_the_scan_pass_returns_a_flagged_partial_result(
     library_path: Path,
 ) -> None:

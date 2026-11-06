@@ -334,7 +334,8 @@ cce library profile --store-root /private/store --persona rob --annotations /pri
 and write only the file named by `--out` (never into the generation, never over an existing
 file). `--limit-records N` scans the first N records in uid order and `--deadline-seconds`
 (default 900) is a wall-clock budget: a deadline during the census stops the command with exit
-status 3 and writes nothing, and one during the scan marks the report or file partial and exits 3.
+status 3 and writes nothing, and one during the scan marks the report partial and exits 3; an `apply` cut short that way
+leaves its file under the name `<out>.partial` so it cannot pass for a whole export.
 
 `--report` prints, per rule, spans, characters, share of all characters, reviewed spans,
 precision and eligibility; the partition check (characters covered, overlaps, gaps); the five

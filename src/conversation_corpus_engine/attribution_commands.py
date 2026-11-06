@@ -413,10 +413,15 @@ class AnnotationWriter:
         self.handle.write(separator + "\n" + json.dumps(entry, sort_keys=True, ensure_ascii=True))
         self.count += 1
 
-    def commit(self) -> None:
+    def commit(self, *, partial: bool = False) -> Path:
+        """Close the JSON list. A complete file takes the requested name; a partial one (the
+        scan was cut short) keeps the `.partial` name so it cannot pass for a whole export."""
         self.handle.write("\n]\n")
         self.handle.close()
+        if partial:
+            return self.temp
         self.temp.replace(self.out)
+        return self.out
 
     def abort(self) -> None:
         self.handle.close()
@@ -658,12 +663,13 @@ def _apply(args: argparse.Namespace) -> int:
             stats, tally = scan(
                 library, census, limit_records=args.limit_records, deadline=deadline, visit=visit
             )
-            writer.commit()
+            written = writer.commit(partial=stats.deadline_reached)
         except BaseException:
             writer.abort()
             raise
     result = {
-        "out": str(out),
+        "out": str(written),
+        "partial": stats.deadline_reached,
         "rules_version": RULES_VERSION,
         "entries": writer.count,
         "messages_scanned": tally.messages,
@@ -680,13 +686,16 @@ def _apply(args: argparse.Namespace) -> int:
         "ledger": str(ledger) if ledger else None,
     }
     text = (
-        f"wrote {writer.count} annotations for {tally.messages} messages to {out}"
+        f"wrote {writer.count} annotations for {tally.messages} messages to {written}"
         f" ({counts['owner_spans']} owner spans, {counts['profile_eligible_spans']} profile-eligible"
         f"; eligible rules: {', '.join(sorted(eligible)) or 'none'})"
     )
     _emit(result, text, args.json)
     if stats.deadline_reached:
-        print("attribute: wall deadline reached; the annotation file is partial", file=sys.stderr)
+        print(
+            f"attribute: wall deadline reached; the annotation file is partial and stays at {written}",
+            file=sys.stderr,
+        )
         return 3
     return 0
 
