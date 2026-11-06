@@ -2106,7 +2106,7 @@ def test_ledger_rows_from_the_previous_rules_version_are_reported_as_stale(
     rewritten = tmp_path / "old-ledger.jsonl"
     rewritten.write_text(
         ledger.read_text(encoding="utf-8").replace(
-            "cce.attribution-rules@6", "cce.attribution-rules@5"
+            "cce.attribution-rules@7", "cce.attribution-rules@6"
         ),
         encoding="utf-8",
     )
@@ -2118,7 +2118,7 @@ def test_ledger_rows_from_the_previous_rules_version_are_reported_as_stale(
     )
     assert result["stale_rows"] == result["ledger_rows"] > 100
     assert result["eligible_strata"] == []
-    assert result["rules_version"] == "cce.attribution-rules@6"
+    assert result["rules_version"] == "cce.attribution-rules@7"
 
 
 def test_review_record_rejects_bad_answers_before_writing_anything(

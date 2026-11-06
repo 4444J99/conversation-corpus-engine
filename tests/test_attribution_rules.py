@@ -1182,6 +1182,44 @@ def test_adjacent_tiny_paragraphs_are_one_run_only_when_joined_300_and_100_share
     assert echo.pasted_back(spread) == ()
 
 
+def test_a_run_stops_at_an_untouched_paragraph_and_never_swallows_owner_text() -> None:
+    echo = AssistantEcho()
+    echo.add_assistant("\n\n".join(TINY))
+    pasted = "\n\n".join(TINY[:22])
+    owner = "My own paragraph about a different subject must keep its own attribution."
+    assert max(map(len, TINY)) < echo.min_hit
+    assert len(" ".join(TINY[:22])) >= echo.min_run
+    text = f"{pasted}\n\n{owner}\n\n{pasted}"
+    second_start = len(pasted) + len(owner) + 4
+    assert echo.pasted_back(text) == ((0, len(pasted)), (second_start, len(text)))
+
+
+@pytest.mark.parametrize("prefix", ["", "An unrelated introduction to this short answer. " * 2])
+def test_short_assistant_turns_are_retained_for_aggregate_echo_hits(prefix: str) -> None:
+    echo = AssistantEcho()
+    replies = LINES[:3]
+    assert all(echo.min_hit <= len(match_form(reply)) < echo.min_shared for reply in replies)
+    assert sum(len(match_form(reply)) for reply in replies) >= echo.min_hit_total
+    for reply in replies:
+        echo.add_assistant(prefix + reply)
+    pasted = "\n\n".join(replies)
+    assert echo.pasted_back(pasted) == pieces_of(pasted)
+    # Retaining a short reply does not turn one isolated hit into an aggregate match.
+    assert echo.pasted_back(replies[0]) == ()
+
+
+def test_short_assistant_fragments_update_cached_matches_and_expire_with_history() -> None:
+    echo = AssistantEcho(history_limit=200)
+    pasted = " / my connective words / ".join(LINES[:3])
+    assert echo.pasted_back(pasted) == ()
+    for reply in LINES[:3]:
+        echo.add_assistant(reply)
+    assert echo.pasted_back(pasted) == ((0, len(pasted)),)
+    echo.add_assistant("A completely unrelated answer about a new subject. " * 10)
+    assert echo.indexed_characters <= echo.history_limit
+    assert echo.pasted_back(pasted) == ()
+
+
 def test_a_run_of_hits_is_one_range_and_owner_paragraphs_around_it_stay_out() -> None:
     echo = AssistantEcho()
     echo.add_assistant("\n\n".join(LINES))

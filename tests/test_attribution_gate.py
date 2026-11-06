@@ -298,11 +298,11 @@ def test_rows_from_another_rules_version_or_an_older_schema_are_ignored_not_coun
     assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v6"
 
 
-PREVIOUS_VERSION = "cce.attribution-rules@5"
+PREVIOUS_VERSION = "cce.attribution-rules@6"
 
 
 def test_rows_written_under_the_previous_rules_version_are_stale_and_never_counted() -> None:
-    assert RULES_VERSION == "cce.attribution-rules@6"
+    assert RULES_VERSION == "cce.attribution-rules@7"
     old = verdict_rows("typed_prefix", ["yes"] * 100, version=PREVIOUS_VERSION)
     summary = summarize(old)
     assert (summary.rows, summary.stale_rows) == (100, 100)
@@ -424,6 +424,19 @@ def test_malformed_ledger_lines_are_quarantined_with_their_line_numbers_not_rais
         assert len(contents.rows) == 2, name
         assert [number for number, _ in contents.quarantined] == [3], name
         assert contents.quarantined[0][1], name
+
+
+@pytest.mark.parametrize("schema", [[], {}])
+def test_unhashable_ledger_schema_is_quarantined_without_losing_valid_rows(schema) -> None:
+    row = ledger_row("b" * 32, "quote", "yes", OWNER_ID, STAMP, stratum="S")
+    malformed = {**row, "schema": schema}
+    with pytest.raises(ValueError, match="schema"):
+        validate_ledger_row(malformed)
+    good = json.dumps(row)
+    contents = parse_ledger([good, json.dumps(malformed), good])
+    assert contents.rows == [row, row]
+    assert [number for number, _ in contents.quarantined] == [2]
+    assert "schema" in contents.quarantined[0][1]
 
 
 def test_conflicting_rows_of_one_reviewer_are_quarantined_and_never_counted() -> None:
@@ -910,8 +923,8 @@ def test_the_exclusion_digest_also_names_the_text_hashes_of_the_excluded_rows() 
     assert exclusion_digest(swapped, OWNER_ID) != digest
 
 
-def test_the_rules_version_and_schemas_are_at_version_six_and_version_five_rows_are_stale() -> None:
-    assert RULES_VERSION == "cce.attribution-rules@6"
+def test_current_rules_keep_v6_schemas_and_reject_older_evidence() -> None:
+    assert RULES_VERSION == "cce.attribution-rules@7"
     assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v6"
     assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v6"
     assert SAMPLE_HEADER_SCHEMA == "cce.attribution-review-sample-header.v6"
@@ -928,7 +941,7 @@ def test_the_rules_version_and_schemas_are_at_version_six_and_version_five_rows_
         assert (summary.rows, summary.stale_rows) == (100, 100)
         assert summary.strata[("typed_prefix", "S")].reviewed == 0
         assert eligible_strata(summary) == frozenset()
-    old_version = verdict_rows("typed_prefix", ["yes"] * 100, version="cce.attribution-rules@5")
+    old_version = verdict_rows("typed_prefix", ["yes"] * 100, version=PREVIOUS_VERSION)
     assert summarize(old_version).stale_rows == 100
     header, rows_drawn = drawn_sample()
     for older in ("v4", "v5"):
