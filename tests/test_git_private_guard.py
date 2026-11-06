@@ -327,6 +327,26 @@ def test_project_extract_refuses_a_git_visible_output_before_fetching_anything(
     assert calls == [] and not (repo / "out").exists()
 
 
+def test_library_export_cards_refuses_a_git_visible_output_before_touching_the_store(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """export-cards writes record text like export does, so it needs the same guard, first."""
+    repo = make_repo(tmp_path, gitignore=".*\n")  # only dotfiles ignored: the old probe passed it
+    missing_store = tmp_path / "no-such-store"
+    code, _, err = run_cli(
+        monkeypatch,
+        capsys,
+        "library",
+        "export-cards",
+        "--store-root",
+        str(missing_store),
+        "--out",
+        str(repo / "cards"),
+    )
+    assert code == 2 and "Git-visible" in err
+    assert not (repo / "cards").exists() and not missing_store.exists()
+
+
 def test_project_extract_still_writes_where_git_cannot_see(tmp_path, monkeypatch, capsys) -> None:
     calls = stub_fetch(monkeypatch)
     repo = make_repo(tmp_path, gitignore="ignored/\n")

@@ -759,9 +759,9 @@ def handle_library(args: argparse.Namespace) -> int:
     try:
         if args.action == "verify-export":
             return _verify_export_command(args)
-        if args.action == "export":
-            # The export is the whole library as plaintext: authorise where it lands before
-            # the library or the reviewed envelope is read.
+        if args.action in {"export", "export-cards"}:
+            # The export is the library's text as plaintext (all of it, or a card per record):
+            # authorise where it lands before the library or the reviewed envelope is read.
             require_git_private(args.out)
         store = configured_store(args.store_root)
         if args.action == "build":
