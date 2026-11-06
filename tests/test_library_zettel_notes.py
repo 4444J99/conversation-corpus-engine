@@ -18,11 +18,13 @@ from conversation_corpus_engine import library_commands
 from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.attributed_knowledge import ZETTEL_SCHEMA, export_zettels
 from conversation_corpus_engine.cli import build_parser
+from conversation_corpus_engine.corpus_store import CorpusStoreError
 from conversation_corpus_engine.library_commands import handle_library, read_record
 from conversation_corpus_engine.library_store import Library
 from conversation_corpus_engine.library_zettel_notes import (
     FRONTMATTER_KEYS,
     build_notes,
+    export_zettel_notes,
     lint_note,
     note_id,
     recover_quote,
@@ -544,6 +546,34 @@ def test_git_visible_directory_is_refused_before_the_library_is_opened(
     code = handle_library(command(work_tree / "visible", tmp_path, tmp_path / "x.json"))
     assert code == 2 and "Git-visible" in capsys.readouterr().err
     assert sorted(p.name for p in work_tree.iterdir()) == [".git"]
+
+
+def test_the_api_refuses_a_git_visible_directory_and_writes_nothing(tmp_path):
+    work_tree = tmp_path / "work"
+    work_tree.mkdir()
+    subprocess.run(["git", "-C", str(work_tree), "init", "-q"], check=True, capture_output=True)
+    with make_library(tmp_path) as library:
+        payload = envelope(library)
+        with pytest.raises(CorpusStoreError, match="Git-visible"):
+            export_zettel_notes(
+                library, payload["zettels"], work_tree / "visible", store_root=tmp_path / "store"
+            )
+    assert sorted(p.name for p in work_tree.iterdir()) == [".git"]
+
+
+def test_top_level_authorship_and_status_in_the_envelope_are_ignored(tmp_path):
+    with make_library(tmp_path) as library:
+        entry = zettel(
+            library,
+            1,
+            [source(library, ref(library, "kiln", 1))],
+            authorship="human",
+            status="stable",
+            author="rob",
+        )
+        (note,) = build_notes(library, [entry])
+        meta, _ = parse_text(note.text)
+        assert (meta["authorship"], meta["status"], meta["author"]) == ("agent", "draft", "model")
 
 
 def test_a_directory_inside_the_library_store_is_refused(world, capsys):

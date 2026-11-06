@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from .attributed_knowledge import export_zettels
+from .corpus_store import require_git_private
 from .library_export import _absolute, _frontmatter_value, _no_symlinks, _span_label
 from .library_note_text import clip, inert, inert_line, inert_lines
 from .library_store import Library
@@ -493,6 +494,7 @@ def export_zettel_notes(
     library: Library, zettels: list[dict[str, Any]], destination: Path, *, store_root: Path
 ) -> dict[str, Any]:
     """Validate, render and write the notes; the destination may not overlap the library store."""
+    require_git_private(destination)
     target = _absolute(destination).resolve(strict=False)
     store = _absolute(store_root).resolve(strict=False)
     if target == store or store in target.parents or target in store.parents:
