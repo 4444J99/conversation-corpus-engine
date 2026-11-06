@@ -1589,6 +1589,9 @@ def attribute_message(
 # --- annotations in the existing cce.span-attribution.v1 form ---------------------------------
 
 
+REJECTED_TEXT_EVIDENCE = "owner_rejected_text"
+
+
 def to_annotation(
     text: str,
     spans: Sequence[AttributedSpan],
@@ -1596,6 +1599,7 @@ def to_annotation(
     owner_id: str | None = None,
     eligible: Collection[tuple[str, str]] = frozenset(),
     verdicts: Mapping[str, str] = types.MappingProxyType({}),
+    rejected_texts: Collection[str] = frozenset(),
 ) -> dict[str, Any]:
     """The `cce.span-attribution.v1` annotation of one message (see `attribution.py`).
 
@@ -1606,7 +1610,10 @@ def to_annotation(
     `unsure` for this very span. `verdicts` maps span ids to the owner's counted verdict; a span
     with one carries it as `owner_verdict` (and as `owner_verdict:<verdict>` evidence, which
     survives the contract's key filtering). A confirmed span is still not eligible while its
-    stratum is closed.
+    stratum is closed. `rejected_texts` holds the SHA-256 of every span text the owner answered
+    `no` to: a span with such a text is never eligible, whichever message it sits in (its twin
+    would otherwise be eligible, or would be again after a re-import), and its evidence says
+    `owner_rejected_text`.
     """
     digest = text_digest(text)
     problems = partition_problems(text, spans, digest)
@@ -1627,6 +1634,14 @@ def to_annotation(
         verdict = verdicts.get(span.span_id)
         if verdict is not None:
             evidence.append(f"owner_verdict:{verdict}")
+        twin = bool(
+            rejected_texts
+            and is_owner
+            and (span.rule, span.stratum) in eligible
+            and text_digest(text[span.start : span.end]) in rejected_texts
+        )
+        if twin:
+            evidence.append(REJECTED_TEXT_EVIDENCE)
         entry = {
             "start": span.start,
             "end": span.end,
@@ -1639,6 +1654,7 @@ def to_annotation(
                 and owner_id
                 and (span.rule, span.stratum) in eligible
                 and verdict in (None, "yes")
+                and not twin
             ),
         }
         if verdict is not None:
@@ -1954,6 +1970,10 @@ class StratumReview:
     # Rows a recorded sample drew for this (rule, stratum) that the ledger has no row for; they
     # are counted as reviewed and unsure (they are inside `unsure` and `reviewed`).
     missing: int = 0
+    # Owner `no` and `unsure` answers whose span is no longer in the scan (or whose text is no
+    # longer the text answered): they stay in the denominator, as errors (inside `reviewed`,
+    # `rejected` and `unsure`).
+    orphan_negative: int = 0
 
 
 @dataclass(frozen=True)
@@ -1973,6 +1993,10 @@ class ReviewSummary:
     text_mismatch_rows: int = 0
     # Rows that recorded samples drew but the ledger lacks, counted as unsure in their stratum.
     missing_rows: int = 0
+    # Orphaned (or text-changed) spans the owner answered `no` or `unsure`: counted as errors.
+    orphan_negative_rows: int = 0
+    # SHA-256 of every span text the owner answered `no` to, orphaned or not (twin protection).
+    rejected_texts: frozenset[str] = frozenset()
     # Earlier answers to a span that a later row answered again (the last answer counts).
     superseded_rows: int = 0
     # The owner's counted verdict on each span (the last answer). A span the ledger names but
@@ -1997,7 +2021,10 @@ def review_statistics(
     schema); its reviewer equals `owner` (None identifies nobody, so nothing counts); and its span
     exists in the scan (`matched` maps span id to (rule, stratum, text_sha256)) under the same rule
     and stratum with the very text the row answered. A span counts once, by its last verdict in
-    file order. `unsure` and `no` both count as reviewed and not confirmed.
+    file order. `unsure` and `no` both count as reviewed and not confirmed. An owner `no` or
+    `unsure` whose span (or whose text) is gone from the scan still counts, as an error in its own
+    (rule, stratum): rejecting a text and then re-importing it must not take the rejection out of
+    the denominator. An orphaned `yes` counts for nothing.
 
     Precision is over the rows a sample drew, not over the rows that happen to be in the ledger:
     every row carries the digest of its sample and how many rows that sample drew for its rule and
@@ -2020,6 +2047,7 @@ def review_statistics(
     for row in candidates:
         kinds.setdefault(row["span_id"], set()).add((row["rule"], row["stratum"]))
     latest: dict[str, dict[str, Any]] = {}
+    orphaned: dict[str, dict[str, Any]] = {}
     held_back: set[str] = set()
     for row in candidates:
         fact = matched.get(row["span_id"])
@@ -2028,10 +2056,12 @@ def review_statistics(
             held_back.add(row["span_id"])
         elif fact is None or fact[:2] != (row["rule"], row["stratum"]):
             orphan += 1
+            orphaned[row["span_id"]] = row
             if fact is not None:
                 held_back.add(row["span_id"])  # the span exists, but this row misdescribes it
         elif fact[2] != row["text_sha256"]:
             mismatched += 1
+            orphaned[row["span_id"]] = row
             held_back.add(row["span_id"])  # the span exists, but its text is not what was seen
         else:
             superseded += row["span_id"] in latest
@@ -2043,6 +2073,12 @@ def review_statistics(
     }
     for row in latest.values():
         counts[(row["rule"], row["stratum"])][row["verdict"]] += 1
+    orphan_negative: dict[tuple[str, str], int] = {}
+    for span, row in orphaned.items():
+        if span not in latest and row["verdict"] != "yes":
+            cell = (row["rule"], row["stratum"])
+            counts[cell][row["verdict"]] += 1
+            orphan_negative[cell] = orphan_negative.get(cell, 0) + 1
     # A drawn row the ledger holds no row for is a row somebody did not answer: unsure.
     drawn_rows: dict[tuple[str, str, str], tuple[int, set[str]]] = {}
     for row in candidates:
@@ -2070,6 +2106,7 @@ def review_statistics(
             eligible=reviewed >= GATE_MIN_REVIEWED
             and confirmed * 100 >= GATE_MIN_PRECISION_PERCENT * reviewed,
             missing=absent,
+            orphan_negative=orphan_negative.get((rule_id, stratum), 0),
         )
     verdicts = {span: row["verdict"] for span, row in latest.items()}
     for span in held_back - verdicts.keys():
@@ -2084,6 +2121,10 @@ def review_statistics(
         quarantined_rows=quarantined,
         text_mismatch_rows=mismatched,
         missing_rows=sum(missing.values()),
+        orphan_negative_rows=sum(orphan_negative.values()),
+        rejected_texts=frozenset(
+            row["text_sha256"] for row in candidates if row["verdict"] == "no"
+        ),
         superseded_rows=superseded,
         verdicts=verdicts,
     )

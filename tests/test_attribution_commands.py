@@ -163,6 +163,7 @@ def test_report_has_no_eligible_rule_without_a_ledger(
         "orphan_rows": 0,
         "text_mismatch_rows": 0,
         "missing_rows": 0,
+        "orphan_negative_rows": 0,
         "non_owner_rows": 0,
         "non_owner_reviewers": {},
         "quarantined_rows": 0,
@@ -1476,6 +1477,96 @@ def test_a_shopped_sample_cannot_be_made_recordable_by_editing_its_header(
         code, _, err = record_answers(capsys, library, ledger, forged, answers)
         assert code == 2 and not ledger.exists(), key
     assert record_answers(capsys, library, tmp_path / "ok.jsonl", default, answers)[0] == 0
+
+
+def typed_index(text: str) -> int:
+    return int(re.search(r"Typed words number (\d+) ", text).group(1))
+
+
+def test_rejected_texts_that_are_re_imported_do_not_reopen_a_closed_stratum(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=140)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(
+        capsys, "review-sample", "--owner-id", "rob", "--library", library, "--per-stratum", "106",
+        "--out", sample,
+    )  # fmt: skip
+    short = [
+        row for row in sample_rows(sample) if (row["rule"], row["stratum"]) == ("typed_prefix", "S")
+    ]
+    assert len(short) == 106
+    rejected = [row["text"] for row in short if row["text"].startswith("Typed words number")][:9]
+    assert len(rejected) == 9
+    answers_for(sample, answers, lambda row: "no" if row["text"] in rejected else "yes")
+    assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
+    report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
+    assert report["profile_eligible"] == []  # 97 of 106 confirmed
+    # A re-import changes six of the nine rejected texts, so their span ids leave the scan.
+    edited = {typed_index(text) for text in rejected[:6]}
+    reimported = build_library(tmp_path / "other" / "g", typed_records=140, edited=edited)
+    report = report_of(capsys, reimported, "--ledger", ledger, "--owner-id", "rob")
+    gate_info = report["gate"]
+    assert gate_info["orphan_negative_rows"] == 6 and gate_info["orphan_rows"] >= 6
+    short_row = next(item for item in report["rules"] if item["rule"] == "typed_prefix")["strata"][
+        "S"
+    ]
+    assert short_row["reviewed"] == 106 and short_row["confirmed"] == 97
+    assert report["profile_eligible"] == []
+    entries, result = apply_entries(
+        capsys, reimported, tmp_path / "re.json", "--ledger", ledger, "--owner-id", "rob"
+    )
+    assert result["eligible_strata"] == [] and result["orphan_negative_rows"] == 6
+    assert result["profile_eligible_spans"] == 0
+
+
+def twin_library(directory: Path, texts: list[str]) -> Path:
+    """Every text twice as an owner span: alone, and ahead of a quoted line. The two messages
+    differ, so the two spans have the same text but not the same span id."""
+    directory.mkdir(parents=True, exist_ok=True)
+    with Library.create(directory / "library.sqlite") as handle:
+        for copy, tail in (("a", ""), ("b", "\n\n> a quoted line from somewhere else")):
+            for index, text in enumerate(texts):
+                handle.put(
+                    Conversation(
+                        provider="chatgpt",
+                        source_id=f"{copy}-{index:03d}",
+                        title="t",
+                        messages=[typed("m0", text + tail)],
+                        extra={"wing": "ai", "lane": "conversations"},
+                    )
+                )
+    return directory / "library.sqlite"
+
+
+def test_the_identical_twin_of_a_rejected_span_is_never_eligible(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    texts = [
+        f"My own note {index} on the river walk and step {index * 11}." for index in range(130)
+    ]
+    library = twin_library(tmp_path / "store" / "g", texts)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    drawn = [row for row in sample_rows(sample) if row["rule"] == "typed_prefix"]
+    assert len(drawn) == 100  # one row per distinct text: its twin is not offered
+    rejected = {row["text"] for row in drawn[:3]}
+    answers_for(sample, answers, lambda row: "no" if row["text"] in rejected else "yes")
+    assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
+    entries, result = apply_entries(
+        capsys, library, tmp_path / "out.json", "--ledger", ledger, "--owner-id", "rob"
+    )
+    assert result["eligible_strata"] == ["typed_prefix:S"]
+    owned = eligible_owner_texts(library, entries)
+    assert owned and rejected.isdisjoint(owned)
+    # Every confirmed text is eligible in both of its messages; a rejected text in neither.
+    confirmed = {row["text"] for row in drawn} - rejected
+    assert sum(text in confirmed for text in owned) == 2 * len(confirmed)
+    assert result["spans_withheld_as_rejected_twin"] == len(rejected)
+    assert result["spans_withheld_by_verdict"] == len(rejected)
+    with Library(library) as handle:
+        segments, _ = collect_owner_segments(handle, entries, "rob")
+    assert rejected.isdisjoint(segments) and sorted(segments) == sorted(owned)
 
 
 def test_review_record_needs_the_sample_it_answers(

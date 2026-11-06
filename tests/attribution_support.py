@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from pathlib import Path
 
 from conversation_corpus_engine.archive_model import Conversation, Message
@@ -70,9 +71,11 @@ PASTED_ANSWER = (
 def conversations(
     typed_records: int = 0,
     medium_records: int = 0,
+    *,
     pasted_answer: bool = False,
     text_suffix: str = "",
     marked_every: int = 0,
+    edited: Collection[int] = (),
 ) -> list[Conversation]:
     items = [
         _chat(
@@ -205,7 +208,8 @@ def conversations(
                         if marked_every and index % marked_every == 0
                         else f"Typed words number {index} in my own voice about topic {index * 7}."
                     )
-                    + text_suffix,
+                    + text_suffix
+                    + ("!" if index in edited else ""),
                 )
             ],
         )
@@ -237,6 +241,7 @@ def build_library(
     pasted_answer: bool = False,
     text_suffix: str = "",
     marked_every: int = 0,
+    edited: Collection[int] = (),
 ) -> Path:
     """Create `directory/library.sqlite` and return its path; the generation is closed again.
 
@@ -246,7 +251,12 @@ def build_library(
     directory.mkdir(parents=True, exist_ok=True)
     with Library.create(directory / "library.sqlite") as library:
         for conversation in conversations(
-            typed_records, medium_records, pasted_answer, text_suffix, marked_every
+            typed_records,
+            medium_records,
+            pasted_answer=pasted_answer,
+            text_suffix=text_suffix,
+            marked_every=marked_every,
+            edited=edited,
         ):
             library.put(conversation)
     return directory / "library.sqlite"

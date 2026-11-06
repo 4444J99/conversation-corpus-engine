@@ -30,7 +30,7 @@ import sys
 import time
 import types
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,6 +45,7 @@ from .attribution_rules import (
     GATE_MIN_PRECISION_PERCENT,
     GATE_MIN_REVIEWED,
     LEDGER_SCHEMA,
+    REJECTED_TEXT_EVIDENCE,
     RULES,
     RULES_VERSION,
     SAMPLE_PER_STRATUM,
@@ -450,6 +451,7 @@ def build_report(
             "orphan_rows": summary.orphan_rows,
             "text_mismatch_rows": summary.text_mismatch_rows,
             "missing_rows": summary.missing_rows,
+            "orphan_negative_rows": summary.orphan_negative_rows,
             "non_owner_rows": summary.non_owner_rows,
             "non_owner_reviewers": dict(sorted(summary.non_owner_reviewers.items())),
             "quarantined_rows": summary.quarantined_rows + malformed,
@@ -709,12 +711,18 @@ def message_entry(
     owner_id: str | None,
     eligible: frozenset[tuple[str, str]],
     verdicts: Mapping[str, str] = types.MappingProxyType({}),
+    rejected_texts: Collection[str] = frozenset(),
 ) -> dict[str, Any] | None:
     """`{source, attribution}` for one message, validated against the existing contract."""
     if not message.referenceable or all(span.author == UNKNOWN for span in spans):
         return None
     annotation = to_annotation(
-        message.text, spans, owner_id=owner_id, eligible=eligible, verdicts=verdicts
+        message.text,
+        spans,
+        owner_id=owner_id,
+        eligible=eligible,
+        verdicts=verdicts,
+        rejected_texts=rejected_texts,
     )
     attributed_spans(message.text, annotation)
     return {
@@ -1047,7 +1055,12 @@ def _apply(args: argparse.Namespace) -> int:
 
         def visit(message: ScannedMessage, spans: list[AttributedSpan]) -> None:
             entry = message_entry(
-                message, spans, owner_id=owner, eligible=eligible, verdicts=summary.verdicts
+                message,
+                spans,
+                owner_id=owner,
+                eligible=eligible,
+                verdicts=summary.verdicts,
+                rejected_texts=summary.rejected_texts,
             )
             if entry is None:
                 counts["messages_without_annotation"] += 1
@@ -1056,6 +1069,9 @@ def _apply(args: argparse.Namespace) -> int:
             for span in entry["attribution"]["spans"]:
                 counts[f"{span['author']}_spans"] += 1
                 counts["profile_eligible_spans"] += bool(span["profile_eligible"])
+                counts["spans_withheld_as_rejected_twin"] += (
+                    REJECTED_TEXT_EVIDENCE in span["evidence"] and "owner_verdict" not in span
+                )
                 counts["spans_withheld_by_verdict"] += (
                     span["author"] == "owner"
                     and span.get("owner_verdict") in ("no", "unsure")
@@ -1087,6 +1103,7 @@ def _apply(args: argparse.Namespace) -> int:
         "owner_spans": counts["owner_spans"],
         "profile_eligible_spans": counts["profile_eligible_spans"],
         "spans_withheld_by_verdict": counts["spans_withheld_by_verdict"],
+        "spans_withheld_as_rejected_twin": counts["spans_withheld_as_rejected_twin"],
         "eligible_strata": sorted(f"{rule}:{stratum}" for rule, stratum in eligible),
         "ledger": str(view.path) if view.path else None,
         "ledger_rows": summary.rows,
@@ -1094,6 +1111,7 @@ def _apply(args: argparse.Namespace) -> int:
         "orphan_rows": summary.orphan_rows,
         "text_mismatch_rows": summary.text_mismatch_rows,
         "missing_rows": summary.missing_rows,
+        "orphan_negative_rows": summary.orphan_negative_rows,
         "non_owner_rows": summary.non_owner_rows,
         "quarantined_rows": summary.quarantined_rows + view.malformed,
         "superseded_rows": summary.superseded_rows,

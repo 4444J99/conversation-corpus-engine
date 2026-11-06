@@ -462,7 +462,10 @@ owner's, its own (rule, stratum) passed the gate, `--owner-id` and `--ledger` ar
 owner did not answer `no` or `unsure` for this very span. A span the owner confirmed (`yes`) is
 eligible only while its stratum is open. A span the ledger names but cannot count cleanly (rows
 that name it as different rules or strata, or that misdescribe it, or whose text hash is not its
-text) is held back as `unsure`. `apply` reports `spans_withheld_by_verdict`.
+text) is held back as `unsure`. A span whose text is the text of a span the owner answered `no`
+to is never eligible either, whichever message it sits in (an identical twin, or the same text
+again after a re-import); its evidence says `owner_rejected_text`. `apply` reports
+`spans_withheld_by_verdict` and `spans_withheld_as_rejected_twin`.
 
 **Every drawn row is accounted for.** The gate cannot be passed by leaving the hard rows blank.
 `review-record` records every row of the sample: a row without a verdict is recorded as `unsure`,
@@ -480,9 +483,12 @@ listed by reviewer and never counted (without `--owner-id` nothing counts); one 
 that name the same span as different rules or strata are **quarantined**, as are malformed lines,
 and never counted; a row whose span id does not exist in the current scan under the same rule and
 stratum is an **orphan** (a fabricated id, an edited rule or stratum, or a message whose text
-changed, since the id includes the text digest) and is never counted; a row whose span exists but
-whose full text does not have the SHA-256 the row answered is a **text mismatch** and is never
-counted; of the rest a span counts once, by its last answer, and earlier answers to it are
+changed, since the id includes the text digest) and an orphaned `yes` counts for nothing; but an
+orphaned `no` or `unsure` of the owner still counts, in the denominator and as an error for its
+own (rule, stratum), and is reported as `orphan_negative_rows`, so rejecting a text and then
+re-importing it does not take the rejection out of the precision; a row whose span exists but
+whose full text does not have the SHA-256 the row answered is a **text mismatch** and is treated
+the same way; of the rest a span counts once, by its last answer, and earlier answers to it are
 reported as **superseded**. A scan cut short by `--limit-records` counts only the spans it saw, so
 decide eligibility from a full scan. Malformed lines and conflicting rows are reported, not fatal;
 if one of them was a `no`, the precision is overstated, so look at `quarantined_rows`.

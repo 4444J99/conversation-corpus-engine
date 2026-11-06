@@ -734,6 +734,99 @@ def test_the_rules_version_and_schemas_are_at_version_four_and_older_rows_are_st
         parse_sample(sample_lines(v3_header, rows_drawn))
 
 
+def test_an_owner_no_whose_span_vanished_still_counts_against_its_stratum() -> None:
+    yes = verdict_rows("typed_prefix", ["yes"] * 97)
+    no = verdict_rows("typed_prefix", ["no"] * 9, start=500)
+    rows = [*yes, *no]
+    assert not gate(rows).eligible and gate(rows).reviewed == 106
+    # Six of the nine rejected texts change (a re-import): their span ids leave the scan.
+    gone = {row["span_id"] for row in no[:6]}
+    matched = {span: fact for span, fact in matched_of(rows).items() if span not in gone}
+    summary = review_statistics(rows, matched=matched, owner=OWNER_ID)
+    review = summary.strata[("typed_prefix", "S")]
+    assert (summary.orphan_rows, summary.orphan_negative_rows) == (6, 6)
+    assert (review.reviewed, review.confirmed, review.rejected) == (106, 97, 9)
+    assert review.orphan_negative == 6 and not review.eligible
+    assert set(summary.verdicts).isdisjoint(gone)
+
+
+def test_orphan_answers_count_only_when_they_are_negative_and_the_owners() -> None:
+    yes = verdict_rows("typed_prefix", ["yes"] * 100)
+    rows = list(yes)
+    assert gate(rows).eligible
+
+    def orphans(verdicts: list[str], start: int, reviewer: str = OWNER_ID, **extra) -> list[dict]:
+        return [
+            ledger_row(
+                f"{start + n:032x}", "typed_prefix", verdict, reviewer, STAMP, stratum="S", **extra
+            )
+            for n, verdict in enumerate(verdicts)
+        ]
+
+    def judged(extra_rows: list[dict]) -> ReviewSummary:
+        matched = matched_of(yes)  # the extra rows name spans the scan does not have
+        return review_statistics([*yes, *extra_rows], matched=matched, owner=OWNER_ID)
+
+    assert judged(orphans(["yes"] * 50, 900)).strata[("typed_prefix", "S")].reviewed == 100
+    assert judged(orphans(["yes"] * 50, 900)).orphan_negative_rows == 0
+    unsure = judged(orphans(["unsure"] * 6, 900))
+    assert (unsure.strata[("typed_prefix", "S")].reviewed, unsure.orphan_negative_rows) == (106, 6)
+    assert not unsure.strata[("typed_prefix", "S")].eligible
+    assert judged(orphans(["no"] * 6, 900, reviewer="someone-else")).orphan_negative_rows == 0
+    stale = orphans(["no"] * 6, 900, rules_version=PREVIOUS_VERSION)
+    assert judged(stale).strata[("typed_prefix", "S")].eligible
+    # The last answer to an orphaned span is the one that counts.
+    flipped = [*orphans(["no"] * 6, 900), *orphans(["yes"] * 6, 900)]
+    assert judged(flipped).orphan_negative_rows == 0
+    # Negative answers count in their own stratum, whatever the others do.
+    elsewhere = [
+        ledger_row(f"{700 + n:032x}", "quote", "no", OWNER_ID, STAMP, stratum="S") for n in range(3)
+    ]
+    other = judged(elsewhere)
+    assert other.strata[("quote", "S")].reviewed == 3
+    assert other.strata[("typed_prefix", "S")].reviewed == 100
+
+
+def test_a_negative_answer_to_a_span_whose_text_changed_counts_too() -> None:
+    yes = verdict_rows("typed_prefix", ["yes"] * 100)
+    no = verdict_rows("typed_prefix", ["no"] * 6, start=700)
+    rows = [*yes, *no]
+    matched = matched_of(rows)
+    for row in no:  # the id still exists in the scan, but its text is not the text answered
+        matched[row["span_id"]] = ("typed_prefix", "S", "f" * 64)
+    summary = review_statistics(rows, matched=matched, owner=OWNER_ID)
+    assert summary.text_mismatch_rows == 6 and summary.orphan_negative_rows == 6
+    assert summary.strata[("typed_prefix", "S")].reviewed == 106
+    assert not summary.strata[("typed_prefix", "S")].eligible
+
+
+def test_the_summary_names_the_texts_the_owner_rejected() -> None:
+    rows = verdict_rows("typed_prefix", ["yes", "no", "unsure", "no"])
+    rows += [ledger_row("9" * 32, "typed_prefix", "no", "someone-else", STAMP, stratum="S")]
+    summary = summarize(rows)
+    assert summary.rejected_texts == {text_hash(f"{1:032x}"), text_hash(f"{3:032x}")}
+    # An orphaned rejection is remembered as well: the text is what was rejected.
+    orphaned = review_statistics(rows, matched={}, owner=OWNER_ID)
+    assert orphaned.rejected_texts == summary.rejected_texts
+
+
+def test_a_span_with_the_text_of_a_rejected_one_is_never_eligible() -> None:
+    eligible = frozenset({("typed_prefix", "S")})
+    (span,) = spans_of(SHORT)
+    rejected = frozenset({text_digest(SHORT)})
+    twin = to_annotation(SHORT, [span], owner_id="rob", eligible=eligible, rejected_texts=rejected)
+    (entry,) = twin["spans"]
+    assert entry["profile_eligible"] is False
+    assert "owner_rejected_text" in entry["evidence"] and "owner_verdict" not in entry
+    (checked,) = attributed_spans(SHORT, twin)
+    assert not owner_profile_eligible(checked, "rob")
+    other = to_annotation(
+        SHORT, [span], owner_id="rob", eligible=eligible, rejected_texts=frozenset({"0" * 64})
+    )
+    assert other["spans"][0]["profile_eligible"] is True
+    assert "owner_rejected_text" not in other["spans"][0]["evidence"]
+
+
 def test_ledger_is_append_only_jsonl_and_refuses_symlinks(tmp_path: Path) -> None:
     path = tmp_path / "ledger.jsonl"
     first = verdict_rows("quote", ["yes", "no"])
