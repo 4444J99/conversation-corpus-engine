@@ -21,6 +21,7 @@ CODE_LOG_TURN = (
     "2026-01-02 03:04:05 ERROR boom\n2026-01-02 03:04:06 ERROR again\n\n"
     "```\nx = 1\n```\n\nWhat should I change?"
 )
+ODD_QUOTE_TURN = 'She measured 5" by 6 and wrote it down.'
 CLI_TURN = "Rename the parser module.\n\nHarness appended context nobody typed."
 CLI_TYPED = len("Rename the parser module.")
 NOTE_TURN = "My thoughts.\n\n> pasted from a website\n\nMore thoughts."
@@ -65,6 +66,7 @@ def conversations(
                 Message(role="assistant", channel="reply", id="m1", text="A synthetic summary."),
                 typed("m2", QUOTE_TURN),
                 typed("m3", CODE_LOG_TURN),
+                typed("m4", ODD_QUOTE_TURN),
             ],
             alternate_messages=[
                 {

@@ -20,6 +20,7 @@ from conversation_corpus_engine.attribution_rules import (
     partition_problems,
     record_info,
     rule_agent_family,
+    rule_ambiguous,
     rule_boilerplate,
     rule_code,
     rule_document_origin,
@@ -526,12 +527,12 @@ def test_blockquote_then_owner_reply() -> None:
 
 
 def test_owner_text_on_both_sides_of_an_indented_blockquote() -> None:
-    text = "As the memo says:\n   > Budgets close in May.\nThat is wrong."
+    text = "As the memo says:\n   > Budgets close in May.\n\nThat is wrong."
     assert view(text, run(text)) == [
         ("typed_prefix", "owner", "As the memo says:"),
         ("unattributed", "unknown", "\n"),
         ("quote", "third_party", "   > Budgets close in May."),
-        ("unattributed", "unknown", "\n"),
+        ("unattributed", "unknown", "\n\n"),
         ("typed_prefix", "owner", "That is wrong."),
     ]
 
@@ -558,6 +559,43 @@ def test_short_unmatched_or_paragraph_crossing_quotes_are_left_alone() -> None:
     assert rule_quote(ctx('He said "hello" and left.')) == []
     assert rule_quote(ctx(f'one stray " mark then {LONG}')) == []
     assert rule_quote(ctx(f'"{LONG}\n\n{LONG}"')) == []
+
+
+def test_one_stray_ascii_quote_makes_its_whole_paragraph_unknown_never_owner() -> None:
+    text = 'He wrote "' + "x" * 60 + 'QUOTED" and 5" is small.'
+    assert rule_quote(ctx(text)) == []
+    assert ranges(rule_ambiguous(ctx(text))) == [(0, len(text))]
+    assert view(text, run(text)) == [("ambiguous", "unknown", text)]
+    assert not [s for s in run(text) if s.author == "owner"]
+
+
+def test_an_odd_quote_paragraph_does_not_taint_its_neighbours() -> None:
+    odd = 'She measured 5" by 6 and wrote it down.'
+    text = f"{odd}\n\nA clean paragraph of my own words.\n\n{odd}"
+    spans = view(text, run(text))
+    assert [(r, a) for r, a, _ in spans if a == "owner"] == [("typed_prefix", "owner")]
+    assert [t for r, a, t in spans if a == "owner"] == ["A clean paragraph of my own words."]
+    assert [r for r, a, _ in spans if r == "ambiguous"] == ["ambiguous", "ambiguous"]
+
+
+def test_even_quote_counts_keep_pairing_and_a_stronger_rule_keeps_its_characters() -> None:
+    even = f'He wrote "{LONG}" and that is all.'
+    assert ranges(rule_quote(ctx(even))) == [(9, 9 + len(LONG) + 2)]
+    assert rule_ambiguous(ctx(even)) == []
+    fenced = '```\nodd " quote\n```'
+    assert [s.rule for s in run(fenced)] == ["code"]
+    quoted = '> a quoted line with an odd " mark'
+    assert [s.rule for s in run(quoted)] == ["quote"]
+    assert rule_ambiguous(ctx("single quotes ' and it's fine")) == []
+
+
+def test_lazy_blockquote_continuation_lines_belong_to_the_quote() -> None:
+    text = "> quoted line\nLAZYCONT line\nmore lazy words\n\nMy reply."
+    assert ranges(rule_quote(ctx(text))) == [(0, text.index("\n\nMy reply."))]
+    assert view(text, run(text))[-1] == ("typed_prefix", "owner", "My reply.")
+    for interrupter in ("```", "# Heading", "- item", "1. item", "---", "~~~"):
+        broken = f"> quoted\nlazy\n{interrupter}\nafter"
+        assert ranges(rule_quote(ctx(broken))) == [(0, len("> quoted\nlazy"))], interrupter
 
 
 def test_pasted_content_wrapper_is_third_party_not_injection() -> None:
@@ -893,6 +931,7 @@ def test_the_rule_table_has_one_documented_order() -> None:
         ("quote", "third_party"),
         ("log_trace", "agent"),
         ("boilerplate", "third_party"),
+        ("ambiguous", "unknown"),
         ("typed_prefix", "owner"),
         ("note_owner", "owner"),
     ]
@@ -939,6 +978,8 @@ def block(rng: random.Random) -> str:
         lambda: "\t" + body,
         lambda: f"<pasted_content>{body}</pasted_content>",
         lambda: f"<unknown-tag>{body}</unknown-tag>",
+        lambda: f'He said "{quoted} and left.',
+        lambda: f"> {body}\n{prose(rng)}",
     ]
     return rng.choice(makers)()
 

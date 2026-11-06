@@ -507,6 +507,10 @@ _MARKED_QUOTES = tuple(
     for opening, closing in (("“", "”"), ("«", "»"), ("„", "“"))
 )
 _BLANK_LINE = re.compile(r"\n[ \t]*\n")
+# A line that starts a new block and so cannot continue a quoted paragraph lazily.
+_BLOCK_START = re.compile(
+    r"^ {0,3}(?:`{3,}|~{3,}|#{1,6}(?:\s|$)|(?:[-*+]|\d{1,9}[.)])\s|([-*_])[ \t]*(?:\1[ \t]*){2,}$)"
+)
 
 
 def rule_quote(context: MessageContext) -> list[Claim]:
@@ -517,8 +521,11 @@ def rule_quote(context: MessageContext) -> list[Claim]:
     claims: list[Claim] = []
     first: int | None = None
     for index, (_, _, content) in enumerate([*lines, (0, 0, "")]):
-        if index < len(lines) and _QUOTE_LINE.match(content):
+        inside = index < len(lines)
+        if inside and _QUOTE_LINE.match(content):
             first = index if first is None else first
+        elif first is not None and inside and content.strip() and not _BLOCK_START.match(content):
+            continue  # a lazy continuation line is still part of the quote
         elif first is not None:
             claims.append((lines[first][0], lines[index - 1][1], "blockquote"))
             first = None
@@ -531,7 +538,7 @@ def rule_quote(context: MessageContext) -> list[Claim]:
     for start, end in _paragraphs(lines):
         marks = [start + offset for offset, char in enumerate(text[start:end]) if char == '"']
         if len(marks) % 2:
-            continue
+            continue  # unpaired quotes: the paragraph is ambiguous (see `rule_ambiguous`)
         claims.extend(
             (opening, closing + 1, "quotation-marks")
             for opening, closing in zip(marks[0::2], marks[1::2], strict=True)
@@ -774,6 +781,21 @@ def rule_boilerplate(context: MessageContext) -> list[Claim]:
     return [(start, end, "verbatim-repeat") for start, end in context.boilerplate]
 
 
+# --- ambiguous text: unknown, never owner -----------------------------------------------------
+
+
+def rule_ambiguous(context: MessageContext) -> list[Claim]:
+    """Text whose authorship cannot be told from its shape. A paragraph with an odd number of
+    ASCII double quotes cannot be paired into quotations, so none of it is attributed. Every
+    stronger rule has already taken its own characters by the time this one runs."""
+    text = context.text
+    claims: list[Claim] = []
+    for start, end in _paragraphs(_lines(text)):
+        if text.count('"', start, end) % 2:
+            claims.append((start, end, "odd-ascii-quotes"))
+    return claims
+
+
 # --- g: notes default ------------------------------------------------------------------------
 
 NOTE_KINDS = frozenset({"note", "document"})
@@ -844,6 +866,12 @@ RULES: tuple[Rule, ...] = (
         THIRD_PARTY,
         "later occurrences of long text that repeats verbatim across the slice",
         rule_boilerplate,
+    ),
+    Rule(
+        "ambiguous",
+        UNKNOWN,
+        "text whose authorship cannot be told (unpaired quotes); never owner",
+        rule_ambiguous,
     ),
     Rule("typed_prefix", OWNER, "the characters the person typed", rule_typed_prefix),
     Rule(
