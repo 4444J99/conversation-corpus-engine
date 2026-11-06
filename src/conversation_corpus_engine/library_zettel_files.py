@@ -382,6 +382,9 @@ def _make_directory(path: Path) -> None:
     while not current.exists():
         missing.append(current)
         current = current.parent
+    # A prior attempt may have created this ancestor but failed its parent sync.
+    # Repair that boundary before treating the existing name as established.
+    _sync_directory(current.parent)
     for directory in reversed(missing):
         _no_symlinks(directory)
         directory.mkdir(mode=0o700, exist_ok=True)
@@ -563,6 +566,9 @@ def write_owned_notes(
         if previous != complete or changed or not (root / MANIFEST_NAME).exists():
             _atomic_write(root / MANIFEST_NAME, final_bytes)
         retained = _recovery_inventory(root) if captured else retained
+        # A previous final-manifest replace can be visible even if its directory
+        # sync failed. An unchanged retry must finish that step before success.
+        _sync_directory(root)
         return {
             "written": len(changed),
             "unchanged": len(planned) - len(changed),

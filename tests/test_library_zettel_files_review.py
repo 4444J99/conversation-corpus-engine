@@ -255,3 +255,68 @@ def test_new_directory_chain_is_synced_before_first_note_publication(tmp_path, m
     assert (
         files.write_owned_notes(root, {"Synthetic.md": entry()}, max_entries=1000)["written"] == 1
     )
+
+
+def test_retry_finishes_failed_final_manifest_sync_without_rewriting(tmp_path, monkeypatch):
+    root = tmp_path / "wiki"
+    manifest = root / files.MANIFEST_NAME
+    sync = files._sync_directory
+
+    def interrupted(path):
+        if (
+            path == root
+            and manifest.exists()
+            and json.loads(manifest.read_text())["state"] == "complete"
+        ):
+            raise OSError("final manifest directory sync failed")
+        sync(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(files, "_sync_directory", interrupted)
+        with pytest.raises(OSError, match="final manifest"):
+            files.write_owned_notes(root, {"Synthetic.md": entry()}, max_entries=1000)
+    before = snapshot(root)
+    mtimes = {path: path.stat().st_mtime_ns for path in root.rglob("*") if path.is_file()}
+    synced = []
+
+    def repaired(path):
+        sync(path)
+        synced.append(path)
+
+    monkeypatch.setattr(files, "_sync_directory", repaired)
+    assert (
+        files.write_owned_notes(root, {"Synthetic.md": entry()}, max_entries=1000)["written"] == 0
+    )
+    assert root in synced
+    assert snapshot(root) == before
+    assert {path: path.stat().st_mtime_ns for path in mtimes} == mtimes
+
+
+def test_retry_repairs_the_nearest_created_ancestor_before_extending_the_chain(
+    tmp_path, monkeypatch
+):
+    ancestor = tmp_path / "one"
+    root = ancestor / "two" / "wiki"
+    sync = files._sync_directory
+
+    def interrupted(path):
+        if path == tmp_path and ancestor.exists():
+            raise OSError("new ancestor directory sync failed")
+        sync(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(files, "_sync_directory", interrupted)
+        with pytest.raises(OSError, match="new ancestor"):
+            files.write_owned_notes(root, {"Synthetic.md": entry()}, max_entries=1000)
+    assert ancestor.is_dir() and not (ancestor / "two").exists()
+    synced = []
+
+    def repaired(path):
+        sync(path)
+        synced.append(path)
+
+    monkeypatch.setattr(files, "_sync_directory", repaired)
+    assert (
+        files.write_owned_notes(root, {"Synthetic.md": entry()}, max_entries=1000)["written"] == 1
+    )
+    assert synced[0] == tmp_path
