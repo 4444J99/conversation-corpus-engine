@@ -1506,6 +1506,14 @@ def attribute_message(
     length = len(text)
     if length == 0:
         return []
+    if not text.isascii():
+        try:
+            text.encode("utf-8")
+        except UnicodeEncodeError:
+            # Text with a lone surrogate has no digest the contract could bind a span to: all of
+            # it is unknown (its digest here is of the surrogate-passing bytes, for the span id).
+            digest = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+            return [AttributedSpan(0, length, UNKNOWN, UNATTRIBUTED, "", digest)]
     context = MessageContext(
         text=text,
         role=role if isinstance(role, str) else "",

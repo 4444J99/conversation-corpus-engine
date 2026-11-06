@@ -1582,6 +1582,36 @@ def test_combining_and_enclosing_marks_alone_are_blank_but_a_mark_on_a_letter_st
     assert [emoji[s.start : s.end] for s in run(emoji) if s.author == "owner"] == [emoji]
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a\ud800b",
+        "\udfff",
+        "ends with a lone surrogate \ud83d",
+        "<system-reminder>x</system-reminder> and mine \udc80 more",
+        "> quoted \ud800\n\nand an owner paragraph",
+    ],
+)
+def test_text_that_cannot_be_encoded_is_one_unknown_span_not_an_exception(text: str) -> None:
+    for record in (CHAT, CLI, NOTE):
+        spans = attribute_message(
+            text, role="user", channel="typed", typed_chars=len(text), record=record
+        )
+        assert [(s.start, s.end, s.author, s.rule) for s in spans] == [
+            (0, len(text), "unknown", "unattributed")
+        ]
+        assert spans[0].profile_eligible is False
+        digest = spans[0].text_digest
+        assert partition_problems(text, spans, digest) == {
+            "gaps": 0,
+            "overlaps": 0,
+            "uncovered": 0,
+            "out_of_range": 0,
+            "digest_mismatch": 0,
+        }
+    assert spans[0].span_id == attribute_message(text, role="user")[0].span_id
+
+
 def test_the_rule_table_has_one_documented_order() -> None:
     assert [(rule.id, rule.author) for rule in RULES] == [
         ("agent_family", "agent"),
