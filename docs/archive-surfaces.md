@@ -514,7 +514,8 @@ repeats; a page with three headings has no contents list; a page's *What links h
 from the vault graph; a topic page is missing, has no hub, or lists other conversations than
 its hub; a message has no single author class or the labelled turns differ from the manifest's
 author counts; the lineage is broken (a ledger that holds no generation, digests with no
-ledger, a ledger that does not chain or does not end at the manifest); the recent-changes page
+ledger, a ledger with no digest file beside it, which is status `baseline-missing`, a ledger that
+does not chain or does not end at the manifest); the recent-changes page
 differs from the latest generation; or a page's history differs from the ledger.
 
 `verify` only reads. A store ingested before the lineage existed has neither lineage file, and
