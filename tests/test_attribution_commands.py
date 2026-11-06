@@ -559,13 +559,14 @@ def test_a_conflicting_answer_is_refused_and_cannot_brick_the_ledger(
     assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
     before = ledger.read_bytes()
 
-    # A second sample, internally consistent, that names the same span as another rule.
+    # A second sample, internally consistent, that names the same span as another rule: it is not
+    # the draw (the ledger-level refusal of a span under two rules is tested in the gate tests).
     forged_sample = tmp_path / "forged-sample.jsonl"
     forged_row = {**real, "rule": "note_owner", "claim": "owner", "verdict": None}
     forge_sample(sample, forged_sample, [forged_row], ledger=ledger)
     answers.write_text(json.dumps({**forged_row, "verdict": "yes"}) + "\n", encoding="utf-8")
     code, _, err = record_answers(capsys, library, ledger, forged_sample, answers)
-    assert code == 2 and "conflict" in err and "nothing was written" in err
+    assert code == 2 and "not the draw" in err
     assert ledger.read_bytes() == before
 
     # A sample is recorded once; the ledger itself still keeps the last answer of a span.
@@ -1440,6 +1441,121 @@ def test_rows_of_other_reviewers_and_of_other_versions_do_not_change_the_draw(
     fresh = tmp_path / "fresh.jsonl"
     assert record_answers(capsys, library, fresh, sample, answers)[0] == 0
     assert record_answers(capsys, library, others, sample, answers, reviewer="rob")[0] == 0
+
+
+def test_a_hand_cut_sample_under_a_rebuilt_header_is_not_the_draw_and_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The header can be rebuilt with a correct digest, library fingerprint and ledger state; the
+    rows are still checked against a fresh draw, so rows cannot be cherry-picked."""
+    library = build_library(tmp_path / "store" / "g", typed_records=130, marked_every=4)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    rows = sample_rows(sample)
+    hard = [row for row in rows if row["rule"] == "typed_prefix" and "ASSIST" in row["text"]]
+    assert hard  # the rows a cherry-picker would like to leave out
+    cut = [row for row in rows if row not in hard]
+    forged = tmp_path / "cut.jsonl"
+    forge_sample(sample, forged, cut)
+    assert parse_sample_file(forged)  # internally consistent: the integrity checks pass
+    answers_for(forged, answers, lambda row: "yes")
+    code, _, err = record_answers(capsys, library, ledger, forged, answers)
+    assert code == 2 and "not the draw" in err and f"lacks {len(hard)} row" in err, err
+    assert not ledger.exists()
+    # Padding with a row the draw would not give, and reordering the rows, are refused as well.
+    reordered = tmp_path / "reordered.jsonl"
+    swapped = [rows[1], rows[0], *rows[2:]]
+    forge_sample(sample, reordered, swapped)
+    answers_for(reordered, answers, lambda row: "yes")
+    code, _, err = record_answers(capsys, library, ledger, reordered, answers)
+    assert code == 2 and "not in the order of the draw" in err and not ledger.exists()
+    edited = tmp_path / "edited.jsonl"
+    forge_sample(sample, edited, [{**rows[0], "length": rows[0]["length"] + 1}, *rows[1:]])
+    code, _, err = record_answers(capsys, library, ledger, edited, answers)
+    assert code == 2 and not ledger.exists()
+    # The honest sample, whole, is recorded.
+    answers_for(sample, answers, lambda row: "yes")
+    assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
+
+
+def parse_sample_file(path: Path) -> object:
+    return attribution_rules.parse_sample(path.read_text(encoding="utf-8").split("\n"))
+
+
+def test_a_sample_drawn_before_the_library_changed_is_refused_and_says_why(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=20)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    answers_for(sample, answers, lambda row: "yes" if row["claim"] == "owner" else None)
+    with Library(library, writable=True) as handle:
+        handle.put(
+            Conversation(
+                provider="chatgpt",
+                source_id="late-arrival",
+                title="late",
+                messages=[typed("m0", "A message imported after the draw.")],
+                extra={"wing": "ai", "lane": "conversations"},
+            )
+        )
+    code, _, err = record_answers(capsys, library, ledger, sample, answers)
+    assert code == 2 and "different library" in err and "draw a new sample" in err, err
+    assert not ledger.exists()
+
+
+def test_the_draw_is_checked_again_while_the_ledger_is_locked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=130)
+    ledger = approve(capsys, library, tmp_path, yes=100)
+    sample, answers = tmp_path / "s2.jsonl", tmp_path / "a2.jsonl"
+    run_cli(
+        capsys,
+        "review-sample",
+        "--owner-id",
+        "rob",
+        "--library",
+        library,
+        "--ledger",
+        ledger,
+        "--out",
+        sample,
+    )
+    answers_for(sample, answers, lambda row: "yes" if row["claim"] == "owner" else None)
+    real_scan = attribution_commands.scan
+    seen: list[str] = []
+
+    def watching(*args: object, **kwargs: object) -> object:
+        # Another process trying to take the ledger now must be turned away.
+        probe = os.open(ledger, os.O_RDWR)
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            seen.append("free")
+        except BlockingIOError:
+            seen.append("locked")
+        finally:
+            os.close(probe)
+        return real_scan(*args, **kwargs)
+
+    monkeypatch.setattr(attribution_commands, "scan", watching)
+    code, _, err = record_answers(capsys, library, ledger, sample, answers)
+    assert code == 0, err
+    assert seen == ["locked"]
+
+
+def test_drawing_the_sample_again_is_bounded_by_the_deadline_and_writes_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=20)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    answers_for(sample, answers, lambda row: "yes" if row["claim"] == "owner" else None)
+    code, _, err = record_answers(
+        capsys, library, ledger, sample, answers, "--deadline-seconds", "1e-9"
+    )
+    assert code == 3 and "nothing was written" in err and not ledger.exists()
+    assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
 
 
 def edit_header(source: Path, target: Path, **changes: object) -> Path:

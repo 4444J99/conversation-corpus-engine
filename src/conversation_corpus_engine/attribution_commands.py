@@ -30,7 +30,7 @@ import sys
 import time
 import types
 from collections import Counter
-from collections.abc import Callable, Collection, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -885,6 +885,15 @@ def add_attribute_parser(library_actions: Any) -> None:
     record.add_argument(
         "--reviewed-at", help="UTC time like 2026-01-02T03:04:05Z (default: the current time)"
     )
+    record.add_argument(
+        "--deadline-seconds",
+        type=_positive_float,
+        default=argparse.SUPPRESS,
+        help=(
+            "Wall-clock budget for drawing the sample again to check it "
+            f"(default {DEFAULT_DEADLINE_SECONDS:g})"
+        ),
+    )
     record.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
 
 
@@ -1144,7 +1153,7 @@ def library_fingerprint(library: Library) -> str:
 
 
 def _reviewed_by_owner(
-    view: LedgerView, owner: str
+    rows: Iterable[dict[str, Any]], owner: str
 ) -> tuple[dict[str, tuple[str, str, str]], set[tuple[str, str, str]]]:
     """What the owner already reviewed: the spans (by id, with the exact text they answered) and
     the texts (by rule, stratum and text key, whichever message they sit in and however they are
@@ -1152,7 +1161,7 @@ def _reviewed_by_owner(
     of another rules version or schema, hides nothing)."""
     current = [
         row
-        for row in view.rows
+        for row in rows
         if row["rules_version"] == RULES_VERSION
         and row["schema"] == LEDGER_SCHEMA
         and row["reviewer"] == owner
@@ -1170,7 +1179,7 @@ def _review_sample(args: argparse.Namespace) -> int:
             "owner's reviews count toward the gate"
         )
     view = _ledger_view(args)
-    exclude, exclude_texts = _reviewed_by_owner(view, owner)
+    exclude, exclude_texts = _reviewed_by_owner(view.rows, owner)
     deadline = Deadline(args.deadline_seconds)
     library, database = _open_target(args)
     sampler = ReviewSampler(
@@ -1283,6 +1292,78 @@ def _answers(path: Path, sample: ReviewSample) -> dict[str, str | None]:
     return answers
 
 
+def _row_without_answer(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in row.items() if key != "verdict"}
+
+
+def _why_not_the_draw(shown: list[dict[str, Any]], drawn: list[dict[str, Any]]) -> str:
+    """What differs between the rows of a sample and the rows a fresh draw gives."""
+    shown_ids = [row["span_id"] for row in shown]
+    drawn_ids = [row["span_id"] for row in drawn]
+    extra = len(set(shown_ids) - set(drawn_ids))
+    lacking = len(set(drawn_ids) - set(shown_ids))
+    if extra or lacking:
+        return (
+            f"it holds {extra} row(s) a fresh draw would not give and lacks {lacking} row(s) "
+            f"it would give ({len(shown_ids)} rows against {len(drawn_ids)})"
+        )
+    if shown_ids != drawn_ids:
+        return "its rows are not in the order of the draw"
+    return "the content of its rows differs from the draw's"
+
+
+def _check_the_draw(
+    database: Path,
+    header: Mapping[str, Any],
+    rows: list[dict[str, Any]],
+    existing: list[dict[str, Any]],
+    seconds: float,
+) -> None:
+    """Draw again, from the library as it is now and the ledger as it stands, with the header's
+    own settings, and refuse the sample unless its rows are exactly that draw (the same span ids
+    in the same order, with the same content). The draw is deterministic, so a sample that was
+    cut, reordered, padded or hand-written, even under a header with a correct digest, library
+    fingerprint and ledger state, is not what `review-sample` gives and is refused."""
+    exclude, exclude_texts = _reviewed_by_owner(existing, header["owner_id"])
+    sampler = ReviewSampler(
+        per_stratum=header["per_stratum"],
+        seed=header["seed"],
+        exclude=exclude,
+        exclude_texts=exclude_texts,
+    )
+    deadline = Deadline(seconds)
+    with Library(database) as library:
+        census = build_census(
+            library,
+            limit_records=None,
+            min_chars=header["repeat_min_chars"],
+            min_occurrences=header["repeat_min_occurrences"],
+            deadline=deadline,
+        )
+        stats, _ = scan(
+            library,
+            census,
+            limit_records=None,
+            deadline=deadline,
+            visit=lambda message, spans: [
+                sampler.offer(span, message.text[span.start : span.end]) for span in spans
+            ],
+        )
+    if stats.deadline_reached:
+        raise DeadlineReached(
+            f"wall deadline of {seconds:g} seconds reached while drawing the sample again "
+            "to check it"
+        )
+    shown = [_row_without_answer(row) for row in rows]
+    drawn = [_row_without_answer(row) for row in sampler.rows(partial=False)]
+    if shown != drawn:
+        raise ValueError(
+            "this sample is not the draw the rules give for this library and this ledger: "
+            f"{_why_not_the_draw(shown, drawn)}. A sample must be exactly what `review-sample` "
+            "draws, in the same order; draw it again and answer all of it"
+        )
+
+
 def _review_record(args: argparse.Namespace) -> int:
     # The one place a clock is read, at the command boundary; the ledger helpers take the time.
     reviewed_at = args.reviewed_at or utc_stamp(datetime.now(UTC))
@@ -1331,13 +1412,21 @@ def _review_record(args: argparse.Namespace) -> int:
         )
     private_directories(ledger.parent)
 
+    checked: set[str] = set()
+
     def drawn_against_this_ledger(existing: list[dict[str, Any]]) -> None:
-        if exclusion_digest(existing, reviewer) != header["exclusion_digest"]:
+        state = exclusion_digest(existing, reviewer)
+        if state != header["exclusion_digest"]:
             raise ValueError(
                 "this sample was drawn against a different ledger state than the one it would be "
-                "recorded into; draw again against this ledger (a sample can be recorded once, "
-                "in order, into the one ledger it was drawn against)"
+                "recorded into; draw again against this ledger (a sample can be recorded once "
+                "into a ledger in the state it was drawn against)"
             )
+        if state not in checked:
+            # While the ledger is locked (a ledger that does not exist yet has nothing to lock,
+            # and is checked before it is created, then again if it changed meanwhile).
+            _check_the_draw(database, header, sample.rows, existing, args.deadline_seconds)
+            checked.add(state)
 
     appended = append_rows(ledger, rows, precondition=drawn_against_this_ledger)
     counts = Counter(f"{row['rule']}:{row['stratum']}" for row in rows)

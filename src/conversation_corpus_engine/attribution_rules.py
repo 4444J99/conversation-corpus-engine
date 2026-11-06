@@ -2585,10 +2585,12 @@ def _check_sample_row(row: Any, number: int) -> dict[str, Any]:
 
 
 def parse_sample(lines: Iterable[str]) -> ReviewSample:
-    """Read a review-sample file and refuse it unless it is exactly what `ReviewSampler` drew:
-    a header whose digest, row count and per-stratum counts match the rows, rows of the current
-    schema and rules version with the hash of the full text each shows, and no repeated span.
-    A tampered or hand-written sample (which cannot have a valid header) is refused."""
+    """Read a review-sample file and refuse it unless it is internally consistent: a header
+    whose digest, row count and per-stratum counts match the rows, rows of the current schema and
+    rules version with the hash and text key of the full text each shows, and no repeated span.
+    A sample edited after it was drawn is refused. This cannot tell a genuine draw from rows cut
+    or written by hand under a header that was digested again (`sample_header` digests any rows);
+    `review-record` does that, by drawing the sample again and comparing the rows."""
     numbered = [(number, line) for number, line in enumerate(lines, start=1) if line.strip()]
     if not numbered:
         raise ValueError("sample is empty: it has no header")

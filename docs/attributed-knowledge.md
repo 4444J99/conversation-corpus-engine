@@ -571,6 +571,22 @@ than the default, or `repeat_min_chars` / `repeat_min_occurrences` other than th
 previewing a sample. The batch size (`--per-stratum`) is free: a smaller batch is a prefix of a
 larger one.
 
+**The rows are the draw.** The draw is deterministic, so a header with a correct digest,
+library fingerprint and ledger state does not make a sample genuine: all three can be recomputed
+for any rows, and honest answers on cherry-picked rows would open a stratum the default draw would
+keep closed. `review-record` therefore draws the sample again, while it holds the ledger's lock,
+with the header's own seed, batch size and census settings, over the library as it is now and the
+owner's rows of the ledger as they stand (the same exclusion), and refuses it (exit status 2,
+nothing written, `not the draw`, with how many rows are extra or lacking) unless the rows of the
+sample are exactly that draw: the same span ids, in the same order, with the same text, length and
+hashes. A library that changed after the draw is refused first, for that reason (`different
+library`). The check reads the library once more, census and scan, and is bounded by
+`--deadline-seconds` (default 900; a deadline exits 3 and writes nothing). A ledger that does not
+exist yet has nothing to lock, so the draw is checked before it is created and again if the ledger
+changed meanwhile. A sample cut short by `--limit-records` or the deadline is a preview and cannot
+be recorded at all, so there is no partial draw to check. A process that can write the ledger
+directly is outside this guarantee, as stated above.
+
 **One ledger, in order, once.** What a draw offers also depends on which ledger it leaves spans out
 against. If that were not bound, draws could be made against a throwaway ledger (recording each
 there so that the next draw moves on) and only the good-looking draws recorded into the real one.
@@ -646,8 +662,10 @@ or `--store-root` (so the ledger is kept out of the store). `--answers` may be t
 this sample (an answers file carrying another or an edited header is refused). It checks the digest
 of the sample and refuses one that was edited (a changed row, or a changed header field of any kind,
 such as the seed, the owner, the library, the census settings or the ledger state, changes the
-digest), cut, hand-written, drawn from another library, drawn for another owner than `--reviewer`,
-drawn against another state of the ledger or already recorded; it refuses an answer whose span id,
+digest), drawn from another library, drawn for another owner than `--reviewer` or drawn against
+another state of the ledger (which is also what an already recorded sample is); then it draws the
+sample again and refuses one whose rows are not that draw (below, **The rows are the draw**); it
+refuses an answer whose span id,
 rule and stratum are not a row of the sample, a span answered twice, a verdict other than `yes`,
 `no` or `unsure`, and a file with JSON nested too deeply to read (`unreadable`), all before
 anything is written. It stamps the current UTC time unless `--reviewed-at` is given. The engine's
