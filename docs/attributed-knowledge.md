@@ -272,6 +272,71 @@ because those capped layouts have no `vault/records/UID.md#message-N` anchors to
 These pages are reading derivatives. They do not create a vault of record, block notes or any
 new attribution; the supplied assertions keep the assurance stated in the export.
 
+## One small note per idea for a wiki (`--format obsidian-md`)
+
+The reading export above is the whole library. A wiki usually wants only the ideas, each as a
+short note that points back to the exact words it came from:
+
+```bash
+cce library zettels --store-root /private/store --input /private/reviewed-ideas.json \
+  --format obsidian-md --out /private/wiki
+```
+
+This writes one file per idea at `notes/zettel/<title>.md` under `--out`. It uses the same
+`cce.reviewed-zettels.v1` envelope and the same validation as the other formats, so a stale
+digest, a missing review or a bad span stops everything before a file is written. `--out` must
+be outside every Git work tree (or ignored by it) and outside the library store; the command
+checks that before it reads the library or the envelope. Nothing is written into the store and
+nothing uses the network.
+
+What a note holds, in plain words:
+
+- **Frontmatter** in the Wiki Standard v1 order, flat, no nested properties: `id`, `type: zettel`,
+  `title`, `summary` (at most 200 characters), `created`, `updated`, `author`, `authorship`,
+  `status`, `sources`, `links`, `aliases`, `tags`.
+- **`sources`** holds one tuple per quote, `cce:<uid>@<version>#m<message>:<start>-<end>
+  sha256:<digest>` (`#a` for an alternate message). The note body also shows the matching
+  `cce library read ... --message N --offset START --limit LENGTH` line, so a reader can reopen
+  the passage.
+- **Exact quotes**, at most 400 characters each. A quote is the stored message text for that span,
+  byte for byte. If an envelope source carries an optional `quote` string it must equal that text
+  exactly or the whole run is refused with the reason. A span longer than 400 characters, or one
+  holding control or line-separator characters, is refused rather than shortened. In the file the
+  quote is a blockquote whose Markdown characters are written as entities, so it cannot become a
+  live link, heading or code fence; a reader sees the same words, and
+  `conversation_corpus_engine.library_zettel_notes.recover_quote` returns the exact original.
+- **`id`** is the created day plus six characters of a hash of the envelope's idea id, for example
+  `20260304-9afdfb`. It does not change when the text is edited. The envelope must therefore carry
+  `created` (`YYYY-MM-DD`, or an ISO timestamp, which is cut to its day) on each idea.
+- **Title** is the file name: at most 100 characters, none of `/ \ : * ? " < > | # ^ [ ]`, unique
+  ignoring case. An unusable title is refused with its reason, not rewritten.
+- **Size**: every note is checked against the Wiki Standard caps before it is written (aim for 4
+  KiB, a warning above 16 KiB, a refusal above 64 KiB), plus line, long-line, base64 and
+  quote-count checks. Warnings are listed in the printed report. The idea text is never clipped.
+
+**Who wrote it.** `authorship` comes only from the attribution already in the envelope, and
+`status` is always `draft`; this command never marks an idea `stable`.
+
+| `authorship` | When |
+|---|---|
+| `agent` | Every span of the idea text is asserted as agent-written. This is how an agent's draft enters. |
+| `human` | The idea text and every quoted word each carry an explicit, evidenced, profile-eligible owner assertion, and the author id of those assertions is the reviewer named in the envelope (the owner reviewed it). |
+| `generated` | Anything else: no attribution, mixed, third party, disputed, retracted, an owner claim with no evidence or not profile-eligible, or a reviewer who is not that owner. |
+
+So unreviewed or unproven text is never labelled as owner-written. Attribution stays a supplied
+assertion; the note says so.
+
+**Agent drafts and the review step.** The intake accepts an idea whose text is agent-written
+(`attribution` spans with `author: agent`) and the note comes out `authorship: agent`,
+`status: draft`. The intake still requires `review.status: "reviewed"`, a reviewer and evidence
+for every idea; an idea with no review is refused, as before. CCE does not write idea text itself.
+
+**Re-running.** Output is deterministic: the same envelope gives the same bytes, and a second run
+rewrites nothing (the report shows `written: 0`). A changed idea rewrites only its own note. A
+file that already holds a different note, or the same id under an older title, stops the run
+before any file is touched. Files the run does not own are never deleted. The `notes/zettel`
+folder is flat: the report warns above 200 notes and the run refuses above 1,000.
+
 ## Deterministic authorship rules
 
 `cce library attribute` derives span attributions from the exact text of every message of a

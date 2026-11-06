@@ -162,6 +162,7 @@ Consumers of the old layout, and what happens to each:
 | `library-index.jsonl` and `records.csv` (LingFrame and other index readers) | Same fields; schema `cce.library-index.v2` for the profiles, `path` is the note or null (empty in the CSV). |
 | `graph.jsonl` | Record nodes carry `path` only when the record has a note; `block:` nodes never do under a profile. |
 | `agent-entry.md` | Rewritten per profile (it no longer links `vault/Home.md` when there is no vault). Legacy text unchanged. |
+| Small wiki notes, one per reviewed idea (`zettels --format obsidian-md --out DIR`) | Works from the library alone, in any layout; see [attributed knowledge](attributed-knowledge.md#one-small-note-per-idea-for-a-wiki---format-obsidian-md). |
 | Reviewed Zettel export (`export --zettels`) | Legacy layout only; refused with any profile, because the pages cite `vault/records/UID.md#message-N`. |
 | My Knowledge Base federation provider (`legacy/my-knowledge-base/src/federation/cce-library-provider.ts`) | It indexes the legacy `vault/records/UID.md` and `vault/blocks/DIGEST.md` notes as documents (shared passages are documents of their own), a real dependency on the layout the profiles drop, so it accepts only a v1 manifest and index. A generation built with any profile, the default included, is refused with a message naming `--vault-profile`; earlier generations still scan. |
 | `cce library search` hit `path`, MCP field `pa` | Unchanged hint (see above); use `read` by UID or the index. |
