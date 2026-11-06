@@ -7,6 +7,7 @@ from pathlib import Path
 from .archive_commands import add_archive_parser, handle_archive
 from .archive_sealed_commands import add_sealed_parser
 from .archive_sealed_commands import run as run_sealed
+from .attribution_commands import add_attribute_parser, handle_attribute
 from .chatgpt_local_session import (
     discover_chatgpt_projects,
     fetch_chatgpt_project,
@@ -744,7 +745,7 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--json", action="store_true")
 
     add_archive_parser(subparsers)
-    add_library_parser(subparsers)
+    add_attribute_parser(add_library_parser(subparsers))
     add_sealed_parser(subparsers)
 
     return parser
@@ -760,7 +761,9 @@ def main() -> None:
     if args.group == "archive":
         raise SystemExit(handle_archive(args))
     if args.group == "library":
-        raise SystemExit(handle_library(args))
+        raise SystemExit(
+            handle_attribute(args) if args.action == "attribute" else handle_library(args)
+        )
 
     if args.group == "corpus" and args.action == "list":
         corpora = list_registered_corpora(args.project_root)

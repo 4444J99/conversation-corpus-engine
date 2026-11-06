@@ -597,7 +597,8 @@ def record_toc(
     return result
 
 
-def add_library_parser(subparsers: Any) -> None:
+def add_library_parser(subparsers: Any) -> Any:
+    """Register `cce library`; returns its subcommand action so other modules can add to it."""
     parser = subparsers.add_parser(
         "library", help="One versioned knowledge library across chats, code, plans and writing"
     )
@@ -795,6 +796,7 @@ def add_library_parser(subparsers: Any) -> None:
     analyze.add_argument("--max-output-bytes", type=int, default=defaults.max_output_bytes)
     analyze.add_argument("--max-atoms", type=int, default=defaults.max_atoms)
     analyze.add_argument("--max-seconds", type=int, default=defaults.max_seconds)
+    return sub
 
 
 _DECIMAL_SECONDS = re.compile(r"-?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)")
