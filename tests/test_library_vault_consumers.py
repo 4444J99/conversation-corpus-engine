@@ -5,17 +5,21 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 import zipfile
 from pathlib import Path
 from types import ModuleType
 
 import pytest
-from vault_support import synthetic_library
+from vault_support import sentinel_lines, synthetic_library
 
+from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.library_export import export_library, verify_export
+from conversation_corpus_engine.library_store import Library
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
+LINK = re.compile(r"(?<!!)\[[^\]\n]*\]\(([^)\n]*)\)")
 
 
 def load(name: str, script: str) -> ModuleType:
@@ -151,3 +155,53 @@ def test_the_obsidian_packager_accepts_the_vault_of_a_profile(
     assert result["split_notes"] == 0  # no note is near the packager's own 256 KiB limit
     assert (tmp_path / "derived" / "Home.md").is_file()
     assert (tmp_path / "derived" / "agent-entry.md").is_file()
+
+
+@pytest.mark.parametrize("profile", ["cards", "full"])
+def test_the_obsidian_packager_rebases_the_agent_entry_and_names_the_generation(
+    obsidian: ModuleType, tmp_path: Path, profile: str
+) -> None:
+    with synthetic_library(tmp_path, 12) as library:
+        export_library(library, tmp_path / "export", vault_profile=profile)
+    assert "(vault/Home.md)" in (tmp_path / "export" / "agent-entry.md").read_text()
+    obsidian.package(
+        tmp_path / "export" / "vault",
+        tmp_path / "derived",
+        agent_entry=tmp_path / "export" / "agent-entry.md",
+        source_generation="synthetic-generation",
+        max_seconds=60,
+    )
+    entry = (tmp_path / "derived" / "agent-entry.md").read_text()
+    targets = [target for target in LINK.findall(entry) if "://" not in target]
+    assert "vault/Home.md" not in entry and "(Home.md)" in entry
+    assert all((tmp_path / "derived" / target.split("#")[0]).is_file() for target in targets)
+    manifest = json.loads((tmp_path / "derived" / ".cce-package" / "manifest.json").read_text())
+    assert manifest["source_generation"] == "synthetic-generation"
+    assert obsidian.verify_package(tmp_path / "derived")["status"] == "verified"
+
+
+def test_the_obsidian_packager_accepts_a_fence_that_crosses_a_full_profile_part(
+    obsidian: ModuleType, tmp_path: Path
+) -> None:
+    body = "```python\n" + sentinel_lines("F", 900) + "\n```\nafter"
+    with Library.create(tmp_path / "library.sqlite") as library:
+        library.put(
+            Conversation(
+                provider="chatgpt",
+                source_id="fenced",
+                title="A record with a long fenced block",
+                messages=[Message(role="user", text=body, id="m0")],
+                extra={"wing": "ai", "lane": "conversations"},
+            )
+        )
+        library.index_blocks()
+        export_library(library, tmp_path / "export", vault_profile="full")
+    assert len(list((tmp_path / "export" / "vault" / "parts").glob("*.md"))) > 1
+    result = obsidian.package(
+        tmp_path / "export" / "vault",
+        tmp_path / "derived",
+        source_generation="synthetic-generation",
+        max_seconds=60,
+    )
+    assert result["status"] == "verified"
+    assert obsidian.verify_package(tmp_path / "derived")["status"] == "verified"
