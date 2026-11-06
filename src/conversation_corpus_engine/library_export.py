@@ -20,7 +20,7 @@ import shlex
 import sys
 import zipfile
 from collections import defaultdict
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -36,14 +36,23 @@ from .library_note_text import FACETS as _FACETS
 from .library_note_text import WINGS as _WINGS
 from .library_note_text import check as _check
 from .library_note_text import clip as _clip
+from .library_note_text import facet_stem
 from .library_note_text import inert as _inert
 from .library_note_text import inert_lines as _inert_lines
 from .library_note_text import plain as _plain
 from .library_note_text import safe_uid as _uid
 from .library_store import Library, canonical_json
+from .library_vault import PROFILE_CARDS, PROFILE_FULL, PROFILE_NONE, VAULT_PROFILES, plan_vault
+from .library_vault_gate import VaultCaps, hard_cap_problems, measure_vault
 
 EXPORT_SCHEMA = "cce.library-export.v1"
 INDEX_SCHEMA = "cce.library-index.v1"
+# The vault profiles (none, cards, full) write the v2 manifest and index: a note path may be
+# absent (null) and there are no block notes, so a v1 reader refuses them instead of misreading.
+EXPORT_SCHEMA_V2 = "cce.library-export.v2"
+INDEX_SCHEMA_V2 = "cce.library-index.v2"
+LEGACY_PROFILE = "legacy"
+EXPORT_PROFILES = (LEGACY_PROFILE, *VAULT_PROFILES)
 _DIGEST = re.compile(r"[a-f0-9]{64}\Z")
 _RECEIPTS = {"library.sqlite", "sources.json", "build-state.json"}
 _LATER_RECEIPTS = _RECEIPTS | {"report.json"}
@@ -71,12 +80,7 @@ _FRONTMATTER_ESCAPES = str.maketrans(
 
 
 def _facet_path(facet: str, value: str) -> str:
-    if facet == "wing" and value in _WINGS:
-        name = value
-    else:
-        slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")[:40] or "value"
-        name = slug + "-" + hashlib.sha256(value.encode()).hexdigest()[:12]
-    return f"vault/hubs/{facet}-{name}.md"
+    return f"vault/hubs/{facet_stem(facet, value)}.md"
 
 
 def _safe_relative(value: str) -> Path:
@@ -156,9 +160,12 @@ class _Writer:
                     stream.write(raw[start : start + _CHUNK])
 
 
-def _index_row(row: dict[str, Any]) -> dict[str, Any]:
+def _index_row(
+    row: dict[str, Any], paths: Mapping[str, str | None] | None = None
+) -> dict[str, Any]:
+    """One index row; ``paths`` (a vault profile) names each record's note, or null for none."""
     return {
-        "schema": INDEX_SCHEMA,
+        "schema": INDEX_SCHEMA if paths is None else INDEX_SCHEMA_V2,
         **{
             key: row[key]
             for key in (
@@ -178,7 +185,7 @@ def _index_row(row: dict[str, Any]) -> dict[str, Any]:
         },
         "version": row["current_version"],
         "digest": row["current_digest"],
-        "path": f"vault/records/{row['uid']}.md",
+        "path": f"vault/records/{row['uid']}.md" if paths is None else paths[row["uid"]],
     }
 
 
@@ -595,37 +602,31 @@ def _graph_rows(
     rows: list[dict[str, Any]],
     repeated: set[str],
     callback: Callable[..., Any] | None,
+    paths: Mapping[str, str | None] | None = None,
 ) -> Iterator[str]:
+    """Graph rows. With ``paths`` (a vault profile) a record node names its note only when it
+    has one and a shared-passage node has no note at all: its text stays in the database."""
     known = {row["uid"] for row in rows}
     for row in rows:
         _check(callback)
-        yield (
-            canonical_json(
-                {
-                    "type": "node",
-                    "id": row["uid"],
-                    "kind": "record",
-                    "path": f"vault/records/{row['uid']}.md",
-                    "wing": row["wing"],
-                    "lane": row["lane"],
-                    "version": row["current_version"],
-                }
-            )
-            + "\n"
-        )
+        node = {
+            "type": "node",
+            "id": row["uid"],
+            "kind": "record",
+            "path": f"vault/records/{row['uid']}.md" if paths is None else paths[row["uid"]],
+            "wing": row["wing"],
+            "lane": row["lane"],
+            "version": row["current_version"],
+        }
+        if node["path"] is None:
+            del node["path"]
+        yield canonical_json(node) + "\n"
     for digest in sorted(repeated):
         _check(callback)
-        yield (
-            canonical_json(
-                {
-                    "type": "node",
-                    "id": "block:" + digest,
-                    "kind": "block",
-                    "path": f"vault/blocks/{digest}.md",
-                }
-            )
-            + "\n"
-        )
+        node = {"type": "node", "id": "block:" + digest, "kind": "block"}
+        if paths is None:
+            node["path"] = f"vault/blocks/{digest}.md"
+        yield canonical_json(node) + "\n"
     absent: set[str] = set()
     for relation in library.connection.execute("SELECT * FROM relations ORDER BY src,dst,kind"):
         _check(callback)
@@ -686,7 +687,11 @@ def _csv_cell(value: Any) -> str:
     return text
 
 
-def _csv_rows(rows: list[dict[str, Any]], callback: Callable[..., Any] | None) -> Iterator[str]:
+def _csv_rows(
+    rows: list[dict[str, Any]],
+    callback: Callable[..., Any] | None,
+    paths: Mapping[str, str | None] | None = None,
+) -> Iterator[str]:
     columns = (
         "uid",
         "title",
@@ -708,12 +713,47 @@ def _csv_rows(rows: list[dict[str, Any]], callback: Callable[..., Any] | None) -
         _check(callback)
         buffer.seek(0)
         buffer.truncate()
-        metadata = _index_row(row)
-        writer.writerow([_csv_cell(metadata[column]) for column in columns])
+        metadata = _index_row(row, paths)
+        writer.writerow(
+            ["" if metadata[column] is None else _csv_cell(metadata[column]) for column in columns]
+        )
         yield buffer.getvalue()
 
 
-def _agent_entry(destination: Path) -> str:
+_PROVIDER_NOTE = "Raw provider exports and original documents remain at source."
+# The three paragraphs after the commands, per layout. The legacy text is the original, byte for byte.
+_ENTRY_TAIL = {
+    LEGACY_PROFILE: (
+        "[Human library](vault/Home.md) has two wings: AI conversations and coding; authored research and creative writing. `library.sqlite` retains compressed normalized revisions and source observations. Raw provider exports and original documents remain at source.\n\n",
+        "`library-index.jsonl` is the compact metadata and canonical-note contract for my-knowledge-base and LingFrame; it is not a second database. `graph.jsonl` records parent relationships and repeated-passage references.\n\n",
+        "`notion-import.zip` contains this Markdown tree and `records.csv`. Notion supports Markdown ZIP and CSV imports; imported internal links and heading anchors may vary, so inspect them after import. This export does not publish or upload private material.\n",
+    ),
+    PROFILE_NONE: (
+        "This generation was built with `--vault-profile none`: it holds no reading vault and no Notion ZIP. "
+        "`library.sqlite` retains compressed normalized revisions and source observations. "
+        + _PROVIDER_NOTE
+        + "\n\n",
+        "`library-index.jsonl` is the compact metadata contract for my-knowledge-base and LingFrame; its `path` is null because no notes exist. `graph.jsonl` records parent relationships and repeated-passage references. `records.csv` lists every record.\n\n",
+        "For a small reading vault run `cce library export-cards --out DIR` (one capped card per record) or rebuild with `--vault-profile cards`. This export does not publish or upload private material.\n",
+    ),
+    PROFILE_CARDS: (
+        "[Human library](vault/Home.md) is a capped card vault (`--vault-profile cards`): one short card per record, most recently updated first, never the full body; its Home note states how many records have no card. `library.sqlite` retains compressed normalized revisions and source observations. "
+        + _PROVIDER_NOTE
+        + "\n\n",
+        "`library-index.jsonl` is the compact metadata contract for my-knowledge-base and LingFrame; its `path` names a record's card and is null for a record without one. `graph.jsonl` records parent relationships and repeated-passage references.\n\n",
+        "`notion-import.zip` contains the card tree and `records.csv`. Notion supports Markdown ZIP and CSV imports; imported internal links and heading anchors may vary, so inspect them after import. This export does not publish or upload private material.\n",
+    ),
+    PROFILE_FULL: (
+        "[Human library](vault/Home.md) holds every record whole, split into linked parts (`--vault-profile full`); repeated passages appear inline and have no notes of their own. `library.sqlite` retains compressed normalized revisions and source observations. "
+        + _PROVIDER_NOTE
+        + "\n\n",
+        "`library-index.jsonl` is the compact metadata and canonical-note contract for my-knowledge-base and LingFrame (`path` names the first part of a record); it is not a second database. `graph.jsonl` records parent relationships and repeated-passage references.\n\n",
+        "`notion-import.zip` contains this Markdown tree and `records.csv`. Notion supports Markdown ZIP and CSV imports; imported internal links and heading anchors may vary, so inspect them after import. This export does not publish or upload private material.\n",
+    ),
+}
+
+
+def _agent_entry(destination: Path, profile: str = LEGACY_PROFILE) -> str:
     registered = (
         destination.parent.name == "generations" and destination.parent.parent.name == "library-all"
     )
@@ -738,13 +778,167 @@ def _agent_entry(destination: Path) -> str:
         + commands
         + fence
         + "\n\n"
-        "[Human library](vault/Home.md) has two wings: AI conversations and coding; authored research and creative writing. `library.sqlite` retains compressed normalized revisions and source observations. Raw provider exports and original documents remain at source.\n\n"
-        "`library-index.jsonl` is the compact metadata and canonical-note contract for my-knowledge-base and LingFrame; it is not a second database. `graph.jsonl` records parent relationships and repeated-passage references.\n\n"
-        "`notion-import.zip` contains this Markdown tree and `records.csv`. Notion supports Markdown ZIP and CSV imports; imported internal links and heading anchors may vary, so inspect them after import. This export does not publish or upload private material.\n"
+        + "".join(_ENTRY_TAIL[profile])
     )
     if len(text.encode()) >= 4096:
         raise ValueError("agent entry exceeds its 4096-byte budget")
     return text
+
+
+def _write_notion_zip(
+    writer: _Writer,
+    destination: Path,
+    members: list[str],
+    check_callback: Callable[..., Any] | None,
+) -> None:
+    with (
+        writer.binary("notion-import.zip") as output,
+        zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive,
+    ):
+        for relative in members:
+            _check(check_callback)
+            info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o100600 << 16
+            with (
+                (destination / relative).open("rb") as source,
+                archive.open(info, "w", force_zip64=True) as target,
+            ):
+                while chunk := source.read(_CHUNK):
+                    _check(check_callback)
+                    target.write(chunk)
+
+
+def _load_rows(
+    library: Library, check_callback: Callable[..., Any] | None
+) -> tuple[list[dict[str, Any]], set[str]]:
+    """Every record row (validated) and the digests of the repeated passages."""
+    rows = []
+    for row in library.rows():
+        _check(check_callback)
+        _uid(row["uid"])
+        if row["wing"] not in _WINGS:
+            raise ValueError("unknown library wing")
+        rows.append(row)
+    repeated: set[str] = set()
+    for row in library.connection.execute(
+        "SELECT b.digest FROM blocks b JOIN occurrences o ON o.digest=b.digest WHERE b.eligible=1 GROUP BY b.digest HAVING COUNT(*)>1"
+    ):
+        _check(check_callback)
+        if not _DIGEST.fullmatch(row["digest"]):
+            raise ValueError("unsafe block digest")
+        repeated.add(row["digest"])
+    return rows, repeated
+
+
+def _require_empty_destination(destination: Path) -> None:
+    _no_symlinks(destination)
+    if destination.exists():
+        if not destination.is_dir():
+            raise FileExistsError(destination)
+        for entry in destination.iterdir():
+            if entry.name not in _RECEIPTS or entry.is_symlink() or not entry.is_file():
+                raise FileExistsError(f"refusing to replace existing export content: {entry}")
+
+
+def _empty_gate(caps: VaultCaps) -> dict[str, Any]:
+    return {
+        "notes": 0,
+        "bytes": 0,
+        "max_note_bytes": 0,
+        "max_note_path": "",
+        "folders": 0,
+        "widest_folder": {"path": ".", "entries": 0},
+        "hub_pages": 0,
+        "max_hub_entries": 0,
+        "findings": [],
+        "complete": True,
+        "ok": True,
+        "clean": True,
+        "caps": caps.as_dict(),
+    }
+
+
+def _export_profile(
+    library: Library,
+    destination: Path,
+    *,
+    check_callback: Callable[..., Any] | None,
+    profile: str,
+    limit_notes: int | None,
+    caps: VaultCaps | None,
+) -> dict[str, Any]:
+    """The none, cards and full layouts: a capped (or absent) vault beside the same indexes."""
+    caps = caps or VaultCaps()
+    destination = _absolute(destination)
+    _require_empty_destination(destination)
+    rows, repeated = _load_rows(library, check_callback)
+    # Planning reads every record it must lay out and refuses, before any directory exists, a
+    # vault that would pass a hard cap.
+    plan = plan_vault(
+        profile,
+        library,
+        rows,
+        prefix="vault/",
+        entry_doc="agent-entry.md",
+        caps=caps,
+        limit_notes=limit_notes,
+        check_callback=check_callback,
+    )
+    destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+    destination.chmod(0o700)
+    for entry in destination.iterdir():
+        entry.chmod(0o600)
+    writer = _Writer(destination, check_callback)
+    plan.write(writer.text)
+    gate = measure_vault(destination / "vault", caps) if profile != PROFILE_NONE else None
+    if gate is not None and not gate["ok"]:
+        raise ValueError("vault breaks its hard caps: " + "; ".join(hard_cap_problems(gate)))
+    writer.text("agent-entry.md", _agent_entry(destination, profile))
+    writer.text(
+        "library-index.jsonl", (canonical_json(_index_row(row, plan.paths)) + "\n" for row in rows)
+    )
+    writer.text("graph.jsonl", _graph_rows(library, rows, repeated, check_callback, plan.paths))
+    writer.text("records.csv", _csv_rows(rows, check_callback, plan.paths))
+    inventory: dict[str, Any] = {
+        "schema": EXPORT_SCHEMA_V2,
+        "profile": profile,
+        "records": len(rows),
+        "blocks": len(repeated),
+    }
+    if profile != PROFILE_NONE:
+        members = sorted(
+            path for path in writer.files if path.endswith(".md") or path == "records.csv"
+        )
+        _write_notion_zip(writer, destination, members, check_callback)
+        inventory["notion_members"] = members
+    if profile == PROFILE_CARDS:
+        inventory["cards"] = {
+            "included": plan.cards,
+            "records": len(rows),
+            "truncated": plan.truncated,
+            "limit_notes": plan.limit_notes,
+        }
+    inventory["files"] = sorted([*writer.files, "export-manifest.json"])
+    writer.text("export-manifest.json", canonical_json(inventory) + "\n")
+    result: dict[str, Any] = {
+        "records": len(rows),
+        "blocks": len(repeated),
+        "files": len(writer.files),
+        "vault": "vault/Home.md" if profile != PROFILE_NONE else None,
+        "index": "library-index.jsonl",
+        "notion": "notion-import.zip" if profile != PROFILE_NONE else None,
+        "profile": profile,
+        "vault_caps": gate or _empty_gate(caps),
+    }
+    if profile == PROFILE_CARDS:
+        result.update(
+            cards=plan.cards,
+            omitted=plan.omitted,
+            truncated=plan.truncated,
+            limit_notes=plan.limit_notes,
+        )
+    return result
 
 
 def export_library(
@@ -753,6 +947,9 @@ def export_library(
     *,
     check_callback: Callable[..., Any] | None = None,
     zettels: dict[str, Any] | None = None,
+    vault_profile: str = LEGACY_PROFILE,
+    limit_notes: int | None = None,
+    caps: VaultCaps | None = None,
 ) -> dict[str, Any]:
     """Create all reading derivatives, refusing any existing owned output.
 
@@ -764,7 +961,33 @@ def export_library(
     against this library before anything is written; every reviewed Zettel then gets
     a page, a hub entry, graph rows and backlinks on the records it cites. Without it
     the output is byte-for-byte what it was before this option existed.
+
+    ``vault_profile`` defaults to the original ``legacy`` layout, unchanged. ``none`` writes no
+    vault and no Notion ZIP, ``cards`` a capped card vault (``limit_notes`` bounds its notes) and
+    ``full`` whole records split into linked parts; the last two never write per-block notes and
+    keep every folder, note and hub inside the vault caps, or refuse before writing (see
+    ``library_vault``). Those layouts carry the v2 manifest and index and no reviewed Zettels.
     """
+    if vault_profile not in EXPORT_PROFILES:
+        raise ValueError(
+            f"unknown vault profile {vault_profile!r}; choose one of "
+            f"{', '.join(VAULT_PROFILES)} (or {LEGACY_PROFILE} for the original layout)"
+        )
+    if vault_profile != LEGACY_PROFILE:
+        if zettels is not None:
+            raise ValueError(
+                "reviewed Zettel pages need the legacy layout; omit --vault-profile (vault_profile)"
+            )
+        return _export_profile(
+            library,
+            destination,
+            check_callback=check_callback,
+            profile=vault_profile,
+            limit_notes=limit_notes,
+            caps=caps,
+        )
+    if limit_notes is not None or caps is not None:
+        raise ValueError("limit_notes and caps apply to the none, cards and full profiles only")
     destination = _absolute(destination)
     _no_symlinks(destination)
     if destination.exists():
@@ -873,22 +1096,7 @@ def export_library(
     notion_members = sorted(
         path for path in writer.files if path.endswith(".md") or path == "records.csv"
     )
-    with (
-        writer.binary("notion-import.zip") as output,
-        zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive,
-    ):
-        for relative in notion_members:
-            _check(check_callback)
-            info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            info.external_attr = 0o100600 << 16
-            with (
-                (destination / relative).open("rb") as source,
-                archive.open(info, "w", force_zip64=True) as target,
-            ):
-                while chunk := source.read(_CHUNK):
-                    _check(check_callback)
-                    target.write(chunk)
+    _write_notion_zip(writer, destination, notion_members, check_callback)
     inventory = {
         "schema": EXPORT_SCHEMA,
         "records": len(rows),
@@ -994,11 +1202,38 @@ def _verify_zettel_pages(
     return problems
 
 
+def _verify_profile_index(
+    profile: str,
+    manifest: dict[str, Any],
+    noted: dict[str, str | None],
+    expected: set[str],
+) -> list[str]:
+    """The v2 index must name exactly the notes the profile wrote, each at most once."""
+    paths = [path for path in noted.values() if path]
+    indexed = set(paths)
+    if profile == PROFILE_NONE:
+        return ["library index names notes in an export built without a vault"] if paths else []
+    tree = "vault/records/" if profile == PROFILE_FULL else "vault/cards/"
+    problems = []
+    if indexed != {path for path in expected if path.startswith(tree) and path.endswith(".md")}:
+        problems.append("record inventory differs from library index")
+    if len(indexed) != len(paths):
+        problems.append("library index names one note for two records")
+    if profile == PROFILE_FULL and len(paths) != len(noted):
+        problems.append("a full vault must name a note for every record")
+    if profile == PROFILE_CARDS:
+        cards = manifest.get("cards")
+        if not isinstance(cards, dict) or cards.get("included") != len(paths):
+            problems.append("card count differs from manifest")
+    return problems
+
+
 def verify_export(
     destination: Path,
     *,
     check_callback: Callable[..., Any] | None = None,
     expected_zettels: int | None = None,
+    caps: VaultCaps | None = None,
 ) -> list[str]:
     """Check inventory, generated links/anchors, identity graph and ZIP parity.
 
@@ -1008,28 +1243,52 @@ def verify_export(
     built from; the Zettel pages found on disk must match it exactly. A Zettel source
     link whose ``#message-N`` or ``#alternate-N`` anchor is absent is reported as an
     unresolved source anchor.
+
+    A v2 manifest (the none, cards and full profiles) is verified for its profile: ``none`` must
+    hold no vault and no Notion ZIP, ``cards`` and ``full`` must keep every note, folder and hub
+    inside the hard caps of ``caps`` (the standard's defaults) and index exactly their notes.
     """
     destination = _absolute(destination)
     problems: list[str] = []
+    profile: str | None = None  # None is the legacy layout
     try:
         _no_symlinks(destination)
         _no_symlinks(destination / "export-manifest.json")
         manifest = json.loads((destination / "export-manifest.json").read_text(encoding="utf-8"))
-        if not isinstance(manifest, dict) or manifest.get("schema") != EXPORT_SCHEMA:
+        if not isinstance(manifest, dict) or manifest.get("schema") not in {
+            EXPORT_SCHEMA,
+            EXPORT_SCHEMA_V2,
+        }:
             raise ValueError("unknown export manifest schema")
         expected = set(manifest["files"])
-        required = {
-            "export-manifest.json",
-            "vault/Home.md",
-            "agent-entry.md",
-            "library-index.jsonl",
-            "graph.jsonl",
-            "records.csv",
-            "notion-import.zip",
-            "vault/hubs/wing-ai.md",
-            "vault/hubs/wing-authored.md",
-        }
         declared = manifest.get("zettels")
+        if manifest["schema"] == EXPORT_SCHEMA_V2:
+            profile = manifest.get("profile")
+            if profile not in VAULT_PROFILES:
+                raise ValueError("unknown vault profile")
+            if declared is not None:
+                raise ValueError("a vault profile carries no reviewed Zettels")
+            required = {
+                "export-manifest.json",
+                "agent-entry.md",
+                "library-index.jsonl",
+                "graph.jsonl",
+                "records.csv",
+            }
+            if profile != PROFILE_NONE:
+                required |= {"vault/Home.md", "notion-import.zip"}
+        else:
+            required = {
+                "export-manifest.json",
+                "vault/Home.md",
+                "agent-entry.md",
+                "library-index.jsonl",
+                "graph.jsonl",
+                "records.csv",
+                "notion-import.zip",
+                "vault/hubs/wing-ai.md",
+                "vault/hubs/wing-authored.md",
+            }
         if declared is not None:
             if isinstance(declared, bool) or not isinstance(declared, int) or declared < 0:
                 raise ValueError("invalid Zettel count")
@@ -1057,6 +1316,14 @@ def verify_export(
     problems.extend(
         _verify_zettel_pages(destination, existing, declared, expected_zettels, check_callback)
     )
+    if profile in {PROFILE_CARDS, PROFILE_FULL}:
+        try:
+            problems.extend(
+                f"vault {line}"
+                for line in hard_cap_problems(measure_vault(destination / "vault", caps))
+            )
+        except OSError as error:
+            problems.append(f"vault unreadable: {error}")
 
     anchors: dict[Path, set[str]] = {}
     for relative in sorted(expected & existing):
@@ -1096,22 +1363,31 @@ def verify_export(
             problems.append(f"unreadable Markdown {relative}: {error}")
 
     identities: set[str] = set()
+    noted: dict[str, str | None] = {}
     try:
         with (destination / "library-index.jsonl").open(encoding="utf-8") as stream:
             for line in stream:
                 _check(check_callback)
                 row = json.loads(line)
                 uid = _uid(row["uid"])
-                if (
-                    uid in identities
-                    or row.get("schema") != INDEX_SCHEMA
-                    or row.get("path") != f"vault/records/{uid}.md"
-                ):
+                path = row.get("path")
+                if profile is None:
+                    consistent = row.get("schema") == INDEX_SCHEMA and path == (
+                        f"vault/records/{uid}.md"
+                    )
+                else:
+                    consistent = row.get("schema") == INDEX_SCHEMA_V2 and (
+                        path is None or (isinstance(path, str) and path in expected)
+                    )
+                if uid in identities or not consistent:
                     raise ValueError("inconsistent library index identity")
                 identities.add(uid)
+                noted[uid] = path
         if len(identities) != manifest["records"]:
             problems.append("library index record count differs from manifest")
-        if {f"vault/records/{uid}.md" for uid in identities} != {
+        if profile is not None:
+            problems.extend(_verify_profile_index(profile, manifest, noted, expected))
+        elif {f"vault/records/{uid}.md" for uid in identities} != {
             path for path in expected if path.startswith("vault/records/")
         }:
             problems.append("record inventory differs from library index")
@@ -1144,6 +1420,8 @@ def verify_export(
     except (OSError, ValueError, KeyError, TypeError) as error:
         problems.append(f"index or graph missing or invalid: {error}")
 
+    if profile == PROFILE_NONE:
+        return problems
     try:
         members = set(manifest["notion_members"])
         if members != {path for path in expected if path.endswith(".md") or path == "records.csv"}:
