@@ -9,7 +9,11 @@ the person add; the exporter therefore touches only what it can prove it wrote:
 * every run writes a manifest of exactly the files it generated, with their sizes and digests;
 * a later run replaces and deletes only files that earlier manifest lists, and refuses, before it
   changes anything, when one of them was edited or when an unlisted file already sits where a card
-  would go (an identical file is adopted, which makes an interrupted run safe to repeat).
+  would go (an identical file is adopted, which makes an interrupted run safe to repeat);
+* the cards, hubs and Home it would write are measured against every hard cap in planning, and a
+  breach refuses before any file is written, deleted or listed. What the person keeps in the
+  folder is theirs: if it alone pushes the folder past a cap, the run completes and says so (a
+  warning on stderr and in the result) instead of failing after the manifest is written.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -26,7 +31,7 @@ from .library_export import _absolute, _no_symlinks, _safe_relative
 from .library_note_text import WINGS, check, safe_uid
 from .library_store import Library
 from .library_vault import PROFILE_CARDS, plan_vault
-from .library_vault_gate import DEFAULT_CAPS, VaultCaps, hard_cap_problems, measure_vault
+from .library_vault_gate import DEFAULT_CAPS, VaultCaps, describe_findings, measure_vault
 
 CARDS_SCHEMA = "cce.library-cards.v1"
 CARDS_MARKER = ".cce-cards-vault"
@@ -221,9 +226,18 @@ def export_cards(
         (json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(),
         replace=(out / CARDS_MANIFEST).exists(),
     )
+    # The manifest above describes a vault whose generated notes already passed the caps in
+    # planning. Whatever else the folder holds is the person's; if it crowds the vault past a cap
+    # that is reported, never raised after the writing is done.
     gate = measure_vault(out, caps)
-    if not gate["ok"]:
-        raise ValueError("card vault breaks its hard caps: " + "; ".join(hard_cap_problems(gate)))
+    warnings = []
+    if gate["findings"]:
+        warnings.append(
+            "the card folder as a whole is outside the vault caps "
+            f"({describe_findings(gate)}); the cards written by this tool fit them, so files of "
+            "your own in the folder account for the rest"
+        )
+        print(f"library: warning: {warnings[0]}", file=sys.stderr)
     return {
         "out": str(out),
         "records": plan.records,
@@ -236,5 +250,7 @@ def export_cards(
         "adopted": adopted,
         "removed": removed,
         "manifest": CARDS_MANIFEST,
+        "generated_caps": plan.gate,
         "vault_caps": gate,
+        "warnings": warnings,
     }

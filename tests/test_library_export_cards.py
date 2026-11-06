@@ -12,6 +12,7 @@ from test_library_build import setup_sources
 from vault_support import synthetic_library
 
 from conversation_corpus_engine import library_commands
+from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.attributed_knowledge import ZETTEL_SCHEMA
 from conversation_corpus_engine.cli import build_parser
 from conversation_corpus_engine.library_cards import (
@@ -21,7 +22,7 @@ from conversation_corpus_engine.library_cards import (
     export_cards,
 )
 from conversation_corpus_engine.library_store import Library
-from conversation_corpus_engine.library_vault_gate import measure_vault
+from conversation_corpus_engine.library_vault_gate import VaultCaps, measure_vault
 
 LINK = re.compile(r"(?<!!)\[[^\]\n]*\]\(([^)\n]*)\)")
 
@@ -357,3 +358,58 @@ def test_export_refuses_reviewed_zettels_with_a_profile_and_names_the_flag(
             str(tmp_path / "x"),
         )
     assert code == 2 and "legacy layout" in capsys.readouterr().err
+
+
+def snapshot(root: Path) -> dict[str, str]:
+    return {path: sha(root / path) for path in files_under(root)}
+
+
+def test_a_crowded_folder_of_the_persons_own_files_warns_and_the_vault_stays_consistent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with synthetic_library(tmp_path, 700, index=False) as source:
+        out = tmp_path / "cards"
+        cards_export(source.path, out)
+        cards_export(source.path, out, limit_notes=500)
+        bucket = next(path for path in sorted((out / "cards").iterdir()) if path.is_dir())
+        for number in range(1100):
+            (bucket / f"mine-{number:04d}.md").write_text("my note")
+        capsys.readouterr()
+        result = cards_export(source.path, out, limit_notes=400)
+    # The cards the tool controls fit the caps, so the run completes; the crowding is the
+    # person's, so it is reported, on stderr and in the result, and nothing is half-replaced.
+    assert result["cards"] < 400 and result["generated_caps"]["ok"] is True
+    assert result["vault_caps"]["ok"] is False
+    assert result["warnings"] and "folder_entries" in result["warnings"][0]
+    assert "warning" in capsys.readouterr().err
+    manifest = json.loads((out / CARDS_MANIFEST).read_text(encoding="utf-8"))
+    listed = {entry["path"] for entry in manifest["files"]}
+    assert manifest["cards"] == result["cards"]
+    on_disk = files_under(out)
+    mine = {f"{bucket.relative_to(out).as_posix()}/mine-{n:04d}.md" for n in range(1100)}
+    assert on_disk == listed | {CARDS_MARKER, CARDS_MANIFEST} | mine
+    for entry in manifest["files"]:
+        assert sha(out / entry["path"]) == entry["sha256"]
+    assert all((out / path).read_text() == "my note" for path in mine)
+
+
+def test_a_vault_that_breaks_a_hard_cap_is_refused_with_nothing_changed(tmp_path: Path) -> None:
+    caps = VaultCaps(note_target=1024, note_warn=2048, note_fail=2048)
+    with synthetic_library(tmp_path, 12) as source:
+        out = tmp_path / "cards"
+        cards_export(source.path, out)
+        (out / "My notes.md").write_text("annotations")
+        before = snapshot(out)
+    with Library.create(tmp_path / "heavy.sqlite") as heavy:
+        heavy.put(
+            Conversation(
+                provider="chatgpt",
+                source_id="brackets",
+                title="Escapes grow",
+                messages=[Message(role="user", text="[" * 1000)],
+                extra={"wing": "ai", "lane": "conversations"},
+            )
+        )
+        with pytest.raises(ValueError, match="note_size"):
+            export_cards(heavy, out, caps=caps)
+    assert snapshot(out) == before
