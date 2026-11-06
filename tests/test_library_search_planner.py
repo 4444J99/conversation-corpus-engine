@@ -619,6 +619,39 @@ def test_plans_proven_empty_after_the_budget_ran_out_give_an_exact_empty_answer(
     assert "notice" not in result
 
 
+# After the budget runs out, the unranked page (and each probe) gets its own allowance of
+# min(max_seconds, 2) seconds. The clock jumps by ``jump`` the moment that page's statement
+# begins, so a jump below the allowance leaves the page whole and a jump past it cuts it.
+ALLOWANCE_CASES = [
+    pytest.param(5.0, 1.9, False, id="just-inside-the-two-second-cap"),
+    pytest.param(5.0, 2.1, True, id="just-past-the-two-second-cap"),
+    pytest.param(1.0, 0.9, False, id="just-inside-a-one-second-budget"),
+    pytest.param(1.0, 1.1, True, id="just-past-a-one-second-budget"),
+]
+
+
+@pytest.mark.parametrize(("seconds", "jump", "cut"), ALLOWANCE_CASES)
+def test_the_unranked_page_is_bounded_by_its_own_allowance(many, monkeypatch, seconds, jump, cut):
+    monkeypatch.setattr(library_store, "SEARCH_PROGRESS_INSTRUCTIONS", 1)
+    clock = FakeClock()
+    monkeypatch.setattr(library_store, "_clock", clock)
+
+    def trace(statement: str) -> None:
+        if "bm25" in statement:
+            clock.now = 100.0
+        elif "ORDER BY record_fts.rowid" in statement:
+            clock.now = 100.0 + jump
+
+    many.connection.set_trace_callback(trace)
+    result = many.search("alpha beta", limit=5, max_seconds=seconds)
+    assert result["partial"] is True and result["plan"] == "and"
+    if cut:
+        assert result["hits"] == [] and result["next_offset"] == 0
+    else:
+        assert uids(result) == [conv(f"m{n:03d}", "x").uid for n in range(5)]
+        assert result["next_offset"] == 5
+
+
 def test_the_budget_composes_with_an_enclosing_progress_scope(many):
     class Stop(Exception):
         pass
