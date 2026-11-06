@@ -31,7 +31,13 @@ from .library_export import _absolute, _no_symlinks, _safe_relative
 from .library_note_text import WINGS, check, safe_uid
 from .library_store import Library
 from .library_vault import PROFILE_CARDS, plan_vault
-from .library_vault_gate import DEFAULT_CAPS, VaultCaps, describe_findings, measure_vault
+from .library_vault_gate import (
+    DEFAULT_CAPS,
+    VaultCaps,
+    describe_findings,
+    hard_cap_problems,
+    measure_vault,
+)
 
 CARDS_SCHEMA = "cce.library-cards.v1"
 CARDS_MARKER = ".cce-cards-vault"
@@ -117,6 +123,75 @@ def _private_write(target: Path, data: bytes, *, replace: bool) -> None:
         os.fsync(stream.fileno())
     if replace:
         path.replace(target)
+
+
+def is_card_folder(directory: Path) -> bool:
+    """Whether `directory` is what `export_cards` makes (its marker or its manifest is there) and
+    not a library export, which has an `export-manifest.json` of its own."""
+    directory = Path(directory)
+    return not os.path.lexists(directory / "export-manifest.json") and any(
+        os.path.lexists(directory / name) for name in (CARDS_MARKER, CARDS_MANIFEST)
+    )
+
+
+def verify_cards(directory: Path, *, caps: VaultCaps | None = None) -> dict[str, Any]:
+    """Check a card folder against the manifest of the run that wrote it.
+
+    Every file the manifest lists must be there as a regular file of the listed size and SHA-256
+    (a listed file that differs was edited since the export, which the next run would refuse to
+    replace). Files the manifest does not list are the person's own and are only counted. The
+    whole folder, theirs included, is then measured against the hard caps of the vault standard,
+    as `measure_vault` does after an export, so a folder that outgrew them reports it here.
+    Returns the problems (empty means valid) with the number of cards listed and of files not.
+    """
+    caps = caps or DEFAULT_CAPS
+    directory = _absolute(Path(directory))
+    problems: list[str] = []
+    report: dict[str, Any] = {"problems": problems, "cards": 0, "unlisted": 0}
+    try:
+        _no_symlinks(directory)
+    except ValueError as error:
+        problems.append(str(error))
+        return report
+    marker, manifest_path = directory / CARDS_MARKER, directory / CARDS_MANIFEST
+    if marker.is_symlink() or not marker.is_file():
+        problems.append(f"card vault marker missing: {CARDS_MARKER}")
+        return report
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        problems.append(f"card manifest missing: {CARDS_MANIFEST}")
+        return report
+    try:
+        files, _ = _previous_run(directory)
+    except (OSError, ValueError) as error:
+        problems.append(str(error))
+        return report
+    report["cards"] = len(files)
+    for path in sorted(files):
+        target = directory / path
+        if not os.path.lexists(target):
+            problems.append(f"missing card file: {path}")
+        elif target.is_symlink() or not target.is_file():
+            problems.append(f"card file is not a regular file: {path}")
+        else:
+            data = target.read_bytes()
+            entry = files[path]
+            if _sha256(data) != entry["sha256"] or len(data) != entry.get("bytes", len(data)):
+                problems.append(f"edited since export: {path}")
+    listed = set(files) | {CARDS_MARKER, CARDS_MANIFEST}
+    for item in directory.rglob("*"):
+        if (
+            item.is_file()
+            and not item.is_symlink()
+            and item.relative_to(directory).as_posix() not in listed
+        ):
+            report["unlisted"] += 1
+    try:
+        problems.extend(
+            f"vault {line}" for line in hard_cap_problems(measure_vault(directory, caps))
+        )
+    except OSError as error:
+        problems.append(f"vault unreadable: {error}")
+    return report
 
 
 def export_cards(

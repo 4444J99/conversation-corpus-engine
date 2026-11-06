@@ -21,7 +21,7 @@ from .library_build import (
     publish_library,
     verify_candidate,
 )
-from .library_cards import export_cards
+from .library_cards import export_cards, is_card_folder, verify_cards
 from .library_export import EXPORT_PROFILES, LEGACY_PROFILE, export_library, verify_export
 from .library_store import (
     BROAD_QUERY_HINT,
@@ -29,6 +29,7 @@ from .library_store import (
     MAX_SEARCH_SECONDS,
     SEARCH_PLANS,
     Library,
+    bounded_int,
     validate_search_seconds,
 )
 from .library_vault import VAULT_PROFILES
@@ -674,7 +675,9 @@ def add_library_parser(subparsers: Any) -> None:
         help="Most notes (cards, hubs and Home) the vault may hold; default 10000, at most 20000",
     )
     verify_export = sub.add_parser(
-        "verify-export", help="Verify an export directory, including its Zettel pages and anchors"
+        "verify-export",
+        help="Verify an export directory, including its Zettel pages and anchors, or an "
+        "export-cards folder (its listed files and the vault caps)",
     )
     common(verify_export)
     verify_export.add_argument("directory", type=Path)
@@ -730,7 +733,11 @@ def add_library_parser(subparsers: Any) -> None:
         f"{DEFAULT_SEARCH_SECONDS:g}); on expiry a partial page in index order is returned, "
         "not an error",
     )
-    read = sub.add_parser("read", help="Read one bounded message span from a source revision")
+    read = sub.add_parser(
+        "read",
+        help="Read one bounded message span, a message range or the table of contents of a "
+        "source revision",
+    )
     common(read)
     read.add_argument("uid")
     read.add_argument("--version")
@@ -739,6 +746,35 @@ def add_library_parser(subparsers: Any) -> None:
     read.add_argument("--sequence", choices=("main", "alternate"), default="main")
     read.add_argument("--offset", type=int, default=0)
     read.add_argument("--limit", type=int, default=12000)
+    read.add_argument(
+        "--around-query",
+        help="centre the passage on the first match of these terms at or after --message; the "
+        "result reports match {message, start, end} or null",
+    )
+    read.add_argument(
+        "--message-end",
+        type=int,
+        help="range read: the messages from --message up to (excluding) this one, with --limit "
+        "as the total character budget (at most 200 messages a call); resume with the "
+        "next_message and next_offset it returns",
+    )
+    read.add_argument(
+        "--toc",
+        action="store_true",
+        help="list a table of contents (markdown headings with message and offset, or a "
+        "per-message index) instead of text",
+    )
+    read.add_argument(
+        "--toc-mode",
+        choices=("auto", "headings", "messages"),
+        help="with --toc: headings, a per-message index, or auto (headings when there are any)",
+    )
+    read.add_argument("--toc-offset", type=int, help="with --toc: entries to skip (default 0)")
+    read.add_argument(
+        "--toc-limit",
+        type=int,
+        help=f"with --toc: entries to list, 1 to {MAX_TOC_ENTRIES} (default 50)",
+    )
     history = sub.add_parser("history", help="Read accepted semantic revisions")
     common(history)
     history.add_argument("uid")
@@ -798,7 +834,93 @@ def _warn_over_caps(out: Path) -> None:
         )
 
 
+def integer_argument(arguments: dict[str, Any], name: str, default: int, maximum: int) -> int:
+    """`arguments[name]` as an integer from its minimum (1 for the counts that must be positive,
+    else 0) to `maximum`, or `default` when it is absent; anything else is a `ValueError`."""
+    value = arguments.get(name, default)
+    minimum = 1 if name in {"limit", "message_end", "toc_limit"} else 0
+    if not bounded_int(value, minimum, maximum):
+        raise ValueError(f"{name} must be an integer from {minimum} to {maximum}")
+    return value
+
+
+def flag_argument(arguments: dict[str, Any], name: str) -> bool:
+    value = arguments.get(name, False)
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
+def read_arguments(
+    library: Library, arguments: dict[str, Any], offset: int, limit: int
+) -> dict[str, Any]:
+    """The read the MCP tool and `cce library read` share: a passage, a message range
+    (`message_end`) or a table of contents (`toc`), from the arguments the caller gave.
+
+    Only the arguments actually given are in `arguments` (the command line leaves out what it was
+    not passed), so a surface cannot accept what the other refuses: `toc_mode`, `toc_offset` and
+    `toc_limit` need `toc`, `toc` excludes `around_query` and `message_end`, and every bound
+    and message is the same.
+    """
+    toc = flag_argument(arguments, "toc")
+    around = arguments.get("around_query")
+    if around is not None and (not isinstance(around, str) or not around.strip()):
+        raise ValueError("around_query must be a nonempty string")
+    toc_args = {"toc_mode", "toc_offset", "toc_limit"} & set(arguments)
+    if toc_args and not toc:
+        raise ValueError("toc_mode, toc_offset and toc_limit require toc")
+    sequence = arguments.get("sequence", "main")
+    if toc:
+        if around is not None or "message_end" in arguments:
+            raise ValueError("toc cannot be combined with around_query or message_end")
+        return record_toc(
+            library,
+            arguments["uid"],
+            version=arguments.get("version"),
+            digest=arguments.get("digest"),
+            sequence=sequence,
+            mode=arguments.get("toc_mode", "auto"),
+            toc_offset=integer_argument(arguments, "toc_offset", 0, 1000000000),
+            toc_limit=integer_argument(arguments, "toc_limit", 50, MAX_TOC_ENTRIES),
+        )
+    return read_record(
+        library,
+        arguments["uid"],
+        version=arguments.get("version"),
+        digest=arguments.get("digest"),
+        message=integer_argument(arguments, "message", 0, 10000000),
+        sequence=sequence,
+        offset=offset,
+        limit=limit,
+        around_query=around,
+        message_end=(
+            integer_argument(arguments, "message_end", 1, 10000000)
+            if "message_end" in arguments
+            else None
+        ),
+    )
+
+
+def _verify_cards_command(args: argparse.Namespace) -> int:
+    if args.zettels is not None:
+        raise ValueError("reviewed Zettels do not apply to a card folder")
+    checked = verify_cards(args.directory)
+    problems = checked["problems"]
+    report = {
+        "directory": str(args.directory),
+        "kind": "cards",
+        "cards": checked["cards"],
+        "unlisted": checked["unlisted"],
+        "valid": not problems,
+        "problems": problems,
+    }
+    print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    return 1 if problems else 0
+
+
 def _verify_export_command(args: argparse.Namespace) -> int:
+    if is_card_folder(args.directory):
+        return _verify_cards_command(args)
     reviewed = None
     if args.zettels is not None:
         entries = _load_zettel_envelope(args.zettels).get("zettels")
@@ -925,16 +1047,27 @@ def handle_library(args: argparse.Namespace) -> int:
                             prefix = "hint: " if line == BROAD_QUERY_HINT else ""
                             print(f"library: {prefix}{line}", file=sys.stderr)
                 elif args.action == "read":
-                    result = read_record(
-                        library,
-                        args.uid,
-                        version=args.version,
-                        digest=args.digest,
-                        message=args.message,
-                        sequence=args.sequence,
-                        offset=args.offset,
-                        limit=args.limit,
-                    )
+                    # The same arguments, checks and messages as the MCP read tool: give only
+                    # what was passed, so an option that needs another is refused alike.
+                    arguments: dict[str, Any] = {
+                        "uid": args.uid,
+                        "message": args.message,
+                        "sequence": args.sequence,
+                    }
+                    for name in (
+                        "version",
+                        "digest",
+                        "around_query",
+                        "message_end",
+                        "toc_mode",
+                        "toc_offset",
+                        "toc_limit",
+                    ):
+                        if getattr(args, name) is not None:
+                            arguments[name] = getattr(args, name)
+                    if args.toc:
+                        arguments["toc"] = True
+                    result = read_arguments(library, arguments, args.offset, args.limit)
                 elif args.action == "history":
                     if args.offset < 0 or not 1 <= args.limit <= 200:
                         raise ValueError("history needs nonnegative offset and limit from 1 to 200")
