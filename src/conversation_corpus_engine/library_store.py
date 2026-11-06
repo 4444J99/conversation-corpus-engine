@@ -14,6 +14,7 @@ import os
 import re
 import sqlite3
 import time
+import unicodedata
 import zlib
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -130,6 +131,14 @@ def validate_count_cap(value: Any) -> int | None:
 _TRAILING_FRAGMENT = re.compile(r"\s\S*$")
 
 
+def _has_token(term: str) -> bool:
+    """Whether FTS5 would find a token in ``term``. ``___`` is a word to the query parser but all
+    separators to the tokenizer, where it matches nothing and constrains nothing. A character
+    the running Python does not know yet counts as a token, so a term is never dropped by mistake.
+    """
+    return any(char.isalnum() or unicodedata.category(char) in ("Co", "Cn") for char in term)
+
+
 @dataclass(frozen=True)
 class QueryTerms:
     """The bounded terms of a query: what the search actually runs on.
@@ -161,7 +170,9 @@ def query_terms(query: str) -> QueryTerms:
         fragment = _TRAILING_FRAGMENT.search(examined)
         if fragment:
             examined = examined[: fragment.start()]
-    raw_phrases, raw_words = fts_terms(examined)
+    raw_phrases, raw_words = (
+        [term for term in terms if _has_token(term)] for terms in fts_terms(examined)
+    )
     shortened = terms_cut = False
     seen: set[str] = set()
     kept: tuple[list[str], list[str]] = ([], [])
@@ -177,7 +188,7 @@ def query_terms(query: str) -> QueryTerms:
                 continue
             seen.add(key)
             target.append(text)
-    ordered = WORD_RE.findall(examined.replace('"', " "))
+    ordered = [word for word in WORD_RE.findall(examined.replace('"', " ")) if _has_token(word)]
     shortened = shortened or any(len(word) > MAX_TERM_CHARS for word in ordered[:MAX_QUERY_TERMS])
     return QueryTerms(
         phrases=tuple(kept[0]),

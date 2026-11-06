@@ -240,3 +240,48 @@ def test_a_tiny_budget_still_returns_a_page_from_the_plan_that_matches(
 def test_the_allowance_floor_and_cap_are_documented_constants():
     assert library_store.UNRANKED_GRACE_SECONDS == 2.0
     assert library_store.MIN_UNRANKED_GRACE_SECONDS == 0.25
+
+
+# --- terms the tokenizer drops --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("plan", ["auto", "phrase", "and", "or"])
+def test_a_term_with_no_token_does_not_change_what_a_query_matches(hardened, plan):
+    """``___`` is a word to the query parser but no token to FTS5: ``alpha ___`` is ``alpha``."""
+    with_noise = hardened.search("alpha ___", plan=plan)
+    plain = hardened.search("alpha", plan=plan)
+    assert with_noise["total"] == plain["total"] == COMMON
+    assert uids(with_noise) == uids(plain)
+
+
+def test_a_query_that_is_only_token_less_terms_matches_nothing(hardened):
+    for query in ("___", "___ ---", "_-' ___", '"___"', '"---" "_"'):
+        result = hardened.search(query)
+        assert result["total"] == 0 and result["hits"] == []
+        assert legacy_search(hardened, query)["total"] == 0
+
+
+def test_token_less_terms_are_dropped_before_the_plan_is_chosen(hardened):
+    """Left in, ``alpha ___`` looked like two words and was answered (and labelled) as a phrase."""
+    result = hardened.search("alpha ___")
+    assert result["plan"] == "and" and "terms_truncated" not in result
+    assert plan_match("alpha ___", "phrase") == '"alpha"'
+    assert plan_match("alpha ___ omega", "phrase") == '"alpha omega"'
+    assert plan_match('"___" alpha', "and") == '"alpha"'
+    assert plan_match("alpha ___ omega", "or") == '"alpha" OR "omega"'
+    assert hardened.search("alpha ___ omega")["plan"] == "and"  # phrase misses, so AND answers
+
+
+def test_terms_with_a_letter_or_digit_are_kept(hardened):
+    assert plan_match("alpha ²", "and") == '"alpha" "²"'
+    assert plan_match("alpha x_y", "and") == '"alpha" "x_y"'
+    assert plan_match("alpha 7", "and") == '"alpha" "7"'
+
+
+def test_operator_looking_queries_fall_through_to_or_where_the_base_returned_nothing(hardened):
+    """NOT, title: and friends are quoted words, not operators: no record holds them together
+    with ``alpha``, so the AND plan is empty and the OR plan answers (the base returned 0)."""
+    for query in ("NOT alpha", "title:alpha", "alpha AND nosuchword"):
+        assert legacy_search(hardened, query)["total"] == 0
+        result = hardened.search(query)
+        assert result["plan"] == "or" and result["total"] == COMMON
