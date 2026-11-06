@@ -152,6 +152,8 @@ def take_census(
     # What passes the planned size (`note_bytes`, `folder_entries`) without yet passing a ceiling.
     # The verdict never reads these; a caller with a warning tier (the library vault gate) does.
     above_target = {"notes": 0, "folders": 0}
+    # The largest of those that stay within a ceiling: the true worst of the warning tier.
+    worst_within_ceiling = {"notes": 0, "folders": 0}
     largest: list[tuple[int, str]] = []
     widest = (0, "")
     files = directories = total_bytes = 0
@@ -182,6 +184,8 @@ def take_census(
                 relative = os.path.relpath(entry.path, root)
                 if kind == NOTE and size > limits.note_bytes:
                     above_target["notes"] += 1
+                    if size <= limits.note_ceiling:
+                        worst_within_ceiling["notes"] = max(worst_within_ceiling["notes"], size)
                 if kind == NOTE and size > limits.note_ceiling:
                     counts["notes"] += 1
                     if len(over_notes) < REPORTED_VIOLATIONS:
@@ -199,6 +203,8 @@ def take_census(
             widest = (entries, os.path.relpath(current, root))
         if entries > limits.folder_entries:
             above_target["folders"] += 1
+            if entries <= limits.folder_ceiling:
+                worst_within_ceiling["folders"] = max(worst_within_ceiling["folders"], entries)
         if entries > limits.folder_ceiling:
             counts["folders"] += 1
             if len(over_folders) < REPORTED_VIOLATIONS:
@@ -217,6 +223,7 @@ def take_census(
         ],
         "widest_folder": {"path": widest[1], "entries": widest[0]},
         "above_target": above_target,
+        "worst_within_ceiling": worst_within_ceiling,
         "violations": {
             "counts": counts,
             "notes": over_notes,

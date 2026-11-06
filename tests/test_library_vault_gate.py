@@ -10,7 +10,9 @@ from conversation_corpus_engine.archive_limits import Limits, take_census
 from conversation_corpus_engine.library_vault_gate import (
     DEFAULT_CAPS,
     VaultCaps,
+    describe_findings,
     hard_cap_problems,
+    measure_planned,
     measure_vault,
 )
 
@@ -79,6 +81,24 @@ def test_an_empty_vault_is_valid(tmp_path: Path) -> None:
     report = measure_vault(tmp_path)
     assert report["notes"] == 0 and report["bytes"] == 0 and report["max_note_bytes"] == 0
     assert report["ok"] and report["clean"]
+
+
+def test_the_warn_tier_reports_its_own_true_worst_not_the_fail_cap(tmp_path: Path) -> None:
+    note(tmp_path, "a.md", 17_000)
+    note(tmp_path, "b.md", 20_000)
+    note(tmp_path, "huge.md", 66_368)
+    for number in range(700):
+        note(tmp_path, f"warned/n{number:04d}.md", 10)
+    for number in range(1001):
+        note(tmp_path, f"failed/n{number:04d}.md", 10)
+    report = measure_vault(tmp_path)
+    by_kind = {(f["code"], f["severity"]): f for f in report["findings"]}
+    assert by_kind["note_size", "warn"]["worst"] == 20_000
+    assert by_kind["note_size", "warn"]["count"] == 2
+    assert by_kind["note_size", "fail"]["worst"] == 66_368
+    assert by_kind["folder_entries", "warn"]["worst"] == 700
+    assert by_kind["folder_entries", "warn"]["count"] == 1
+    assert by_kind["folder_entries", "fail"]["worst"] == 1001
 
 
 def test_a_note_past_the_warn_size_warns_and_past_the_fail_size_fails(tmp_path: Path) -> None:
@@ -208,3 +228,75 @@ def test_the_census_reports_what_exceeds_the_target_without_changing_its_verdict
     report = take_census(tmp_path, limits)
     assert report["above_target"] == {"notes": 1, "folders": 0}
     assert report["ok"] and report["violations"]["counts"] == {"notes": 0, "data": 0, "folders": 0}
+
+
+def planned_set() -> dict[str, str]:
+    """A small vault that breaks or strains every kind of cap, as path -> text."""
+    rows = "".join(f"- [Record {n}](../records/r{n}.md) - r{n}\n" for n in range(101))
+    files = {
+        "vault/Home.md": "# Home\n",
+        "vault/records/ok.md": "x" * 3000,
+        "vault/records/warned-a.md": "x" * 17_000,
+        "vault/records/warned-b.md": "x" * 20_000,
+        "vault/records/huge.md": "x" * 66_368,
+        "vault/hubs/wide.md": "# Hub\n\n" + rows,
+        "vault/hubs/narrow.md": "# Hub\n\n- [One](../records/ok.md) - ok\n",
+    }
+    files.update({f"vault/crowded/n{n:04d}.md": "x" for n in range(1001)})
+    files.update({f"vault/warm/n{n:04d}.md": "x" for n in range(700)})
+    return files
+
+
+def comparable(report: dict) -> dict:
+    keys = ("notes", "bytes", "max_note_bytes", "hub_pages", "max_hub_entries", "ok", "clean")
+    shape = {key: report[key] for key in keys}
+    shape["widest"] = report["widest_folder"]["entries"]
+    shape["findings"] = sorted(
+        (f["code"], f["severity"], f.get("count"), f["worst"], f["limit"])
+        for f in report["findings"]
+    )
+    return shape
+
+
+def test_a_planned_set_is_measured_exactly_like_the_same_files_on_disk(tmp_path: Path) -> None:
+    files = planned_set()
+    for relative, text in files.items():
+        note(tmp_path, relative, 0).write_text(text, encoding="utf-8")
+    planned = measure_planned(files, root="vault/")
+    on_disk = measure_vault(tmp_path / "vault")
+    assert comparable(planned) == comparable(on_disk)
+    assert not planned["ok"]
+    assert {(f["code"], f["severity"]) for f in planned["findings"]} == {
+        ("note_size", "warn"),
+        ("note_size", "fail"),
+        ("folder_entries", "warn"),
+        ("folder_entries", "fail"),
+        ("hub_entries", "fail"),
+    }
+    assert planned["max_note_path"] == "records/huge.md"
+    assert hard_cap_problems(planned)
+
+
+def test_a_planned_set_within_the_caps_is_clean_and_reads_no_disk() -> None:
+    files = {"Home.md": "# Home\n", "cards/a.md": "a", "hubs/h.md": "- [A](../cards/a.md)\n"}
+    report = measure_planned(files)
+    assert report["ok"] and report["clean"] and report["notes"] == 3
+    assert report["widest_folder"] == {"path": ".", "entries": 3}
+    assert measure_planned({})["ok"]
+
+
+def test_planned_notes_and_bytes_have_the_vault_tiers() -> None:
+    caps = VaultCaps(vault_notes_warn=2, vault_notes_fail=3, vault_bytes_warn=5, vault_bytes_fail=8)
+    files = {f"n{n}.md": "xx" for n in range(4)}
+    kinds = {(f["code"], f["severity"]) for f in measure_planned(files, caps)["findings"]}
+    assert kinds == {("vault_notes", "fail"), ("vault_bytes", "warn")}
+    assert {
+        f["code"] for f in measure_planned({"a.md": "xxxx", "b.md": "xxxxx"}, caps)["findings"]
+    } == {"vault_bytes"}
+
+
+def test_findings_are_described_on_one_line() -> None:
+    line = describe_findings(measure_planned(planned_set(), root="vault/"))
+    assert "\n" not in line
+    assert "fail note_size (66368 past 65536)" in line
+    assert "warn note_size (20000 past 16384)" in line

@@ -25,7 +25,7 @@ from .library_cards import export_cards
 from .library_export import EXPORT_PROFILES, LEGACY_PROFILE, export_library, verify_export
 from .library_store import Library
 from .library_vault import VAULT_PROFILES
-from .library_vault_gate import measure_vault
+from .library_vault_gate import describe_findings, measure_vault
 from .paths import default_project_root
 from .persona_extract import extract_persona_lexicon
 
@@ -541,14 +541,11 @@ def _load_zettel_envelope(path: Path) -> dict[str, Any]:
 
 def _warn_over_caps(out: Path) -> None:
     """Say, on stderr, when the legacy layout just written is one a reading app may not open."""
-    findings = measure_vault(Path(out) / "vault")["findings"]
-    if findings:
-        kinds = "; ".join(
-            f"{item['severity']} {item['code']} ({item['worst']} past {item['limit']})"
-            for item in findings
-        )
+    report = measure_vault(Path(out) / "vault")
+    if report["findings"]:
         print(
-            f"library: warning: the legacy export layout is outside the vault caps ({kinds}). "
+            "library: warning: the legacy export layout is outside the vault caps "
+            f"({describe_findings(report)}). "
             "A reading app may be unable to open it. Use --vault-profile cards or full, or "
             "`cce library export-cards --out DIR`, for a vault that fits.",
             file=sys.stderr,
