@@ -51,6 +51,8 @@ from conversation_corpus_engine.cli import build_parser, main
 from conversation_corpus_engine.library_store import Library
 
 STAMP = "2026-01-02T03:04:05Z"
+# Nesting deep enough to exhaust the JSON parser's recursion on every supported Python.
+DEEP_NESTING = 1_500_000
 SAMPLE_KEYS = {
     "schema",
     "rules_version",
@@ -1926,6 +1928,26 @@ def test_a_file_created_at_the_output_during_the_run_is_never_replaced(
     assert code == 2 and "already exists" in err
     assert out.read_text(encoding="utf-8") == "A FILE THE OWNER MADE DURING THE RUN\n"
     assert not out.with_name("result.out.partial").exists()
+
+
+def test_deeply_nested_json_is_refused_as_unreadable_not_a_crash(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    answered(sample, answers, 1)
+    deep = tmp_path / "deep.jsonl"
+    deep.write_text("[" * DEEP_NESTING + "]" * DEEP_NESTING + "\n", encoding="utf-8")
+    code, _, err = record_answers(capsys, library, ledger, sample, deep)
+    assert code == 2 and "answers line 1" in err and "unreadable" in err
+    code, _, err = record_answers(capsys, library, ledger, deep, answers)
+    assert code == 2 and "sample line 1" in err and "unreadable" in err
+    assert not ledger.exists()
+    hostile = tmp_path / "hostile-ledger.jsonl"
+    hostile.write_text(deep.read_text(encoding="utf-8"), encoding="utf-8")
+    report = report_of(capsys, library, "--ledger", hostile, "--owner-id", "rob")
+    assert report["gate"]["quarantined_rows"] == 1
 
 
 def test_an_existing_output_is_refused_for_every_writer(
