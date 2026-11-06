@@ -163,16 +163,25 @@ def pack(blocks: Sequence[str], first_budget: int, budget: int) -> list[list[str
 
 
 def paginate_rows(
-    head: Sequence[str], rows: Sequence[str], first_budget: int, budget: int
+    head: Sequence[str],
+    rows: Sequence[str],
+    first_budget: int,
+    budget: int,
+    max_rows: int | None = None,
 ) -> list[list[str]]:
-    """Group list rows into pages: the first page opens with `head`, every row lands whole."""
+    """Group list rows into pages: the first page opens with `head`, every row lands whole.
+
+    A page closes when the next row would pass its byte budget or, when `max_rows` is given,
+    when it already holds that many rows (the head is not a row).
+    """
     head_size = sum(utf8_size(line) + 1 for line in head)
     pages: list[list[str]] = [[]]
     used = head_size
     limit = first_budget
     for row in rows:
         size = utf8_size(row) + 1
-        if used + size > limit and pages[-1]:
+        full = max_rows is not None and len(pages[-1]) >= max_rows
+        if (used + size > limit or full) and pages[-1]:
             pages.append([])
             used = 0
             limit = budget

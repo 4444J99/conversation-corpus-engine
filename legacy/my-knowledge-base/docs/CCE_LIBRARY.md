@@ -45,6 +45,12 @@ or failed hash check fails the scan visibly; records are never silently omitted
 to fit a limit. Include/exclude globs do not select CCE membership: its pinned
 export manifest and compact index own that membership.
 
+The provider indexes the legacy per-record and shared-passage notes, so it scans
+only generations with a v1 export manifest. A generation built with
+`cce library build --vault-profile none|cards|full` (the CCE default is `none`)
+has a v2 manifest and no shared-passage notes; the scan then fails with a message
+naming `--vault-profile` instead of indexing a partial set.
+
 Enqueue a scan through `POST /api/federation/sources/:id/scan` as usual. Both
 `incremental` and `full` modes read the complete published CCE record set.
 CCE scans retain previously cached identities that are absent from a later

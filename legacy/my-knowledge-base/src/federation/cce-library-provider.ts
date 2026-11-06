@@ -222,6 +222,11 @@ export class CceLibraryProvider {
     if (report.schema !== 'cce.library-build.v1' || report.complete !== true) invalid('CCE generation is not verified complete');
     const artifacts = object(report.artifacts, 'artifact inventory');
     const manifest = reader.json(join(generation, 'export-manifest.json'), artifactFor(artifacts, 'export-manifest.json'));
+    if (manifest.schema === 'cce.library-export.v2') {
+      // The vault profiles write no per-record or shared-passage notes in the legacy layout this
+      // provider indexes (the cards and full layouts differ, and none has no vault at all).
+      invalid(`CCE generation was built with --vault-profile ${String(manifest.profile)}, which has no legacy per-record and shared-passage notes to index; only generations with a v1 export manifest can be scanned. Read records through cce library search and read.`);
+    }
     if (manifest.schema !== 'cce.library-export.v1' || !Array.isArray(manifest.files) ||
         !Number.isSafeInteger(manifest.records) || !Number.isSafeInteger(manifest.blocks) ||
         (manifest.records as number) < 0 || (manifest.blocks as number) < 0) invalid('Invalid CCE export manifest');

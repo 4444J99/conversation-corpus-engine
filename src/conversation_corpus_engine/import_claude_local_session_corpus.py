@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -15,6 +16,7 @@ from .claude_local_session import (
     load_prior_acquisition,
     save_acquisition_state,
 )
+from .corpus_store import git_visible_refusal
 from .import_claude_export_corpus import import_claude_export_corpus, now_iso
 from .sharded_collection import content_hash_key, write_collection
 from .source_lifecycle import build_source_snapshot
@@ -216,6 +218,11 @@ def import_claude_local_session_corpus(
 
 def main() -> int:
     args = parse_args()
+    # The corpus is the signed-in session's conversations as plaintext, and --output-root
+    # defaults to the working directory: refuse a folder Git can see before the session is read.
+    if (refusal := git_visible_refusal(args.output_root)) is not None:
+        print(f"output refused: {refusal}", file=sys.stderr)
+        return 2
     payload = import_claude_local_session_corpus(
         args.local_root,
         args.output_root,

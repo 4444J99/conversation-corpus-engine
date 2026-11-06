@@ -15,6 +15,8 @@ The refreshed candidate had finished ingestion, indexing, the fingerprints and f
 
 Derivatives come to about 0.7 to 0.9 times the database, so the finished output is about 1.7 to 1.9 times the database. The 2026-10-27 generation sits at the upper edge of that range (15.2 GiB against a 7.89 GiB database). Set `max_output_bytes` to at least twice the database size before a build, and leave extra headroom (the 24 GiB resume was about 2.5 times the refreshed database) for the ZIP header rewrites that are charged on top. A cap that is only a little above 1.7 times the database will pass on a small corpus and trip during export on a larger one. The cap also drives the admission check (free space must cover the cap plus 1 GiB outside export-reuse modes), so raise it only as far as the disk allows.
 
+Addendum (vault profiles): the rule above measures the legacy export layout, whose per-record and per-passage notes plus the Notion ZIP made up most of the derivatives. A build now defaults to `--vault-profile none`, which writes no vault and no ZIP, so its derivatives are only the index, graph, CSV and entry note; the `cards` profile adds at most 20,000 small notes. Re-measure before relaxing a cap that was sized from the figures above.
+
 ## Reading a build while it runs
 
 `cce library build` prints one `{"library_progress": {...}}` line per event on stderr. Every event carries `elapsed_seconds` since the build started. The stages, in order, and what the silence after each one means:

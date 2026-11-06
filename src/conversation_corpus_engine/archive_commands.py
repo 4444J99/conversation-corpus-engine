@@ -30,6 +30,7 @@ from .archive_ingest import (
     retained_after_failure,
 )
 from .archive_limits import Limits, census_problems, take_census
+from .archive_lineage import LineageError
 from .archive_naming import names_payload, render_names_text, verify_names
 from .archive_serve import serve
 from .archive_site import build_site, count_conversation_pages
@@ -303,6 +304,7 @@ def run_stages(
     limits: Limits | None = None,
     merge: bool = False,
     allow_input_loss: bool = False,
+    rebuild_lineage: bool = False,
 ) -> dict[str, Any]:
     paths, authorization = context.paths, context.write_authorization()
     limits = limits or Limits()
@@ -334,6 +336,7 @@ def run_stages(
                 library_root=context.library_root,
                 merge=merge,
                 allow_input_loss=allow_input_loss,
+                rebuild_lineage=rebuild_lineage,
             )
             result[stage] = {
                 "totals": manifest["totals"],
@@ -424,6 +427,13 @@ def add_archive_parser(subparsers: Any) -> None:
             "--allow-input-loss",
             action="store_true",
             help="explicitly allow --merge to omit a previous library or live-capture input",
+        )
+        parser.add_argument(
+            "--rebuild-lineage",
+            action="store_true",
+            help="accept a lineage that cannot be trusted (a damaged ledger, or a digest "
+            "baseline the ledger does not describe): re-baseline from the current sources and "
+            "append one generation flagged rebuilt; no ledger row is deleted",
         )
 
     ingest_parser = sub.add_parser("ingest", help="Read raw exports into the normalized store")
@@ -663,9 +673,13 @@ def handle_archive(args: argparse.Namespace) -> int:
                 limits=limits,
                 merge=args.merge,
                 allow_input_loss=args.allow_input_loss,
+                rebuild_lineage=args.rebuild_lineage,
             )
         except MergeInputLoss as exc:
             print(f"archive merge refused: {exc}", file=sys.stderr)
+            return 2
+        except LineageError as exc:
+            print(f"archive lineage refused: {exc}", file=sys.stderr)
             return 2
         verified: dict[str, Any] = {}
         problems = verify_archive(paths, limits, report=verified) if action == "build" else []
@@ -680,7 +694,11 @@ def handle_archive(args: argparse.Namespace) -> int:
         return 0 if payload["ok"] else 1
 
     if action in {"analyze", "vault", "database", "graph", "site"}:
-        result = run_stages(context, (action,), limits=limits_from_args(args))
+        try:
+            result = run_stages(context, (action,), limits=limits_from_args(args))
+        except LineageError as exc:
+            print(f"archive lineage refused: {exc}", file=sys.stderr)
+            return 2
         print(json.dumps(result[action], indent=2, sort_keys=True))
         return 0
 

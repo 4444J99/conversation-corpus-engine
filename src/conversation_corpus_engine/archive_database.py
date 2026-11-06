@@ -12,6 +12,7 @@ from .corpus_store import CorpusWriteAuthorization
 BATCH = 500
 WORD_RE = re.compile(r"[\w][\w'-]*", re.UNICODE)
 PHRASE_RE = re.compile(r'"([^"]+)"')
+CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 SCHEMA = """
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE conversations (
@@ -43,12 +44,21 @@ def database_path(paths: ArchivePaths) -> Path:
     return paths.database
 
 
+def fts_terms(text: str) -> tuple[list[str], list[str]]:
+    """The quoted phrases (stripped) and the loose words of free text, in ``fts_query`` order.
+
+    Control characters count as spaces: a NUL inside a quoted phrase would otherwise end the
+    FTS5 string early ("unterminated string"), and none of them is part of a word.
+    """
+    text = CONTROL_RE.sub(" ", text)
+    phrases = [p.strip() for p in PHRASE_RE.findall(text) if WORD_RE.search(p)]
+    return phrases, WORD_RE.findall(PHRASE_RE.sub(" ", text))
+
+
 def fts_query(text: str) -> str:
     """Turn free text into a safe FTS5 query: quoted phrases and quoted words, all ANDed."""
-    phrases = [f'"{p.strip()}"' for p in PHRASE_RE.findall(text) if WORD_RE.search(p)]
-    remainder = PHRASE_RE.sub(" ", text)
-    words = [f'"{w}"' for w in WORD_RE.findall(remainder)]
-    return " ".join([*phrases, *words])
+    phrases, words = fts_terms(text)
+    return " ".join([*(f'"{p}"' for p in phrases), *(f'"{w}"' for w in words)])
 
 
 def build_database(paths: ArchivePaths, authorization: CorpusWriteAuthorization) -> dict[str, Any]:

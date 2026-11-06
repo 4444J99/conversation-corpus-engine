@@ -501,7 +501,43 @@ moves an existing conversation page URL.
   added, changed and removed (continued on linked pages past the cap) above a table of the last
   20 generations, and each conversation page ends with a *History* section: its newest 8
   revisions, linking to their row on that page while the generation is still in the table.
-  Nothing is derived by diffing pages.
+  Nothing is derived by diffing pages. The ledger and the digest file change together in
+  three steps, each safe to stop after: the new digests are written and synced to
+  `index-all-digests.jsonl.pending`; the ledger row is appended, carrying the sha256 of that
+  file in its `baseline` field; the pending file is renamed over the digest file. Every ingest
+  begins by settling an interrupted commit: a pending file the last row describes is renamed into
+  place, any other is discarded. What a crash leaves behind therefore does not depend on what the
+  next ingest reads: changed sources are diffed against the baseline the ledger describes, and no
+  generation is lost or recorded twice. `cce archive verify` reports a leftover pending file
+  and names the remedy (`cce archive ingest`). A digest file that is simply gone is rewritten by
+  an ingest of unchanged sources without adding a generation; if the sources changed meanwhile,
+  the next generation lists every conversation as added.
+
+  A crash only ever leaves a pending file the last row describes (finished by the next ingest)
+  or one it does not (discarded). What a crash cannot leave is a digest file that the last row's
+  `baseline` hash does not match with no pending file that does: the pending file was deleted or
+  edited after the row was written, or the digest file was replaced or restored from another
+  time. The next generation would be diffed against a stale baseline and the same generation
+  recorded twice, so an ingest refuses before it reads anything (exit 2, "lineage baseline
+  diverged from the ledger"; an edited pending file is left in place as evidence) and `verify`
+  fails with the same words (`lineage` status `baseline-diverged`). A ledger with an unreadable
+  line (a write cut short) is refused the same way and reported as `damaged`, naming the file
+  rather than a JSON error. A row without a `baseline` hash (written before rows carried it) has
+  nothing to compare. `verify` also lists any other `index-all-digests.jsonl.pending*` file as
+  stray: an ingest settles only its own pending file and never adopts another.
+
+  The remedy is explicit: `cce archive ingest|build --rebuild-lineage` digests the current
+  sources again (a provider this call did not read is digested from its stored shards),
+  replaces the baseline and appends exactly one row flagged `"rebuilt": true`. That row lists no
+  added, changed or removed uid, because the baseline that would say what changed is the one
+  that cannot be trusted. No ledger row is deleted: a damaged ledger keeps every readable row
+  and a copy of the damaged file is saved beside it as `index-all-lineage.jsonl.damaged`. A
+  ledger damaged in the middle (rows that still parse follow the unreadable line) is not
+  rebuilt, because the rebuild would drop those rows from the ledger: the ingest and `verify`
+  name the line, and the file has to be repaired by hand or restored from a copy. Not
+  detectable: a ledger and a digest file both rolled back together to an earlier consistent
+  state, and a ledger emptied of rows while a digest file remains (`verify` reports that one as
+  `empty`, an ingest does not refuse it).
 
 `cce archive verify` (and the verify that closes `build`) reports a `wiki` block (pages,
 messages and messages anchored, pages with a table of contents, backlink and history pages,
@@ -514,7 +550,8 @@ repeats; a page with three headings has no contents list; a page's *What links h
 from the vault graph; a topic page is missing, has no hub, or lists other conversations than
 its hub; a message has no single author class or the labelled turns differ from the manifest's
 author counts; the lineage is broken (a ledger that holds no generation, digests with no
-ledger, a ledger that does not chain or does not end at the manifest); the recent-changes page
+ledger, a ledger with no digest file beside it, which is status `baseline-missing`, a ledger that
+does not chain or does not end at the manifest); the recent-changes page
 differs from the latest generation; or a page's history differs from the ledger.
 
 `verify` only reads. A store ingested before the lineage existed has neither lineage file, and

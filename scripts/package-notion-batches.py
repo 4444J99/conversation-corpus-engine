@@ -16,6 +16,7 @@ import re
 import shutil
 import signal
 import stat
+import sys
 import threading
 import time
 import zipfile
@@ -30,6 +31,10 @@ FAILURE_RESERVE = 16384
 MAX_ENTRIES = 5000
 MAX_BATCH_BYTES = 250 * 1024**2
 SCHEMA = "cce.notion-batches.v1"
+
+
+class MissingInput(ValueError):
+    """The canonical ZIP is absent; the CLI reports it as one line and exits with code 2."""
 
 
 def compatibility(size: int) -> dict[str, bool]:
@@ -317,6 +322,13 @@ def package(
     source, output = Path(source).absolute(), Path(output).absolute()
     _safe_path(source)
     _safe_path(output)
+    if not source.is_file():
+        raise MissingInput(
+            f"canonical ZIP not found: {source}. A generation built with --vault-profile none "
+            "writes no notion-import.zip; write one from the published generation with "
+            "`cce library export --vault-profile cards --out DIR` (or full) and package "
+            "DIR/notion-import.zip"
+        )
     if output.exists():
         raise FileExistsError(output)
     if any(
@@ -571,6 +583,24 @@ def package(
             raise
 
 
+def require_private_output(parser: argparse.ArgumentParser, path: Path) -> None:
+    """Refuse an output directory Git can see: the batches hold the library as plaintext.
+
+    An output outside every Git work tree, or one the work tree ignores, passes. The check runs
+    before the source is read; a refusal exits with the usage-error status.
+    """
+    # The engine is needed only by the command line; the packer itself stays standalone.
+    from conversation_corpus_engine.corpus_store import (  # noqa: PLC0415
+        CorpusStoreError,
+        require_git_private,
+    )
+
+    try:
+        require_git_private(path)
+    except CorpusStoreError as error:
+        parser.error(str(error))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path, help="Published full notion-import.zip (read-only)")
@@ -583,17 +613,22 @@ def main() -> int:
     parser.add_argument("--max-seconds", type=int, default=1800)
     parser.add_argument("--wrapper", default="library")
     args = parser.parse_args()
+    require_private_output(parser, args.output)
     os.nice(10)
-    result = package(
-        args.source,
-        args.output,
-        max_entries=args.max_entries,
-        max_batch_bytes=args.max_batch_bytes,
-        max_output_bytes=args.max_output_bytes,
-        max_seconds=args.max_seconds,
-        wrapper=args.wrapper,
-        progress=lambda value: print(json.dumps(value), flush=True),
-    )
+    try:
+        result = package(
+            args.source,
+            args.output,
+            max_entries=args.max_entries,
+            max_batch_bytes=args.max_batch_bytes,
+            max_output_bytes=args.max_output_bytes,
+            max_seconds=args.max_seconds,
+            wrapper=args.wrapper,
+            progress=lambda value: print(json.dumps(value), flush=True),
+        )
+    except MissingInput as error:
+        print(f"package-notion-batches: {error}", file=sys.stderr)
+        return 2
     print(
         json.dumps(
             {
