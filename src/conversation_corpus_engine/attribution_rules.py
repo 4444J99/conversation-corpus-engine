@@ -2245,10 +2245,15 @@ def load_json_line(line: str, label: str, number: int) -> Any:
         raise ValueError(f"{label} line {number}: not JSON") from error
 
 
-def sample_digest(rows: Sequence[Mapping[str, Any]]) -> str:
-    """SHA-256 over the canonical form of the sample's rows, answers left out (`verdict`)."""
-    stripped = [{key: value for key, value in row.items() if key != "verdict"} for row in rows]
-    canonical = json.dumps(stripped, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+def sample_digest(header: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> str:
+    """SHA-256 over the canonical JSON of the whole header (every field except `sample_digest`
+    itself) and of the rows, answers left out (`verdict`). Editing any header field, such as the
+    seed, the owner, the library, the repeat-census settings or the ledger state, changes it."""
+    document = {
+        "header": {key: value for key, value in header.items() if key != "sample_digest"},
+        "rows": [{key: value for key, value in row.items() if key != "verdict"} for row in rows],
+    }
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -2289,15 +2294,14 @@ def sample_header(
     repeat_min_occurrences: int = DEFAULT_REPEAT_MIN_OCCURRENCES,
     exclusion_digest: str = EMPTY_EXCLUSION_DIGEST,
 ) -> dict[str, Any]:
-    """The first line of a sample file: it counts and digests the rows and names the library
-    (its fingerprint), the owner the sample was drawn for, the settings that decide which spans
-    exist and in what order they are drawn (seed, repeat census) and the ledger state the draw
-    excluded against (`exclusion_digest`)."""
-    return {
+    """The first line of a sample file: it counts the rows, digests itself and the rows, and names
+    the library (its fingerprint), the owner the sample was drawn for, the settings that decide
+    which spans exist and in what order they are drawn (seed, repeat census) and the ledger state
+    the draw excluded against (`exclusion_digest`)."""
+    header = {
         "schema": SAMPLE_HEADER_SCHEMA,
         "rules_version": RULES_VERSION,
         "rows": len(rows),
-        "sample_digest": sample_digest(rows),
         "library": library,
         "owner_id": owner_id,
         "seed": seed,
@@ -2308,6 +2312,7 @@ def sample_header(
         "exclusion_digest": exclusion_digest,
         "drawn": drawn_counts(rows),
     }
+    return {**header, "sample_digest": sample_digest(header, rows)}
 
 
 def preview_only_reasons(header: Mapping[str, Any]) -> list[str]:
@@ -2414,8 +2419,8 @@ def parse_sample(lines: Iterable[str]) -> ReviewSample:
         problems.append(f"the header counts {header['rows']} rows but the file holds {len(rows)}")
     if len({row["span_id"] for row in rows}) != len(rows):
         problems.append("a span appears twice")
-    if header["sample_digest"] != sample_digest(rows):
-        problems.append("the rows do not match the header's digest")
+    if header["sample_digest"] != sample_digest(header, rows):
+        problems.append("the header and rows do not match the header's digest")
     if header["drawn"] != drawn_counts(rows):
         problems.append("the per-stratum counts do not match the rows")
     if header["partial"] is not all(row["partial"] for row in rows) and rows:

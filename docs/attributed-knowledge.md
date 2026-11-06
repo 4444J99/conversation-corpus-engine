@@ -491,7 +491,7 @@ if one of them was a `no`, the precision is overstated, so look at `quarantined_
 supplies; `--owner-id` is self-reported. A process that can write the ledger and read the library
 can append rows with real span ids and the owner's name, and the gate cannot tell them from the
 owner's own; the sample digest and the library fingerprint are integrity checks that anyone can
-recompute, not authentication. The gate protects against mistakes, omission and fabrication
+recompute (a header edited and re-digested passes them), not authentication. The gate protects against mistakes, omission and fabrication
 (made-up ids, a rule or text edited in a row, an edited sample, a reviewer that is not the owner,
 blank rows dropped, samples chosen among many draws or ledgers), not against an adversary
 holding the owner's permissions.
@@ -545,7 +545,8 @@ Every stratum is sampled. A span of up to 360 characters is shown whole; a longe
 240 characters, `[...N chars omitted...]` and its last 120, with its exact `length`. Each row shows
 the span text, the SHA-256 of the full span text, the rule and its description, the claimed author
 class and the stratum, nothing about the record. The first line of the file is a **header**:
-the row count, a SHA-256 digest over the rows (answers left out), the library fingerprint (a digest
+the row count, a SHA-256 digest over the canonical JSON of the whole header (every field but the
+digest itself) and the rows (answers left out), the library fingerprint (a digest
 of every record's uid, version and revision digest), the owner the sample was drawn for, the seed,
 the repeat-census settings, whether the scan was cut short (`partial`), the ledger state the draw
 excluded against (`exclusion_digest`) and the number of rows drawn per `rule:stratum`. Passing `--ledger` leaves out only the spans the
@@ -556,7 +557,9 @@ output. A sample file holds private text: keep it out of version control.
 
 `review-record` requires `--sample` (the file `review-sample` wrote), `--answers` and `--library`
 or `--store-root` (so the ledger is kept out of the store). It re-hashes the sample and refuses one
-that was edited, cut, hand-written, drawn from another library, drawn for another owner than
+that was edited (a changed row, or a changed header field of any kind, such as the seed, the owner,
+the library, the census settings or the ledger state, changes the digest), cut, hand-written, drawn
+from another library, drawn for another owner than
 `--reviewer` or drawn against another state of the ledger; it refuses an answer whose span id, rule and stratum are not a row of the sample, a
 span answered twice, a verdict other than `yes`, `no` or `unsure`, and a file with JSON nested too
 deeply to read (`unreadable`), all before anything is written. It stamps the current UTC time

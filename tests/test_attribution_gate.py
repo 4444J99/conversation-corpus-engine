@@ -1039,13 +1039,61 @@ def drawn_sample(count: int = 6) -> tuple[dict, list[dict]]:
 def test_a_sample_document_round_trips_and_its_digest_ignores_the_answers() -> None:
     header, rows = drawn_sample()
     assert header["rows"] == len(rows) == 5 and header["drawn"] == {"quote:S": 5}
-    assert header["sample_digest"] == sample_digest(rows) and header["owner_id"] == OWNER_ID
+    assert header["sample_digest"] == sample_digest(header, rows)
+    assert header["owner_id"] == OWNER_ID
     parsed = parse_sample(sample_text(header, rows).splitlines())
     assert parsed.header == header and parsed.rows == rows
     answered = [{**row, "verdict": "yes"} for row in rows]
-    assert sample_digest(answered) == header["sample_digest"]
+    assert sample_digest(header, answered) == header["sample_digest"]
     assert parse_sample(sample_text(header, answered).splitlines()).rows == answered
-    assert sample_digest(rows) != sample_digest(rows[:-1])
+    assert sample_digest(header, rows) != sample_digest(header, rows[:-1])
+
+
+HEADER_EDITS = {
+    "schema": "cce.attribution-review-sample-header.v3",
+    "rules_version": "cce.attribution-rules@3",
+    "rows": 4,
+    "library": "e" * 64,
+    "owner_id": "someone-else",
+    "seed": "a-seed-picked-after-looking",
+    "per_stratum": 6,
+    "partial": True,
+    "repeat_min_chars": 100,
+    "repeat_min_occurrences": 5,
+    "exclusion_digest": "0" * 64,
+    "drawn": {"quote:S": 4},
+    "sample_digest": "0" * 64,
+}
+
+
+def test_every_header_field_is_covered_by_the_sample_digest() -> None:
+    header, rows = drawn_sample()
+    assert set(HEADER_EDITS) == set(header)
+    digests = {sample_digest(header, rows)}
+    for key, value in HEADER_EDITS.items():
+        edited = {**header, key: value}
+        with pytest.raises(ValueError):
+            parse_sample(sample_lines(edited, rows))
+        if key != "sample_digest":
+            digests.add(sample_digest(edited, rows))
+    # Each edit would have changed the digest, so none of them is undetectable.
+    assert len(digests) == len(HEADER_EDITS)
+    for edited in (
+        {**header, "generated_at": "2026-01-01T00:00:00Z"},
+        dict(list(header.items())[:-1]),
+    ):
+        with pytest.raises(ValueError, match="keys"):
+            parse_sample(sample_lines(edited, rows))
+
+
+def test_a_header_edit_with_a_recomputed_digest_passes_the_integrity_check() -> None:
+    """Stated scope: the digest is an integrity check anyone can recompute, not authentication."""
+    header, rows = drawn_sample()
+    edited = {**header, "seed": "another-seed"}
+    edited["sample_digest"] = sample_digest(edited, rows)
+    parsed = parse_sample(sample_lines(edited, rows))
+    assert parsed.header["seed"] == "another-seed"
+    assert preview_only_reasons(parsed.header)  # but it is still only a preview
 
 
 def test_a_sample_is_recordable_only_when_it_is_the_default_draw_over_the_whole_library() -> None:

@@ -42,6 +42,7 @@ from conversation_corpus_engine.attribution_rules import (
     RULES,
     RULES_VERSION,
     SAMPLE_SCHEMA,
+    SAMPLE_SEED,
     append_ledger,
     drawn_counts,
     exclusion_digest,
@@ -534,14 +535,10 @@ def test_editing_the_text_of_a_message_orphans_every_review_of_it(
 def forge_sample(source: Path, target: Path, rows: list[dict], ledger: Path | None = None) -> None:
     """A sample file with its own consistent header (what a careful forger would write), naming
     the state of `ledger` as the one it was drawn against."""
-    header = {
-        **sample_header(source),
-        "rows": len(rows),
-        "sample_digest": sample_digest(rows),
-        "drawn": drawn_counts(rows),
-    }
+    header = {**sample_header(source), "rows": len(rows), "drawn": drawn_counts(rows)}
     if ledger is not None:
         header["exclusion_digest"] = exclusion_digest(read_ledger(ledger).rows, "rob")
+    header["sample_digest"] = sample_digest(header, rows)
     target.write_text(sample_text(header, rows), encoding="utf-8")
 
 
@@ -1422,6 +1419,63 @@ def test_rows_of_other_reviewers_and_of_other_versions_do_not_change_the_draw(
     fresh = tmp_path / "fresh.jsonl"
     assert record_answers(capsys, library, fresh, sample, answers)[0] == 0
     assert record_answers(capsys, library, others, sample, answers, reviewer="rob")[0] == 0
+
+
+def edit_header(source: Path, target: Path, **changes: object) -> Path:
+    """The sample file with some header fields changed and nothing else recomputed."""
+    lines = source.read_text(encoding="utf-8").splitlines()
+    header = {**json.loads(lines[0]), **changes}
+    lines[0] = json.dumps(header, ensure_ascii=False, sort_keys=True)
+    target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return target
+
+
+def test_a_shopped_sample_cannot_be_made_recordable_by_editing_its_header(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=30)
+    previewed, answers = tmp_path / "shopped.jsonl", tmp_path / "a.jsonl"
+    code, _, err = run_cli(
+        capsys,
+        "review-sample",
+        "--owner-id",
+        "rob",
+        "--library",
+        library,
+        "--seed",
+        "shopping-seed-17",
+        "--limit-records",
+        "20",
+        "--out",
+        previewed,
+    )
+    assert code == 0, err
+    preview = previewed.with_name("shopped.jsonl.partial")
+    answered(preview, answers, 3)
+    default = tmp_path / "default.jsonl"
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", default)
+    edits = {
+        "seed": SAMPLE_SEED,
+        "partial": False,
+        "repeat_min_chars": 200,
+        "library": sample_header(default)["library"],
+        "exclusion_digest": "1" * 64,
+        "per_stratum": 7,
+    }
+    for key, value in edits.items():
+        forged = edit_header(preview, tmp_path / f"forged-{key}.jsonl", **{key: value})
+        ledger = tmp_path / f"ledger-{key}.jsonl"
+        code, _, err = record_answers(capsys, library, ledger, forged, answers)
+        assert code == 2 and not ledger.exists(), key
+        assert "altered" in err or "cannot be recorded" in err, (key, err)
+    # Editing the header of a real, recordable sample is refused as well.
+    answered(default, answers, 3)
+    for key, value in (("owner_id", "someone"), ("library", "e" * 64), ("rows", 1), ("seed", "s")):
+        forged = edit_header(default, tmp_path / f"real-{key}.jsonl", **{key: value})
+        ledger = tmp_path / f"real-ledger-{key}.jsonl"
+        code, _, err = record_answers(capsys, library, ledger, forged, answers)
+        assert code == 2 and not ledger.exists(), key
+    assert record_answers(capsys, library, tmp_path / "ok.jsonl", default, answers)[0] == 0
 
 
 def test_review_record_needs_the_sample_it_answers(
