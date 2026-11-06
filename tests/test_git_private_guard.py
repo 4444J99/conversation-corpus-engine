@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -345,6 +346,157 @@ def test_library_export_cards_refuses_a_git_visible_output_before_touching_the_s
     )
     assert code == 2 and "Git-visible" in err
     assert not (repo / "cards").exists() and not missing_store.exists()
+
+
+# --- spelling: on a case-insensitive volume the caller's case is not the disk's case -------------
+
+
+def fake_volume(listings: dict[str, list[str]], *, case_insensitive: bool = True):
+    """A `list_directory` / `exists` pair over a made-up tree, so the canonicaliser runs anywhere."""
+    by_path = {Path(key): names for key, names in listings.items()}
+
+    def list_directory(directory: Path) -> list[str]:
+        if directory not in by_path:
+            raise FileNotFoundError(str(directory))
+        return list(by_path[directory])
+
+    def fold(name: str) -> str:
+        return unicodedata.normalize("NFC", name).casefold()
+
+    def exists(path: Path) -> bool:
+        names = by_path.get(path.parent, [])
+        if case_insensitive:
+            return any(fold(name) == fold(path.name) for name in names)
+        return path.name in names
+
+    return list_directory, exists
+
+
+def canonical(path: str, listings, **kwargs) -> Path:
+    list_directory, exists = fake_volume(listings, **kwargs)
+    return corpus_store.canonical_spelling(Path(path), list_directory=list_directory, exists=exists)
+
+
+TREE = {
+    "/": ["work", "other"],
+    "/work": ["Repo", "notes"],
+    "/work/Repo": ["ignored", "Docs"],
+    "/work/Repo/ignored": ["Sub"],
+}
+
+
+def test_the_canonical_spelling_is_the_one_on_disk() -> None:
+    assert canonical("/WORK/repo/IGNORED/sub", TREE) == Path("/work/Repo/ignored/Sub")
+    assert canonical("/work/Repo/ignored/Sub", TREE) == Path("/work/Repo/ignored/Sub")
+
+
+def test_the_canonical_spelling_keeps_what_does_not_exist_yet_as_given() -> None:
+    assert canonical("/work/repo/IGNORED/NewDir/Deeper", TREE) == Path(
+        "/work/Repo/ignored/NewDir/Deeper"
+    )
+    # beneath the first missing component nothing is listed, so nothing is rewritten
+    assert canonical("/work/repo/Fresh/IGNORED", TREE) == Path("/work/Repo/Fresh/IGNORED")
+
+
+def test_a_case_sensitive_volume_never_has_its_names_rewritten() -> None:
+    """`Docs` is not `docs` there: a name that does not exist is new, not a respelling."""
+    sensitive = {"/": ["work"], "/work": ["docs"], "/work/docs": []}
+    assert canonical("/work/Docs/x", sensitive, case_insensitive=False) == Path("/work/Docs/x")
+    assert canonical("/work/docs/x", sensitive, case_insensitive=False) == Path("/work/docs/x")
+
+
+def test_two_entries_for_one_name_are_refused_not_guessed() -> None:
+    clash = {"/": ["work"], "/work": ["Out", "OUT"]}
+    with pytest.raises(CorpusStoreError, match="more than one"):
+        canonical("/work/out", clash)
+    # an exact spelling needs no guess
+    assert canonical("/work/Out", clash) == Path("/work/Out")
+
+
+def test_a_name_that_exists_but_cannot_be_matched_is_refused() -> None:
+    """exists() says yes and no listed entry folds to it: the spelling cannot be established."""
+    tree = {"/": ["work"], "/work": ["something-else"]}
+    list_directory, _ = fake_volume(tree)
+    with pytest.raises(CorpusStoreError, match="spelling"):
+        corpus_store.canonical_spelling(
+            Path("/work/odd"), list_directory=list_directory, exists=lambda path: True
+        )
+
+
+def test_an_unreadable_directory_is_refused_not_skipped() -> None:
+    def refuse(directory: Path) -> list[str]:
+        raise PermissionError(13, "denied", str(directory))
+
+    with pytest.raises(CorpusStoreError, match="Could not list"):
+        corpus_store.canonical_spelling(
+            Path("/work/x"), list_directory=refuse, exists=lambda path: True
+        )
+
+
+def test_unicode_normalisation_does_not_hide_an_entry() -> None:
+    """APFS treats a precomposed and a decomposed name as one; the listing keeps one of them."""
+    on_disk = "café"
+    asked = "café"
+    tree = {"/": ["work"], "/work": [on_disk]}
+    assert canonical(f"/work/{asked.upper()}", tree) == Path(f"/work/{on_disk}")
+
+
+def case_insensitive_volume(directory: Path) -> bool:
+    probe = directory / "CasE-Probe"
+    probe.mkdir()
+    try:
+        return (directory / "case-probe").exists()
+    finally:
+        probe.rmdir()
+
+
+@pytest.fixture
+def needs_case_insensitive_volume(tmp_path: Path) -> None:
+    if not case_insensitive_volume(tmp_path):
+        pytest.skip("the temporary directory is on a case-sensitive file system")
+
+
+def case_sensitive_repo(root: Path, *, gitignore: str) -> Path:
+    repo = make_repo(root, gitignore=gitignore)
+    git(repo, "config", "core.ignorecase", "false")
+    return repo
+
+
+def test_a_respelled_directory_is_judged_where_the_files_really_land(
+    tmp_path, needs_case_insensitive_volume
+) -> None:
+    """A rule for `IGNORED/` does not ignore the real `ignored/` when git matches by exact case,
+    and a path spelled `IGNORED/x` writes into `ignored/`. The old check asked git about the
+    spelling alone, so it said private about a directory it would then fill."""
+    repo = case_sensitive_repo(tmp_path, gitignore="IGNORED/\n")
+    (repo / "ignored").mkdir()
+    for spelling in ("IGNORED", "ignored", "Ignored"):
+        with pytest.raises(CorpusStoreError, match="Git-visible"):
+            require_git_private(repo / spelling / "x")
+    assert not (repo / "ignored" / "x").exists(), "the check creates nothing"
+
+
+def test_both_spellings_must_be_private(tmp_path, needs_case_insensitive_volume) -> None:
+    """The rule names the real case. The accurate spelling passes; any other spelling is judged
+    by name as well and git, matching exact case, does not ignore it, so the strictest wins."""
+    repo = case_sensitive_repo(tmp_path, gitignore="ignored/\n")
+    (repo / "ignored").mkdir()
+    assert require_git_private(repo / "ignored" / "x") == (repo / "ignored" / "x")
+    with pytest.raises(CorpusStoreError, match="Git-visible"):
+        require_git_private(repo / "IGNORED" / "x")
+
+
+def test_a_respelled_path_to_the_repository_itself_is_still_judged(
+    tmp_path, needs_case_insensitive_volume
+) -> None:
+    (tmp_path / "Outer").mkdir()
+    repo = case_sensitive_repo(tmp_path / "Outer", gitignore="ignored/\n")
+    (repo / "ignored").mkdir()
+    (repo / "visible").mkdir()
+    respelled = tmp_path / "OUTER" / "repo"
+    assert require_git_private(respelled / "ignored" / "x") == (respelled / "ignored" / "x")
+    with pytest.raises(CorpusStoreError, match="Git-visible"):
+        require_git_private(respelled / "visible" / "x")
 
 
 def test_project_extract_still_writes_where_git_cannot_see(tmp_path, monkeypatch, capsys) -> None:

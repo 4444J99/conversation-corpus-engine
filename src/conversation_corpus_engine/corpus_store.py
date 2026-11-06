@@ -3,10 +3,11 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import unicodedata
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .federation import REGISTRY_VERSION, load_registry, now_iso, registry_path, save_registry
 
@@ -279,6 +280,64 @@ def _directory_pattern_ignores(git_root: Path, relative: str) -> bool:
     return len(fields) >= 4 and fields[2].endswith("/") and not fields[2].startswith("!")
 
 
+def _list_directory(directory: Path) -> list[str]:
+    with os.scandir(directory) as entries:
+        return [entry.name for entry in entries]
+
+
+def _fold(name: str) -> str:
+    """What a case- and normalisation-insensitive volume (APFS by default) takes for one name."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def canonical_spelling(
+    path: Path,
+    *,
+    list_directory: Callable[[Path], Sequence[str]] = _list_directory,
+    exists: Callable[[Path], bool] = os.path.lexists,
+) -> Path:
+    """`path` with every component that exists spelled the way its directory lists it.
+
+    On a case-insensitive volume `repo/IGNORED/x` reaches the directory `repo/ignored`, while Git
+    (with `core.ignorecase=false`) matches rules to the spelling it is given. Walking from the
+    root, each component is looked up among its parent's entries: an exact entry is kept, and one
+    that differs only in case or Unicode normalisation is replaced by the entry on disk. A
+    component with no such entry is new (on a case-sensitive volume `Docs` is not `docs`, and
+    `exists` says so), so it and everything below it keep the caller's spelling. Two entries that
+    both fold to the name, none exact, cannot be told apart and are refused, as is a directory
+    that cannot be listed: the answer would otherwise rest on a guess.
+
+    `list_directory` and `exists` are the filesystem; a test can supply a made-up one.
+    """
+    parts = path.parts
+    current = Path(parts[0]) if parts else path
+    for index, name in enumerate(parts[1:], start=1):
+        try:
+            names = list(list_directory(current))
+        except OSError as exc:
+            raise CorpusStoreError(
+                f"Could not list {current} to establish the on-disk spelling of {path}: {exc}"
+            ) from exc
+        if name in names:
+            current = current / name
+            continue
+        if not exists(current / name):
+            return current.joinpath(*parts[index:])
+        matches = [entry for entry in names if _fold(entry) == _fold(name)]
+        if not matches:
+            raise CorpusStoreError(
+                f"{current / name} exists but {current} lists no entry for it, so the on-disk "
+                f"spelling of {path} cannot be established"
+            )
+        if len(matches) > 1:
+            raise CorpusStoreError(
+                f"{current} holds more than one entry that {name!r} could name "
+                f"({', '.join(sorted(matches))}), so the on-disk spelling of {path} is ambiguous"
+            )
+        current = current / matches[0]
+    return current
+
+
 def require_git_private(directory: Path) -> Path:
     """Refuse a directory that private text must not land in. Returns the resolved path.
 
@@ -290,6 +349,12 @@ def require_git_private(directory: Path) -> Path:
     `.git/info/exclude`, the global excludes file, negations) and nothing is created to find out.
     The directory may not exist yet. Symlinks are followed first, so the answer is for where the
     text would really land.
+
+    Case is settled before Git is asked (`canonical_spelling`): every component that exists is
+    spelled the way the disk lists it, and when that differs from what the caller wrote, both
+    spellings must be private, so a rule that matches only the caller's spelling cannot clear a
+    directory that is Git-visible under its real name (a repository with `core.ignorecase=false`
+    on a case-insensitive volume), and the strictest answer wins.
 
     Git runs without the variables that relocate or hide a repository (`GIT_LOCATION_VARIABLES`),
     and its "not a git repository" counts as "outside every work tree" only when no `.git` exists
@@ -315,26 +380,45 @@ def require_git_private(directory: Path) -> Path:
             f"Directory is Git-visible and cannot hold private text: {resolved} ({why})"
         )
 
-    try:
-        relative = resolved.relative_to(git_root).as_posix()
-    except ValueError:
-        raise visible(f"it is not under the work tree {git_root} that Git reported") from None
-    if relative == ".":
-        raise visible("it is the work tree itself")
+    canonical = canonical_spelling(resolved)
+    root_parts = canonical_spelling(git_root).parts
+    depth = len(root_parts)
+    if canonical.parts[:depth] != root_parts:
+        raise visible(f"it is not under the work tree {git_root} that Git reported")
     exists = resolved.exists()
-    if exists:
-        tracked = _run_git(git_root, "ls-files", "-z", "--", relative)
-        if tracked.returncode != 0:
-            raise CorpusStoreError(f"Could not list the tracked files beneath {resolved}")
-        if tracked.stdout:
-            raise visible("it holds Git-tracked files")
-    children = [f"{relative}/{name}" for name in PRIVATE_PROBE_CHILDREN]
-    ignored = _check_ignore(git_root, [relative, *children])
-    if relative not in ignored and (exists or not _directory_pattern_ignores(git_root, relative)):
-        raise visible("Git does not ignore the directory itself")
-    for child in children:
-        if child not in ignored:
-            raise visible(f"Git would show {child.removeprefix(relative + '/')} written inside it")
+
+    def judge(relative: str) -> str | None:
+        """Why Git would show text written under `relative`, or None when it would not."""
+        if relative == ".":
+            return "it is the work tree itself"
+        if exists:
+            tracked = _run_git(git_root, "ls-files", "-z", "--", relative)
+            if tracked.returncode != 0:
+                raise CorpusStoreError(f"Could not list the tracked files beneath {resolved}")
+            if tracked.stdout:
+                return "it holds Git-tracked files"
+        children = [f"{relative}/{name}" for name in PRIVATE_PROBE_CHILDREN]
+        ignored = _check_ignore(git_root, [relative, *children])
+        if relative not in ignored and (
+            exists or not _directory_pattern_ignores(git_root, relative)
+        ):
+            return "Git does not ignore the directory itself"
+        for child in children:
+            if child not in ignored:
+                return f"Git would show {child.removeprefix(relative + '/')} written inside it"
+        return None
+
+    on_disk = "/".join(canonical.parts[depth:]) or "."
+    as_given = "/".join(resolved.parts[depth:]) or "."
+    spellings = [("on-disk", on_disk)]
+    if as_given != on_disk:
+        spellings.append(("given", as_given))
+    for which, relative in spellings:
+        why = judge(relative)
+        if why is not None:
+            raise visible(
+                why if len(spellings) == 1 else f"{why}; the {which} spelling is {relative}"
+            )
     return resolved
 
 

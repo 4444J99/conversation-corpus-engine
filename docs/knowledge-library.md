@@ -156,6 +156,7 @@ The two MCP tools support a locate-then-read flow that stays inside a token budg
 - Git also ignores the names an export writes beneath it: `.private-probe`, `x.md`, `x.json`, `x.jsonl` and `x/y.md`. A rule that ignores only dotfiles (`.*`), one extension, or only the old probe name does not make a directory private, and `ignored/*` with `!ignored/vault/` does not either.
 - An existing directory holds no tracked file.
 - The directory is not the work tree itself, and symlinks are resolved first, so the answer is for where the text would land. Nothing is created to find out.
+- Case is settled before Git is asked. On a case-insensitive volume `repo/IGNORED/x` reaches the directory `repo/ignored`, while a repository with `core.ignorecase=false` matches its rules to the spelling it is given. Every path component that exists is therefore respelled the way its parent directory lists it (also across Unicode normalisation), and when that differs from what the caller wrote, both spellings must pass, so the strictest answer wins. Two entries that both fit one name, or a directory that cannot be listed, are refused rather than guessed.
 
 **What Git is told.** The git processes run without `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`, `GIT_CEILING_DIRECTORIES`, `GIT_DISCOVERY_ACROSS_FILESYSTEM` and `GIT_NAMESPACE` (a `GIT_DIR` that does not exist makes git say "not a git repository" about every directory). Configuration variables stay, so a developer's own ignore rules count.
 
