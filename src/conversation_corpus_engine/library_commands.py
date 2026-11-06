@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .archive_database import PHRASE_RE, WORD_RE
+from .archive_text import FenceTracker
 from .attributed_knowledge import ZETTEL_SCHEMA, export_zettels, zettel_atoms
 from .corpus_store import CorpusStoreError, require_git_private
 from .library_analysis import AnalysisLimits, export_analysis
@@ -44,7 +45,7 @@ PASSAGE_LIMIT = 1500
 MAX_RANGE_MESSAGES = 200
 MAX_TOC_ENTRIES = 500
 PREVIEW_CHARS = 80
-HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t#]*$")
+LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|[\r\n])|[^\r\n]+")
 STEM_SUFFIXES = ("ing", "ed", "es", "s", "ly")
 
 
@@ -316,13 +317,36 @@ def _read_range(
     return result
 
 
+def _atx_heading(line: str) -> tuple[int, str] | None:
+    """(level, title) of an ATX heading line (CommonMark: up to three spaces of indent, one to six
+    `#`, then a space or tab; an optional closing run of `#` after whitespace is not the title).
+    Linear in the line: nothing here backtracks. A heading with no title is not an entry."""
+    body = line.rstrip("\r\n")
+    stripped = body.lstrip(" ")
+    if len(body) - len(stripped) > 3:
+        return None
+    rest = stripped.lstrip("#")
+    level = len(stripped) - len(rest)
+    if not 1 <= level <= 6 or (rest and rest[0] not in " \t"):
+        return None
+    title = rest.strip(" \t")
+    unclosed = title.rstrip("#")
+    if unclosed != title and (not unclosed or unclosed[-1] in " \t"):
+        title = unclosed.rstrip(" \t")
+    return (level, title) if title else None
+
+
 def _headings(text: str) -> list[tuple[int, int, str]]:
-    found, position, fenced = [], 0, False
-    for line in text.splitlines(keepends=True):
-        if line.strip().startswith(("```", "~~~")):
-            fenced = not fenced
-        elif not fenced and (heading := HEADING_RE.match(line.rstrip("\r\n"))):
-            found.append((position, len(heading.group(1)), heading.group(2)))
+    """(character offset of the line, level, title) of every ATX heading outside fenced code.
+
+    Lines end at `\\n`, `\\r\\n` or `\\r` only, as in CommonMark; the other separators that
+    `str.splitlines` honours (U+2028, form feed, ...) are ordinary characters. Fences follow the
+    shared `FenceTracker`, so a tilde fence is not closed by backticks and a longer fence holds a
+    shorter one."""
+    found, position, tracker = [], 0, FenceTracker()
+    for line in LINE_RE.findall(text):
+        if not tracker.feed(line) and (heading := _atx_heading(line)):
+            found.append((position, *heading))
         position += len(line)
     return found
 
