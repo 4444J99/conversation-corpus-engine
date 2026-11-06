@@ -279,7 +279,7 @@ published library generation. A provider's `user` role is not proof that the own
 span: injected system text, command output and tool results sit inside user turns, pasted logs,
 quotes, tables, emails and code are not the owner's prose, an assistant's answer can be pasted
 back into a turn, and AI-written skill and instruction files are filed under documents. The
-engine (`conversation_corpus_engine.attribution_rules`, version `cce.attribution-rules@7`)
+engine (`conversation_corpus_engine.attribution_rules`, version `cce.attribution-rules@8`)
 therefore labels a span `owner` only when an owner-granting rule claims it and no other rule
 does. When a rule is ambiguous the text becomes `unknown` or a non-owner class, never owner.
 **No rule is profile-eligible until the precision gate below is met**, and every span the
@@ -304,10 +304,10 @@ annotations, the census and the sample; it does not abort the run.
 
 ### Rules version
 
-The version string (`cce.attribution-rules@7`) names the rule semantics and every artifact carries
+The version string (`cce.attribution-rules@8`) names the rule semantics and every artifact carries
 it: span ids (so a span id from another version never matches), the annotation evidence
-(`cce.attribution-rules@7:rule:<id>`), the rows of review samples and the rows of the review
-ledger. When the rules or the gate change meaning the version is bumped (`@7` retains short
+(`cce.attribution-rules@8:rule:<id>`), the rows of review samples and the rows of the review
+ledger. When the rules or the gate change meaning the version is bumped (`@8` adds the explicit third-party source-family rule; `@7` retains short
 assistant replies so their whole-paragraph hits and fragments can contribute to aggregate echo
 matching; the ledger and sample formats remain at `.v6`; `@6` made "the same
 text" the text as a reader sees it, one `text_key` for the gate, the draw and the twin veto, made
@@ -328,6 +328,7 @@ so no higher rule can lose a character to an owner claim.
 
 | # | Rule id | Class | Decides |
 |---|---------|-------|---------|
+| 0 | `third_party_origin` | third_party | every message of a record from a third-party family: the fetched web pages of the `webcapture` family ([web captures](knowledge-library.md#web-captures)). It runs before every other rule, whatever the role, channel, typed count, URL or text, so nothing of a saved page is ever `owner` or `agent`. The added rule advances semantics to `cce.attribution-rules@8`; earlier review rows remain preserved and are reported as stale |
 | 1 | `agent_family` | agent | assistant, model, tool and system turns of every provider; user turns on a machine channel; provider metadata naming an agent; a coding CLI's subagent prompts and turns that `archive_provenance.classify_user_turn` calls harness text |
 | 2 | `document_origin` | agent | a record whose provenance says an agent produced it (`agent_authored`, `generated_by`, ...), the agent memory and plan families, agent instruction or skill files by file name or folder, and for documents, notes and plans a generated-by footer, co-author line or skill frontmatter anywhere in the text |
 | 3 | `inline_injection` | agent | wrapper blocks inside a turn: the archive's injected tags (`system-reminder`, `local-command-*`, ...), `command-name`, `command-message`, `command-args`, tool-result and attachment blocks. Same-name tags nest (a depth counter), quoted attribute values may hold angle brackets, and an unclosed block runs to the end |
@@ -510,7 +511,7 @@ already reads: `source` is the exact canonical reference without offsets and `at
 `cce.span-attribution.v1` annotation whose spans are the non-unknown spans (uncovered text is
 unknown by the contract). Messages whose id is empty or not unique in their sequence cannot be
 referenced exactly and are counted, not annotated. The file holds offsets, ids and evidence
-(`cce.attribution-rules@7:rule:<id>`, `stratum:<S|M|L>`, `span:<id>`, and `owner_verdict:<verdict>`
+(`cce.attribution-rules@8:rule:<id>`, `stratum:<S|M|L>`, `span:<id>`, and `owner_verdict:<verdict>`
 for a span the owner answered), no message text. A span the owner answered also carries
 `owner_verdict` as a key of its own. Owner spans carry `--owner-id` as `author_id`; without it no
 span can reach a strict profile.

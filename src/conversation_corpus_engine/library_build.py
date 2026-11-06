@@ -32,6 +32,7 @@ from .library_store import (
     digest_json,
 )
 from .library_vault import PROFILE_NONE, VAULT_PROFILES
+from .web_capture import DEFAULT_MAX_ROW_BYTES, iter_web_captures
 
 DEFAULT_VAULT_PROFILE = PROFILE_NONE
 SOURCES_SCHEMA = "cce.library-sources.v1"
@@ -106,12 +107,15 @@ def current_generation(store_root: Path) -> Path | None:
 def _validate_manifest(manifest: dict[str, Any]) -> dict[str, int]:
     if manifest.get("schema") != SOURCES_SCHEMA:
         raise ValueError(f"source manifest must use {SOURCES_SCHEMA}")
-    for key in ("archives", "snapshot_archives", "estate_databases"):
+    for key in ("archives", "snapshot_archives", "estate_databases", "web_captures"):
         values = manifest.get(key, [])
         if not isinstance(values, list) or any(
             not isinstance(value, str) or not Path(value).is_absolute() for value in values
         ):
             raise ValueError(f"{key} must list explicit absolute source paths")
+    row_limit = manifest.get("web_capture_max_row_bytes", DEFAULT_MAX_ROW_BYTES)
+    if isinstance(row_limit, bool) or not isinstance(row_limit, int) or row_limit <= 0:
+        raise ValueError("web_capture_max_row_bytes must be positive")
     if not isinstance(manifest.get("documents", []), list):
         raise ValueError("documents must be a list of explicit source declarations")
     resume_generation = manifest.get("resume_generation")
@@ -126,7 +130,13 @@ def _validate_manifest(manifest: dict[str, Any]) -> dict[str, int]:
         raise ValueError("indexed/export resume mode requires resume_generation")
     if resume_mode == "export" and any(
         manifest.get(key)
-        for key in ("archives", "snapshot_archives", "estate_databases", "documents")
+        for key in (
+            "archives",
+            "snapshot_archives",
+            "estate_databases",
+            "web_captures",
+            "documents",
+        )
     ):
         raise ValueError("export resume cannot include new source declarations")
     native_limit = manifest.get("native_max_source_bytes", 64 * 1024**2)
@@ -219,7 +229,7 @@ def build_library(
     destination = store_root / DIRECTORY / "generations" / name
     sources = [
         Path(path)
-        for key in ("archives", "snapshot_archives", "estate_databases")
+        for key in ("archives", "snapshot_archives", "estate_databases", "web_captures")
         for path in manifest.get(key, [])
     ]
     sources.extend(Path(row["root"]).expanduser() for row in manifest.get("documents", []))
@@ -558,6 +568,20 @@ def build_library(
                         }
                         for code, count in native_report.get("findings", {}).items()
                     )
+                if manifest.get("web_captures"):
+                    capture_report: dict[str, Any] = {}
+                    for item in iter_web_captures(
+                        manifest["web_captures"],
+                        report=capture_report,
+                        max_row_bytes=manifest.get(
+                            "web_capture_max_row_bytes", DEFAULT_MAX_ROW_BYTES
+                        ),
+                        max_records=max(0, limits["max_records"] - report["accepted_observations"]),
+                        check_callback=check_bound,
+                    ):
+                        accept(item)
+                    report["sources"].append({"kind": "web_captures", "report": capture_report})
+                    report["findings"].extend(capture_report["findings"])
                 document_report: dict[str, Any] = {}
                 for item in iter_documents(manifest.get("documents", []), report=document_report):
                     accept(item)

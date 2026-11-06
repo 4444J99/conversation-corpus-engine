@@ -118,6 +118,7 @@ def prepare_resume(
         ):
             raise ValueError("inherited resume baseline count mismatch")
     native_paths: list[str] = []
+    capture_paths: list[str] = []
     for index, source in enumerate(sources):
         check()
         if not isinstance(source, dict):
@@ -129,6 +130,15 @@ def prepare_resume(
             native = source.get("report", {})
             total += _count(native.get("records", 0), kind)
             native_paths.append(source.get("path"))
+        elif kind == "web_captures" and index < len(sources) - 1:
+            counts = source.get("report", {}).get("counts", {})
+            total += _count(counts.get("records", 0), "web capture records")
+            declared = source.get("report", {}).get("sources", [])
+            if not isinstance(declared, list) or any(
+                not isinstance(item, dict) for item in declared
+            ):
+                raise ValueError("invalid web capture source collection receipt")
+            capture_paths.extend(item.get("path") for item in declared)
         elif kind == "documents" and index == len(sources) - 1:
             counts = source.get("report", {}).get("counts", {})
             total += _count(counts.get("ingested", 0), "documents ingested")
@@ -137,6 +147,8 @@ def prepare_resume(
             raise ValueError("invalid or incomplete resume source sequence")
     if native_paths != manifest.get("estate_databases", []):
         raise ValueError("resume native source collection differs from declared sources")
+    if capture_paths != manifest.get("web_captures", []):
+        raise ValueError("resume web capture source collection differs from declared sources")
     if total != _count(report.get("accepted_observations"), "accepted_observations"):
         raise ValueError("resume accepted observations differ from source counts")
     phase = state.get("phase", report.get("phase"))
