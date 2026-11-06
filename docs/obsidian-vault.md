@@ -15,7 +15,7 @@ uv run --extra obsidian python scripts/package-obsidian-vault.py /private/librar
 
 The `obsidian` extra installs the required `markdown-it-py==4.2.0`; the boundary mapper refuses other parser versions. The development extra includes the same pin for tests.
 
-The output parent must already exist and the output itself must not exist. Existing outputs are never replaced. A failed attempt remains available for inspection; use a new destination for a subsequent attempt. Source/output overlap and output anywhere within a recognized canonical `library-all/generations/` generation are refused.
+The output parent must already exist and the output itself must not exist. Existing outputs are never replaced. A failed attempt remains available for inspection; use a new destination for a subsequent attempt. Source/output overlap and output anywhere within a recognized canonical `library-all/generations/` generation are refused. So is an output that Git can see (inside a work tree and not ignored by it), before the source is read: the derivative holds the library as plaintext. `scripts/repair-obsidian-inline.py` applies the same rule to its `--output`.
 
 Every Markdown output, including record notes, repeated passages, hubs, original-path indexes, and optional agent entry, stays within the note-byte limit. Conservative source segments usually use half that limit, leaving room for navigation rewrites and code-fence wrappers. Dense anchor links receive smaller segments. The bound includes UTF-8 paths expanding into percent-encoded navigation targets. A single long UTF-8 line can be divided without splitting a character. Splitting changes the reading layout; it does not truncate source text.
 

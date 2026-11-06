@@ -571,6 +571,24 @@ def package(
             raise
 
 
+def require_private_output(parser: argparse.ArgumentParser, path: Path) -> None:
+    """Refuse an output directory Git can see: the batches hold the library as plaintext.
+
+    An output outside every Git work tree, or one the work tree ignores, passes. The check runs
+    before the source is read; a refusal exits with the usage-error status.
+    """
+    # The engine is needed only by the command line; the packer itself stays standalone.
+    from conversation_corpus_engine.corpus_store import (  # noqa: PLC0415
+        CorpusStoreError,
+        require_git_private,
+    )
+
+    try:
+        require_git_private(path)
+    except CorpusStoreError as error:
+        parser.error(str(error))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path, help="Published full notion-import.zip (read-only)")
@@ -583,6 +601,7 @@ def main() -> int:
     parser.add_argument("--max-seconds", type=int, default=1800)
     parser.add_argument("--wrapper", default="library")
     args = parser.parse_args()
+    require_private_output(parser, args.output)
     os.nice(10)
     result = package(
         args.source,

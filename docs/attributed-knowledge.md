@@ -218,8 +218,12 @@ cce library export --store-root /private/store --zettels /private/reviewed-ideas
 cce library verify-export /private/zettel-export --zettels /private/reviewed-ideas.json --json
 ```
 
-The Python equivalents are `export_library(library, destination, zettels=envelope)` and
-`verify_export(destination, expected_zettels=count)`. The envelope is validated against the
+The export is the whole library as plaintext, so `--out` must be outside every Git work tree or
+ignored by the one it is in; any other `--out` is refused with exit status 2 before the library or
+the envelope is read. `verify-export` writes nothing and needs no such check.
+
+The Python equivalents are `export_library(library, destination, zettels=envelope)` (it applies the
+same refusal) and `verify_export(destination, expected_zettels=count)`. The envelope is validated against the
 exact canonical library first (the same validation as `export_zettels`); an invalid
 envelope writes nothing. A Zettel id longer than 512 characters is refused because the
 id is shown on its page. Without the option the export is byte-for-byte unchanged and its

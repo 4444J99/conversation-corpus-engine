@@ -12,7 +12,7 @@ python3 scripts/package-notion-batches.py \
   --max-output-bytes 8589934592
 ```
 
-Choose a new output directory outside the published generation. The CLI lowers process priority. It has a hard POSIX wall timer, cooperative checkpoints, a logical output cap, and a measured 1 GiB free-space floor. Failed attempts retain their partial outputs and failure receipt; the completed manifest is written last. Existing destinations and source symlinks are rejected.
+Choose a new output directory outside the published generation. The CLI refuses, before it reads the source, an output directory that Git can see (inside a work tree and not ignored by it): the batches hold the library as plaintext. The CLI lowers process priority. It has a hard POSIX wall timer, cooperative checkpoints, a logical output cap, and a measured 1 GiB free-space floor. Failed attempts retain their partial outputs and failure receipt; the completed manifest is written last. Existing destinations and source symlinks are rejected.
 
 | Setting | Default / meaning |
 | --- | --- |

@@ -30,6 +30,7 @@ from .archive_text import FenceTracker
 from .archive_vault import INLINE_CODE_RE
 from .attributed_knowledge import ZETTEL_SCHEMA, export_zettels
 from .attribution import ASSURANCE
+from .corpus_store import require_git_private
 from .library_blocks import render_blocks, split_blocks
 from .library_store import Library, canonical_json
 
@@ -816,6 +817,9 @@ def export_library(
     """
     destination = _absolute(destination)
     _no_symlinks(destination)
+    # The exports are the whole library as plaintext, so a directory Git can see is refused here
+    # too: the builder authorised its generation the same way, and this covers every other caller.
+    require_git_private(destination)
     if destination.exists():
         if not destination.is_dir():
             raise FileExistsError(destination)

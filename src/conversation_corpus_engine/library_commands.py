@@ -12,7 +12,7 @@ from typing import Any
 
 from .archive_database import PHRASE_RE, WORD_RE
 from .attributed_knowledge import ZETTEL_SCHEMA, export_zettels, zettel_atoms
-from .corpus_store import CorpusStoreError
+from .corpus_store import CorpusStoreError, require_git_private
 from .library_analysis import AnalysisLimits, export_analysis
 from .library_build import build_library, current_generation, publish_library, verify_candidate
 from .library_export import export_library, verify_export
@@ -44,7 +44,7 @@ PASSAGE_LIMIT = 1500
 MAX_RANGE_MESSAGES = 200
 MAX_TOC_ENTRIES = 500
 PREVIEW_CHARS = 80
-HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)[ \t#]*$")
+LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|[\r\n])|[^\r\n]+")
 STEM_SUFFIXES = ("ing", "ed", "es", "s", "ly")
 
 
@@ -108,8 +108,15 @@ def _sequences(
 
 def passage_handoff(
     payload: dict[str, Any], query: str, limit: int = PASSAGE_LIMIT
-) -> dict[str, Any]:
-    """Exact read arguments for the passage of a record that best answers a search query."""
+) -> tuple[dict[str, Any], bool]:
+    """Read arguments for the passage of a record that best answers a search query, and whether
+    that passage was located.
+
+    The arguments are exactly what `cce_library_read` takes (`message`, `offset`, `limit`, plus
+    `sequence` for the alternate branch), nothing else, so a caller can pass them as they are.
+    When no query term occurs in any message they point at the start of the record and the flag
+    is False; the caller reports that beside the arguments, never inside them.
+    """
     main, alternates = _sequences(payload)
     best = None
     for sequence, messages in (("main", main), ("alternate", alternates)):
@@ -121,7 +128,7 @@ def passage_handoff(
             break
         best = best or (sequence, messages, match)
     if best is None:
-        return {"message": 0, "offset": 0, "limit": limit, "located": False}
+        return {"message": 0, "offset": 0, "limit": limit}, False
     sequence, messages, match = best
     length = len(str(messages[match["message"]].get("text", "")))
     handoff = {
@@ -131,7 +138,7 @@ def passage_handoff(
     }
     if sequence != "main":
         handoff["sequence"] = sequence
-    return handoff
+    return handoff, True
 
 
 def _check_cursor(message: int, offset: int, limit: int, sequence: str) -> None:
@@ -309,14 +316,129 @@ def _read_range(
     return result
 
 
+def _atx_heading(line: str) -> tuple[int, str] | None:
+    """(level, title) of an ATX heading line, or None for any other line (CommonMark: up to three
+    spaces of indent, one to six `#`, then a space, a tab or the end of the line; an optional
+    closing run of `#` after whitespace is not part of the title, which may be empty).
+    Linear in the line: nothing here backtracks."""
+    body = line.rstrip("\r\n")
+    stripped = body.lstrip(" ")
+    if len(body) - len(stripped) > 3:
+        return None
+    rest = stripped.lstrip("#")
+    level = len(stripped) - len(rest)
+    if not 1 <= level <= 6 or (rest and rest[0] not in " \t"):
+        return None
+    title = rest.strip(" \t")
+    unclosed = title.rstrip("#")
+    if unclosed != title and (not unclosed or unclosed[-1] in " \t"):
+        title = unclosed.rstrip(" \t")
+    return level, title
+
+
+FENCE_LINE_RE = re.compile(r"(`{3,}|~{3,})(.*)")
+ITEM_MARKER_RE = re.compile(r"([-*+]|(\d{1,9})[.)])(?=[ \t]|$)")
+THEMATIC_BREAK_RE = re.compile(r"([-*_])(?:[ \t]*\1){2,}[ \t]*")
+SETEXT_UNDERLINE_RE = re.compile(r"=+[ \t]*")
+TAB_STOP = 4
+
+
+def _indentation(body: str, start: int = 0) -> tuple[int, str]:
+    """(column reached, rest of the line) after the leading spaces and tabs, a tab running to the
+    next multiple of four, counting from column `start`."""
+    column, index = start, 0
+    while index < len(body) and body[index] in " \t":
+        column += 1 if body[index] == " " else TAB_STOP - column % TAB_STOP
+        index += 1
+    return column, body[index:]
+
+
 def _headings(text: str) -> list[tuple[int, int, str]]:
-    found, position, fenced = [], 0, False
-    for line in text.splitlines(keepends=True):
-        if line.strip().startswith(("```", "~~~")):
-            fenced = not fenced
-        elif not fenced and (heading := HEADING_RE.match(line.rstrip("\r\n"))):
-            found.append((position, len(heading.group(1)), heading.group(2)))
-        position += len(line)
+    """(character offset of the line, level, title) of every top-level ATX heading outside code.
+
+    This follows CommonMark for what decides whether a heading line is one:
+
+    * Lines end at `\\n`, `\\r\\n` or `\\r` only; the other separators `str.splitlines` honours
+      (U+2028, form feed, ...) are ordinary characters, and so is a no-break space.
+    * A fence opens on three or more backticks or tildes indented 0-3 spaces. A tab, four spaces
+      or any other character before it makes the line indented code or paragraph text. It closes
+      only on the same character, at least as long, indented 0-3 spaces and followed by nothing.
+    * Inside a list item (lines after a marker, indented to its content offset) a fence may be
+      indented further: 0-3 columns past the content offset, and the same for its closing line. A
+      line indented less than the content offset ends the item, and a fence open in it, unless it
+      continues the item's paragraph; a heading, a rule or a fence always ends it. Items nest.
+    * A heading inside a list item or a quote is not top level, and is not listed.
+    """
+    found: list[tuple[int, int, str]] = []
+    position = 0
+    fence: tuple[str, int, int] | None = None  # character, length and container of the open fence
+    items: list[int] = []  # content offsets of the open list items, outermost first
+    paragraph = False  # the last line was paragraph text, which a lazy continuation may extend
+    blank = True
+    for line in LINE_RE.findall(text):
+        start, position = position, position + len(line)
+        body = line.rstrip("\r\n")
+        columns, rest = _indentation(body)
+        if not rest:
+            blank = True
+            continue
+        after_blank, blank = blank, False
+        if fence is not None:
+            character, length, container = fence
+            if container and columns < container:
+                fence = None  # the list item ended, and its fence with it: read the line afresh
+            else:
+                closing = FENCE_LINE_RE.match(rest)
+                if (
+                    closing
+                    and closing.group(1)[0] == character
+                    and len(closing.group(1)) >= length
+                    and not closing.group(2).strip(" \t")
+                    and columns - container <= 3
+                ):
+                    fence = None
+                continue
+        depth = sum(1 for offset in items if offset <= columns)  # the items this line is within
+        container = items[depth - 1] if depth else 0
+        relative = columns - container
+        opener = FENCE_LINE_RE.match(rest)
+        if opener and relative <= 3 and not (opener.group(1)[0] == "`" and "`" in opener.group(2)):
+            del items[depth:]
+            fence = (opener.group(1)[0], len(opener.group(1)), container)
+            paragraph = False
+            continue
+        if relative <= 3 and THEMATIC_BREAK_RE.fullmatch(rest):
+            del items[depth:]
+            paragraph = False
+            continue
+        if relative <= 3 and (marker := ITEM_MARKER_RE.match(rest)):
+            innermost = items[-1] if items else 0
+            within_paragraph = paragraph and not after_blank and columns >= innermost
+            content_column, content = _indentation(rest[marker.end() :], columns + marker.end())
+            gap = content_column - (columns + marker.end())
+            numbered = marker.group(2)
+            if not within_paragraph or (content and (not numbered or int(numbered) == 1)):
+                del items[depth:]
+                items.append(columns + marker.end() + (gap if content and 1 <= gap <= 4 else 1))
+                first = FENCE_LINE_RE.match(content)
+                if first and not (first.group(1)[0] == "`" and "`" in first.group(2)):
+                    fence = (first.group(1)[0], len(first.group(1)), items[-1])
+                    paragraph = False
+                else:
+                    paragraph = bool(content) and _atx_heading(content) is None
+                continue
+        if relative <= 3 and (heading := _atx_heading(" " * relative + rest)):
+            if container == 0 and heading[1]:
+                found.append((start, *heading))
+            del items[depth:]
+            paragraph = False
+            continue
+        if after_blank or not paragraph:
+            del items[depth:]  # a new block; otherwise this lazily continues the paragraph
+        if relative <= 3 and paragraph and not after_blank and SETEXT_UNDERLINE_RE.fullmatch(rest):
+            paragraph = False
+        else:
+            paragraph = relative <= 3 or (paragraph and not after_blank)
     return found
 
 
@@ -426,7 +548,12 @@ def add_library_parser(subparsers: Any) -> None:
         "export", help="Write the private reading export, optionally with reviewed Zettel pages"
     )
     common(export)
-    export.add_argument("--out", type=Path, required=True, help="New export directory")
+    export.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="New export directory, outside every Git work tree or ignored by it",
+    )
     export.add_argument(
         "--zettels", type=Path, help="Private reviewed-Zettels JSON envelope to render as pages"
     )
@@ -529,6 +656,10 @@ def handle_library(args: argparse.Namespace) -> int:
     try:
         if args.action == "verify-export":
             return _verify_export_command(args)
+        if args.action == "export":
+            # The export is the whole library as plaintext: authorise where it lands before
+            # the library or the reviewed envelope is read.
+            require_git_private(args.out)
         store = configured_store(args.store_root)
         if args.action == "build":
             manifest = json.loads(args.manifest.read_text(encoding="utf-8"))

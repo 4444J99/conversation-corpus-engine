@@ -401,13 +401,23 @@ def _lineage_problems(
     A store ingested before the lineage existed has neither lineage file (an ingest writes the
     ledger and the digests together). That is not a fault: it passes with a note in the wiki
     block, and the same checks then hold its site to an empty history. A ledger with no digests
-    beside it, or a ledger file that holds no generation, is a broken lineage and fails.
+    beside it (its digest baseline is lost), digests with no ledger, or a ledger file that holds
+    no generation, is a broken lineage and fails.
     """
     ledger = load_lineage(paths)
     report["generations"] = len(ledger)
     problems = []
     if ledger:
         report["lineage"] = {"status": "recorded", "note": ""}
+        if not paths.digests.exists():
+            # The ledger says what each generation changed against the digest baseline that
+            # the next ingest diffs from; without it the next generation would list every
+            # conversation as added.
+            report["lineage"]["status"] = "baseline-missing"
+            problems.append(
+                f"digest baseline missing: the ledger records {len(ledger)} generation(s) but "
+                "its digest file is absent; run `cce archive ingest`"
+            )
     elif paths.lineage.exists():
         report["lineage"]["status"] = "empty"
         problems.append("generation lineage holds no generation: run `cce archive ingest`")
@@ -419,6 +429,12 @@ def _lineage_problems(
         )
     else:
         report["lineage"] = {"status": "absent", "note": LINEAGE_ABSENT_NOTE}
+    if paths.digests_pending.exists():
+        problems.append(
+            f"interrupted lineage commit: {paths.digests_pending.name} is left over from an "
+            "ingest that stopped between its steps; run `cce archive ingest` to finish or "
+            "discard it"
+        )
     for index, record in enumerate(ledger, 1):
         parent = ledger[index - 2]["fingerprint"] if index > 1 else ""
         if record.get("generation") != index or record.get("parent") != parent:

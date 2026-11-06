@@ -3,6 +3,7 @@ and recent changes. Every string here is invented."""
 
 from __future__ import annotations
 
+import hashlib
 import html
 import importlib
 import json
@@ -735,7 +736,10 @@ def test_ingest_records_the_first_generation_with_every_conversation_added(built
         "added",
         "changed",
         "removed",
+        "baseline",
     }, "no wall-clock field: a generation is named by its fingerprint and the data's own day"
+    digest = hashlib.sha256(built.paths.digests.read_bytes()).hexdigest()
+    assert first["baseline"] == digest, "the row carries the sha256 of the baseline it describes"
 
 
 def test_ingesting_an_unchanged_export_again_adds_no_generation(built) -> None:
@@ -1046,3 +1050,42 @@ def test_verify_fails_on_a_fragment_that_only_looks_like_the_search_state(built)
             f"#{fragment}" in item and "no such anchor" in item for item in report["problems"]
         ), href
         assert report["dangling_links"] >= 1, href
+
+
+# --- the ledger and its digest baseline travel together: all four combinations -----------------
+
+
+@pytest.mark.parametrize(
+    ("ledger", "digests", "status", "problem"),
+    [
+        pytest.param(False, False, "absent", None, id="neither-pre-lineage-store-passes"),
+        pytest.param(False, True, "partial", "generation lineage missing", id="digests-only"),
+        pytest.param(True, False, "baseline-missing", "digest baseline missing", id="ledger-only"),
+        pytest.param(True, True, "recorded", None, id="both-recorded-passes"),
+    ],
+)
+def test_verify_holds_the_ledger_and_its_digest_baseline_together(
+    built, ledger, digests, status, problem
+) -> None:
+    if not ledger and not digests:
+        drop_lineage(built)  # a store that predates the lineage, with a site built to match
+    if not ledger:
+        built.paths.lineage.unlink(missing_ok=True)
+    if not digests:
+        built.paths.digests.unlink(missing_ok=True)
+    report = wiki().verify_site_wiki(built.paths)
+    assert report["lineage"]["status"] == status
+    if problem is None:
+        assert report["problems"] == []
+        assert report["lineage"]["note"] == ("" if ledger else wiki().LINEAGE_ABSENT_NOTE)
+    else:
+        assert any(problem in item for item in report["problems"]), report["problems"]
+
+
+def test_a_ledger_without_digests_names_the_remedy_and_does_not_hide_other_problems(built) -> None:
+    built.paths.digests.unlink()
+    problems = wiki().verify_site_wiki(built.paths)["problems"]
+    (missing,) = [item for item in problems if "digest baseline missing" in item]
+    assert "cce archive" in missing
+    # The lost baseline is one problem among the checks that still run (here the ledger is intact).
+    assert not any("broken" in item or "behind the manifest" in item for item in problems)

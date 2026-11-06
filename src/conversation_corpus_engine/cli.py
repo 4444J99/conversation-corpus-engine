@@ -25,7 +25,7 @@ from .corpus_candidates import (
     rollback_corpus_promotion,
     stage_corpus_candidate,
 )
-from .corpus_store import register_corpus_store
+from .corpus_store import CorpusStoreError, register_corpus_store, require_git_private
 from .dashboard import build_dashboard, render_dashboard_text
 from .evaluation import run_corpus_evaluation
 from .evaluation_bootstrap import bootstrap_provider_evaluation
@@ -945,6 +945,14 @@ def main() -> None:
         return
 
     if args.group == "project" and args.action == "extract":
+        # The extract is the project's files and conversations as plaintext, written wherever
+        # --output says: refuse a directory Git can see before anything is fetched. (The routed
+        # destinations of `project route` and `project sync` deliver into organ and repo
+        # checkouts by design and are not covered.)
+        try:
+            require_git_private(args.output)
+        except CorpusStoreError as exc:
+            parser.error(str(exc))
         payload = fetch_chatgpt_project(
             args.project_id,
             args.output,
