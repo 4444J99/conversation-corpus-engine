@@ -598,13 +598,47 @@ def _inside(path: Path, folder: Path) -> bool:
     return path == folder or folder in path.parents
 
 
+def _identity_of(path: Path, stat: Callable[[Path], Any]) -> tuple[int, int] | None:
+    try:
+        info = stat(path)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
+
+
+def inside_by_identity(
+    path: Path, roots: list[Path], *, stat: Callable[[Path], Any] = os.stat
+) -> Path | None:
+    """The protected root that `path` sits in or is, found by file identity rather than by
+    spelling, or None. The existing ancestors of the path (the nearest one for a path whose tail
+    does not exist yet, and every one above it) are compared by (device, inode) with the roots,
+    so a different spelling of the same folder, such as another letter case on a case-insensitive
+    volume, is recognised. Roots that do not exist protect nothing."""
+    protected: dict[tuple[int, int], Path] = {}
+    for root in roots:
+        identity = _identity_of(root, stat)
+        if identity is not None:
+            protected.setdefault(identity, root)
+    if not protected:
+        return None
+    for ancestor in (path, *path.parents):
+        identity = _identity_of(ancestor, stat)
+        if identity in protected:
+            return protected[identity]
+    return None
+
+
 def library_roots(args: argparse.Namespace, database: Path) -> list[Path]:
     """Every place a writer must stay out of: the generation, its parent, the store the library
     sits in (found through the builder's `library-all` folder, a store folder given as the
     library, `--store-root` or the configured store)."""
     resolved = database.resolve()
     roots = [resolved.parent, resolved.parent.parent]
-    roots.extend(ancestor.parent for ancestor in resolved.parents if ancestor.name == DIRECTORY)
+    roots.extend(
+        ancestor.parent
+        for ancestor in resolved.parents
+        if ancestor.name.casefold() == DIRECTORY.casefold()
+    )
     configured = [
         args.store_root,
         os.environ.get(STORE_ENV),
@@ -620,6 +654,10 @@ def _refuse_store(path: Path, roots: list[Path]) -> Path:
     resolved = out.parent.resolve() / out.name
     for root in roots:
         if _inside(resolved, root):
+            raise ValueError(f"output must be outside the library store ({root}): {out}")
+    for candidate in (out, resolved):
+        root = inside_by_identity(candidate, roots)
+        if root is not None:
             raise ValueError(f"output must be outside the library store ({root}): {out}")
     if out.is_symlink():
         raise ValueError(f"output must not be a symlink: {out}")

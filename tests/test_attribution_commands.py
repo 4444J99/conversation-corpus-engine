@@ -13,6 +13,7 @@ import sys
 import zlib
 from collections import Counter
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from attribution_support import (
@@ -1580,6 +1581,94 @@ def test_no_writer_may_write_inside_the_generation_or_anywhere_in_the_store(
             assert code == 2 and "library store" in err, (name, argv[0])
             assert not target.exists(), (name, argv[0])
     assert not (store / "notes").exists()
+
+
+class FakeStat:
+    """Stands in for `os.stat`: names (any spelling) map to a device and inode."""
+
+    def __init__(self, table: dict[str, tuple[int, int]]) -> None:
+        self.table = table
+
+    def __call__(self, path: str | Path) -> SimpleNamespace:
+        key = str(path)
+        if key not in self.table:
+            raise FileNotFoundError(key)
+        device, inode = self.table[key]
+        return SimpleNamespace(st_dev=device, st_ino=inode)
+
+
+def test_the_identity_comparison_finds_a_path_that_differs_only_in_spelling() -> None:
+    stat = FakeStat(
+        {
+            "/": (1, 2),
+            "/a": (1, 3),
+            "/a/store": (1, 8),
+            "/a/STORE": (1, 8),
+            "/a/store/lib": (1, 9),
+            "/a/STORE/LIB": (1, 9),
+            "/a/store/lib/gen": (1, 10),
+            "/a/STORE/LIB/GEN": (1, 10),
+            "/a/elsewhere": (1, 77),
+        }
+    )
+    roots = [Path("/a/store/lib/gen"), Path("/a/store/lib")]
+    inside = attribution_commands.inside_by_identity
+    # the generation under another spelling: the very same directory
+    assert inside(Path("/a/STORE/LIB/GEN/case.json"), roots, stat=stat) == roots[0]
+    # a path whose tail does not exist yet: the nearest existing ancestor decides
+    assert inside(Path("/a/STORE/LIB/new/dir/x.json"), roots, stat=stat) == roots[1]
+    assert inside(Path("/a/STORE/LIB"), roots, stat=stat) == roots[1]
+    # a sibling and a parent of the roots are not inside them
+    assert inside(Path("/a/elsewhere/x.json"), roots, stat=stat) is None
+    assert inside(Path("/a/STORE/x.json"), roots, stat=stat) is None
+    # roots that do not exist protect nothing
+    assert inside(Path("/a/elsewhere/x.json"), [Path("/nope")], stat=stat) is None
+    # the same inode number on another device is another file
+    other_device = FakeStat({**stat.table, "/a/STORE/LIB/GEN": (2, 10)})
+    assert inside(Path("/a/STORE/LIB/GEN/case.json"), roots[:1], stat=other_device) is None
+
+
+def case_insensitive(directory: Path) -> bool:
+    (directory / "probe.case").touch()
+    return (directory / "PROBE.CASE").exists()
+
+
+def test_a_path_spelled_in_another_case_is_still_inside_the_store(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    if not case_insensitive(tmp_path):
+        pytest.skip("this volume is case sensitive: the unit test above covers the comparison")
+    library = build_library(tmp_path / "store" / "gen", typed_records=3)
+    out = tmp_path / "STORE" / "GEN" / "case.json"
+    code, _, err = run_cli(capsys, "apply", "--library", library, "--out", out)
+    assert code == 2 and "outside the library" in err
+    generation = tmp_path / "store" / "gen"
+    assert not (generation / "case.json").exists()
+    assert not (generation / "case.json.partial").exists()
+    sample = tmp_path / "STORE" / "s.jsonl"
+    code, _, err = run_cli(
+        capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample
+    )
+    assert (
+        code == 2 and "outside the library" in err and not (tmp_path / "store" / "s.jsonl").exists()
+    )
+    ledger = tmp_path / "STORE" / "led.jsonl"
+    other = tmp_path / "other-sample.jsonl"
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", other)
+    answers = tmp_path / "answers.jsonl"
+    answers.write_text("", encoding="utf-8")
+    code, _, err = record_answers(capsys, library, ledger, other, answers)
+    assert (
+        code == 2
+        and "outside the library" in err
+        and not (tmp_path / "store" / "led.jsonl").exists()
+    )
+    shouting = tmp_path / "STORE" / "GEN" / "library.sqlite"
+    code, _, err = run_cli(
+        capsys, "apply", "--library", shouting, "--out", tmp_path / "store" / "x.json"
+    )
+    assert code == 2 and "outside the library" in err
+    assert not (tmp_path / "store" / "x.json").exists()
 
 
 def test_review_record_must_know_the_library_so_the_ledger_stays_out_of_its_store(
