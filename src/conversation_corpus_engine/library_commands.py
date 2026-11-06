@@ -108,8 +108,15 @@ def _sequences(
 
 def passage_handoff(
     payload: dict[str, Any], query: str, limit: int = PASSAGE_LIMIT
-) -> dict[str, Any]:
-    """Exact read arguments for the passage of a record that best answers a search query."""
+) -> tuple[dict[str, Any], bool]:
+    """Read arguments for the passage of a record that best answers a search query, and whether
+    that passage was located.
+
+    The arguments are exactly what `cce_library_read` takes (`message`, `offset`, `limit`, plus
+    `sequence` for the alternate branch), nothing else, so a caller can pass them as they are.
+    When no query term occurs in any message they point at the start of the record and the flag
+    is False; the caller reports that beside the arguments, never inside them.
+    """
     main, alternates = _sequences(payload)
     best = None
     for sequence, messages in (("main", main), ("alternate", alternates)):
@@ -121,7 +128,7 @@ def passage_handoff(
             break
         best = best or (sequence, messages, match)
     if best is None:
-        return {"message": 0, "offset": 0, "limit": limit, "located": False}
+        return {"message": 0, "offset": 0, "limit": limit}, False
     sequence, messages, match = best
     length = len(str(messages[match["message"]].get("text", "")))
     handoff = {
@@ -131,7 +138,7 @@ def passage_handoff(
     }
     if sequence != "main":
         handoff["sequence"] = sequence
-    return handoff
+    return handoff, True
 
 
 def _check_cursor(message: int, offset: int, limit: int, sequence: str) -> None:

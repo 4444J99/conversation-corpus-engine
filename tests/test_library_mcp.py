@@ -246,7 +246,8 @@ def test_title_only_match_has_a_start_of_record_locator(mcp):
     found = mcp(SEARCH_TOOL, query="Branchy", depth="L0")
     hit = found["hits"][0]
     assert hit["read"]["message"] == 0 and hit["read"]["offset"] == 0
-    assert hit["read"]["located"] is False
+    # Not located is said on the hit; `read` stays exactly the read tool's arguments.
+    assert hit["located"] is False and "located" not in hit["read"]
 
 
 def test_read_around_query_centres_on_the_first_match(mcp):
@@ -426,13 +427,16 @@ def test_default_search_degrades_one_malformed_hit_instead_of_failing_the_page(m
     by_uid = {hit["uid"]: hit for hit in result["hits"]}
     assert set(by_uid) == {good.uid, bad.uid}
     fallback = by_uid[bad.uid]["read"]
-    assert set(fallback) == {"uid", "message", "offset", "limit", "located", "locator_error"}
+    assert set(fallback) == {"uid", "message", "offset", "limit"}
     assert fallback["uid"] == bad.uid and fallback["message"] == 0 and fallback["offset"] == 0
-    assert fallback["limit"] == PASSAGE_LIMIT and fallback["located"] is False
-    assert isinstance(fallback["locator_error"], str) and fallback["locator_error"]
-    assert set(by_uid[bad.uid]) >= LEGACY_HIT_KEYS
+    assert fallback["limit"] == PASSAGE_LIMIT
+    degraded = by_uid[bad.uid]
+    assert degraded["located"] is False
+    assert isinstance(degraded["locator_error"], str) and degraded["locator_error"]
+    assert set(degraded) >= LEGACY_HIT_KEYS
     intact = by_uid[good.uid]["read"]
     assert set(intact) == {"uid", "message", "offset", "limit"}
+    assert not {"located", "locator_error"} & set(by_uid[good.uid])
     assert SENTINEL not in json.dumps(result)
 
 
@@ -471,6 +475,7 @@ def unpacked(result: dict, compact: bool) -> dict:
             "returned": result["returned"],
             "next_offset": result["next_offset"],
             "reads": {hit["uid"]: dict(hit["read"]) for hit in result["hits"]},
+            "flags": {hit["uid"]: located_flags(hit) for hit in result["hits"]},
         }
     return {
         "total": result["n"],
@@ -483,7 +488,16 @@ def unpacked(result: dict, compact: bool) -> dict:
             }
             for hit in result["h"]
         },
+        "flags": {
+            hit["i"]: located_flags({SHORT_KEYS.get(key, key): value for key, value in hit.items()})
+            for hit in result["h"]
+        },
     }
+
+
+def located_flags(hit: dict) -> dict:
+    """The hit-level not-located signal (`located`, `locator_error`), under its long names."""
+    return {key: hit[key] for key in ("located", "locator_error") if key in hit}
 
 
 SEARCH_MODES = [
@@ -510,17 +524,13 @@ def test_one_malformed_record_among_several_leaves_the_other_hits_and_counts_int
     assert set(page["reads"]) == set(uids.values())
     for name, uid in uids.items():
         read = page["reads"][uid]
+        flags = page["flags"][uid]
         if name == "omega":
-            assert read == {
-                "uid": uid,
-                "message": 0,
-                "offset": 0,
-                "limit": PASSAGE_LIMIT,
-                "located": False,
-                "locator_error": read["locator_error"],
-            }
-            assert read["locator_error"] and SENTINEL not in read["locator_error"]
+            assert read == {"uid": uid, "message": 0, "offset": 0, "limit": PASSAGE_LIMIT}
+            assert flags == {"located": False, "locator_error": flags["locator_error"]}
+            assert flags["locator_error"] and SENTINEL not in flags["locator_error"]
             continue
+        assert flags == {}
         assert read == {"uid": uid, "message": LEADS[name], "offset": 0, "limit": PASSAGE_LIMIT}
         passage = call(READ_TOOL, **read)
         assert (
@@ -532,10 +542,14 @@ def test_one_malformed_record_among_several_leaves_the_other_hits_and_counts_int
 def test_compact_search_carries_the_located_and_locator_error_keys_without_a_uid(mount):
     result = paged_library(mount)(SEARCH_TOOL, query="pagemark", depth="L0", compact=True)
     bad_uid = paged_record("omega").uid
-    degraded = next(hit for hit in result["h"] if hit["i"] == bad_uid)["r"]
-    assert set(degraded) == {"m", "o", "l", "lc", "le"} and degraded["lc"] is False
-    intact = next(hit for hit in result["h"] if hit["i"] != bad_uid)["r"]
-    assert set(intact) == {"m", "o", "l"}
+    # The signal sits on the hit, so `r` keeps only the read tool's arguments (no uid, short keys).
+    degraded = next(hit for hit in result["h"] if hit["i"] == bad_uid)
+    assert set(degraded["r"]) == {"m", "o", "l"}
+    assert set(degraded) == {"i", "t", "s", "r", "lc", "le"} and degraded["lc"] is False
+    assert isinstance(degraded["le"], str) and degraded["le"]
+    intact = next(hit for hit in result["h"] if hit["i"] != bad_uid)
+    assert set(intact["r"]) == {"m", "o", "l"} and set(intact) == {"i", "t", "s", "r"}
+    assert library_mcp.COMPACT_KEYS["located"] == "lc"
     assert library_mcp.COMPACT_KEYS["locator_error"] == "le"
 
 
@@ -609,11 +623,12 @@ def test_every_malformed_data_error_class_degrades_only_its_own_hit(mount, monke
 
     monkeypatch.setattr(library_mcp, "passage_handoff", handoff)
     result = call(SEARCH_TOOL, query="pagemark", depth="L0")
-    reads = {hit["uid"]: hit["read"] for hit in result["hits"]}
-    assert result["total"] == result["returned"] == len(LEADS) == len(reads)
-    assert reads[bad_uid]["located"] is False
-    assert f"({error.__name__})" in reads[bad_uid]["locator_error"]
-    assert [uid for uid, read in reads.items() if "locator_error" in read] == [bad_uid]
+    hits = {hit["uid"]: hit for hit in result["hits"]}
+    assert result["total"] == result["returned"] == len(LEADS) == len(hits)
+    assert hits[bad_uid]["located"] is False
+    assert f"({error.__name__})" in hits[bad_uid]["locator_error"]
+    assert [uid for uid, hit in hits.items() if "locator_error" in hit] == [bad_uid]
+    assert not any({"located", "locator_error"} & set(hit["read"]) for hit in hits.values())
     assert SENTINEL not in json.dumps(result)
 
 
@@ -626,3 +641,63 @@ def test_a_database_failure_is_not_a_malformed_record_and_still_fails_the_call(m
     monkeypatch.setattr(library_mcp, "passage_handoff", broken)
     with pytest.raises(sqlite3.OperationalError):
         call(SEARCH_TOOL, query="pagemark", depth="L0")
+
+
+READ_PROPERTIES = {
+    item["name"]: set(item["inputSchema"]["properties"]) for item in library_mcp.tool_definitions()
+}
+
+
+def probe_records(alternates=SENTINEL) -> dict[str, Conversation]:
+    """One record per way a hit's passage is (or is not) located, all matching `readprobe`."""
+    return {
+        "located": synthetic(
+            "located", "Plain located", "opening words then readprobe in the body"
+        ),
+        "title_only": synthetic("title-only", "Readprobe in the title only", "body without it"),
+        "alternate": Conversation(
+            provider="chatgpt",
+            source_id="alternate",
+            title="Branch record",
+            messages=[Message(role="user", text="main branch words")],
+            extra={"alternate_messages": [{"role": "assistant", "text": "branch readprobe here"}]},
+        ),
+        "malformed": synthetic(
+            "malformed", "Readprobe malformed", "readprobe body", {"alternate_messages": alternates}
+        ),
+    }
+
+
+@pytest.mark.parametrize("mode", SEARCH_MODES)
+def test_every_hit_read_object_is_exactly_the_read_tools_arguments(mount, mode):
+    """`read` is documented as the arguments to pass to cce_library_read, so it must carry nothing
+    else: a located, title-only, alternate-branch or malformed-record hit alike (default, L0,
+    compact; a compact `r` is decoded with the full key table and gets its uid back first)."""
+    records = probe_records()
+    call = mount(*records.values())
+    result = call(SEARCH_TOOL, query="readprobe", **mode)
+    page = unpacked(result, mode.get("compact", False))
+    assert page["total"] == page["returned"] == len(records) and page["next_offset"] is None
+    uids = {name: record.uid for name, record in records.items()}
+    assert set(page["reads"]) == set(uids.values())
+    for name, uid in uids.items():
+        read = page["reads"][uid]
+        assert set(read) <= READ_PROPERTIES[READ_TOOL], (name, sorted(read))
+        if name == "malformed":
+            # The record's own shape is unreadable, so a read of it fails by design, and says so
+            # by naming the record; it is not refused as an unsupported argument.
+            with pytest.raises(ValueError, match=re.escape(uid)) as refused:
+                call(READ_TOOL, **read)
+            assert "unsupported" not in str(refused.value)
+            continue
+        passage = call(READ_TOOL, **read)
+        assert passage["uid"] == uid and passage["message"] == read["message"]
+        if name == "located":
+            assert "readprobe" in passage["text"]
+        if name == "alternate":
+            assert read["sequence"] == "alternate" and "readprobe" in passage["text"]
+    # What is not located is said on the hit, never inside `read`.
+    assert page["flags"][uids["located"]] == {} and page["flags"][uids["alternate"]] == {}
+    assert page["flags"][uids["title_only"]] == {"located": False}
+    flags = page["flags"][uids["malformed"]]
+    assert flags["located"] is False and flags["locator_error"]
