@@ -35,6 +35,7 @@ import os
 import re
 import types
 import unicodedata
+from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -45,7 +46,7 @@ from .archive_provenance import INJECTED_TAGS, classify_user_turn
 from .archive_read_library import FAMILIES
 from .attribution import ATTRIBUTION_SCHEMA, text_digest
 
-RULES_VERSION = "cce.attribution-rules@2"
+RULES_VERSION = "cce.attribution-rules@3"
 
 OWNER = "owner"
 AGENT = "agent"
@@ -1404,10 +1405,13 @@ def to_annotation(
 
 # --- the owner-review ledger and the precision gate ------------------------------------------
 
-LEDGER_SCHEMA = "cce.attribution-review-ledger.v2"
-# Rows of an earlier ledger version carry no stratum; they are read but never counted.
-LEGACY_LEDGER_SCHEMAS = frozenset({"cce.attribution-review-ledger.v1"})
-SAMPLE_SCHEMA = "cce.attribution-review-sample.v2"
+LEDGER_SCHEMA = "cce.attribution-review-ledger.v3"
+# Rows of an earlier ledger schema lack the sample binding; they are read but never counted.
+LEGACY_LEDGER_SCHEMAS = frozenset(
+    {"cce.attribution-review-ledger.v1", "cce.attribution-review-ledger.v2"}
+)
+SAMPLE_SCHEMA = "cce.attribution-review-sample.v3"
+SAMPLE_HEADER_SCHEMA = "cce.attribution-review-sample-header.v3"
 VERDICTS = ("yes", "no", "unsure")
 # A (rule, stratum) may be profile-eligible only when at least this many of its spans were
 # reviewed by the owner and at least this share of them (counting unsure and no as not confirmed)
@@ -1415,16 +1419,24 @@ VERDICTS = ("yes", "no", "unsure")
 GATE_MIN_REVIEWED = 100
 GATE_MIN_PRECISION_PERCENT = 95
 SAMPLE_PER_STRATUM = 100
-SAMPLE_SEED = "cce-attribution-review-v2"
+SAMPLE_SEED = "cce-attribution-review-v3"
 # A long span is shown to the owner as a bounded excerpt plus its exact length.
 EXCERPT_HEAD = 240
 EXCERPT_TAIL = 120
 
-_LEDGER_KEYS = frozenset(
-    {"schema", "rules_version", "span_id", "rule", "stratum", "verdict", "reviewer", "reviewed_at"}
+_LEGACY_V1_KEYS = frozenset(
+    {"schema", "rules_version", "span_id", "rule", "verdict", "reviewer", "reviewed_at"}
 )
-_LEGACY_LEDGER_KEYS = _LEDGER_KEYS - {"stratum"}
+_LEGACY_V2_KEYS = _LEGACY_V1_KEYS | {"stratum"}
+# What a row binds itself to: the sample it answers, the full text it saw (as a digest) and how
+# many rows that sample drew for its (rule, stratum).
+_LEDGER_KEYS = _LEGACY_V2_KEYS | {"sample_digest", "text_sha256", "drawn"}
+_LEGACY_KEYS_BY_SCHEMA = {
+    "cce.attribution-review-ledger.v1": _LEGACY_V1_KEYS,
+    "cce.attribution-review-ledger.v2": _LEGACY_V2_KEYS,
+}
 _SPAN_ID = re.compile(r"[0-9a-f]{32}")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
 UTC_STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
@@ -1440,7 +1452,7 @@ def validate_ledger_row(row: Any) -> dict[str, Any]:
     if not isinstance(row, dict):
         raise ValueError("ledger row must be an object")
     legacy = row.get("schema") in LEGACY_LEDGER_SCHEMAS
-    expected = _LEGACY_LEDGER_KEYS if legacy else _LEDGER_KEYS
+    expected = _LEGACY_KEYS_BY_SCHEMA[row["schema"]] if legacy else _LEDGER_KEYS
     if set(row) != expected:
         raise ValueError(f"ledger row keys must be exactly {sorted(expected)}")
     if row["schema"] != LEDGER_SCHEMA and not legacy:
@@ -1457,8 +1469,15 @@ def validate_ledger_row(row: Any) -> dict[str, Any]:
         or (version == RULES_VERSION and rule not in RULE_BY_ID)
     ):
         raise ValueError(f"ledger row names an unknown rule: {rule!r}")
-    if not legacy and row["stratum"] not in STRATA:
+    if "stratum" in expected and row["stratum"] not in STRATA:
         raise ValueError(f"ledger row stratum must be one of {list(STRATA)}")
+    if not legacy:
+        for key in ("sample_digest", "text_sha256"):
+            if not isinstance(row[key], str) or not _SHA256.fullmatch(row[key]):
+                raise ValueError(f"ledger row {key} must be 64 lowercase hexadecimal digits")
+        drawn = row["drawn"]
+        if isinstance(drawn, bool) or not isinstance(drawn, int) or drawn < 1:
+            raise ValueError("ledger row drawn must be a positive integer")
     if row["verdict"] not in VERDICTS:
         raise ValueError(f"ledger row verdict must be one of {list(VERDICTS)}")
     reviewer = row["reviewer"]
@@ -1484,9 +1503,14 @@ def ledger_row(
     reviewed_at: str,
     *,
     stratum: str,
+    sample_digest: str,
+    text_sha256: str,
+    drawn: int,
     rules_version: str = RULES_VERSION,
 ) -> dict[str, Any]:
-    """One owner verdict on one span. The time is a parameter: no clock is read here."""
+    """One owner verdict on one span of one sample. The time is a parameter: no clock is read
+    here. The row names the sample (`sample_digest`), the full text the owner saw
+    (`text_sha256`) and how many rows that sample drew for the span's rule and stratum."""
     return validate_ledger_row(
         {
             "schema": LEDGER_SCHEMA,
@@ -1497,6 +1521,9 @@ def ledger_row(
             "verdict": verdict,
             "reviewer": reviewer,
             "reviewed_at": reviewed_at,
+            "sample_digest": sample_digest,
+            "text_sha256": text_sha256,
+            "drawn": drawn,
         }
     )
 
@@ -1613,6 +1640,9 @@ class StratumReview:
     unsure: int
     precision: float | None
     eligible: bool
+    # Rows a recorded sample drew for this (rule, stratum) that the ledger has no row for; they
+    # are counted as reviewed and unsure (they are inside `unsure` and `reviewed`).
+    missing: int = 0
 
 
 @dataclass(frozen=True)
@@ -1628,6 +1658,10 @@ class ReviewSummary:
     orphan_rows: int = 0
     # Rows of one reviewer that name the same span as different rules or strata: not counted.
     quarantined_rows: int = 0
+    # Rows whose span exists in the scan but whose text is not the text the row answered.
+    text_mismatch_rows: int = 0
+    # Rows that recorded samples drew but the ledger lacks, counted as unsure in their stratum.
+    missing_rows: int = 0
     # Earlier answers to a span that a later row answered again (the last answer counts).
     superseded_rows: int = 0
     # The owner's counted verdict on each span (the last answer). A span the ledger names but
@@ -1642,7 +1676,7 @@ class ReviewSummary:
 def review_statistics(
     rows: Iterable[dict[str, Any]],
     *,
-    matched: Mapping[str, tuple[str, str]],
+    matched: Mapping[str, tuple[str, str, str]],
     owner: str | None,
     rules_version: str = RULES_VERSION,
 ) -> ReviewSummary:
@@ -1650,12 +1684,16 @@ def review_statistics(
 
     A row counts only when all of these hold: it is current (this `rules_version`, the current
     schema); its reviewer equals `owner` (None identifies nobody, so nothing counts); and its span
-    id exists in the scan (`matched` maps span id to (rule, stratum)) under the same rule and
-    stratum. A span counts once, by its last verdict in file order. `unsure` and `no` both count
-    as reviewed and not confirmed. The precision test is integer arithmetic.
+    exists in the scan (`matched` maps span id to (rule, stratum, text_sha256)) under the same rule
+    and stratum with the very text the row answered. A span counts once, by its last verdict in
+    file order. `unsure` and `no` both count as reviewed and not confirmed.
+
+    Precision is over the rows a sample drew, not over the rows that happen to be in the ledger:
+    every row carries the digest of its sample and how many rows that sample drew for its rule and
+    stratum, and a drawn row the ledger lacks counts as `unsure`. The test is integer arithmetic.
     """
     candidates: list[dict[str, Any]] = []
-    total = stale = non_owner = orphan = quarantined = superseded = 0
+    total = stale = non_owner = orphan = quarantined = superseded = mismatched = 0
     reviewers: dict[str, int] = {}
     for raw in rows:
         row = validate_ledger_row(raw)
@@ -1673,13 +1711,17 @@ def review_statistics(
     latest: dict[str, dict[str, Any]] = {}
     held_back: set[str] = set()
     for row in candidates:
+        fact = matched.get(row["span_id"])
         if len(kinds[row["span_id"]]) > 1:
             quarantined += 1
             held_back.add(row["span_id"])
-        elif matched.get(row["span_id"]) != (row["rule"], row["stratum"]):
+        elif fact is None or fact[:2] != (row["rule"], row["stratum"]):
             orphan += 1
-            if row["span_id"] in matched:
+            if fact is not None:
                 held_back.add(row["span_id"])  # the span exists, but this row misdescribes it
+        elif fact[2] != row["text_sha256"]:
+            mismatched += 1
+            held_back.add(row["span_id"])  # the span exists, but its text is not what was seen
         else:
             superseded += row["span_id"] in latest
             latest[row["span_id"]] = row
@@ -1690,9 +1732,21 @@ def review_statistics(
     }
     for row in latest.values():
         counts[(row["rule"], row["stratum"])][row["verdict"]] += 1
+    # A drawn row the ledger holds no row for is a row somebody did not answer: unsure.
+    drawn_rows: dict[tuple[str, str, str], tuple[int, set[str]]] = {}
+    for row in candidates:
+        key = (row["sample_digest"], row["rule"], row["stratum"])
+        drawn, present = drawn_rows.get(key, (0, set()))
+        present.add(row["span_id"])
+        drawn_rows[key] = (max(drawn, row["drawn"]), present)
+    missing: dict[tuple[str, str], int] = {}
+    for (_, rule_id, stratum), (drawn, present) in drawn_rows.items():
+        short = max(0, drawn - len(present))
+        missing[(rule_id, stratum)] = missing.get((rule_id, stratum), 0) + short
     reviews: dict[tuple[str, str], StratumReview] = {}
     for (rule_id, stratum), tally in counts.items():
-        reviewed = sum(tally.values())
+        absent = missing.get((rule_id, stratum), 0)
+        reviewed = sum(tally.values()) + absent
         confirmed = tally["yes"]
         reviews[(rule_id, stratum)] = StratumReview(
             rule=rule_id,
@@ -1700,10 +1754,11 @@ def review_statistics(
             reviewed=reviewed,
             confirmed=confirmed,
             rejected=tally["no"],
-            unsure=tally["unsure"],
+            unsure=tally["unsure"] + absent,
             precision=(confirmed / reviewed) if reviewed else None,
             eligible=reviewed >= GATE_MIN_REVIEWED
             and confirmed * 100 >= GATE_MIN_PRECISION_PERCENT * reviewed,
+            missing=absent,
         )
     verdicts = {span: row["verdict"] for span, row in latest.items()}
     for span in held_back - verdicts.keys():
@@ -1716,6 +1771,8 @@ def review_statistics(
         non_owner_reviewers=reviewers,
         orphan_rows=orphan,
         quarantined_rows=quarantined,
+        text_mismatch_rows=mismatched,
+        missing_rows=sum(missing.values()),
         superseded_rows=superseded,
         verdicts=verdicts,
     )
@@ -1743,8 +1800,12 @@ class ReviewSampler:
     One stratum per (rule, length stratum). Within it the sample is the `per_stratum` distinct
     span texts with the smallest seeded hash, so it does not depend on the order spans are
     offered. A span of up to 360 characters is shown whole; a longer one as a bounded excerpt with
-    its exact length, so the owner can judge the whole span. Rows show nothing about the record a
-    span came from.
+    its exact length, so the owner can judge the whole span; every row also carries the SHA-256 of
+    the span's full text. Rows show nothing about the record a span came from.
+
+    `exclude` keeps spans out that were already reviewed. A mapping from span id to
+    (rule, stratum, text_sha256) excludes a span only when it is exactly that reviewed span; a
+    plain collection of ids excludes those ids whatever they are.
     """
 
     def __init__(
@@ -1752,22 +1813,30 @@ class ReviewSampler:
         *,
         per_stratum: int = SAMPLE_PER_STRATUM,
         seed: str = SAMPLE_SEED,
-        exclude: Collection[str] = (),
+        exclude: Collection[str] | Mapping[str, tuple[str, str, str]] = (),
     ) -> None:
         if isinstance(per_stratum, bool) or not isinstance(per_stratum, int) or per_stratum < 1:
             raise ValueError("per_stratum must be a positive integer")
         self.per_stratum = per_stratum
         self.seed = seed
-        self.exclude = frozenset(exclude)
+        self.exclude: Mapping[str, tuple[str, str, str] | None] = (
+            dict(exclude) if isinstance(exclude, Mapping) else dict.fromkeys(exclude)
+        )
         self._heaps: dict[tuple[str, str], list[int]] = {}
-        self._members: dict[tuple[str, str], dict[int, tuple[str, int, str, bool]]] = {}
+        self._members: dict[tuple[str, str], dict[int, tuple[str, int, str, bool, str]]] = {}
+
+    def _already_reviewed(self, span: AttributedSpan, text: str) -> bool:
+        if span.span_id not in self.exclude:
+            return False
+        reviewed = self.exclude[span.span_id]
+        return reviewed is None or reviewed == (span.rule, span.stratum, text_digest(text))
 
     def offer(self, span: AttributedSpan, text: str) -> None:
         """Consider one span; `text` is exactly the span's own characters."""
         if span.rule not in RULE_BY_ID or span.author == UNKNOWN or blank_text(text):
             return
         identifier = span.span_id
-        if identifier in self.exclude:
+        if self._already_reviewed(span, text):
             return
         stratum = span.stratum
         normalized = " ".join(text.split())
@@ -1780,14 +1849,14 @@ class ReviewSampler:
         members = self._members.setdefault(slot, {})
         if key in members:
             if identifier < members[key][0]:
-                members[key] = (identifier, len(text), *review_excerpt(text))
+                members[key] = (identifier, len(text), *review_excerpt(text), text_digest(text))
         elif len(heap) < self.per_stratum:
             heapq.heappush(heap, -key)
-            members[key] = (identifier, len(text), *review_excerpt(text))
+            members[key] = (identifier, len(text), *review_excerpt(text), text_digest(text))
         elif key < -heap[0]:
             evicted = -heapq.heapreplace(heap, -key)
             del members[evicted]
-            members[key] = (identifier, len(text), *review_excerpt(text))
+            members[key] = (identifier, len(text), *review_excerpt(text), text_digest(text))
 
     def rows(self, *, partial: bool = False) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -1795,7 +1864,7 @@ class ReviewSampler:
             for stratum in STRATA:
                 members = self._members.get((rule.id, stratum), {})
                 for key in sorted(members):
-                    identifier, length, text, excerpted = members[key]
+                    identifier, length, text, excerpted, full_digest = members[key]
                     result.append(
                         {
                             "schema": SAMPLE_SCHEMA,
@@ -1808,8 +1877,190 @@ class ReviewSampler:
                             "length": length,
                             "excerpted": excerpted,
                             "text": text,
+                            "text_sha256": full_digest,
                             "verdict": None,
                             "partial": partial,
                         }
                     )
         return result
+
+
+# --- the sample document: a header that binds the rows --------------------------------------
+
+_SAMPLE_ROW_KEYS = frozenset(
+    {
+        "schema",
+        "rules_version",
+        "span_id",
+        "rule",
+        "stratum",
+        "claim",
+        "rule_description",
+        "length",
+        "excerpted",
+        "text",
+        "text_sha256",
+        "verdict",
+        "partial",
+    }
+)
+_SAMPLE_HEADER_KEYS = frozenset(
+    {
+        "schema",
+        "rules_version",
+        "rows",
+        "sample_digest",
+        "library",
+        "owner_id",
+        "seed",
+        "per_stratum",
+        "partial",
+        "drawn",
+    }
+)
+
+
+def load_json_line(line: str, label: str, number: int) -> Any:
+    """One JSON value of a JSONL file; text nested too deeply to parse is refused like any other
+    unreadable line instead of escaping as a crash."""
+    try:
+        return json.loads(line)
+    except RecursionError:
+        raise ValueError(f"{label} line {number}: unreadable (nested too deeply)") from None
+    except ValueError as error:
+        raise ValueError(f"{label} line {number}: not JSON") from error
+
+
+def sample_digest(rows: Sequence[Mapping[str, Any]]) -> str:
+    """SHA-256 over the canonical form of the sample's rows, answers left out (`verdict`)."""
+    stripped = [{key: value for key, value in row.items() if key != "verdict"} for row in rows]
+    canonical = json.dumps(stripped, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def drawn_counts(rows: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+    """How many rows a sample drew for each `rule:stratum`."""
+    counts = Counter(f"{row['rule']}:{row['stratum']}" for row in rows)
+    return dict(sorted(counts.items()))
+
+
+def sample_header(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    library: str,
+    owner_id: str,
+    seed: str,
+    per_stratum: int,
+    partial: bool,
+) -> dict[str, Any]:
+    """The first line of a sample file: it counts and digests the rows and names the library
+    (its fingerprint) and the owner the sample was drawn for."""
+    return {
+        "schema": SAMPLE_HEADER_SCHEMA,
+        "rules_version": RULES_VERSION,
+        "rows": len(rows),
+        "sample_digest": sample_digest(rows),
+        "library": library,
+        "owner_id": owner_id,
+        "seed": seed,
+        "per_stratum": per_stratum,
+        "partial": partial,
+        "drawn": drawn_counts(rows),
+    }
+
+
+def sample_text(header: Mapping[str, Any], rows: Iterable[Mapping[str, Any]]) -> str:
+    """The sample as JSONL: the header, then one row per line."""
+    return "".join(
+        json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in (header, *rows)
+    )
+
+
+@dataclass(frozen=True)
+class ReviewSample:
+    """A review-sample file that passed every integrity check."""
+
+    header: dict[str, Any]
+    rows: list[dict[str, Any]]
+
+
+def _stale_sample(what: str) -> ValueError:
+    return ValueError(
+        f"sample {what}: drawn under another rules version or schema than the current "
+        f"{RULES_VERSION}; draw a new sample"
+    )
+
+
+def _check_sample_row(row: Any, number: int) -> dict[str, Any]:
+    if not isinstance(row, dict) or row.get("schema") != SAMPLE_SCHEMA:
+        raise _stale_sample(f"line {number}")
+    if set(row) != _SAMPLE_ROW_KEYS:
+        raise ValueError(
+            f"sample line {number}: row keys must be exactly {sorted(_SAMPLE_ROW_KEYS)}"
+        )
+    if row["rules_version"] != RULES_VERSION:
+        raise _stale_sample(f"line {number}")
+    problems = []
+    if not isinstance(row["span_id"], str) or not _SPAN_ID.fullmatch(row["span_id"]):
+        problems.append("span_id")
+    if row["rule"] not in RULE_BY_ID or row["claim"] != RULE_BY_ID[row["rule"]].author:
+        problems.append("rule")
+    if row["stratum"] not in STRATA:
+        problems.append("stratum")
+    if not isinstance(row["text_sha256"], str) or not _SHA256.fullmatch(row["text_sha256"]):
+        problems.append("text_sha256")
+    if not isinstance(row["text"], str) or not row["text"]:
+        problems.append("text")
+    length = row["length"]
+    if isinstance(length, bool) or not isinstance(length, int) or length < 1:
+        problems.append("length")
+    if not isinstance(row["excerpted"], bool) or not isinstance(row["partial"], bool):
+        problems.append("excerpted/partial")
+    if problems:
+        raise ValueError(f"sample line {number}: bad {', '.join(problems)}")
+    if not row["excerpted"] and (
+        row["length"] != len(row["text"]) or text_digest(row["text"]) != row["text_sha256"]
+    ):
+        raise ValueError(f"sample line {number}: the text does not match its length and hash")
+    if row["excerpted"] and row["length"] <= EXCERPT_HEAD + EXCERPT_TAIL:
+        raise ValueError(f"sample line {number}: an excerpt of a span that short")
+    return row
+
+
+def parse_sample(lines: Iterable[str]) -> ReviewSample:
+    """Read a review-sample file and refuse it unless it is exactly what `ReviewSampler` drew:
+    a header whose digest, row count and per-stratum counts match the rows, rows of the current
+    schema and rules version with the hash of the full text each shows, and no repeated span.
+    A tampered or hand-written sample (which cannot have a valid header) is refused."""
+    numbered = [(number, line) for number, line in enumerate(lines, start=1) if line.strip()]
+    if not numbered:
+        raise ValueError("sample is empty: it has no header")
+    first_number, first_line = numbered[0]
+    header = load_json_line(first_line, "sample", first_number)
+    if not isinstance(header, dict) or header.get("schema") != SAMPLE_HEADER_SCHEMA:
+        raise _stale_sample("has no header")
+    if set(header) != _SAMPLE_HEADER_KEYS:
+        raise ValueError(f"sample header keys must be exactly {sorted(_SAMPLE_HEADER_KEYS)}")
+    if header["rules_version"] != RULES_VERSION:
+        raise _stale_sample("header")
+    rows = [
+        _check_sample_row(load_json_line(line, "sample", number), number)
+        for number, line in numbered[1:]
+    ]
+    problems = []
+    if header["rows"] != len(rows):
+        problems.append(f"the header counts {header['rows']} rows but the file holds {len(rows)}")
+    if len({row["span_id"] for row in rows}) != len(rows):
+        problems.append("a span appears twice")
+    if header["sample_digest"] != sample_digest(rows):
+        problems.append("the rows do not match the header's digest")
+    if header["drawn"] != drawn_counts(rows):
+        problems.append("the per-stratum counts do not match the rows")
+    if header["partial"] is not all(row["partial"] for row in rows) and rows:
+        problems.append("the partial flags disagree")
+    for key in ("library", "owner_id"):
+        if not isinstance(header[key], str) or not header[key].strip():
+            problems.append(f"the header needs a {key}")
+    if problems:
+        raise ValueError(f"sample was altered or is not a sample: {'; '.join(problems)}")
+    return ReviewSample(header=dict(header), rows=rows)

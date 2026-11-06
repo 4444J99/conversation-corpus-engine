@@ -21,6 +21,7 @@ precision, and the ledger is only ever read here (`review-record` appends to it)
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -42,10 +43,10 @@ from .attribution_rules import (
     DEFAULT_REPEAT_MIN_OCCURRENCES,
     GATE_MIN_PRECISION_PERCENT,
     GATE_MIN_REVIEWED,
+    LEDGER_SCHEMA,
     RULES,
     RULES_VERSION,
     SAMPLE_PER_STRATUM,
-    SAMPLE_SCHEMA,
     SAMPLE_SEED,
     STRATA,
     UNATTRIBUTED,
@@ -55,6 +56,7 @@ from .attribution_rules import (
     AttributedSpan,
     RecordInfo,
     RepeatCensus,
+    ReviewSample,
     ReviewSampler,
     ReviewSummary,
     append_ledger,
@@ -62,10 +64,14 @@ from .attribution_rules import (
     blank_text,
     eligible_strata,
     ledger_row,
+    load_json_line,
+    parse_sample,
     partition_problems,
     read_ledger,
     record_info,
     review_statistics,
+    sample_header,
+    sample_text,
     stratum_of,
     to_annotation,
     utc_stamp,
@@ -409,6 +415,8 @@ def build_report(
             "ledger_rows": summary.rows,
             "stale_rows": summary.stale_rows,
             "orphan_rows": summary.orphan_rows,
+            "text_mismatch_rows": summary.text_mismatch_rows,
+            "missing_rows": summary.missing_rows,
             "non_owner_rows": summary.non_owner_rows,
             "non_owner_reviewers": dict(sorted(summary.non_owner_reviewers.items())),
             "quarantined_rows": summary.quarantined_rows + malformed,
@@ -609,6 +617,12 @@ def check_ledger_path(path: Path, roots: list[Path]) -> Path:
     ledger = _refuse_store(path, roots)
     require_git_private(ledger.parent)
     return ledger
+
+
+def _stratum_of_evidence(span: dict[str, Any]) -> tuple[str, str]:
+    """The (rule, stratum) an annotation entry names in its evidence."""
+    rule = span["evidence"][0].split(":rule:")[1]
+    return rule, span["evidence"][1].split(":")[1]
 
 
 def message_entry(
@@ -829,16 +843,21 @@ def _ledger_view(args: argparse.Namespace) -> LedgerView:
 
 
 class MatchRecorder:
-    """Notes which ledger span ids exist in the scan, and under which rule and stratum."""
+    """Notes which ledger span ids exist in the scan, under which rule and stratum and with which
+    exact text (the SHA-256 of the span's characters)."""
 
     def __init__(self, wanted: set[str]) -> None:
         self.wanted = wanted
-        self.matched: dict[str, tuple[str, str]] = {}
+        self.matched: dict[str, tuple[str, str, str]] = {}
 
     def visit(self, message: ScannedMessage, spans: list[AttributedSpan]) -> None:
         for span in spans:
             if span.span_id in self.wanted:
-                self.matched[span.span_id] = (span.rule, span.stratum)
+                self.matched[span.span_id] = (
+                    span.rule,
+                    span.stratum,
+                    text_digest(message.text[span.start : span.end]),
+                )
 
 
 def _owner(args: argparse.Namespace) -> str | None:
@@ -932,7 +951,11 @@ def _apply(args: argparse.Namespace) -> int:
             for span in entry["attribution"]["spans"]:
                 counts[f"{span['author']}_spans"] += 1
                 counts["profile_eligible_spans"] += bool(span["profile_eligible"])
-                counts["spans_withheld_by_verdict"] += span.get("owner_verdict") in ("no", "unsure")
+                counts["spans_withheld_by_verdict"] += (
+                    span["author"] == "owner"
+                    and span.get("owner_verdict") in ("no", "unsure")
+                    and _stratum_of_evidence(span) in eligible
+                )
 
         try:
             stats, tally = scan(
@@ -964,6 +987,8 @@ def _apply(args: argparse.Namespace) -> int:
         "ledger_rows": summary.rows,
         "stale_rows": summary.stale_rows,
         "orphan_rows": summary.orphan_rows,
+        "text_mismatch_rows": summary.text_mismatch_rows,
+        "missing_rows": summary.missing_rows,
         "non_owner_rows": summary.non_owner_rows,
         "quarantined_rows": summary.quarantined_rows + view.malformed,
         "superseded_rows": summary.superseded_rows,
@@ -983,13 +1008,42 @@ def _apply(args: argparse.Namespace) -> int:
     return 0
 
 
+def library_fingerprint(library: Library) -> str:
+    """Names the exact library a sample was drawn from: a digest of every record's uid, current
+    version and current revision digest (the whole library, whatever slice was scanned)."""
+    digest = hashlib.sha256()
+    for row in library.rows():
+        digest.update(f"{row['uid']}\t{row['current_version']}\t{row['current_digest']}\n".encode())
+    return digest.hexdigest()
+
+
+def _reviewed_by_owner(view: LedgerView, owner: str) -> dict[str, tuple[str, str, str]]:
+    """The spans the owner already reviewed: only current rows of the owner's own identity count
+    (a row of another reviewer, or of another rules version or schema, hides nothing)."""
+    return {
+        row["span_id"]: (row["rule"], row["stratum"], row["text_sha256"])
+        for row in view.rows
+        if row["rules_version"] == RULES_VERSION
+        and row["schema"] == LEDGER_SCHEMA
+        and row["reviewer"] == owner
+    }
+
+
 def _review_sample(args: argparse.Namespace) -> int:
-    exclude = _ledger_view(args).wanted
+    owner = _owner(args)
+    if owner is None:
+        raise ValueError(
+            "review-sample needs --owner-id: a sample is drawn for one owner, and only that "
+            "owner's reviews count toward the gate"
+        )
+    view = _ledger_view(args)
+    exclude = _reviewed_by_owner(view, owner)
     deadline = Deadline(args.deadline_seconds)
     library, database = _open_target(args)
     sampler = ReviewSampler(per_stratum=args.per_stratum, seed=args.seed, exclude=exclude)
     with library:
         out = check_output(args.out, library_roots(args, database)) if args.out else None
+        fingerprint = library_fingerprint(library)
         census = _census(library, args, deadline)
         stats, _ = scan(
             library,
@@ -1002,11 +1056,20 @@ def _review_sample(args: argparse.Namespace) -> int:
         )
     partial = not stats.complete
     rows = sampler.rows(partial=partial)
-    payload = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows)
+    header = sample_header(
+        rows,
+        library=fingerprint,
+        owner_id=owner,
+        seed=args.seed,
+        per_stratum=args.per_stratum,
+        partial=partial,
+    )
+    payload = sample_text(header, rows)
     summary = {
         "rules_version": RULES_VERSION,
         "sampled": len(rows),
-        "per_stratum": dict(Counter(f"{row['rule']}:{row['stratum']}" for row in rows)),
+        "sample_digest": header["sample_digest"],
+        "per_stratum": header["drawn"],
         "complete": stats.complete,
         "partial": partial,
     }
@@ -1032,93 +1095,100 @@ def _review_sample(args: argparse.Namespace) -> int:
     return 0
 
 
-def _load_sample(path: Path) -> dict[str, dict[str, Any]]:
-    """The rows of a review-sample file by span id; a malformed sample is refused."""
-    rows: dict[str, dict[str, Any]] = {}
+def _answers(path: Path, sample: ReviewSample) -> dict[str, str | None]:
+    """The owner's answers by span id: each must name a row of the sample (its rule, stratum,
+    rules version and, when echoed, its text hash must agree) and carry a verdict or none."""
+    by_id = {row["span_id"]: row for row in sample.rows}
+    answers: dict[str, str | None] = {}
     for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), start=1):
         if not line.strip():
             continue
-        try:
-            row = json.loads(line)
-        except ValueError as error:
-            raise ValueError(f"sample line {number}: not JSON") from error
-        if (
-            not isinstance(row, dict)
-            or row.get("schema") != SAMPLE_SCHEMA
-            or not all(
-                isinstance(row.get(key), str) and row[key]
-                for key in ("span_id", "rule", "stratum", "rules_version")
-            )
-        ):
-            raise ValueError(f"sample line {number}: not a {SAMPLE_SCHEMA} row")
-        if row["rules_version"] != RULES_VERSION:
-            raise ValueError(
-                f"sample line {number}: drawn under rules version {row['rules_version']}, "
-                f"not the current {RULES_VERSION}; draw a new sample"
-            )
-        rows.setdefault(row["span_id"], row)
-    return rows
-
-
-def _review_record(args: argparse.Namespace) -> int:
-    # The one place a clock is read, at the command boundary; the ledger helpers take the time.
-    reviewed_at = args.reviewed_at or utc_stamp(datetime.now(UTC))
-    ledger = check_ledger_path(args.ledger, library_roots(args, _database_path(args)))
-    sample = _load_sample(args.sample)
-    rows: list[dict[str, Any]] = []
-    skipped = 0
-    for number, line in enumerate(args.answers.read_text(encoding="utf-8").split("\n"), start=1):
-        if not line.strip():
-            continue
-        try:
-            answer = json.loads(line)
-        except ValueError as error:
-            raise ValueError(f"answers line {number}: not JSON") from error
+        answer = load_json_line(line, "answers", number)
         if not isinstance(answer, dict):
             raise ValueError(f"answers line {number}: must be an object")
-        verdict = answer.get("verdict")
-        if verdict in (None, ""):
-            skipped += 1
-            continue
-        verdict = str(verdict).strip().lower()
-        if verdict not in VERDICTS:
-            raise ValueError(f"answers line {number}: verdict must be one of {list(VERDICTS)}")
-        bound = sample.get(str(answer.get("span_id")))
+        bound = by_id.get(str(answer.get("span_id")))
         if (
             bound is None
             or answer.get("rule") != bound["rule"]
             or answer.get("stratum") != bound["stratum"]
             or answer.get("rules_version", bound["rules_version"]) != bound["rules_version"]
+            or answer.get("text_sha256", bound["text_sha256"]) != bound["text_sha256"]
         ):
             raise ValueError(
                 f"answers line {number}: the span id, rule and stratum are not those of a row "
                 "of the sample"
             )
-        try:
-            rows.append(
-                ledger_row(
-                    bound["span_id"],
-                    bound["rule"],
-                    verdict,
-                    args.reviewer,
-                    reviewed_at,
-                    stratum=bound["stratum"],
-                    rules_version=bound["rules_version"],
-                )
+        if bound["span_id"] in answers:
+            raise ValueError(f"answers line {number}: the span is answered twice")
+        verdict = answer.get("verdict")
+        if verdict in (None, ""):
+            answers[bound["span_id"]] = None
+            continue
+        verdict = str(verdict).strip().lower()
+        if verdict not in VERDICTS:
+            raise ValueError(
+                f"answers line {number}: verdict must be one of {list(VERDICTS)} "
+                "(there is no skip: leave a row blank and it is recorded as unsure)"
             )
-        except ValueError as error:
-            raise ValueError(f"answers line {number}: {error}") from error
+        answers[bound["span_id"]] = verdict
+    return answers
+
+
+def _review_record(args: argparse.Namespace) -> int:
+    # The one place a clock is read, at the command boundary; the ledger helpers take the time.
+    reviewed_at = args.reviewed_at or utc_stamp(datetime.now(UTC))
+    reviewer = args.reviewer
+    database = _database_path(args)
+    ledger = check_ledger_path(args.ledger, library_roots(args, database))
+    sample = parse_sample(args.sample.read_text(encoding="utf-8").split("\n"))
+    header = sample.header
+    if reviewer != header["owner_id"]:
+        raise ValueError(
+            "this sample was drawn for another owner identity; only that owner can record it"
+        )
+    with Library(database) as library:
+        if library_fingerprint(library) != header["library"]:
+            raise ValueError(
+                "this sample was drawn from a different library than the one named here; "
+                "draw a new sample"
+            )
+    answers = _answers(args.answers, sample)
+    # Every row the sample drew is accounted for: a row without a verdict is unsure.
+    rows: list[dict[str, Any]] = []
+    unanswered = 0
+    for row in sample.rows:
+        verdict = answers.get(row["span_id"])
+        unanswered += verdict is None
+        rows.append(
+            ledger_row(
+                row["span_id"],
+                row["rule"],
+                verdict or "unsure",
+                reviewer,
+                reviewed_at,
+                stratum=row["stratum"],
+                sample_digest=header["sample_digest"],
+                text_sha256=row["text_sha256"],
+                drawn=header["drawn"][f"{row['rule']}:{row['stratum']}"],
+                rules_version=row["rules_version"],
+            )
+        )
     private_directories(ledger.parent)
     appended = append_ledger(ledger, rows)
     counts = Counter(f"{row['rule']}:{row['stratum']}" for row in rows)
     result = {
         "ledger": str(args.ledger),
         "appended": appended,
-        "unanswered": skipped,
+        "unanswered": unanswered,
+        "recorded_as_unsure": unanswered,
+        "sample_digest": header["sample_digest"],
         "strata": {key: {"appended": count} for key, count in sorted(counts.items())},
     }
     _emit(
-        result, f"appended {appended} verdicts to {args.ledger} ({skipped} unanswered)", args.json
+        result,
+        f"appended {appended} verdicts to {args.ledger} "
+        f"({unanswered} unanswered, recorded as unsure)",
+        args.json,
     )
     return 0
 

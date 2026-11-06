@@ -36,8 +36,13 @@ from conversation_corpus_engine.attribution_commands import (
 )
 from conversation_corpus_engine.attribution_rules import (
     RULES,
+    RULES_VERSION,
+    SAMPLE_SCHEMA,
     append_ledger,
+    drawn_counts,
     ledger_row,
+    sample_digest,
+    sample_text,
 )
 from conversation_corpus_engine.cli import build_parser, main
 from conversation_corpus_engine.library_store import Library
@@ -54,6 +59,7 @@ SAMPLE_KEYS = {
     "length",
     "excerpted",
     "text",
+    "text_sha256",
     "verdict",
     "partial",
 }
@@ -146,6 +152,8 @@ def test_report_has_no_eligible_rule_without_a_ledger(
         "ledger_rows": 0,
         "stale_rows": 0,
         "orphan_rows": 0,
+        "text_mismatch_rows": 0,
+        "missing_rows": 0,
         "non_owner_rows": 0,
         "non_owner_reviewers": {},
         "quarantined_rows": 0,
@@ -229,7 +237,12 @@ def test_the_library_is_never_modified(
     report_of(capsys, library_path)
     assert run_cli(capsys, "apply", "--library", library_path, "--out", tmp_path / "a.json")[0] == 0
     sample = tmp_path / "sample.jsonl"
-    assert run_cli(capsys, "review-sample", "--library", library_path, "--out", sample)[0] == 0
+    assert (
+        run_cli(
+            capsys, "review-sample", "--owner-id", "rob", "--library", library_path, "--out", sample
+        )[0]
+        == 0
+    )
     assert fingerprint(library_path.parent) == before
 
 
@@ -441,7 +454,7 @@ def test_apply_without_an_owner_id_never_marks_a_span_eligible(
     _, result = apply_entries(capsys, library_path, tmp_path / "a.json", "--ledger", ledger)
     assert result["eligible_strata"] == []
     assert result["profile_eligible_spans"] == 0
-    assert result["non_owner_rows"] == 100
+    assert result["non_owner_rows"] == result["ledger_rows"] > 100
 
 
 def test_fabricated_ledger_rows_count_for_nothing_in_report_and_apply(
@@ -452,7 +465,17 @@ def test_fabricated_ledger_rows_count_for_nothing_in_report_and_apply(
     append_ledger(
         forged,
         [
-            ledger_row(f"{index:032x}", "typed_prefix", "yes", "rob", STAMP, stratum="S")
+            ledger_row(
+                f"{index:032x}",
+                "typed_prefix",
+                "yes",
+                "rob",
+                STAMP,
+                stratum="S",
+                sample_digest="a" * 64,
+                text_sha256="b" * 64,
+                drawn=100,
+            )
             for index in range(100)
         ],
     )
@@ -476,8 +499,9 @@ def test_rows_from_a_non_owner_reviewer_are_listed_and_never_counted(
     ledger = approve(capsys, library_path, tmp_path, reviewer="agent:codex")
     report = report_of(capsys, library_path, "--ledger", ledger, "--owner-id", "rob")
     gate_info = report["gate"]
-    assert gate_info["non_owner_rows"] == 100 and gate_info["orphan_rows"] == 0
-    assert gate_info["non_owner_reviewers"] == {"agent:codex": 100}
+    assert gate_info["non_owner_rows"] == gate_info["ledger_rows"] > 100
+    assert gate_info["orphan_rows"] == 0
+    assert gate_info["non_owner_reviewers"] == {"agent:codex": gate_info["ledger_rows"]}
     assert report["profile_eligible"] == []
     owner_report = report_of(capsys, library_path, "--ledger", ledger, "--owner-id", "agent:codex")
     assert owner_report["profile_eligible"] == ["typed_prefix:S"]
@@ -494,9 +518,20 @@ def test_editing_the_text_of_a_message_orphans_every_review_of_it(
     report = report_of(capsys, edited, "--ledger", ledger, "--owner-id", "rob")
     assert report["profile_eligible"] == []
     # Only the fixture messages whose text did not change keep their reviews.
-    row = next(item for item in report["rules"] if item["rule"] == "typed_prefix")
+    counted = sum(item["reviewed"] for row in report["rules"] for item in row["strata"].values())
     assert report["gate"]["orphan_rows"] >= 80
-    assert row["strata"]["S"]["reviewed"] + report["gate"]["orphan_rows"] == 100
+    assert counted + report["gate"]["orphan_rows"] == report["gate"]["ledger_rows"]
+
+
+def forge_sample(source: Path, target: Path, rows: list[dict]) -> None:
+    """A sample file with its own consistent header (what a careful forger would write)."""
+    header = {
+        **sample_header(source),
+        "rows": len(rows),
+        "sample_digest": sample_digest(rows),
+        "drawn": drawn_counts(rows),
+    }
+    target.write_text(sample_text(header, rows), encoding="utf-8")
 
 
 def test_a_conflicting_answer_is_refused_and_cannot_brick_the_ledger(
@@ -504,18 +539,17 @@ def test_a_conflicting_answer_is_refused_and_cannot_brick_the_ledger(
 ) -> None:
     library = build_library(tmp_path / "store" / "g", typed_records=3)
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
-    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
     real = next(row for row in sample_rows(sample) if row["rule"] == "typed_prefix")
     answers.write_text(json.dumps({**real, "verdict": "yes"}) + "\n", encoding="utf-8")
     assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
     before = ledger.read_bytes()
 
-    # A second sample file that names the same span as another rule (a forged or edited one).
+    # A second sample, internally consistent, that names the same span as another rule.
     forged_sample = tmp_path / "forged-sample.jsonl"
-    forged_sample.write_text(json.dumps({**real, "rule": "note_owner"}) + "\n", encoding="utf-8")
-    answers.write_text(
-        json.dumps({**real, "rule": "note_owner", "verdict": "yes"}) + "\n", encoding="utf-8"
-    )
+    forged_row = {**real, "rule": "note_owner", "claim": "owner", "verdict": None}
+    forge_sample(sample, forged_sample, [forged_row])
+    answers.write_text(json.dumps({**forged_row, "verdict": "yes"}) + "\n", encoding="utf-8")
     code, _, err = record_answers(capsys, library, ledger, forged_sample, answers)
     assert code == 2 and "conflict" in err and "nothing was written" in err
     assert ledger.read_bytes() == before
@@ -523,7 +557,9 @@ def test_a_conflicting_answer_is_refused_and_cannot_brick_the_ledger(
     answers.write_text(json.dumps({**real, "verdict": "no"}) + "\n", encoding="utf-8")
     assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
     report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
-    assert report["gate"]["superseded_rows"] == 1 and report["gate"]["quarantined_rows"] == 0
+    # Recording the sample again re-answers every row of it; the last answer counts.
+    assert report["gate"]["superseded_rows"] == len(sample_rows(sample))
+    assert report["gate"]["quarantined_rows"] == 0
 
 
 def test_a_hand_damaged_ledger_is_reported_not_fatal(
@@ -531,7 +567,11 @@ def test_a_hand_damaged_ledger_is_reported_not_fatal(
 ) -> None:
     library = build_library(tmp_path / "store" / "g", typed_records=110)
     ledger = approve(capsys, library, tmp_path)
-    first = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
+    first = next(
+        row
+        for row in map(json.loads, ledger.read_text(encoding="utf-8").splitlines())
+        if (row["rule"], row["stratum"]) == ("typed_prefix", "S")
+    )
     clash = {**first, "rule": "note_owner"}
     with ledger.open("a", encoding="utf-8") as handle:
         handle.write("{truncated\n" + json.dumps(clash) + "\n")
@@ -625,8 +665,19 @@ def test_apply_limit_records_flags_the_slice(
 # --- review sample, record and the gate ------------------------------------------------------
 
 
-def sample_rows(path: Path) -> list[dict]:
+def sample_lines(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def sample_header(path: Path) -> dict:
+    header, *_ = sample_lines(path)
+    assert header["schema"] == "cce.attribution-review-sample-header.v3"
+    return header
+
+
+def sample_rows(path: Path) -> list[dict]:
+    """The rows of a sample (or of an answers file): everything after the header, if any."""
+    return [row for row in sample_lines(path) if row["schema"] == SAMPLE_SCHEMA]
 
 
 def test_review_sample_is_deterministic_bounded_and_shows_only_the_span_and_its_rule(
@@ -634,8 +685,18 @@ def test_review_sample_is_deterministic_bounded_and_shows_only_the_span_and_its_
 ) -> None:
     library = build_library(tmp_path / "store" / "g", typed_records=130)
     first, second = tmp_path / "s1.jsonl", tmp_path / "s2.jsonl"
-    assert run_cli(capsys, "review-sample", "--library", library, "--out", first)[0] == 0
-    assert run_cli(capsys, "review-sample", "--library", library, "--out", second)[0] == 0
+    assert (
+        run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", first)[
+            0
+        ]
+        == 0
+    )
+    assert (
+        run_cli(
+            capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", second
+        )[0]
+        == 0
+    )
     assert first.read_bytes() == second.read_bytes()
     rows = sample_rows(first)
     per_stratum = Counter((row["rule"], row["stratum"]) for row in rows)
@@ -646,24 +707,51 @@ def test_review_sample_is_deterministic_bounded_and_shows_only_the_span_and_its_
     blob = first.read_text(encoding="utf-8")
     assert "chatgpt-" not in blob and "claudecode" not in blob and "owner-chat" not in blob
     few = tmp_path / "few.jsonl"
-    run_cli(capsys, "review-sample", "--library", library, "--out", few, "--per-rule", "4")
+    run_cli(
+        capsys,
+        "review-sample",
+        "--owner-id",
+        "rob",
+        "--library",
+        library,
+        "--out",
+        few,
+        "--per-rule",
+        "4",
+    )
     assert max(Counter((r["rule"], r["stratum"]) for r in sample_rows(few)).values()) == 4
     also = tmp_path / "also.jsonl"
-    run_cli(capsys, "review-sample", "--library", library, "--out", also, "--per-stratum", "4")
+    run_cli(
+        capsys,
+        "review-sample",
+        "--owner-id",
+        "rob",
+        "--library",
+        library,
+        "--out",
+        also,
+        "--per-stratum",
+        "4",
+    )
     assert also.read_bytes() == few.read_bytes()
 
 
 def test_review_sample_streams_to_standard_output_and_reports_the_short_span_bias(
     library_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    code, out, err = run_cli(capsys, "review-sample", "--library", library_path)
+    code, out, err = run_cli(
+        capsys, "review-sample", "--owner-id", "rob", "--library", library_path
+    )
     assert code == 0
     assert all(json.loads(line)["schema"] for line in out.splitlines())
+    header, *body = map(json.loads, out.splitlines())
+    assert header["schema"] == "cce.attribution-review-sample-header.v3"
     summary = json.loads(err.strip().splitlines()[-1])
-    assert summary["sampled"] == len(out.splitlines())
+    assert summary["sampled"] == len(body) == header["rows"]
+    assert summary["sample_digest"] == header["sample_digest"] and header["owner_id"] == "rob"
     strata = {key.split(":")[1] for key in summary["per_stratum"]}
     assert strata == {"S", "M"}
-    medium = [row for row in map(json.loads, out.splitlines()) if row["stratum"] == "M"]
+    medium = [row for row in body if row["stratum"] == "M"]
     assert medium and all(240 < row["length"] <= 2000 for row in medium)
     assert all(row["excerpted"] is (row["length"] > 360) for row in medium)
 
@@ -717,7 +805,10 @@ def approve(
 ) -> Path:
     """Sample, answer the short typed_prefix rows and record them: a ledger of real reviews."""
     sample, answers, ledger = (tmp_path / f"{name}-{kind}.jsonl" for kind in ("s", "a", "l"))
-    assert run_cli(capsys, "review-sample", "--library", library, "--out", sample)[0] == 0
+    drawn = run_cli(
+        capsys, "review-sample", "--owner-id", reviewer, "--library", library, "--out", sample
+    )
+    assert drawn[0] == 0
     answered(sample, answers, yes)
     code, _, err = record_answers(capsys, library, ledger, sample, answers, reviewer=reviewer)
     assert code == 0, err
@@ -730,12 +821,15 @@ def test_sampling_answering_and_reporting_close_the_gate_loop(
 ) -> None:
     library = build_library(tmp_path / "store" / "g", typed_records=130)
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
-    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
     answered(sample, answers, yes)
     code, out, err = record_answers(capsys, library, ledger, sample, answers, "--json")
     assert code == 0, err
     recorded = json.loads(out)
-    assert recorded["appended"] == 100 and recorded["unanswered"] > 0
+    drawn = sample_rows(sample)
+    # Every row the sample drew is recorded; the ones nobody answered are recorded as unsure.
+    assert recorded["appended"] == len(drawn) > 100
+    assert recorded["unanswered"] == len(drawn) - 100 > 0
     assert recorded["strata"]["typed_prefix:S"]["appended"] == 100
     report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
     row = next(item for item in report["rules"] if item["rule"] == "typed_prefix")
@@ -743,16 +837,27 @@ def test_sampling_answering_and_reporting_close_the_gate_loop(
     assert (short["reviewed"], short["confirmed"], short["eligible"]) == (100, yes, eligible)
     assert not row["strata"]["M"]["eligible"] and not row["strata"]["L"]["eligible"]
     assert report["profile_eligible"] == (["typed_prefix:S"] if eligible else [])
-    assert report["gate"]["ledger_rows"] == 100
+    assert report["gate"]["ledger_rows"] == len(drawn)
     assert (report["gate"]["orphan_rows"], report["gate"]["non_owner_rows"]) == (0, 0)
     _, result = apply_entries(
         capsys, library, tmp_path / "out.json", "--ledger", ledger, "--owner-id", "rob"
     )
     assert (result["profile_eligible_spans"] > 0) is eligible
     again = tmp_path / "again.jsonl"
-    run_cli(capsys, "review-sample", "--library", library, "--ledger", ledger, "--out", again)
-    reviewed = {row["span_id"] for row in sample_rows(answers) if row["verdict"]}
-    assert len(reviewed) == 100
+    run_cli(
+        capsys,
+        "review-sample",
+        "--owner-id",
+        "rob",
+        "--library",
+        library,
+        "--ledger",
+        ledger,
+        "--out",
+        again,
+    )
+    reviewed = {row["span_id"] for row in drawn}
+    assert len(reviewed) == len(drawn)
     assert reviewed.isdisjoint(row["span_id"] for row in sample_rows(again))
 
 
@@ -776,7 +881,7 @@ def test_a_long_pasted_answer_is_not_eligible_until_its_own_stratum_passes(
         tmp_path / "store" / "g", typed_records=110, medium_records=105, pasted_answer=True
     )
     sample, ledger = tmp_path / "sample.jsonl", tmp_path / "ledger.jsonl"
-    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
 
     short_answers = tmp_path / "short.jsonl"
     answered(sample, short_answers, 100, stratum="S")
@@ -789,8 +894,15 @@ def test_a_long_pasted_answer_is_not_eligible_until_its_own_stratum_passes(
     assert texts and not any("tokenizes then builds" in text for text in texts)
     assert all(len(text) <= 240 for text in texts)
 
+    # Recording the sample again accounts for every row again: a row left blank is unsure, so the
+    # second round repeats the short answers too.
     medium_answers = tmp_path / "medium.jsonl"
     answered(sample, medium_answers, 100, stratum="M")
+    both = [json.loads(line) for line in medium_answers.read_text(encoding="utf-8").splitlines()]
+    short_by_id = {row["span_id"]: row["verdict"] for row in sample_rows(short_answers)}
+    for row in both:
+        row["verdict"] = row["verdict"] or short_by_id[row["span_id"]]
+    medium_answers.write_text("".join(json.dumps(row) + "\n" for row in both), encoding="utf-8")
     assert record_answers(capsys, library, ledger, sample, medium_answers)[0] == 0
     entries, result = apply_entries(
         capsys, library, tmp_path / "two.json", "--ledger", ledger, "--owner-id", "rob"
@@ -810,7 +922,7 @@ def test_spans_the_owner_answered_no_are_never_eligible_once_their_stratum_opens
 ) -> None:
     library = build_library(tmp_path / "store" / "g", typed_records=130)
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
-    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
     answered(sample, answers, 97)
     rejected = {row["span_id"] for row in sample_rows(answers) if row["verdict"] == "no"}
     assert len(rejected) == 3
@@ -843,6 +955,257 @@ def test_spans_the_owner_answered_no_are_never_eligible_once_their_stratum_opens
     assert owned and refused_texts.isdisjoint(owned)
 
 
+def answers_for(sample: Path, target: Path, decide) -> None:
+    """An answers file: the sample's rows, each with the verdict `decide(row)` (None: blank)."""
+    rows = sample_rows(sample)
+    for row in rows:
+        row["verdict"] = decide(row)
+    target.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+
+def test_skipping_the_hard_rows_and_drawing_again_cannot_open_a_stratum(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A quarter of the typed turns read like a model's: the owner leaves exactly those blank.
+    library = build_library(tmp_path / "store" / "g", typed_records=330, marked_every=4)
+    ledger = tmp_path / "ledger.jsonl"
+    seen: set[str] = set()
+    for number in range(3):
+        sample, answers = tmp_path / f"s{number}.jsonl", tmp_path / f"a{number}.jsonl"
+        extra = ("--ledger", ledger) if ledger.exists() else ()
+        drawn = run_cli(
+            capsys,
+            "review-sample",
+            "--owner-id",
+            "rob",
+            "--library",
+            library,
+            *extra,
+            "--out",
+            sample,
+        )
+        assert drawn[0] == 0
+        # A blank row stays in the ledger as unsure, so the next sample never draws it again.
+        ids = {row["span_id"] for row in sample_rows(sample)}
+        assert ids and seen.isdisjoint(ids)
+        seen |= ids
+        answers_for(sample, answers, lambda row: None if "ASSIST" in row["text"] else "yes")
+        assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
+        report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
+        assert "typed_prefix:S" not in report["profile_eligible"], number
+    short = next(item for item in report["rules"] if item["rule"] == "typed_prefix")["strata"]["S"]
+    assert short["reviewed"] >= 250 and short["precision"] < 0.8
+    entries, result = apply_entries(
+        capsys, library, tmp_path / "out.json", "--ledger", ledger, "--owner-id", "rob"
+    )
+    assert result["eligible_strata"] == [] and result["profile_eligible_spans"] == 0
+    flagged = [span for entry in entries for span in entry["attribution"]["spans"]]
+    assert not any(span["profile_eligible"] for span in flagged)
+
+
+def test_every_row_of_a_sample_is_recorded_and_a_blank_row_is_unsure(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=6)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    rows = sample_rows(sample)
+    first = next(row for row in rows if row["rule"] == "typed_prefix")
+    answers.write_text(json.dumps({**first, "verdict": "yes"}) + "\n", encoding="utf-8")
+    code, out, err = record_answers(capsys, library, ledger, sample, answers, "--json")
+    assert code == 0, err
+    result = json.loads(out)
+    recorded = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+    assert len(recorded) == len(rows) == result["appended"] > 1
+    assert {row["span_id"] for row in recorded} == {row["span_id"] for row in rows}
+    verdicts = {row["span_id"]: row["verdict"] for row in recorded}
+    assert verdicts.pop(first["span_id"]) == "yes"
+    assert set(verdicts.values()) == {"unsure"} and result["unanswered"] == len(rows) - 1
+    header = sample_header(sample)
+    assert {row["sample_digest"] for row in recorded} == {header["sample_digest"]}
+    by_id = {row["span_id"]: row for row in rows}
+    for row in recorded:
+        assert row["text_sha256"] == by_id[row["span_id"]]["text_sha256"]
+        assert row["drawn"] == header["drawn"][f"{row['rule']}:{row['stratum']}"]
+
+
+def test_there_is_no_skip_and_a_span_cannot_be_answered_twice(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    first = next(row for row in sample_rows(sample) if row["rule"] == "typed_prefix")
+    for verdict in ("skip", "n/a", "maybe"):
+        answers.write_text(json.dumps({**first, "verdict": verdict}) + "\n", encoding="utf-8")
+        code, _, err = record_answers(capsys, library, ledger, sample, answers)
+        assert code == 2 and "answers line 1" in err and "no skip" in err, verdict
+        assert not ledger.exists()
+    answers.write_text(
+        json.dumps({**first, "verdict": "yes"})
+        + "\n"
+        + json.dumps({**first, "verdict": "no"})
+        + "\n",
+        encoding="utf-8",
+    )
+    code, _, err = record_answers(capsys, library, ledger, sample, answers)
+    assert code == 2 and "answers line 2" in err and "twice" in err and not ledger.exists()
+    answers.write_text("", encoding="utf-8")
+    assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
+    recorded = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+    assert recorded and {row["verdict"] for row in recorded} == {"unsure"}
+
+
+def test_review_record_refuses_a_tampered_hand_written_or_foreign_sample(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
+    other = build_library(tmp_path / "other" / "g", typed_records=4)
+    sample, answers = tmp_path / "s.jsonl", tmp_path / "a.jsonl"
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    answers_for(sample, answers, lambda row: "yes")
+    lines = sample.read_text(encoding="utf-8").splitlines()
+    typed_line = next(i for i, line in enumerate(lines) if '"rule": "typed_prefix"' in line)
+    cases = {
+        "an edited text": (
+            [
+                *lines[:typed_line],
+                lines[typed_line].replace('"text": "', '"text": "Edited '),
+                *lines[typed_line + 1 :],
+            ],
+            library,
+            "rob",
+            "does not match",
+        ),
+        "a dropped row": (
+            [*lines[:typed_line], *lines[typed_line + 1 :]],
+            library,
+            "rob",
+            "altered",
+        ),
+        "no header": (lines[1:], library, "rob", "no header"),
+        "another library": (lines, other, "rob", "different library"),
+        "another owner": (lines, library, "someone-else", "another owner"),
+    }
+    for name, (body, target, reviewer, message) in cases.items():
+        forged, ledger = tmp_path / f"{len(name)}.jsonl", tmp_path / f"{len(name)}-l.jsonl"
+        forged.write_text("\n".join(body) + "\n", encoding="utf-8")
+        code, _, err = record_answers(capsys, target, ledger, forged, answers, reviewer=reviewer)
+        assert code == 2 and message in err, (name, err)
+        assert not ledger.exists(), name
+
+
+def test_review_sample_needs_an_owner_identity_and_binds_the_sample_to_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
+    code, _, err = run_cli(capsys, "review-sample", "--library", library)
+    assert code == 2 and "--owner-id" in err
+    ledger = tmp_path / "l.jsonl"
+    ledger.write_text("", encoding="utf-8")
+    code, _, err = run_cli(capsys, "review-sample", "--library", library, "--ledger", ledger)
+    assert code == 2 and "--owner-id" in err
+    sample = tmp_path / "s.jsonl"
+    assert (
+        run_cli(
+            capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample
+        )[0]
+        == 0
+    )
+    header = sample_header(sample)
+    assert header["owner_id"] == "rob" and header["rules_version"] == RULES_VERSION
+    assert header["rows"] == len(sample_rows(sample)) and header["partial"] is False
+    with Library(library) as handle:
+        assert header["library"] == attribution_commands.library_fingerprint(handle)
+
+
+def test_review_sample_hides_only_spans_the_owner_already_reviewed(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=130)
+    fresh = tmp_path / "fresh.jsonl"
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", fresh)
+    # Somebody else's reviews of these very spans, and rows of the owner that name no span.
+    others = approve(capsys, library, tmp_path, reviewer="agent:codex", name="other")
+    orphans = tmp_path / "orphans.jsonl"
+    append_ledger(
+        orphans,
+        [
+            ledger_row(
+                f"{index:032x}",
+                "typed_prefix",
+                "yes",
+                "rob",
+                STAMP,
+                stratum="S",
+                sample_digest="a" * 64,
+                text_sha256="b" * 64,
+                drawn=50,
+            )
+            for index in range(50)
+        ],
+    )
+    noise = tmp_path / "noise.jsonl"
+    noise.write_text(
+        others.read_text(encoding="utf-8") + orphans.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    again = tmp_path / "again.jsonl"
+    code, _, err = run_cli(
+        capsys,
+        "review-sample",
+        "--owner-id",
+        "rob",
+        "--library",
+        library,
+        "--ledger",
+        noise,
+        "--out",
+        again,
+    )
+    assert code == 0, err
+    assert again.read_bytes() == fresh.read_bytes()
+    mine = approve(capsys, library, tmp_path, name="mine")
+    later = tmp_path / "later.jsonl"
+    run_cli(
+        capsys,
+        "review-sample",
+        "--owner-id",
+        "rob",
+        "--library",
+        library,
+        "--ledger",
+        mine,
+        "--out",
+        later,
+    )
+    reviewed = {row["span_id"] for row in sample_rows(fresh)}
+    assert reviewed and reviewed.isdisjoint(row["span_id"] for row in sample_rows(later))
+
+
+def test_a_row_counts_only_if_the_scans_span_has_the_text_it_answered(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=110)
+    ledger = approve(capsys, library, tmp_path)
+    assert report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")[
+        "profile_eligible"
+    ] == ["typed_prefix:S"]
+    rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+    target = next(row for row in rows if (row["rule"], row["stratum"]) == ("typed_prefix", "S"))
+    target["text_sha256"] = "0" * 64
+    forged = tmp_path / "forged-ledger.jsonl"
+    forged.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    report = report_of(capsys, library, "--ledger", forged, "--owner-id", "rob")
+    assert report["gate"]["text_mismatch_rows"] == 1 and report["gate"]["orphan_rows"] == 0
+    short = next(item for item in report["rules"] if item["rule"] == "typed_prefix")["strata"]["S"]
+    assert short["reviewed"] == 99 and short["eligible"] is False
+    assert report["profile_eligible"] == []
+    _, result = apply_entries(
+        capsys, library, tmp_path / "f.json", "--ledger", forged, "--owner-id", "rob"
+    )
+    assert result["text_mismatch_rows"] == 1 and result["eligible_strata"] == []
+
+
 def test_review_record_needs_the_sample_it_answers(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -870,7 +1233,7 @@ def test_review_record_refuses_answers_that_are_not_in_the_sample(
 ) -> None:
     library = build_library(tmp_path / "store" / "g", typed_records=3)
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
-    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
     real = next(row for row in sample_rows(sample) if row["rule"] == "typed_prefix")
     real["verdict"] = "yes"
     forgeries = {
@@ -896,7 +1259,7 @@ def test_a_sample_drawn_under_the_previous_rules_version_is_refused(
     sample, old_sample, answers, ledger = (
         tmp_path / name for name in ("s.jsonl", "old.jsonl", "a.jsonl", "l.jsonl")
     )
-    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
     rows = [row for row in sample_rows(sample) if row["rule"] == "typed_prefix"]
     stale = [{**row, "rules_version": "cce.attribution-rules@1"} for row in rows]
     old_sample.write_text("".join(json.dumps(row) + "\n" for row in stale), encoding="utf-8")
@@ -919,18 +1282,19 @@ def test_ledger_rows_from_the_previous_rules_version_are_reported_as_stale(
     rewritten = tmp_path / "old-ledger.jsonl"
     rewritten.write_text(
         ledger.read_text(encoding="utf-8").replace(
-            "cce.attribution-rules@2", "cce.attribution-rules@1"
+            "cce.attribution-rules@3", "cce.attribution-rules@2"
         ),
         encoding="utf-8",
     )
     report = report_of(capsys, library, "--ledger", rewritten, "--owner-id", "rob")
-    assert report["gate"]["stale_rows"] == 100 and report["gate"]["ledger_rows"] == 100
+    assert report["gate"]["stale_rows"] == report["gate"]["ledger_rows"] > 100
     assert report["profile_eligible"] == [] and report["gate"]["orphan_rows"] == 0
     _, result = apply_entries(
         capsys, library, tmp_path / "stale.json", "--ledger", rewritten, "--owner-id", "rob"
     )
-    assert result["stale_rows"] == 100 and result["eligible_strata"] == []
-    assert result["rules_version"] == "cce.attribution-rules@2"
+    assert result["stale_rows"] == result["ledger_rows"] > 100
+    assert result["eligible_strata"] == []
+    assert result["rules_version"] == "cce.attribution-rules@3"
 
 
 def test_review_record_rejects_bad_answers_before_writing_anything(
@@ -938,7 +1302,7 @@ def test_review_record_rejects_bad_answers_before_writing_anything(
 ) -> None:
     library = build_library(tmp_path / "store" / "g", typed_records=3)
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
-    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
     good = next(row for row in sample_rows(sample) if row["rule"] == "typed_prefix")
     good["verdict"] = "yes"
     answers.write_text(
@@ -957,7 +1321,7 @@ def test_review_record_stamps_the_current_utc_time_only_when_none_is_given(
 ) -> None:
     library = build_library(tmp_path / "store" / "g", typed_records=3)
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
-    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
     row = next(item for item in sample_rows(sample) if item["rule"] == "typed_prefix")
     answers.write_text(json.dumps({**row, "verdict": "YES"}) + "\n", encoding="utf-8")
     code, _, _ = run_cli(
@@ -975,9 +1339,15 @@ def test_review_record_stamps_the_current_utc_time_only_when_none_is_given(
         "rob",
     )
     assert code == 0
-    recorded = json.loads(ledger.read_text(encoding="utf-8"))
-    assert recorded["verdict"] == "yes" and recorded["reviewer"] == "rob"
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", recorded["reviewed_at"])
+    recorded = {
+        entry["span_id"]: entry
+        for entry in map(json.loads, ledger.read_text(encoding="utf-8").splitlines())
+    }
+    assert recorded[row["span_id"]]["verdict"] == "yes"
+    assert {entry["reviewer"] for entry in recorded.values()} == {"rob"}
+    assert len(recorded) == len(sample_rows(sample))
+    stamps = {entry["reviewed_at"] for entry in recorded.values()}
+    assert all(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp) for stamp in stamps)
 
 
 # --- messages that cannot be encoded -----------------------------------------------------------
@@ -1040,7 +1410,12 @@ def test_a_message_with_a_lone_surrogate_is_counted_and_never_aborts_a_run(
         for entry in entries
     )
     sample = tmp_path / "s.jsonl"
-    assert run_cli(capsys, "review-sample", "--library", library, "--out", sample)[0] == 0
+    assert (
+        run_cli(
+            capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample
+        )[0]
+        == 0
+    )
     assert "ud800" not in sample.read_text(encoding="utf-8")
 
 
@@ -1080,7 +1455,12 @@ def sample_and_answers(
     capsys: pytest.CaptureFixture[str], library: Path, tmp_path: Path
 ) -> tuple[Path, Path]:
     sample, answers = tmp_path / "s.jsonl", tmp_path / "a.jsonl"
-    assert run_cli(capsys, "review-sample", "--library", library, "--out", sample)[0] == 0
+    assert (
+        run_cli(
+            capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample
+        )[0]
+        == 0
+    )
     row = next(item for item in sample_rows(sample) if item["rule"] == "typed_prefix")
     answers.write_text(json.dumps({**row, "verdict": "yes"}) + "\n", encoding="utf-8")
     return sample, answers
@@ -1100,7 +1480,7 @@ def test_no_writer_may_write_inside_the_generation_or_anywhere_in_the_store(
     for name, target in targets.items():
         for argv in (
             ("apply", "--library", library, "--out", target),
-            ("review-sample", "--library", library, "--out", target),
+            ("review-sample", "--owner-id", "rob", "--library", library, "--out", target),
             (
                 "review-record",
                 "--library",
@@ -1178,7 +1558,15 @@ def test_a_git_visible_destination_is_refused_before_anything_is_written(
     (repo / ".gitignore").write_text("private/\n", encoding="utf-8")
     for argv in (
         ("apply", "--library", library, "--out", repo / "visible" / "a.json"),
-        ("review-sample", "--library", library, "--out", repo / "visible" / "s.jsonl"),
+        (
+            "review-sample",
+            "--owner-id",
+            "rob",
+            "--library",
+            library,
+            "--out",
+            repo / "visible" / "s.jsonl",
+        ),
         (
             "review-record",
             "--library",
@@ -1208,7 +1596,12 @@ def test_every_output_is_private_and_new_directories_are_0700(
     sample = tmp_path / "fresh" / "nested" / "s.jsonl"
     old = os.umask(0)
     try:
-        assert run_cli(capsys, "review-sample", "--library", library, "--out", sample)[0] == 0
+        assert (
+            run_cli(
+                capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample
+            )[0]
+            == 0
+        )
         assert mode(sample) == 0o600
         assert mode(sample.parent) == 0o700 and mode(sample.parent.parent) == 0o700
         out = tmp_path / "other" / "a.json"
@@ -1251,6 +1644,8 @@ def test_a_slice_or_deadline_cut_output_is_written_under_the_partial_name(
     code, out_text, _ = run_cli(
         capsys,
         "review-sample",
+        "--owner-id",
+        "rob",
         "--library",
         library,
         "--out",
@@ -1290,7 +1685,7 @@ def test_a_slice_or_deadline_cut_output_is_written_under_the_partial_name(
     )
     cut = tmp_path / "cut.jsonl"
     code, out_text, err = run_cli(
-        capsys, "review-sample", "--library", library, "--out", cut, "--json"
+        capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", cut, "--json"
     )
     assert code == 3 and "partial" in err
     assert json.loads(out_text)["partial"] is True and not cut.exists()
@@ -1303,7 +1698,15 @@ def test_a_complete_scan_leaves_no_partial_marker(
     library = build_library(tmp_path / "store" / "gen")
     sample = tmp_path / "s.jsonl"
     code, out_text, _ = run_cli(
-        capsys, "review-sample", "--library", library, "--out", sample, "--json"
+        capsys,
+        "review-sample",
+        "--owner-id",
+        "rob",
+        "--library",
+        library,
+        "--out",
+        sample,
+        "--json",
     )
     assert code == 0 and json.loads(out_text)["partial"] is False
     assert sample.exists() and not sample.with_name("s.jsonl.partial").exists()
@@ -1324,7 +1727,9 @@ def test_a_leftover_partial_file_is_refused_before_any_work_starts(
     for command, name in (("apply", "a.json"), ("review-sample", "s.jsonl")):
         out = tmp_path / name
         out.with_name(name + ".partial").write_text("old", encoding="utf-8")
-        code, _, err = run_cli(capsys, command, "--library", library, "--out", out)
+        code, _, err = run_cli(
+            capsys, command, "--owner-id", "rob", "--library", library, "--out", out
+        )
         assert code == 2 and "leftover" in err and ".partial" in err
         assert len(err.strip().splitlines()) == 1
         assert out.with_name(name + ".partial").read_text(encoding="utf-8") == "old"
@@ -1337,7 +1742,9 @@ def test_an_existing_output_is_refused_for_every_writer(
     out = tmp_path / "taken.out"
     out.write_text("keep", encoding="utf-8")
     for command in ("apply", "review-sample"):
-        code, _, err = run_cli(capsys, command, "--library", library, "--out", out)
+        code, _, err = run_cli(
+            capsys, command, "--owner-id", "rob", "--library", library, "--out", out
+        )
         assert code == 2 and "already exists" in err
     link = tmp_path / "link.out"
     link.symlink_to(tmp_path / "target.out")

@@ -72,6 +72,7 @@ def conversations(
     medium_records: int = 0,
     pasted_answer: bool = False,
     text_suffix: str = "",
+    marked_every: int = 0,
 ) -> list[Conversation]:
     items = [
         _chat(
@@ -191,13 +192,20 @@ def conversations(
         _chat(f"tmpl-{index}", [typed("t0", f"{TEMPLATE}\n\nTopic {index}: my own question.")])
         for index in range(4)
     )
+    # `marked_every`: every k-th typed turn reads "ASSIST ...", text the typed rule claims as the
+    # owner's although the owner would reject it (the hard rows of a review).
     items.extend(
         _chat(
             f"typed-{index:03d}",
             [
                 typed(
                     "t0",
-                    f"Typed words number {index} in my own voice about topic {index * 7}.{text_suffix}",
+                    (
+                        f"ASSIST words number {index} that a model produced about topic {index * 7}."
+                        if marked_every and index % marked_every == 0
+                        else f"Typed words number {index} in my own voice about topic {index * 7}."
+                    )
+                    + text_suffix,
                 )
             ],
         )
@@ -228,6 +236,7 @@ def build_library(
     medium_records: int = 0,
     pasted_answer: bool = False,
     text_suffix: str = "",
+    marked_every: int = 0,
 ) -> Path:
     """Create `directory/library.sqlite` and return its path; the generation is closed again.
 
@@ -237,7 +246,7 @@ def build_library(
     directory.mkdir(parents=True, exist_ok=True)
     with Library.create(directory / "library.sqlite") as library:
         for conversation in conversations(
-            typed_records, medium_records, pasted_answer, text_suffix
+            typed_records, medium_records, pasted_answer, text_suffix, marked_every
         ):
             library.put(conversation)
     return directory / "library.sqlite"

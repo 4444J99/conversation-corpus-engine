@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -35,19 +36,28 @@ from conversation_corpus_engine.attribution_rules import (
     append_ledger,
     attribute_message,
     eligible_strata,
-    ledger_row,
     parse_ledger,
+    parse_sample,
     read_ledger,
     review_excerpt,
     review_statistics,
+    sample_digest,
+    sample_header,
+    sample_text,
     stratum_of,
     to_annotation,
     validate_ledger_row,
+)
+from conversation_corpus_engine.attribution_rules import (
+    ledger_row as build_ledger_row,
 )
 
 CHAT = RecordInfo(provider="chatgpt", kind="chat", wing="ai")
 STAMP = "2026-01-02T03:04:05Z"
 OWNER_ID = "owner-1"
+SAMPLE_DIGEST = "d" * 64
+# Nesting deep enough to exhaust the JSON parser's recursion on every supported Python.
+DEEP = 1_500_000
 SHORT = "Typed words in my own voice."
 MEDIUM = ("A medium typed paragraph about the quiet harbour at dawn. " * 11).strip()
 LARGE = ("A large typed passage about long walks and the weather. " * 45).strip()
@@ -55,6 +65,28 @@ LARGE = ("A large typed passage about long walks and the weather. " * 45).strip(
 
 def spans_of(text: str) -> list[AttributedSpan]:
     return attribute_message(text, role="user", channel="typed", typed_chars=len(text), record=CHAT)
+
+
+def text_hash(span_id: str) -> str:
+    """The text hash a test row claims to have answered (the tests' scans agree with it)."""
+    return hashlib.sha256(span_id.encode()).hexdigest()
+
+
+def ledger_row(
+    span_id: str,
+    rule: str,
+    verdict: str,
+    reviewer: str,
+    reviewed_at: str,
+    *,
+    stratum: str,
+    **extra,
+) -> dict:
+    """A current-schema row of a one-row-per-span sample, unless the test says otherwise."""
+    options = {"sample_digest": SAMPLE_DIGEST, "text_sha256": text_hash(span_id), "drawn": 1}
+    return build_ledger_row(
+        span_id, rule, verdict, reviewer, reviewed_at, stratum=stratum, **(options | extra)
+    )
 
 
 def verdict_rows(
@@ -79,9 +111,14 @@ def verdict_rows(
     ]
 
 
-def matched_of(rows: list[dict]) -> dict[str, tuple[str, str]]:
-    """The scan evidence that every row's span exists under the rule and stratum it names."""
-    return {row["span_id"]: (row["rule"], row["stratum"]) for row in rows if "stratum" in row}
+def matched_of(rows: list[dict]) -> dict[str, tuple[str, str, str]]:
+    """The scan evidence that every row's span exists under the rule and stratum it names, with
+    the very text the row answered."""
+    return {
+        row["span_id"]: (row["rule"], row["stratum"], row["text_sha256"])
+        for row in rows
+        if "text_sha256" in row
+    }
 
 
 def summarize(rows: list[dict], **overrides) -> ReviewSummary:
@@ -229,17 +266,27 @@ def test_rows_from_another_rules_version_or_an_older_schema_are_ignored_not_coun
         "reviewer": "r",
         "reviewed_at": STAMP,
     }
-    summary = summarize([*rows, validate_ledger_row(legacy)])
+    legacy_with_stratum = {
+        **legacy,
+        "schema": "cce.attribution-review-ledger.v2",
+        "span_id": "e" * 32,
+        "stratum": "S",
+    }
+    summary = summarize(
+        [*rows, validate_ledger_row(legacy), validate_ledger_row(legacy_with_stratum)]
+    )
     assert summary.strata[("typed_prefix", "S")].reviewed == 0
-    assert (summary.rows, summary.stale_rows) == (101, 101)
+    assert (summary.rows, summary.stale_rows) == (102, 102)
     assert eligible_strata(summary) == frozenset()
+    assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v3"
+    assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v3"
 
 
-PREVIOUS_VERSION = "cce.attribution-rules@1"
+PREVIOUS_VERSION = "cce.attribution-rules@2"
 
 
 def test_rows_written_under_the_previous_rules_version_are_stale_and_never_counted() -> None:
-    assert RULES_VERSION == "cce.attribution-rules@2"
+    assert RULES_VERSION == "cce.attribution-rules@3"
     old = verdict_rows("typed_prefix", ["yes"] * 100, version=PREVIOUS_VERSION)
     summary = summarize(old)
     assert (summary.rows, summary.stale_rows) == (100, 100)
@@ -449,6 +496,81 @@ def test_ledger_row_refuses_bad_input_and_never_reads_the_clock() -> None:
         } | kwargs
         with pytest.raises(ValueError, match="ledger"):
             ledger_row(**arguments)
+
+
+def test_a_ledger_row_binds_the_sample_the_text_and_the_drawn_count() -> None:
+    row = ledger_row("a" * 32, "quote", "yes", OWNER_ID, STAMP, stratum="S")
+    assert set(row) == {
+        "schema",
+        "rules_version",
+        "span_id",
+        "rule",
+        "stratum",
+        "verdict",
+        "reviewer",
+        "reviewed_at",
+        "sample_digest",
+        "text_sha256",
+        "drawn",
+    }
+    for bad in (
+        {"sample_digest": "xyz"},
+        {"sample_digest": "D" * 64},
+        {"text_sha256": "1" * 63},
+        {"drawn": 0},
+        {"drawn": True},
+        {"drawn": "5"},
+    ):
+        with pytest.raises(ValueError, match="ledger"):
+            ledger_row("a" * 32, "quote", "yes", OWNER_ID, STAMP, stratum="S", **bad)
+    for key in ("sample_digest", "text_sha256", "drawn"):
+        without = {name: value for name, value in row.items() if name != key}
+        with pytest.raises(ValueError, match="keys"):
+            validate_ledger_row(without)
+
+
+def test_a_row_counts_only_when_the_scans_span_has_the_text_the_row_answered() -> None:
+    rows = verdict_rows("typed_prefix", ["yes"] * 100)
+    assert gate(rows).eligible
+    first = f"{0:032x}"
+    rule, stratum, _ = matched_of(rows)[first]
+    edited = matched_of(rows) | {first: (rule, stratum, "0" * 64)}
+    summary = review_statistics(rows, matched=edited, owner=OWNER_ID)
+    review = summary.strata[("typed_prefix", "S")]
+    assert summary.text_mismatch_rows == 1 and summary.orphan_rows == 0
+    assert review.confirmed == 99 and review.reviewed == 99 and not review.eligible
+    assert summary.verdicts[first] == "unsure" and first in summary.verdicts
+
+
+def test_precision_is_over_the_rows_a_sample_drew_not_the_rows_the_ledger_kept() -> None:
+    kept = verdict_rows("typed_prefix", ["yes"] * 60)
+    drew_a_hundred = [{**row, "drawn": 100} for row in kept]
+    summary = summarize(drew_a_hundred)
+    review = summary.strata[("typed_prefix", "S")]
+    assert (review.reviewed, review.confirmed, review.unsure) == (100, 60, 40)
+    assert review.missing == 40 and summary.missing_rows == 40
+    assert not review.eligible and review.precision == 0.6
+    untouched = summarize(kept).strata[("typed_prefix", "S")]
+    assert untouched.reviewed == 60 and untouched.missing == 0
+    full = verdict_rows("typed_prefix", ["yes"] * 96 + ["no"] * 4)
+    assert gate([{**row, "drawn": 100} for row in full]).eligible
+
+
+def test_a_drawn_row_that_is_only_an_orphan_is_present_not_missing() -> None:
+    rows = [{**row, "drawn": 100} for row in verdict_rows("typed_prefix", ["yes"] * 100)]
+    summary = review_statistics(rows, matched={}, owner=OWNER_ID)
+    assert summary.orphan_rows == 100 and summary.missing_rows == 0
+    assert summary.strata[("typed_prefix", "S")].reviewed == 0
+
+
+def test_two_samples_are_judged_each_by_what_it_drew() -> None:
+    first = [{**row, "drawn": 50} for row in verdict_rows("typed_prefix", ["yes"] * 50)]
+    second = [
+        {**row, "drawn": 50, "sample_digest": "e" * 64}
+        for row in verdict_rows("typed_prefix", ["yes"] * 30, start=1000)
+    ]
+    review = gate(first + second)
+    assert (review.reviewed, review.confirmed, review.missing) == (100, 80, 20)
 
 
 def test_ledger_is_append_only_jsonl_and_refuses_symlinks(tmp_path: Path) -> None:
@@ -674,9 +796,11 @@ def test_sample_rows_show_only_the_span_its_rule_and_a_blank_verdict() -> None:
         "length",
         "excerpted",
         "text",
+        "text_sha256",
         "verdict",
         "partial",
     }
+    assert row["text_sha256"] == text_digest(row["text"])
     assert row["schema"] == SAMPLE_SCHEMA and row["verdict"] is None and row["partial"] is False
     assert (row["rule"], row["stratum"], row["claim"]) == ("quote", "S", "third_party")
     assert row["rule_description"] == RULE_BY_ID["quote"].description
@@ -715,6 +839,103 @@ def test_sample_skips_already_reviewed_spans_and_whitespace_and_unknown_spans() 
         for span in attribute_message(text, role="user", channel="project", record=CHAT):
             empty.offer(span, text[span.start : span.end])
     assert empty.rows() == []
+
+
+def test_the_sampler_excludes_only_the_exact_reviewed_span() -> None:
+    drawn = ReviewSampler(per_stratum=100)
+    offer_all(drawn, many_quotes(5))
+    rows = drawn.rows()
+    reviewed = {
+        row["span_id"]: (row["rule"], row["stratum"], row["text_sha256"]) for row in rows[:2]
+    }
+    again = ReviewSampler(per_stratum=100, exclude=reviewed)
+    offer_all(again, many_quotes(5))
+    assert {row["span_id"] for row in again.rows()} == {row["span_id"] for row in rows[2:]}
+    for name, edit in (
+        ("another text", lambda kind: (kind[0], kind[1], "0" * 64)),
+        ("another rule", lambda kind: ("code", kind[1], kind[2])),
+        ("another stratum", lambda kind: (kind[0], "M", kind[2])),
+    ):
+        wrong = {span: edit(kind) for span, kind in reviewed.items()}
+        sampler = ReviewSampler(per_stratum=100, exclude=wrong)
+        offer_all(sampler, many_quotes(5))
+        assert len(sampler.rows()) == 5, name
+
+
+# --- the sample document: a header that binds the rows ----------------------------------------
+
+
+def drawn_sample(count: int = 6) -> tuple[dict, list[dict]]:
+    sampler = ReviewSampler(per_stratum=5)
+    offer_all(sampler, many_quotes(count))
+    rows = sampler.rows()
+    header = sample_header(
+        rows, library="f" * 64, owner_id=OWNER_ID, seed=sampler.seed, per_stratum=5, partial=False
+    )
+    return header, rows
+
+
+def test_a_sample_document_round_trips_and_its_digest_ignores_the_answers() -> None:
+    header, rows = drawn_sample()
+    assert header["rows"] == len(rows) == 5 and header["drawn"] == {"quote:S": 5}
+    assert header["sample_digest"] == sample_digest(rows) and header["owner_id"] == OWNER_ID
+    parsed = parse_sample(sample_text(header, rows).splitlines())
+    assert parsed.header == header and parsed.rows == rows
+    answered = [{**row, "verdict": "yes"} for row in rows]
+    assert sample_digest(answered) == header["sample_digest"]
+    assert parse_sample(sample_text(header, answered).splitlines()).rows == answered
+    assert sample_digest(rows) != sample_digest(rows[:-1])
+
+
+def sample_lines(header: dict, rows: list[dict]) -> list[str]:
+    return sample_text(header, rows).splitlines()
+
+
+def test_a_tampered_or_hand_written_sample_is_refused() -> None:
+    header, rows = drawn_sample()
+    fake_excerpt = {**rows[0], "excerpted": True}
+    edited_text = {**rows[0], "text": "an edited quote"}
+    edited_text["length"] = len(edited_text["text"])
+    edited_text["text_sha256"] = text_digest(edited_text["text"])
+    other_id = {**rows[1], "span_id": "9" * 32}
+    other_stratum = {**rows[1], "stratum": "M"}
+    stale_row = {**rows[1], "rules_version": "cce.attribution-rules@2"}
+    cases = {
+        "an edited text with a repaired hash": (header, [edited_text, *rows[1:]], "altered"),
+        "a text that no longer matches its hash": (
+            header,
+            [{**rows[0], "text": "changed"}, *rows[1:]],
+            "hash",
+        ),
+        "another span id": (header, [rows[0], other_id, *rows[2:]], "altered"),
+        "another stratum": (header, [rows[0], other_stratum, *rows[2:]], "altered"),
+        "a dropped row": (header, rows[:-1], "counts 5 rows"),
+        "a repeated row": ({**header, "rows": 6}, [*rows, rows[0]], "twice"),
+        "a wrong digest": ({**header, "sample_digest": "0" * 64}, rows, "digest"),
+        "wrong counts": ({**header, "drawn": {"quote:S": 4}}, rows, "per-stratum"),
+        "an excerpt of a short span": (header, [fake_excerpt, *rows[1:]], "short"),
+        "another rules version": (header, [stale_row, *rows[2:]], "rules version"),
+        "a header of another version": (
+            {**header, "rules_version": "cce.attribution-rules@2"},
+            rows,
+            "rules version",
+        ),
+    }
+    for name, (head, body, message) in cases.items():
+        with pytest.raises(ValueError, match=message):
+            parse_sample(sample_lines(head, body))
+        assert name
+    with pytest.raises(ValueError, match="no header"):
+        parse_sample([json.dumps(row) for row in rows])  # hand-written: rows without a header
+    with pytest.raises(ValueError, match="empty"):
+        parse_sample(["", "  "])
+    with pytest.raises(ValueError, match="sample line 1: unreadable"):
+        parse_sample(["[" * DEEP + "]" * DEEP])
+    with pytest.raises(ValueError, match="sample line 2: not JSON"):
+        parse_sample([json.dumps(header), "{broken"])
+    missing_owner = {**header, "owner_id": " "}
+    with pytest.raises(ValueError, match="owner_id"):
+        parse_sample(sample_lines(missing_owner, rows))
 
 
 def test_sampler_validates_its_parameters() -> None:
