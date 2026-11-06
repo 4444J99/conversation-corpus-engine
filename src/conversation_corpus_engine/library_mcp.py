@@ -18,6 +18,7 @@ from .library_commands import (
     open_library,
     passage_handoff,
     read_arguments,
+    read_cursor,
 )
 from .library_commands import flag_argument as _flag
 from .library_commands import integer_argument as _integer
@@ -525,10 +526,11 @@ def call_tool(store_root: Path, name: str, arguments: dict[str, Any]) -> dict[st
     for key in schema["required"]:
         if not isinstance(arguments.get(key), str) or not arguments[key].strip():
             raise ValueError(f"{key} must be a nonempty string")
-    offset = _integer(arguments, "offset", 0, 1000000000)
-    limit = _integer(
-        arguments, "limit", 12000 if name == READ_TOOL else 20, 32000 if name == READ_TOOL else 200
-    )
+    if name == READ_TOOL:
+        offset, limit = read_cursor(arguments)
+    else:
+        offset = _integer(arguments, "offset", 0, 1000000000)
+        limit = _integer(arguments, "limit", 20, 200)
     generation, library = open_library(store_root)
     with library:
         if name == SEARCH_TOOL:

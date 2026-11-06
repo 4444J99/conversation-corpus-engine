@@ -851,6 +851,19 @@ def flag_argument(arguments: dict[str, Any], name: str) -> bool:
     return value
 
 
+def read_cursor(arguments: dict[str, Any]) -> tuple[int, int]:
+    """The (offset, limit) of a read, after the checks made of every read before the library is
+    opened: a nonempty `uid`, `offset` from 0 to 1,000,000,000 and `limit` from 1 to 32,000
+    (default 12,000). A table of contents ignores both but is held to them all the same."""
+    uid = arguments.get("uid")
+    if not isinstance(uid, str) or not uid.strip():
+        raise ValueError("uid must be a nonempty string")
+    return (
+        integer_argument(arguments, "offset", 0, 1000000000),
+        integer_argument(arguments, "limit", 12000, 32000),
+    )
+
+
 def read_arguments(
     library: Library, arguments: dict[str, Any], offset: int, limit: int
 ) -> dict[str, Any]:
@@ -1053,6 +1066,8 @@ def handle_library(args: argparse.Namespace) -> int:
                         "uid": args.uid,
                         "message": args.message,
                         "sequence": args.sequence,
+                        "offset": args.offset,
+                        "limit": args.limit,
                     }
                     for name in (
                         "version",
@@ -1067,7 +1082,7 @@ def handle_library(args: argparse.Namespace) -> int:
                             arguments[name] = getattr(args, name)
                     if args.toc:
                         arguments["toc"] = True
-                    result = read_arguments(library, arguments, args.offset, args.limit)
+                    result = read_arguments(library, arguments, *read_cursor(arguments))
                 elif args.action == "history":
                     if args.offset < 0 or not 1 <= args.limit <= 200:
                         raise ValueError("history needs nonnegative offset and limit from 1 to 200")

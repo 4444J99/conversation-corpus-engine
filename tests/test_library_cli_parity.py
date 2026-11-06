@@ -136,6 +136,11 @@ REFUSED = {
         {"around_query": "zebra", "message_end": 3},
     ),
     "message-out-of-range": (["--message", "10000001"], {"message": 10000001}),
+    # the tool checks offset and limit of every read, a table of contents included
+    "toc-with-limit-zero": (["--toc", "--limit", "0"], {"toc": True, "limit": 0}),
+    "toc-with-negative-offset": (["--toc", "--offset", "-1"], {"toc": True, "offset": -1}),
+    "offset-over-the-bound": (["--offset", "2000000000"], {"offset": 2000000000}),
+    "limit-over-the-bound": (["--limit", "32001"], {"limit": 32001}),
 }
 
 
@@ -149,6 +154,14 @@ def test_the_command_line_refuses_what_the_mcp_tool_refuses_in_the_same_words(
     code, out, err = cli_read(env, capsys, *flags)
     assert code == 2 and out == ""
     assert err.strip() == f"library: {refusal.value}"
+
+
+def test_an_empty_uid_is_refused_in_the_same_words(env, capsys) -> None:
+    with pytest.raises(ValueError) as refusal:
+        library_mcp.call_tool(env.store, READ_TOOL, {"uid": " "})
+    args = build_parser().parse_args(["library", "read", " ", "--store-root", str(env.store)])
+    assert handle_library(args) == 2
+    assert capsys.readouterr().err.strip() == f"library: {refusal.value}"
 
 
 def test_an_unknown_toc_mode_is_refused_on_both(env) -> None:
