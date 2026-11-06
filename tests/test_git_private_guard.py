@@ -8,11 +8,12 @@ temporary directory outside any other work tree.
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from conversation_corpus_engine import corpus_store
+from conversation_corpus_engine import cli, corpus_store
 from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.corpus_store import CorpusStoreError, require_git_private
 from conversation_corpus_engine.library_export import export_library
@@ -274,3 +275,71 @@ def test_a_fake_not_a_repository_answer_cannot_clear_a_real_work_tree(tmp_path, 
 def test_a_directory_whose_ancestors_hold_no_dot_git_is_private_when_git_says_so(tmp_path) -> None:
     deep = tmp_path / "a" / "b" / "c"
     assert require_git_private(deep) == deep.resolve()
+
+
+# --- the other command that writes a provider's text to a directory the caller names ------------
+
+
+def run_cli(monkeypatch, capsys, *argv: str) -> tuple[int, str, str]:
+    monkeypatch.setattr(sys, "argv", ["cce", *argv])
+    code = 0
+    try:
+        cli.main()
+    except SystemExit as exit_:
+        code = int(exit_.code or 0)
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def stub_fetch(monkeypatch) -> list[Path]:
+    calls: list[Path] = []
+
+    def fetch(project_id, output_root, **kwargs):
+        calls.append(output_root)
+        return {
+            "project_name": "Synthetic project",
+            "output_root": str(output_root),
+            "file_count": 0,
+            "total_files": 0,
+            "conversation_count": 0,
+        }
+
+    monkeypatch.setattr(cli, "fetch_chatgpt_project", fetch)
+    return calls
+
+
+def test_project_extract_refuses_a_git_visible_output_before_fetching_anything(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    calls = stub_fetch(monkeypatch)
+    repo = make_repo(tmp_path, gitignore=".*\n")  # only dotfiles ignored: the old probe passed it
+    code, _, err = run_cli(
+        monkeypatch,
+        capsys,
+        "project",
+        "extract",
+        "--project-id",
+        "g-p-x",
+        "--output",
+        str(repo / "out"),
+    )
+    assert code == 2 and "Git-visible" in err
+    assert calls == [] and not (repo / "out").exists()
+
+
+def test_project_extract_still_writes_where_git_cannot_see(tmp_path, monkeypatch, capsys) -> None:
+    calls = stub_fetch(monkeypatch)
+    repo = make_repo(tmp_path, gitignore="ignored/\n")
+    for output in (tmp_path / "outside" / "out", repo / "ignored" / "out"):
+        code, out, _ = run_cli(
+            monkeypatch,
+            capsys,
+            "project",
+            "extract",
+            "--project-id",
+            "g-p-x",
+            "--output",
+            str(output),
+        )
+        assert code == 0 and "Synthetic project" in out
+    assert calls == [tmp_path / "outside" / "out", repo / "ignored" / "out"]
