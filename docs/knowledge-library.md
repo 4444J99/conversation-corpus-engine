@@ -25,6 +25,7 @@ Register a private store through the existing `cce corpus-store register` interf
 cce library build --manifest /private/library-sources.json --project-root /private/project --store-root /private/store --publish
 cce library status --store-root /private/store
 cce library search lattice --store-root /private/store --limit 20 --offset 0
+cce library search "ledger entries" --store-root /private/store --plan auto --max-seconds 15
 cce library read RECORD_UID --store-root /private/store --message 0 --offset 0 --limit 12000
 cce library history RECORD_UID --store-root /private/store
 cce library read RECORD_UID --store-root /private/store --version 1.1.0
@@ -34,7 +35,7 @@ cce library analyze lattice --output /private/store/derived/analysis/lattice --p
 cce library verify --store-root /private/store
 ```
 
-`CCE_LIBRARY_STORE_ROOT` supplies the store when a command omits it; the existing `CCE_CORPUS_STORE_ROOT` is a fallback. Search returns an exact total, bounded excerpts, stable record identities, vault paths and the next offset. Read retrieves one message span and reports main/alternate sequence counts; use `--sequence alternate` (MCP `sequence: "alternate"`) to page retained conversation branches. History and digest selection also expose retained snapshots that were not selected as the current body. `cce-mcp --library-store-root /private/store` adds three read-only tools: `cce_library_search`, `cce_library_read`, and `cce_library_history`. Clients cannot choose arbitrary filesystem paths through these tools.
+`CCE_LIBRARY_STORE_ROOT` supplies the store when a command omits it; the existing `CCE_CORPUS_STORE_ROOT` is a fallback. Search returns a total (exact up to 1000 matches), bounded excerpts, stable record identities, vault paths and the next offset, and it plans and time-bounds the query (see [search planning](#search-planning-time-budget-and-capped-totals)). Read retrieves one message span and reports main/alternate sequence counts; use `--sequence alternate` (MCP `sequence: "alternate"`) to page retained conversation branches. History and digest selection also expose retained snapshots that were not selected as the current body. `cce-mcp --library-store-root /private/store` adds three read-only tools: `cce_library_search`, `cce_library_read`, and `cce_library_history`. Clients cannot choose arbitrary filesystem paths through these tools.
 
 ## Source manifest
 
@@ -91,9 +92,42 @@ Build receipts report source findings and `coverage_complete` separately from su
 
 The two MCP tools support a locate-then-read flow that stays inside a token budget. Defaults keep the previous output (new fields are additive).
 
-- `cce_library_search`: `depth: "L0"` returns only `uid`, a one-line `title` (80 characters at most), `score` (bm25, higher is better) and `read`, within `budget_tokens` (default 900, at most 1200 at L0; at most 20000 at L1). Tokens are estimated as UTF-8 bytes / 4 of the compact JSON text, and the response states the estimate (`token_estimate`, or `tk` in compact mode). Hits that do not fit are left for `next_offset` and `truncated` is true; a budget too small for a single hit is an error. `compact: true` shortens keys (the tool schema lists them). Every response states `total` with `total_exact` and `total_label` (an exact number today; the form `N+` is reserved for capped counts).
+- `cce_library_search`: `depth: "L0"` returns only `uid`, a one-line `title` (80 characters at most), `score` (bm25, higher is better) and `read`, within `budget_tokens` (default 900, at most 1200 at L0; at most 20000 at L1). Tokens are estimated as UTF-8 bytes / 4 of the compact JSON text, and the response states the estimate (`token_estimate`, or `tk` in compact mode). Hits that do not fit are left for `next_offset` and `truncated` is true; a budget too small for a single hit is an error. `compact: true` shortens keys (the tool schema lists them). Every response states `total` with `total_exact` and `total_label` (the number itself while the count is exact, and `1000+` once more than 1000 records match), and, additively, the `plan` that answered, `partial`, `ranked` and `elapsed_s` (see [search planning](#search-planning-time-budget-and-capped-totals)).
 - Passage handoff: every hit carries `read`, the exact `cce_library_read` arguments (`uid`, `message`, `offset`, `limit`, plus `sequence` when the best match is in the alternate branch) for the first message that holds every query term, falling back to the first message holding any. Stemming is approximated, so a stemmed-only match can fall back to the start of the record, which is flagged `located: false`. A record whose stored shape cannot be interpreted (for example a malformed alternate sequence) never fails the page that lists it: its hit keeps every normal field and its `read` is the start-of-record locator with `located: false` and a short content-free `locator_error` (`le` in compact mode), while a direct read of that record raises an error that names it.
 - `cce_library_read`: `around_query` centres the passage on the first match at or after `message` and reports `match` (`message`, `start`, `end`, or null); `message_end` reads a message range under a total character `limit` and returns `next_message` / `next_offset` to resume (at most 200 messages per call); `toc: true` lists markdown headings with message and character offsets (or a per-message index when there are none), paged by `toc_offset` / `toc_limit` with an exact `toc_total`; `compact: true` drops the envelope metadata and shortens keys.
+
+### Search planning, time budget and capped totals
+
+Ranking every match by bm25 means reading the position lists of each matching record, so the cost grows with the number of matches and with how common the words are, not with the size of the page. On a large library a query of several common words can match thousands of records and take many seconds to minutes, while the same words as a quoted phrase, or one rare word, answer almost at once. Search therefore plans the query, bounds its time and caps its count.
+
+**Plan order.** An unquoted query of two or more words (`plan: "auto"`, the default) runs as:
+
+| step | plan | matches a record when |
+|---|---|---|
+| 1 | `phrase` | all the words are adjacent and in order |
+| 2 | `and` | every word occurs, anywhere in the record |
+| 3 | `or` | any word occurs |
+
+The planner stops at the first plan that matches at least one record in the filtered set (the `wing`, `lane`, `provider` and `kind` filters apply; the `offset` and `limit` do not, so every page of one query is answered by the same plan), and the response names it in `plan`. If no plan matches, `plan` is `or` with `total` 0. A single word, or a query that already quotes a phrase, is not planned: it runs as written (every word and quoted phrase must match) and reports `plan: "and"`. `--plan` / `plan` forces one plan (`phrase`, `and` or `or`) and runs only that one; on a quoted or single-word query, `phrase` requires all its words adjacent and `or` accepts any of its words or quoted phrases. Pass the `plan` of one response to the next page to skip re-planning.
+
+`and` is exactly what search did before planning existed: its words were always AND-ed (SQLite FTS5 reads space-separated terms as an implicit AND), never OR-ed, so `plan: "and"` returns identical hits in identical order. `or` is new behavior. A broader fallback can surface records that hold only some of the words, which is why the response says which plan answered.
+
+**Cost of OR.** `or` accepts every record with any word, so with common words it matches the most records and is the slowest plan; so is `and` with common words when the phrase misses. When an `or` plan matches more than the count cap, the response carries `hint`: "quote a phrase or add terms for a faster, more precise search" (the command line also prints it to stderr). The time budget below is what bounds the case where the phrase misses and the broader plans are large.
+
+**Time budget.** `--max-seconds` (command line) and `max_seconds` (MCP) default to 15 seconds and must be above 0 and at most 600; the Python `Library.search` has no budget unless `max_seconds` is passed. One deadline covers the whole call (the phrase probe, the counts and the ranking) and is enforced through the SQLite progress handler, so a slow ranking is interrupted rather than waited for. When it runs out the call does not fail: it returns the first matches of the answering plan in index order (the order records were added) with `partial: true`, `ranked: false`, a `notice` saying so and the same `hint`; their `score` is null. Producing that page gets a short further allowance of its own (at most 2 seconds). A call that finishes in time reports `partial: false` and `ranked: true`. `elapsed_s` is the time the search used. Offsets continue in index order for a partial page, which is not the order of the ranked pages; run a narrower query (quote a phrase, add terms) or raise the budget to get ranked results.
+
+**Capped count.** Counting every match of a huge set is itself costly, so `total` is exact only up to `count_cap` (1000 by default in the Python API, fixed at 1000 for the command line and the MCP tool). When more records match, `total` is the cap, `total_exact` is false and `total_label` is `"1000+"` (compact mode carries `n` and `nx`). The cap changes neither which hits are returned nor their order, and `next_offset` keeps advancing past the cap until the last page. `count_cap=None` counts exactly.
+
+| field | compact key | meaning |
+|---|---|---|
+| `plan` | `pn` | the plan that answered (`phrase`, `and` or `or`) |
+| `partial` | `pt` | true when the time budget ran out |
+| `ranked` | `rk` | false when ranking was abandoned and hits are in index order |
+| `elapsed_s` | `es` | seconds the search used |
+| `total_exact`, `total_label` | `nx` (flag only) | whether `total` is exact; its text form, e.g. `1000+` |
+| `notice`, `hint` | `nt`, `ht` | present only on a partial page or a broad OR |
+
+`cce library analyze QUERY` keeps the previous selection: it runs the `and` plan with an exact matched count, so its receipt is unchanged by planning.
 
 ## Retrieval benchmark at the MCP boundary
 
