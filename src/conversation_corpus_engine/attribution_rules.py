@@ -866,16 +866,17 @@ def _repeat_units(text: str, min_chars: int) -> list[tuple[int, int, int]]:
 
 
 def _collapsed_key(stripped: str) -> tuple[int, int]:
-    """Length and census key of a text with every whitespace run collapsed to one space. A huge
+    """Length and census key of a text with its invisible characters (format characters and
+    non-whitespace controls) deleted and every whitespace run collapsed to one space. A huge
     text is hashed piece by piece (the pieces end at whitespace, so the bytes hashed are exactly
     those of the one-shot form) instead of being split into every one of its words at once."""
     if len(stripped) <= 2 * ECHO_CHUNK:
-        collapsed = " ".join(stripped.split())
+        collapsed = " ".join(delete_invisible(stripped).split())
         return len(collapsed), _repeat_key(collapsed)
     digest = hashlib.sha256()
     length = 0
     for chunk in _chunks(stripped):
-        piece = " ".join(chunk.split())
+        piece = " ".join(delete_invisible(chunk).split())
         if piece:
             data = f" {piece}" if length else piece
             digest.update(data.encode("utf-8"))
@@ -978,10 +979,12 @@ _SPACE_RUN = re.compile(r"\s+")
 
 def match_form(text: str) -> str:
     """Text as the echo compares it, so that rewrapping, case, markdown, list numbering,
-    punctuation, smart quotes and dashes, compatibility characters and spacing cannot hide a paste:
-    NFKC, case-folded, list markers and numbering dropped, every punctuation or symbol character
-    read as a space, whitespace collapsed."""
-    folded = unicodedata.normalize("NFKC", text).casefold()
+    punctuation, smart quotes and dashes, compatibility characters, spacing and invisible
+    characters cannot hide a paste: format characters (zero-width space and joiners, U+2060, the
+    soft hyphen, ...) and control characters deleted (not read as a space, which would cut a
+    word in two), NFKC, case-folded, list markers and numbering dropped, every punctuation or
+    symbol character read as a space, whitespace collapsed."""
+    folded = unicodedata.normalize("NFKC", delete_invisible(text)).casefold()
     folded = _LIST_MARKER.sub(" ", folded)
     return " ".join(_NOT_TEXT.sub(" ", folded).split())
 

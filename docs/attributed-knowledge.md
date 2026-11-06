@@ -325,7 +325,7 @@ so no higher rule can lose a character to an owner claim.
 | 6 | `quote` | third_party | markdown blockquote lines (and the lazy continuation lines that follow one), passages of 40 or more characters inside matching quotation marks, and pasted-content wrappers |
 | 7 | `log_trace` | agent | timestamped log lines, Python tracebacks, stack traces (an exception header with its frame, or two frames, even at two lines) and runs of three or more tool-output shaped lines |
 | 8 | `pasted_block` | third_party | a pasted email: a `From:`, `To:`, `Subject:` or `Date:` header line that anything follows, two header lines in a row, an original-message or forward marker, or an on-date-wrote line; it runs to the end of the message because its extent cannot be proven. And a markdown table: two or more consecutive lines that each hold two or more pipes (no separator row needed), two or more consecutive lines that each hold the same number of pipes (rows without outer pipes, such as `Name | Cost`), or lines with pipes that include a separator row. Consequence: owner text written after a pasted email in the same message is third party too; put your own words before the paste or in a separate message |
-| 9 | `boilerplate` | third_party | later occurrences of a long text that repeats verbatim after whitespace normalization |
+| 9 | `boilerplate` | third_party | later occurrences of a long text that repeats verbatim after whitespace normalization and with invisible characters deleted |
 | 10 | `pasted_back` | third_party | text a user turn pastes back from an earlier assistant turn of the same conversation (see below) |
 | 11 | `ambiguous` | unknown | a paragraph with an odd number of ASCII double quotes; and a note or document of the owner's own library that states an AI had a hand in it anywhere (see below) |
 | 12 | `typed_prefix` | owner | the first `typed_chars` characters of a user turn on the `typed` channel |
@@ -355,10 +355,12 @@ broad: a person's name that is also an assistant's (*asked Claude*) taints the n
 costs recall.
 
 **Pasted-back text (rule 10).** `AssistantEcho` compares each user turn with the assistant turns
-before it in the same conversation. Both sides are put in a match form (NFKC, case-folded, list
-markers and numbering, emphasis, headings, backticks, punctuation, smart quotes and dashes dropped,
-whitespace collapsed), so re-casing, rewrapping, bulleting, renumbering or stripping markup does not
-hide a paste. Three things are pasted back:
+before it in the same conversation. Both sides are put in a match form (format characters such
+as the zero-width space and joiners, the word joiner U+2060 and the soft hyphen, and control
+characters deleted, not read as spaces; NFKC, case-folded, list markers and numbering, emphasis,
+headings, backticks, punctuation, smart quotes and dashes dropped, whitespace collapsed), so
+re-casing, rewrapping, bulleting, renumbering, stripping markup or sprinkling invisible characters
+through the text does not hide a paste. Three things are pasted back:
 
 - a paragraph of at least 60 match-form characters that holds a stretch of 60 or more characters
   shared with an assistant turn;
@@ -385,7 +387,14 @@ verifier's 20-to-95 shape in 50 percent; one quote of 20 to 95 characters as its
 46 percent; two such paragraphs in 73 percent; three quotes of 20 to 59 characters as separate
 paragraphs, which stack to the 100-character total, in 77 percent (0 percent before the echo-hit
 rule). That is the accepted conservative cost: text that is verbatim an assistant's, in amounts that
-add up, is not the owner's, and what is lost is recall, never precision. **Known limits:** pieces
+add up, is not the owner's, and what is lost is recall, never precision. **Invisible characters,
+measured (300 generated pastes per shape: an assistant answer of five paragraphs of about 1,500
+characters, or of eight paragraphs of 20 to 59 characters, pasted back into one turn):** with U+2060 every 7 characters, U+200B or U+00AD every 15, or U+200B every 40, the
+paste was fully carved in 0, 0, 0 and 56 percent of the long-paragraph pastes and in 0, 0, 0 and
+11 percent of the short-paragraph pastes before the match form deleted such characters, and in
+100 percent of both after, the same as the unmarked paste; three copies of a 350-character
+paragraph with the later copies marked differently were found as boilerplate in 0 percent before
+and 100 percent after, and the carve table above is unchanged. **Known limits:** pieces
 pasted in turns with an assistant reply between them (a stretch ends at an assistant turn, so a
 "noted" between two pastes starts a new stretch), pastes from another conversation, and pastes of
 text beyond the indexed head are not recognised; the length strata below stay as defence in depth
@@ -395,7 +404,8 @@ turns go first, the newest included in the count), and each indexed turn is kept
 64-bit window hashes and its normalized head, never its full text.
 
 Boilerplate is decided by a census over the slice that is scanned. A paragraph, or a whole
-multi-paragraph message, of at least 200 characters (`--repeat-min-chars`) that occurs at least
+multi-paragraph message, of at least 200 characters (`--repeat-min-chars`, counted after whitespace
+is collapsed and invisible characters are deleted) that occurs at least
 3 times (`--repeat-min-occurrences`) is repeated; its first occurrence in scan order (record uid,
 main sequence before alternate, message index) is left to the other rules and every later one is
 boilerplate. A different slice, such as one cut by `--limit-records`, can therefore decide a span
