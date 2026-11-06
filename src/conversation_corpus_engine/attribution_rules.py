@@ -33,6 +33,7 @@ import itertools
 import json
 import os
 import re
+import time
 import types
 import unicodedata
 from array import array
@@ -1780,13 +1781,59 @@ def _read_all(descriptor: int) -> bytes:
     return b"".join(chunks)
 
 
-def append_ledger(path: Path, rows: Sequence[dict[str, Any]]) -> int:
+LEDGER_LOCK_SECONDS = 30.0
+_LOCK_POLL_SECONDS = 0.05
+
+
+@dataclass(frozen=True)
+class LedgerAppend:
+    """What one append did."""
+
+    appended: int
+    # The ledger ended in a line cut short; a newline was written first, so that fragment is now
+    # one malformed line, which every reader quarantines.
+    repaired_torn_line: bool = False
+
+
+def _lock_exclusively(
+    descriptor: int,
+    timeout: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+) -> None:
+    """Take the exclusive lock, polling for up to `timeout` seconds: a ledger some other process
+    holds is waited for, never waited on forever."""
+    deadline = clock() + timeout
+    while True:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if clock() >= deadline:
+                raise ValueError(
+                    f"ledger is locked by another process (waited {timeout:g} seconds); "
+                    "nothing was written"
+                ) from None
+            sleep(_LOCK_POLL_SECONDS)
+
+
+def append_rows(
+    path: Path,
+    rows: Sequence[dict[str, Any]],
+    *,
+    lock_timeout: float | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+) -> LedgerAppend:
     """Append validated rows to an append-only JSONL ledger.
 
     Nothing is written when any row is malformed or names a span one reviewer already reviewed
     as a different rule or stratum (re-answering a span under the same rule and stratum is fine:
-    the last answer wins). Reading, checking and writing happen under one exclusive lock, in one
-    write, and a ledger created here is private (mode 0600).
+    the last answer wins). Reading, checking and writing happen under one exclusive lock (waited
+    for up to `LEDGER_LOCK_SECONDS`, else ValueError), in one write, and a ledger created here is
+    private (mode 0600). If the file does not end in a newline an earlier write was cut short:
+    a newline is written first, the fragment stays as one quarantined line, and the result says
+    so.
     """
     valid = [validate_ledger_row(row) for row in rows]
     if path.is_symlink():
@@ -1798,22 +1845,28 @@ def append_ledger(path: Path, rows: Sequence[dict[str, Any]]) -> int:
     flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags, 0o600)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        _lock_exclusively(
+            descriptor, LEDGER_LOCK_SECONDS if lock_timeout is None else lock_timeout, clock, sleep
+        )
         existing = _read_all(descriptor)
-        if existing and not existing.endswith(b"\n"):
-            raise ValueError("ledger does not end with a newline; an earlier write was cut short")
+        torn = bool(existing) and not existing.endswith(b"\n")
         if not existing:
             os.fchmod(descriptor, 0o600)
         conflict = _kind_conflict(parse_ledger(_decode(existing)).rows, valid)
         if conflict:
             raise ValueError(f"ledger conflict: {conflict}; nothing was written")
-        data = payload.encode("utf-8")
+        data = (b"\n" if torn else b"") + payload.encode("utf-8")
         while data:
             data = data[os.write(descriptor, data) :]
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-    return len(valid)
+    return LedgerAppend(appended=len(valid), repaired_torn_line=torn)
+
+
+def append_ledger(path: Path, rows: Sequence[dict[str, Any]]) -> int:
+    """`append_rows`, returning only how many rows were appended."""
+    return append_rows(path, rows).appended
 
 
 @dataclass(frozen=True)

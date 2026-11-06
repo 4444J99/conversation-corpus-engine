@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import random
 from pathlib import Path
 
@@ -21,6 +23,7 @@ from conversation_corpus_engine.attribution_rules import (
     EXCERPT_TAIL,
     GATE_MIN_PRECISION_PERCENT,
     GATE_MIN_REVIEWED,
+    LEDGER_LOCK_SECONDS,
     LEDGER_SCHEMA,
     RULE_BY_ID,
     RULES,
@@ -34,6 +37,7 @@ from conversation_corpus_engine.attribution_rules import (
     ReviewSummary,
     StratumReview,
     append_ledger,
+    append_rows,
     attribute_message,
     eligible_strata,
     parse_ledger,
@@ -571,6 +575,78 @@ def test_two_samples_are_judged_each_by_what_it_drew() -> None:
     ]
     review = gate(first + second)
     assert (review.reviewed, review.confirmed, review.missing) == (100, 80, 20)
+
+
+def test_a_torn_last_line_becomes_one_quarantined_row_and_appending_goes_on(
+    tmp_path: Path,
+) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    append_ledger(ledger, verdict_rows("quote", ["yes", "no"]))
+    with ledger.open("ab") as handle:
+        handle.write(b'{"schema": "cce.attribution-review-ledger.v3", "rules_ver')
+    result = append_rows(ledger, verdict_rows("quote", ["yes"], start=7))
+    assert (result.appended, result.repaired_torn_line) == (1, True)
+    contents = read_ledger(ledger)
+    assert [row["span_id"] for row in contents.rows] == [f"{0:032x}", f"{1:032x}", f"{7:032x}"]
+    assert [number for number, _ in contents.quarantined] == [3]
+    assert ledger.read_bytes().endswith(b"\n")
+    again = append_rows(ledger, verdict_rows("quote", ["yes"], start=8))
+    assert (again.appended, again.repaired_torn_line) == (1, False)
+    assert append_ledger(ledger, verdict_rows("quote", ["yes"], start=9)) == 1
+
+
+class VirtualTime:
+    """A clock that only moves when the code under test sleeps."""
+
+    def __init__(self, on_sleep=None) -> None:
+        self.now = 0.0
+        self.sleeps = 0
+        self.on_sleep = on_sleep
+
+    def clock(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        self.sleeps += 1
+        if self.on_sleep:
+            self.on_sleep(self.sleeps)
+
+
+def test_a_ledger_locked_by_another_process_is_waited_for_then_refused(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_bytes(b"")
+    holder = os.open(ledger, os.O_RDWR)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        time = VirtualTime()
+        with pytest.raises(ValueError, match="locked by another process"):
+            append_rows(
+                ledger,
+                verdict_rows("quote", ["yes"]),
+                lock_timeout=30.0,
+                clock=time.clock,
+                sleep=time.sleep,
+            )
+        assert 30.0 <= time.now < 31.0 and time.sleeps > 10
+        assert ledger.read_bytes() == b""
+        release = VirtualTime(
+            lambda count: fcntl.flock(holder, fcntl.LOCK_UN) if count == 3 else None
+        )
+        result = append_rows(
+            ledger,
+            verdict_rows("quote", ["yes"]),
+            lock_timeout=30.0,
+            clock=release.clock,
+            sleep=release.sleep,
+        )
+        assert result.appended == 1 and release.sleeps == 3
+    finally:
+        os.close(holder)
+
+
+def test_the_default_lock_wait_is_thirty_seconds() -> None:
+    assert LEDGER_LOCK_SECONDS == 30.0
 
 
 def test_ledger_is_append_only_jsonl_and_refuses_symlinks(tmp_path: Path) -> None:

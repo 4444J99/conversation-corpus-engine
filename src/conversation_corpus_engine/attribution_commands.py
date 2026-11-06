@@ -59,7 +59,7 @@ from .attribution_rules import (
     ReviewSample,
     ReviewSampler,
     ReviewSummary,
-    append_ledger,
+    append_rows,
     attribute_message,
     blank_text,
     eligible_strata,
@@ -1248,20 +1248,22 @@ def _review_record(args: argparse.Namespace) -> int:
             )
         )
     private_directories(ledger.parent)
-    appended = append_ledger(ledger, rows)
+    appended = append_rows(ledger, rows)
     counts = Counter(f"{row['rule']}:{row['stratum']}" for row in rows)
     result = {
         "ledger": str(args.ledger),
-        "appended": appended,
+        "appended": appended.appended,
         "unanswered": unanswered,
         "recorded_as_unsure": unanswered,
         "sample_digest": header["sample_digest"],
+        "repaired_torn_line": appended.repaired_torn_line,
         "strata": {key: {"appended": count} for key, count in sorted(counts.items())},
     }
     _emit(
         result,
-        f"appended {appended} verdicts to {args.ledger} "
-        f"({unanswered} unanswered, recorded as unsure)",
+        f"appended {appended.appended} verdicts to {args.ledger} "
+        f"({unanswered} unanswered, recorded as unsure)"
+        + (" after repairing a cut-short last line" if appended.repaired_torn_line else ""),
         args.json,
     )
     return 0

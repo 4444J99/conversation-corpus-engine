@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -27,7 +28,7 @@ from attribution_support import (
     typed,
 )
 
-from conversation_corpus_engine import attribution_commands
+from conversation_corpus_engine import attribution_commands, attribution_rules
 from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.attributed_knowledge import collect_owner_segments
 from conversation_corpus_engine.attribution import attributed_spans, owner_profile_eligible
@@ -1948,6 +1949,45 @@ def test_deeply_nested_json_is_refused_as_unreadable_not_a_crash(
     hostile.write_text(deep.read_text(encoding="utf-8"), encoding="utf-8")
     report = report_of(capsys, library, "--ledger", hostile, "--owner-id", "rob")
     assert report["gate"]["quarantined_rows"] == 1
+
+
+def test_review_record_repairs_a_torn_ledger_and_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    answered(sample, answers, 1)
+    ledger.write_text('{"schema": "cce.attribution-review-ledger.v3", "rul', encoding="utf-8")
+    code, out, err = record_answers(capsys, library, ledger, sample, answers, "--json")
+    assert code == 0, err
+    result = json.loads(out)
+    assert result["repaired_torn_line"] is True
+    report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
+    assert report["gate"]["quarantined_rows"] == 1
+    assert report["gate"]["ledger_rows"] == result["appended"]
+    code, out, _ = record_answers(capsys, library, ledger, sample, answers, "--json")
+    assert code == 0 and json.loads(out)["repaired_torn_line"] is False
+
+
+def test_review_record_waits_for_a_locked_ledger_and_then_exits_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
+    sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
+    run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
+    answered(sample, answers, 1)
+    monkeypatch.setattr(attribution_rules, "LEDGER_LOCK_SECONDS", 0.2)
+    ledger.write_bytes(b"")
+    holder = os.open(ledger, os.O_RDWR)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    try:
+        code, _, err = record_answers(capsys, library, ledger, sample, answers)
+    finally:
+        os.close(holder)
+    assert code == 2 and "locked by another process" in err
+    assert ledger.read_bytes() == b""
+    assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
 
 
 def test_an_existing_output_is_refused_for_every_writer(
