@@ -50,7 +50,7 @@ from .archive_provenance import INJECTED_TAGS, classify_user_turn
 from .archive_read_library import FAMILIES
 from .attribution import ATTRIBUTION_SCHEMA, text_digest
 
-RULES_VERSION = "cce.attribution-rules@9"
+RULES_VERSION = "cce.attribution-rules@10"
 
 OWNER = "owner"
 AGENT = "agent"
@@ -120,12 +120,61 @@ def marks_agent_origin(mapping: Any) -> str:
     return ""
 
 
+# Path conventions added in rules @10. A folder component (case-insensitive, either separator)
+# that only agents write into.
+AGENT_PLAIN_DIRECTORIES = frozenset({"skills"})
+# A `memory` component directly under an `intake` component: the agent memory intake.
+AGENT_MEMORY_PARENT = "intake"
+AGENT_MEMORY_CHILD = "memory"
+# The agent task list file, by exact base name.
+AGENT_TASK_FILE = "tasks.md"
+# AI names recognised in a file base name (see `_ai_name_in`): the whole delimited token must be
+# one of these, or `gpt` with an optional version glued on (`gpt4`, `gpt4o`; `gpt-4` splits into
+# the tokens `gpt` and `4`).
+AI_NAME_TOKENS = frozenset(
+    {"claude", "gemini", "chatgpt", "copilot", "codex", "opencode", "antigravity"}
+)
+_GPT_TOKEN = re.compile(r"gpt(?:\d[a-z0-9]*)?")
+_TOKEN_DELIMITERS = re.compile(r"[^a-z0-9]+")
+# `.github` holds workflows and community files that may be hand-written: not agent, not owner.
+GITHUB_DIRECTORY = ".github"
+# Files that are nobody's prose: images, calendars, property lists, archives, PDFs (received
+# documents whose author cannot be told) and the data formats.
+NON_PROSE_EXTENSIONS = frozenset(
+    {".ics", ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".tif", ".tiff"}
+    | {".bmp", ".svg", ".plist", ".zip", ".gz", ".tgz", ".tar", ".pdf"}
+    | {".json", ".jsonl", ".csv", ".xml"}
+)
+# Data formats an authored notes family (an export of the owner's notes) may legitimately use.
+DATA_EXTENSIONS = frozenset({".json", ".jsonl", ".csv", ".xml"})
+# The bundle layout of a package document: `Name.pages/Data/...`, `Name.pages/metadata/...`.
+PACKAGE_SUFFIX = ".pages"
+PACKAGE_METADATA_FILE = "documentidentifier"
+
+
+def _path_parts(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, str) or not value:
+        return ()
+    return PurePosixPath(value.replace("\\", "/")).parts
+
+
+def _ai_name_in(base: str) -> bool:
+    """True if a file base name holds an AI name as a whole word. The extension is dropped, the
+    rest is lower-cased and split at every run of characters that are not ASCII letters or digits
+    (space, `-`, `_`, `.`, brackets), and a token must equal an AI name (claude, gemini, chatgpt,
+    copilot, codex, opencode, antigravity) or be `gpt` with an optional version glued on. So
+    `Untitled-1-Claude.md` and `run_gemini_notes.json` match, while `claudette`, `copilots`,
+    `mycopilot`, `geminize` and `gptq` do not. CamelCase is not split."""
+    tokens = _TOKEN_DELIMITERS.split(PurePosixPath(base).stem.lower())
+    return any(token in AI_NAME_TOKENS or _GPT_TOKEN.fullmatch(token) for token in tokens)
+
+
 def _path_reason(provenance: Mapping[str, Any]) -> str:
+    """The agent-origin convention a source path matches. The older conventions (base names,
+    rules files, agent dot-folders) are tried first, so a path that matches both an old and a new
+    one keeps the old reason."""
     for key in ("source_file", "source_path"):
-        value = provenance.get(key)
-        if not isinstance(value, str) or not value:
-            continue
-        parts = PurePosixPath(value.replace("\\", "/")).parts
+        parts = _path_parts(provenance.get(key))
         if not parts:
             continue
         base = parts[-1].lower()
@@ -133,9 +182,46 @@ def _path_reason(provenance: Mapping[str, Any]) -> str:
             return f"path:{base}"
         if base.endswith(".mdc"):
             return "path:rules-file"
+        folders = [part.lower() for part in parts[:-1]]
         for part in parts[:-1]:
             if part.lower() in AGENT_DIRECTORIES:
                 return f"path:{part.lower()}"
+        for folder in folders:
+            if folder in AGENT_PLAIN_DIRECTORIES:
+                return f"path:{folder}"
+        if any(
+            (parent, child) == (AGENT_MEMORY_PARENT, AGENT_MEMORY_CHILD)
+            for parent, child in itertools.pairwise(folders)
+        ):
+            return "path:intake-memory"
+        if base == AGENT_TASK_FILE:
+            return f"path:{AGENT_TASK_FILE}"
+        if _ai_name_in(parts[-1]):
+            return "path:ai-name"
+    return ""
+
+
+def _unattributable_path_reason(provenance: Mapping[str, Any], *, notes_family: bool) -> str:
+    """Why a source path says no one's prose can be told from the record, else ''. Only asked
+    when no agent convention matched. `.github` files, files inside a package document bundle,
+    and files whose extension is not prose (data formats excepted for an authored notes family)."""
+    for key in ("source_file", "source_path"):
+        parts = _path_parts(provenance.get(key))
+        if not parts:
+            continue
+        folders = [part.lower() for part in parts[:-1]]
+        if GITHUB_DIRECTORY in folders:
+            return f"path:{GITHUB_DIRECTORY}"
+        base = parts[-1].lower()
+        if any(folder.endswith(PACKAGE_SUFFIX) for folder in folders) or (
+            base == PACKAGE_METADATA_FILE
+        ):
+            return "path:pages-bundle"
+        extension = PurePosixPath(base).suffix
+        if extension in NON_PROSE_EXTENSIONS and not (
+            notes_family and extension in DATA_EXTENSIONS
+        ):
+            return f"path:non-prose:{extension}"
     return ""
 
 
@@ -157,6 +243,9 @@ class RecordInfo:
     # Why the whole record is another party's text ('' when nothing says so): the provider is a
     # family of captured third-party text, such as a fetched web page.
     third_party_origin: str = ""
+    # Why the whole record is nobody's attributable prose ('' when nothing says so): its source
+    # path is a `.github` folder, a package bundle internal or a non-prose file. Never owner.
+    unknown_origin: str = ""
 
 
 def third_party_origin_of(provider: Any) -> str:
@@ -203,6 +292,9 @@ def record_info(payload: Mapping[str, Any]) -> RecordInfo:
                 origin = f"text:{marker}" if marker else ""
             if authored and kind in NOTE_KINDS and not ai_marker:
                 ai_marker = _ai_marker(body)
+    unknown = ""
+    if not origin and kind in DOCUMENT_KINDS:
+        unknown = _unattributable_path_reason(provenance, notes_family=authored and kind == "note")
     third_party = third_party_origin_of(provider)
     return RecordInfo(
         provider=provider,
@@ -213,6 +305,7 @@ def record_info(payload: Mapping[str, Any]) -> RecordInfo:
         agent_origin=origin,
         ai_marker=ai_marker,
         third_party_origin=third_party,
+        unknown_origin=unknown,
     )
 
 
@@ -1393,8 +1486,12 @@ def rule_ambiguous(context: MessageContext) -> list[Claim]:
     number of ASCII double quotes cannot be paired into quotations, and a note or document of the
     person's own library that states an AI had a hand in it anywhere cannot be split into the
     person's sections and the machine's: none of it is attributed. Every stronger rule has
-    already taken its own characters by the time this one runs."""
+    already taken its own characters by the time this one runs. A document whose source path
+    says its text is nobody's attributable prose (a `.github` file, a package bundle internal, a
+    non-prose file such as an image or a calendar) is unknown in whole, whatever its role."""
     text = context.text
+    if context.record.unknown_origin:
+        return [(0, len(text), f"origin={context.record.unknown_origin}")]
     marker = ""
     if _owns_notes(context.record):
         marker = context.record.ai_marker or _ai_marker(text)
