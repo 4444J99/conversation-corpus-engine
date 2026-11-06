@@ -96,3 +96,27 @@ def test_verify_reports_a_record_without_a_search_row_at_its_own_row(path):
     with Library(path) as library:
         problems = library.verify(full=False)
     assert "search identity is not aligned with its record row" in problems
+
+
+def test_the_ranking_statement_does_not_build_excerpts_for_every_match(path):
+    """SQLite computes every selected column of every match before it sorts, so the statement
+    that sorts by relevance must not select the excerpt; a second statement reads just the page."""
+    statements: list[str] = []
+    with Library(path) as library:
+        library.connection.set_trace_callback(statements.append)
+        result = library.search("alpha shared", limit=1)
+    ranking = [s for s in statements if "bm25" in s]
+    excerpts = [s for s in statements if "snippet(" in s]
+    assert len(ranking) == 1 and "snippet(" not in ranking[0]
+    assert len(excerpts) == 1 and "bm25" not in excerpts[0]
+    # Paging still works: one more row than the page decides whether another page follows.
+    assert len(result["hits"]) == 1 and result["next_offset"] == 1 and result["total"] == 2
+
+
+def test_two_pages_of_a_ranked_search_do_not_repeat_or_skip_a_record(path):
+    with Library(path) as library:
+        first = library.search("alpha shared", limit=1, offset=0)
+        second = library.search("alpha shared", limit=1, offset=1)
+    seen = [hit["uid"] for hit in first["hits"]] + [hit["uid"] for hit in second["hits"]]
+    assert sorted(seen) == sorted({conv("one", "x").uid, conv("two", "x").uid})
+    assert second["next_offset"] is None
