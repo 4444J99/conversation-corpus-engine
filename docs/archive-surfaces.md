@@ -105,7 +105,7 @@ limits, and `cce archive census` checks any tree against them.
 | `--folder-entries` | 1,800 (ceiling 2,000) | a month folder spills into one folder per day, a day into hash buckets |
 | `--shard-bytes` | 48 MiB (data ceiling 64 MiB) | a provider-month shard rolls to `-002`, `-003` |
 | SQLite files | exempt from the size ceiling | they are paged by their engine, never rendered, and sharded by provider and month anyway |
-| one oversize conversation | exempt, by name, from the data ceiling | a conversation is never cut, so a row larger than a shard is its own shard; the manifest marks it `oversize_row` and the census lists it under `violations.exempt` with the reason |
+| one oversize conversation | exempt, by name, from the data ceiling | a conversation is never cut, so a row larger than the shard target is its own shard and the manifest marks it `oversize_row`; the census lists that file under `violations.exempt` only if it also exceeds the data ceiling |
 
 - **Splitting is lossless.** A message that does not fit is cut at line boundaries; a fenced code
   block cut this way is closed at the end of the piece and reopened at the start of the next, so
@@ -273,10 +273,11 @@ changes the source fingerprint, as any recorded input does. A ZIP that is not na
 recorded; preserve its original checksum in the capture receipt. Private source paths in build
 receipts belong in the private store, not in the code repository.
 
-A conversation larger than a shard (one Antigravity session is
-about 170 MiB) is never cut: its shard is that one row, the manifest marks it `oversize_row`, and
-the census lists the file under `violations.exempt` with the reason instead of ignoring the
-ceiling — a data file past the ceiling that the manifest does not name is still a violation.
+A conversation larger than the shard target is never cut: its shard is that one row and
+the manifest marks it `oversize_row`. If that shard also exceeds the data ceiling, the
+census lists the file under `violations.exempt` with the reason. A shard larger than the
+target but within the ceiling needs no exemption in the census. A data file past the
+ceiling that the manifest does not name is still a violation.
 This exemption preserves the canonical record; it does not exempt an encrypted publication
 from its own unit, chunk, manifest or total-capacity limits.
 
