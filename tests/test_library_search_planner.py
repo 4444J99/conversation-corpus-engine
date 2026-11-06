@@ -508,13 +508,18 @@ def test_an_expired_budget_in_a_later_plan_names_that_plan(many, monkeypatch):
     clock = FakeClock()
     monkeypatch.setattr(library_store, "_clock", clock)
 
+    counts = []
+
     def trace(statement: str) -> None:
-        # The AND plan is the first statement that names both words without the phrase quotes.
-        if '"alpha" "beta"' in statement:
-            clock.now = 100.0
+        # The phrase plan counts first (no match), then the AND plan counts: expire during that.
+        if "COUNT(*)" in statement:
+            counts.append(statement)
+            if len(counts) == 2:
+                clock.now = 100.0
 
     many.connection.set_trace_callback(trace)
     result = many.search("alpha beta", limit=2, max_seconds=1.0)
+    assert len(counts) == 2
     assert result["plan"] == "and" and result["partial"] is True and result["ranked"] is False
 
 

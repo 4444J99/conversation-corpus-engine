@@ -525,7 +525,11 @@ def add_library_parser(subparsers: Any) -> None:
 
 def _search_seconds(text: str) -> float:
     try:
-        return validate_search_seconds(float(text))
+        number = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    try:
+        return validate_search_seconds(number)
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from None
 

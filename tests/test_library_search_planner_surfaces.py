@@ -308,24 +308,27 @@ def test_cli_accepts_every_plan(plan):
     assert parse("--plan", plan).plan == plan
 
 
+BAD_BUDGET = "max_seconds must be a number greater than 0 and at most 600"
+
+
 @pytest.mark.parametrize(
-    "extra",
+    ("extra", "message"),
     [
-        ("--plan", "fast"),
-        ("--plan", "AND"),
-        ("--max-seconds", "0"),
-        ("--max-seconds", "-3"),
-        ("--max-seconds", "601"),
-        ("--max-seconds", "abc"),
-        ("--max-seconds", "nan"),
-        ("--max-seconds", "inf"),
+        (("--plan", "fast"), "argument --plan: invalid choice: 'fast'"),
+        (("--plan", "AND"), "argument --plan: invalid choice: 'AND'"),
+        (("--max-seconds", "0"), BAD_BUDGET),
+        (("--max-seconds", "-3"), BAD_BUDGET),
+        (("--max-seconds", "601"), BAD_BUDGET),
+        (("--max-seconds", "nan"), BAD_BUDGET),
+        (("--max-seconds", "inf"), BAD_BUDGET),
+        (("--max-seconds", "abc"), "argument --max-seconds: 'abc' is not a number"),
     ],
 )
-def test_cli_rejects_a_bad_plan_or_budget_before_searching(extra, capsys):
+def test_cli_rejects_a_bad_plan_or_budget_before_searching(extra, message, capsys):
     with pytest.raises(SystemExit) as raised:
         parse(*extra)
     assert raised.value.code == 2
-    assert extra[0] in capsys.readouterr().err
+    assert message in capsys.readouterr().err
 
 
 def test_cli_help_documents_the_plan_order_the_budget_and_the_cost_of_or(capsys):
