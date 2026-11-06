@@ -21,6 +21,9 @@ EVIDENCE = (
 )
 _INERT = re.compile(r"[\[\]`\\*_#|!]")
 _RULE_LINE = re.compile(r"([ \t]*)([-=])([-= \t]*)")
+# An entity the escapers themselves emit (or that a reader already sees as inert text): the
+# named five and decimal or hex numeric references, with either case of the hex marker.
+_ESCAPED_ENTITY_SPLIT = re.compile(r"(&(?:amp|lt|gt|quot|#[0-9]+|#[xX][0-9a-fA-F]+);)")
 
 
 def facet_stem(facet: str, value: str) -> str:
@@ -45,11 +48,24 @@ def safe_uid(value: str) -> str:
 
 
 def plain(value: Any) -> str:
-    """One inert line for source-supplied titles and metadata, not Markdown."""
-    text = html.escape(" ".join(str(value).split()), quote=False)
-    for character in "[]`\\*_#|!":
-        text = text.replace(character, f"&#{ord(character)};")
-    return text
+    """One inert line for source-supplied titles and metadata, not Markdown.
+
+    Escaping is idempotent, in two ways. The special characters are replaced in one pass: a
+    sequential replace turned ``[`` into ``&#91;`` and then re-escaped the ``#`` inside that
+    new entity, emitting ``&&#35;91;`` for every bracket, backtick, backslash, star or
+    underscore. And an entity that is already present (``&#35;``, ``&amp;``, a hex reference in
+    either case) passes through unchanged, so escaping an escaped title cannot double-escape it.
+    Text without entities or specials renders as before.
+    """
+    text = " ".join(str(value).split())
+    rendered = []
+    for index, segment in enumerate(_ESCAPED_ENTITY_SPLIT.split(text)):
+        if index % 2:
+            rendered.append(segment)
+            continue
+        escaped = html.escape(segment, quote=False)
+        rendered.append(_INERT.sub(lambda match: f"&#{ord(match[0])};", escaped))
+    return "".join(rendered)
 
 
 def inert(value: Any, limit: int | None = None) -> str:

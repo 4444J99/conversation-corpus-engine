@@ -316,7 +316,12 @@ def _fit_units(units: list[str], limit: int) -> list[str]:
         if utf8_size(unit) <= limit:
             fitted.append(unit)
             continue
-        for index, chunk in enumerate(split_text(unit, limit - CONTINUATION_RESERVE)):
+        # The notes are CommonMark, where a fence indented one to three spaces, inside a list item
+        # or not, must close and reopen at that indentation (a column-0 closer would end the item
+        # and open a fence of its own). Other openers keep the column-0 lines; see archive_split.
+        for index, chunk in enumerate(
+            split_text(unit, limit - CONTINUATION_RESERVE, container_fences=True)
+        ):
             fitted.append(chunk.text() if index == 0 else CONTINUATION + chunk.text())
     return fitted
 
