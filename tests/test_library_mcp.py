@@ -701,3 +701,50 @@ def test_every_hit_read_object_is_exactly_the_read_tools_arguments(mount, mode):
     assert page["flags"][uids["title_only"]] == {"located": False}
     flags = page["flags"][uids["malformed"]]
     assert flags["located"] is False and flags["locator_error"]
+
+
+LONG_QUERY = "nomatch " * 1000
+EMPTY_BUDGETED_MODES = [
+    pytest.param({"budget_tokens": 300}, id="l1"),
+    pytest.param({"budget_tokens": 300, "compact": True}, id="l1-compact"),
+    pytest.param({"depth": "L0", "budget_tokens": 300}, id="l0"),
+    pytest.param({"depth": "L0", "budget_tokens": 300, "compact": True}, id="l0-compact"),
+]
+
+
+@pytest.mark.parametrize("mode", EMPTY_BUDGETED_MODES)
+def test_a_budgeted_search_with_no_hits_still_keeps_its_hard_budget(mount, mode):
+    """The budget is a hard promise on every response, an empty one included: at L1 the echoed
+    query is what a very long unmatched query would otherwise blow it with."""
+    compact = mode.get("compact", False)
+    call = mount(synthetic("only", "Only record", "body words"))
+    result = call(SEARCH_TOOL, query=LONG_QUERY, **mode)
+    assert (result["n"] if compact else result["total"]) == 0
+    assert (result["h"] if compact else result["hits"]) == []
+    stated = result["tk"] if compact else result["token_estimate"]["tokens"]
+    assert compact_tokens(result) <= mode["budget_tokens"] and stated <= mode["budget_tokens"]
+    if mode.get("depth") != "L0":
+        echoed = result["q" if compact else "query"]
+        assert echoed.startswith("nomatch nomatch ") and len(echoed) < len(LONG_QUERY)
+        assert "truncated" in echoed and str(len(LONG_QUERY)) in echoed
+
+
+def test_a_short_query_is_echoed_whole_and_an_unbudgeted_search_is_unchanged(mount):
+    call = mount(synthetic("only", "Only record", "body words"))
+    assert call(SEARCH_TOOL, query="nomatch", budget_tokens=300)["query"] == "nomatch"
+    assert call(SEARCH_TOOL, query=LONG_QUERY)["query"] == LONG_QUERY
+    assert call(SEARCH_TOOL, query=LONG_QUERY, compact=True)["q"] == LONG_QUERY
+
+
+def test_a_budget_the_empty_response_cannot_fit_is_an_error_not_an_overflow(tmp_path, monkeypatch):
+    path = tmp_path / "small-library.sqlite"
+    with Library.create(path) as library:
+        library.put(synthetic("only", "Only record", "body words"))
+    generation = tmp_path / ("g" * 400)
+    monkeypatch.setattr(library_mcp, "open_library", lambda root: (generation, Library(path)))
+    with pytest.raises(ValueError, match="budget_tokens 100 is too small"):
+        library_mcp.call_tool(tmp_path, SEARCH_TOOL, {"query": LONG_QUERY, "budget_tokens": 100})
+    result = library_mcp.call_tool(
+        tmp_path, SEARCH_TOOL, {"query": LONG_QUERY, "budget_tokens": 500}
+    )
+    assert compact_tokens(result) <= 500 and result["total"] == 0

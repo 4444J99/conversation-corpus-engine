@@ -27,6 +27,10 @@ L0_MAX_BUDGET = 1200
 MAX_BUDGET = 20000
 MIN_BUDGET = 100
 TITLE_CHARS = 80
+# A budgeted L1 response echoes the query only up to this many characters (then a visible marker).
+QUERY_ECHO_CHARS = 120
+# Smaller echoes a response with no hit falls back to when the first does not fit its budget.
+QUERY_ECHO_FALLBACKS = (24, 0)
 TOKEN_BASIS = "bytes/4"
 # What a malformed stored record can raise while its read locator is computed. Anything else (a
 # database failure, for example) is not a property of one record and still fails the whole call.
@@ -295,6 +299,13 @@ def _one_line(title: str) -> str:
     return line if len(line) <= TITLE_CHARS else line[: TITLE_CHARS - 3] + "..."
 
 
+def _echo(query: str, characters: int) -> str:
+    """The query as a budgeted response repeats it: whole when short, else cut with a marker."""
+    if len(query) <= characters:
+        return query
+    return f"{query[:characters]}...[query truncated, {len(query)} characters]"
+
+
 def _locator(library: Library, uid: str, query: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """Read arguments of a hit's best passage, and what to say about them on the hit itself.
 
@@ -363,6 +374,8 @@ def _search(
     scores = _scores(library, query, [hit["uid"] for hit in hits])
     measured = budget is not None or compact
     total = found["total"]
+    # Only a budgeted response promises a size, so only it bounds the echoed query.
+    echo_characters = QUERY_ECHO_CHARS if budget is not None else None
 
     def entry(hit: dict[str, Any]) -> dict[str, Any]:
         arguments, flags = _locator(library, hit["uid"], query)
@@ -372,7 +385,9 @@ def _search(
         base = {"uid": hit["uid"], "title": _one_line(hit["title"])} if depth == "L0" else dict(hit)
         return {**base, "score": scores.get(hit["uid"]), "read": read, **flags}
 
-    def assemble(kept: list[dict[str, Any]], truncated: bool, tokens: int) -> dict[str, Any]:
+    def assemble(
+        kept: list[dict[str, Any]], truncated: bool, tokens: int, echo: int | None
+    ) -> dict[str, Any]:
         next_offset = offset + len(kept) if truncated else found["next_offset"]
         if depth == "L0":
             document: dict[str, Any] = {
@@ -384,6 +399,8 @@ def _search(
                 key: value for key, value in found.items() if key not in {"hits", "next_offset"}
             }
             document["generation"] = str(generation)
+            if echo is not None:
+                document["query"] = _echo(found["query"], echo)
         document.update(
             total=total,
             total_exact=True,
@@ -403,10 +420,12 @@ def _search(
             )
         return _shorten(document) if compact else document
 
-    def settle(kept: list[dict[str, Any]], truncated: bool) -> tuple[dict[str, Any], int]:
+    def settle(
+        kept: list[dict[str, Any]], truncated: bool, echo: int | None = echo_characters
+    ) -> tuple[dict[str, Any], int]:
         tokens = 0
         for _ in range(6):
-            document = assemble(kept, truncated, tokens)
+            document = assemble(kept, truncated, tokens, echo)
             estimate = estimate_tokens(document)
             if not measured:
                 return document, estimate
@@ -429,7 +448,17 @@ def _search(
                 )
             break
         kept, best = trial, document
-    return best if best is not None else settle([], False)[0]
+    if best is not None:
+        return best
+    # No hit: the response is its envelope alone, which has to fit the budget as well. The echoed
+    # query is what can overflow it, so shrink that before giving up.
+    for echo in (QUERY_ECHO_CHARS, *QUERY_ECHO_FALLBACKS):
+        document, estimate = settle([], False, echo)
+        if estimate <= budget:
+            return document
+    raise ValueError(
+        f"budget_tokens {budget} is too small for an empty response; need at least {estimate}"
+    )
 
 
 def call_tool(store_root: Path, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
