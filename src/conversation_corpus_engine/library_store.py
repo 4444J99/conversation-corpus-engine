@@ -870,8 +870,12 @@ class Library:
 
         def source(match: str) -> tuple[str, list[Any]]:
             where = " AND ".join(["record_fts MATCH ?", *clauses])
+            # Joined on the row number, never on the stored ``uid`` column: reading that column
+            # loads the whole stored conversation body of every match (megabytes each), which
+            # made a common-word search on a large library take tens of seconds. ``put`` inserts
+            # each search row under its record's row number and ``verify`` checks that alignment.
             return (
-                "FROM record_fts JOIN records r ON r.uid=record_fts.uid WHERE " + where,
+                "FROM record_fts JOIN records r ON r.rowid=record_fts.rowid WHERE " + where,
                 [match, *filters],
             )
 
@@ -1116,6 +1120,13 @@ class Library:
             "SELECT uid FROM records EXCEPT SELECT uid FROM record_fts"
         ).fetchone():
             problems.append("record absent from search")
+        # Search joins its rows to records by row number, so every record must sit under the
+        # search row that carries its own uid.
+        if self.connection.execute(
+            "SELECT 1 FROM records r LEFT JOIN record_fts f ON f.rowid=r.rowid "
+            "WHERE f.uid IS NOT r.uid LIMIT 1"
+        ).fetchone():
+            problems.append("search identity is not aligned with its record row")
         if full:
             for row in self.connection.execute("SELECT digest,payload,raw_bytes FROM objects"):
                 if check_callback:
