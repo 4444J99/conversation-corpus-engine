@@ -93,7 +93,7 @@ def message_text(library: Library, source: dict) -> str:
 
 @pytest.fixture
 def library_path(tmp_path: Path) -> Path:
-    return build_library(tmp_path / "generation")
+    return build_library(tmp_path / "store" / "generation")
 
 
 # --- --report --------------------------------------------------------------------------------
@@ -394,7 +394,7 @@ def test_apply_writes_valid_digest_bound_annotations_in_the_profile_input_form(
 def test_apply_output_feeds_the_strict_profile_with_no_owner_text_until_the_gate_passes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library_path = build_library(tmp_path / "g", typed_records=110)
+    library_path = build_library(tmp_path / "store" / "g", typed_records=110)
     entries, _ = apply_entries(capsys, library_path, tmp_path / "plain.json", "--owner-id", "rob")
     with Library(library_path) as library:
         owner, other = collect_owner_segments(library, entries, "rob")
@@ -428,7 +428,7 @@ def test_apply_output_feeds_the_strict_profile_with_no_owner_text_until_the_gate
 def test_apply_without_an_owner_id_never_marks_a_span_eligible(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library_path = build_library(tmp_path / "g", typed_records=110)
+    library_path = build_library(tmp_path / "store" / "g", typed_records=110)
     ledger = approve(capsys, library_path, tmp_path)
     _, result = apply_entries(capsys, library_path, tmp_path / "a.json", "--ledger", ledger)
     assert result["eligible_strata"] == []
@@ -439,7 +439,7 @@ def test_apply_without_an_owner_id_never_marks_a_span_eligible(
 def test_fabricated_ledger_rows_count_for_nothing_in_report_and_apply(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library_path = build_library(tmp_path / "g", typed_records=110)
+    library_path = build_library(tmp_path / "store" / "g", typed_records=110)
     forged = tmp_path / "forged.jsonl"
     append_ledger(
         forged,
@@ -464,7 +464,7 @@ def test_fabricated_ledger_rows_count_for_nothing_in_report_and_apply(
 def test_rows_from_a_non_owner_reviewer_are_listed_and_never_counted(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library_path = build_library(tmp_path / "g", typed_records=110)
+    library_path = build_library(tmp_path / "store" / "g", typed_records=110)
     ledger = approve(capsys, library_path, tmp_path, reviewer="agent:codex")
     report = report_of(capsys, library_path, "--ledger", ledger, "--owner-id", "rob")
     gate_info = report["gate"]
@@ -478,11 +478,11 @@ def test_rows_from_a_non_owner_reviewer_are_listed_and_never_counted(
 def test_editing_the_text_of_a_message_orphans_every_review_of_it(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library_path = build_library(tmp_path / "g", typed_records=110)
+    library_path = build_library(tmp_path / "store" / "g", typed_records=110)
     ledger = approve(capsys, library_path, tmp_path)
     ok = report_of(capsys, library_path, "--ledger", ledger, "--owner-id", "rob")
     assert ok["profile_eligible"] == ["typed_prefix:S"]
-    edited = build_library(tmp_path / "edited", typed_records=110, text_suffix="!")
+    edited = build_library(tmp_path / "other-store" / "edited", typed_records=110, text_suffix="!")
     report = report_of(capsys, edited, "--ledger", ledger, "--owner-id", "rob")
     assert report["profile_eligible"] == []
     # Only the fixture messages whose text did not change keep their reviews.
@@ -494,7 +494,7 @@ def test_editing_the_text_of_a_message_orphans_every_review_of_it(
 def test_a_conflicting_answer_is_refused_and_cannot_brick_the_ledger(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library = build_library(tmp_path / "g", typed_records=3)
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
     run_cli(capsys, "review-sample", "--library", library, "--out", sample)
     real = next(row for row in sample_rows(sample) if row["rule"] == "typed_prefix")
@@ -521,7 +521,7 @@ def test_a_conflicting_answer_is_refused_and_cannot_brick_the_ledger(
 def test_a_hand_damaged_ledger_is_reported_not_fatal(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library = build_library(tmp_path / "g", typed_records=110)
+    library = build_library(tmp_path / "store" / "g", typed_records=110)
     ledger = approve(capsys, library, tmp_path)
     first = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
     clash = {**first, "rule": "note_owner"}
@@ -564,7 +564,7 @@ def test_an_answer_pasted_back_into_a_cli_session_is_not_owner_text(
 def test_a_limited_scan_counts_only_the_spans_it_saw(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library_path = build_library(tmp_path / "g", typed_records=110)
+    library_path = build_library(tmp_path / "store" / "g", typed_records=110)
     ledger = approve(capsys, library_path, tmp_path)
     report = report_of(
         capsys, library_path, "--ledger", ledger, "--owner-id", "rob", "--limit-records", "40"
@@ -605,7 +605,7 @@ def sample_rows(path: Path) -> list[dict]:
 def test_review_sample_is_deterministic_bounded_and_shows_only_the_span_and_its_rule(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library = build_library(tmp_path / "g", typed_records=130)
+    library = build_library(tmp_path / "store" / "g", typed_records=130)
     first, second = tmp_path / "s1.jsonl", tmp_path / "s2.jsonl"
     assert run_cli(capsys, "review-sample", "--library", library, "--out", first)[0] == 0
     assert run_cli(capsys, "review-sample", "--library", library, "--out", second)[0] == 0
@@ -701,7 +701,7 @@ def approve(
 def test_sampling_answering_and_reporting_close_the_gate_loop(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], yes: int, eligible: bool
 ) -> None:
-    library = build_library(tmp_path / "g", typed_records=130)
+    library = build_library(tmp_path / "store" / "g", typed_records=130)
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
     run_cli(capsys, "review-sample", "--library", library, "--out", sample)
     answered(sample, answers, yes)
@@ -746,7 +746,7 @@ def test_a_long_pasted_answer_is_not_eligible_until_its_own_stratum_passes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     library = build_library(
-        tmp_path / "g", typed_records=110, medium_records=105, pasted_answer=True
+        tmp_path / "store" / "g", typed_records=110, medium_records=105, pasted_answer=True
     )
     sample, ledger = tmp_path / "sample.jsonl", tmp_path / "ledger.jsonl"
     run_cli(capsys, "review-sample", "--library", library, "--out", sample)
@@ -799,7 +799,7 @@ def test_review_record_needs_the_sample_it_answers(
 def test_review_record_refuses_answers_that_are_not_in_the_sample(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library = build_library(tmp_path / "g", typed_records=3)
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
     run_cli(capsys, "review-sample", "--library", library, "--out", sample)
     real = next(row for row in sample_rows(sample) if row["rule"] == "typed_prefix")
@@ -823,7 +823,7 @@ def test_review_record_refuses_answers_that_are_not_in_the_sample(
 def test_review_record_rejects_bad_answers_before_writing_anything(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library = build_library(tmp_path / "g", typed_records=3)
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
     run_cli(capsys, "review-sample", "--library", library, "--out", sample)
     good = next(row for row in sample_rows(sample) if row["rule"] == "typed_prefix")
@@ -842,7 +842,7 @@ def test_review_record_rejects_bad_answers_before_writing_anything(
 def test_review_record_stamps_the_current_utc_time_only_when_none_is_given(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library = build_library(tmp_path / "g", typed_records=3)
+    library = build_library(tmp_path / "store" / "g", typed_records=3)
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
     run_cli(capsys, "review-sample", "--library", library, "--out", sample)
     row = next(item for item in sample_rows(sample) if item["rule"] == "typed_prefix")
@@ -901,7 +901,7 @@ def poison_one_message(database: Path, uid_suffix: str, message: int, text: str)
 def test_a_message_with_a_lone_surrogate_is_counted_and_never_aborts_a_run(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library = build_library(tmp_path / "store")
+    library = build_library(tmp_path / "store" / "gen")
     poison_one_message(library, "owner-chat", 0, "before \ud800 after")
     with Library(library) as handle:
         assert (
@@ -932,7 +932,7 @@ def test_a_message_with_a_lone_surrogate_is_counted_and_never_aborts_a_run(
 
 
 def test_the_census_skips_unencodable_messages_instead_of_failing(tmp_path: Path) -> None:
-    library = build_library(tmp_path / "store")
+    library = build_library(tmp_path / "store" / "gen")
     poison_one_message(library, "owner-chat", 0, "before \ud800 after " + "x" * 300)
     with Library(library) as handle:
         census = build_census(
@@ -1011,7 +1011,7 @@ def test_no_writer_may_write_inside_the_generation_or_anywhere_in_the_store(
 def test_review_record_must_know_the_library_so_the_ledger_stays_out_of_its_store(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library = build_library(tmp_path / "store")
+    library = build_library(tmp_path / "store" / "gen")
     sample, answers = sample_and_answers(capsys, library, tmp_path)
     ledger = tmp_path / "ledger.jsonl"
     code, _, err = run_cli(
@@ -1032,7 +1032,7 @@ def test_review_record_must_know_the_library_so_the_ledger_stays_out_of_its_stor
 def test_a_bare_generation_protects_its_folder_and_its_parent(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library = build_library(tmp_path / "store")
+    library = build_library(tmp_path / "store" / "gen")
     for target in (library.parent / "x.json", library.parent.parent / "x.json"):
         code, _, err = run_cli(capsys, "apply", "--library", library, "--out", target)
         assert code == 2 and "library store" in err and not target.exists()
@@ -1056,7 +1056,7 @@ def test_an_explicit_store_root_is_protected_too(
 def test_a_git_visible_destination_is_refused_before_anything_is_written(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library = build_library(tmp_path / "store")
+    library = build_library(tmp_path / "store" / "gen")
     sample, answers = sample_and_answers(capsys, library, tmp_path)
     repo = tmp_path / "repo"
     (repo / "visible").mkdir(parents=True)
@@ -1091,7 +1091,7 @@ def test_a_git_visible_destination_is_refused_before_anything_is_written(
 def test_every_output_is_private_and_new_directories_are_0700(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library = build_library(tmp_path / "store")
+    library = build_library(tmp_path / "store" / "gen")
     sample = tmp_path / "fresh" / "nested" / "s.jsonl"
     old = os.umask(0)
     try:
@@ -1124,7 +1124,7 @@ def test_a_slice_or_deadline_cut_output_is_written_under_the_partial_name(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    library = build_library(tmp_path / "store")
+    library = build_library(tmp_path / "store" / "gen")
     out = tmp_path / "a.json"
     code, out_text, _ = run_cli(
         capsys, "apply", "--library", library, "--out", out, "--limit-records", "2", "--json"
@@ -1187,7 +1187,7 @@ def test_a_slice_or_deadline_cut_output_is_written_under_the_partial_name(
 def test_a_complete_scan_leaves_no_partial_marker(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library = build_library(tmp_path / "store")
+    library = build_library(tmp_path / "store" / "gen")
     sample = tmp_path / "s.jsonl"
     code, out_text, _ = run_cli(
         capsys, "review-sample", "--library", library, "--out", sample, "--json"
@@ -1202,7 +1202,7 @@ def test_a_leftover_partial_file_is_refused_before_any_work_starts(
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    library = build_library(tmp_path / "store")
+    library = build_library(tmp_path / "store" / "gen")
 
     def forbidden(*args, **kwargs):
         raise AssertionError("the census must not start")
@@ -1220,7 +1220,7 @@ def test_a_leftover_partial_file_is_refused_before_any_work_starts(
 def test_an_existing_output_is_refused_for_every_writer(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    library = build_library(tmp_path / "store")
+    library = build_library(tmp_path / "store" / "gen")
     out = tmp_path / "taken.out"
     out.write_text("keep", encoding="utf-8")
     for command in ("apply", "review-sample"):

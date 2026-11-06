@@ -208,15 +208,15 @@ def build_library(
     pasted_answer: bool = False,
     text_suffix: str = "",
 ) -> Path:
-    """Create `directory/gen/library.sqlite` and return its path (the generation is closed again).
+    """Create `directory/library.sqlite` and return its path; the generation is closed again.
 
-    The extra level keeps the generation's parent, which the writers protect, inside `directory`.
+    The writers protect the generation folder and its parent, so tests place `directory` one
+    level below the folder they write outputs into.
     """
-    generation = directory / "gen"
-    generation.mkdir(parents=True, exist_ok=True)
-    with Library.create(generation / "library.sqlite") as library:
+    directory.mkdir(parents=True, exist_ok=True)
+    with Library.create(directory / "library.sqlite") as library:
         for conversation in conversations(
             typed_records, medium_records, pasted_answer, text_suffix
         ):
             library.put(conversation)
-    return generation / "library.sqlite"
+    return directory / "library.sqlite"
