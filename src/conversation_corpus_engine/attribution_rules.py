@@ -1264,6 +1264,21 @@ def rule_pasted_block(context: MessageContext) -> list[Claim]:
         if stop - index >= 2 and table not in claims:
             claims.append(table)
         index = stop
+    # Rows of a table without outer pipes ("Name | Cost"): two or more consecutive lines that
+    # each hold the same number of pipes, at least one.
+    index = 0
+    while index < len(lines):
+        pipes = lines[index][2].count("|")
+        if not pipes:
+            index += 1
+            continue
+        stop = index
+        while stop < len(lines) and lines[stop][2].count("|") == pipes:
+            stop += 1
+        table = (lines[index][0], lines[stop - 1][1], "markdown-table")
+        if stop - index >= 2 and table not in claims:
+            claims.append(table)
+        index = stop
     return claims
 
 

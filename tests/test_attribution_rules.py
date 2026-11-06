@@ -1483,8 +1483,9 @@ def test_a_markdown_table_with_a_separator_row_is_third_party() -> None:
 def test_two_lines_of_two_or_more_pipes_each_are_a_table_without_a_separator_row() -> None:
     for text in ("a | b | c\nd | e | f", "| x | y |\n| 1 | 2 |", "x | y |\n| 1 | 2"):
         assert ranges(rule_pasted_block(ctx(text))) == [(0, len(text))], text
+    # Rows without outer pipes: consecutive lines that each hold the same number of pipes.
     note = "Name | Cost\nRent | TBL2"
-    assert rule_pasted_block(ctx(note)) == []  # one pipe a line and no separator row
+    assert ranges(rule_pasted_block(ctx(note))) == [(0, len(note))]
     inside = "Mine.\n\n| a | b |\n| c | d |\n\nMine again."
     assert view(inside, run(inside, record=NOTE))[2][:2] == ("pasted_block", "third_party")
 
@@ -1494,6 +1495,8 @@ def test_pipes_that_are_not_a_table_stay_text() -> None:
     assert rule_pasted_block(ctx("|---|---|")) == []
     assert rule_pasted_block(ctx("only one | of these | lines has pipes\nplain words")) == []
     assert rule_pasted_block(ctx("a | b\nplain words\nc | d")) == []
+    assert rule_pasted_block(ctx("a | b\nc | d | e")) == []  # one pipe, then two
+    assert rule_pasted_block(ctx("a | b\nplain words after one pipe line")) == []
 
 
 # --- g: notes default ------------------------------------------------------------------------
