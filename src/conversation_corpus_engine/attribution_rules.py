@@ -48,7 +48,7 @@ from .archive_provenance import INJECTED_TAGS, classify_user_turn
 from .archive_read_library import FAMILIES
 from .attribution import ATTRIBUTION_SCHEMA, text_digest
 
-RULES_VERSION = "cce.attribution-rules@3"
+RULES_VERSION = "cce.attribution-rules@4"
 
 OWNER = "owner"
 AGENT = "agent"
@@ -1649,13 +1649,18 @@ def to_annotation(
 
 # --- the owner-review ledger and the precision gate ------------------------------------------
 
-LEDGER_SCHEMA = "cce.attribution-review-ledger.v3"
-# Rows of an earlier ledger schema lack the sample binding; they are read but never counted.
+LEDGER_SCHEMA = "cce.attribution-review-ledger.v4"
+# Rows of an earlier ledger schema were written under other gate rules; they are read but never
+# counted.
 LEGACY_LEDGER_SCHEMAS = frozenset(
-    {"cce.attribution-review-ledger.v1", "cce.attribution-review-ledger.v2"}
+    {
+        "cce.attribution-review-ledger.v1",
+        "cce.attribution-review-ledger.v2",
+        "cce.attribution-review-ledger.v3",
+    }
 )
-SAMPLE_SCHEMA = "cce.attribution-review-sample.v3"
-SAMPLE_HEADER_SCHEMA = "cce.attribution-review-sample-header.v3"
+SAMPLE_SCHEMA = "cce.attribution-review-sample.v4"
+SAMPLE_HEADER_SCHEMA = "cce.attribution-review-sample-header.v4"
 VERDICTS = ("yes", "no", "unsure")
 # A (rule, stratum) may be profile-eligible only when at least this many of its spans were
 # reviewed by the owner and at least this share of them (counting unsure and no as not confirmed)
@@ -1663,7 +1668,7 @@ VERDICTS = ("yes", "no", "unsure")
 GATE_MIN_REVIEWED = 100
 GATE_MIN_PRECISION_PERCENT = 95
 SAMPLE_PER_STRATUM = 100
-SAMPLE_SEED = "cce-attribution-review-v3"
+SAMPLE_SEED = "cce-attribution-review-v4"
 # A long span is shown to the owner as a bounded excerpt plus its exact length.
 EXCERPT_HEAD = 240
 EXCERPT_TAIL = 120
@@ -1674,10 +1679,12 @@ _LEGACY_V1_KEYS = frozenset(
 _LEGACY_V2_KEYS = _LEGACY_V1_KEYS | {"stratum"}
 # What a row binds itself to: the sample it answers, the full text it saw (as a digest) and how
 # many rows that sample drew for its (rule, stratum).
-_LEDGER_KEYS = _LEGACY_V2_KEYS | {"sample_digest", "text_sha256", "drawn"}
+_LEGACY_V3_KEYS = _LEGACY_V2_KEYS | {"sample_digest", "text_sha256", "drawn"}
+_LEDGER_KEYS = _LEGACY_V3_KEYS
 _LEGACY_KEYS_BY_SCHEMA = {
     "cce.attribution-review-ledger.v1": _LEGACY_V1_KEYS,
     "cce.attribution-review-ledger.v2": _LEGACY_V2_KEYS,
+    "cce.attribution-review-ledger.v3": _LEGACY_V3_KEYS,
 }
 _SPAN_ID = re.compile(r"[0-9a-f]{32}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -1879,6 +1886,7 @@ def append_rows(
     lock_timeout: float | None = None,
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
+    precondition: Callable[[list[dict[str, Any]]], None] | None = None,
 ) -> LedgerAppend:
     """Append validated rows to an append-only JSONL ledger.
 
@@ -1888,7 +1896,9 @@ def append_rows(
     for up to `LEDGER_LOCK_SECONDS`, else ValueError), in one write, and a ledger created here is
     private (mode 0600). If the file does not end in a newline an earlier write was cut short:
     a newline is written first, the fragment stays as one quarantined line, and the result says
-    so.
+    so. `precondition`, if given, is called with the valid rows already in the ledger while the
+    lock is held (and with no rows, before anything is created, for a ledger that does not exist
+    yet); if it raises, nothing is written.
     """
     valid = [validate_ledger_row(row) for row in rows]
     if path.is_symlink():
@@ -1896,6 +1906,8 @@ def append_rows(
     conflict = _kind_conflict([], valid)
     if conflict:
         raise ValueError(f"ledger conflict: {conflict}; nothing was written")
+    if precondition is not None and not path.exists():
+        precondition([])
     payload = "".join(json.dumps(row, sort_keys=True, ensure_ascii=True) + "\n" for row in valid)
     flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(path, flags, 0o600)
@@ -1907,7 +1919,10 @@ def append_rows(
         torn = bool(existing) and not existing.endswith(b"\n")
         if not existing:
             os.fchmod(descriptor, 0o600)
-        conflict = _kind_conflict(parse_ledger(_decode(existing)).rows, valid)
+        existing_rows = parse_ledger(_decode(existing)).rows
+        if precondition is not None:
+            precondition(existing_rows)
+        conflict = _kind_conflict(existing_rows, valid)
         if conflict:
             raise ValueError(f"ledger conflict: {conflict}; nothing was written")
         data = (b"\n" if torn else b"") + payload.encode("utf-8")
@@ -2213,6 +2228,7 @@ _SAMPLE_HEADER_KEYS = frozenset(
         "partial",
         "repeat_min_chars",
         "repeat_min_occurrences",
+        "exclusion_digest",
         "drawn",
     }
 )
@@ -2242,6 +2258,25 @@ def drawn_counts(rows: Iterable[Mapping[str, Any]]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
+def exclusion_digest(rows: Iterable[Mapping[str, Any]], owner: str) -> str:
+    """Names the ledger state a draw excludes against: SHA-256 over the sorted
+    (span id, verdict) pairs of the current rows of `owner`. Rows of other reviewers, of other
+    rules versions and of older schemas hide nothing from a draw, so they are not part of it.
+    A repeated answer is part of the state, so every recording moves the digest on."""
+    pairs = sorted(
+        [row["span_id"], row["verdict"]]
+        for row in rows
+        if row["schema"] == LEDGER_SCHEMA
+        and row["rules_version"] == RULES_VERSION
+        and row["reviewer"] == owner
+    )
+    canonical = json.dumps(pairs, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+EMPTY_EXCLUSION_DIGEST = exclusion_digest([], "")
+
+
 def sample_header(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -2252,10 +2287,12 @@ def sample_header(
     partial: bool,
     repeat_min_chars: int = DEFAULT_REPEAT_MIN_CHARS,
     repeat_min_occurrences: int = DEFAULT_REPEAT_MIN_OCCURRENCES,
+    exclusion_digest: str = EMPTY_EXCLUSION_DIGEST,
 ) -> dict[str, Any]:
     """The first line of a sample file: it counts and digests the rows and names the library
-    (its fingerprint), the owner the sample was drawn for, and the settings that decide which
-    spans exist and in what order they are drawn (seed, repeat census)."""
+    (its fingerprint), the owner the sample was drawn for, the settings that decide which spans
+    exist and in what order they are drawn (seed, repeat census) and the ledger state the draw
+    excluded against (`exclusion_digest`)."""
     return {
         "schema": SAMPLE_HEADER_SCHEMA,
         "rules_version": RULES_VERSION,
@@ -2268,6 +2305,7 @@ def sample_header(
         "partial": partial,
         "repeat_min_chars": repeat_min_chars,
         "repeat_min_occurrences": repeat_min_occurrences,
+        "exclusion_digest": exclusion_digest,
         "drawn": drawn_counts(rows),
     }
 
@@ -2388,6 +2426,10 @@ def parse_sample(lines: Iterable[str]) -> ReviewSample:
     for key in ("repeat_min_chars", "repeat_min_occurrences"):
         if isinstance(header[key], bool) or not isinstance(header[key], int) or header[key] < 1:
             problems.append(f"the header needs a positive {key}")
+    if not isinstance(header["exclusion_digest"], str) or not _SHA256.fullmatch(
+        header["exclusion_digest"]
+    ):
+        problems.append("the header needs an exclusion_digest (64 lowercase hexadecimal digits)")
     if problems:
         raise ValueError(f"sample was altered or is not a sample: {'; '.join(problems)}")
     return ReviewSample(header=dict(header), rows=rows)

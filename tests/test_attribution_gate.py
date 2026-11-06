@@ -19,6 +19,7 @@ from conversation_corpus_engine.attribution import (
     text_digest,
 )
 from conversation_corpus_engine.attribution_rules import (
+    EMPTY_EXCLUSION_DIGEST,
     EXCERPT_HEAD,
     EXCERPT_TAIL,
     GATE_MIN_PRECISION_PERCENT,
@@ -28,6 +29,7 @@ from conversation_corpus_engine.attribution_rules import (
     RULE_BY_ID,
     RULES,
     RULES_VERSION,
+    SAMPLE_HEADER_SCHEMA,
     SAMPLE_PER_STRATUM,
     SAMPLE_SCHEMA,
     SAMPLE_SEED,
@@ -41,6 +43,7 @@ from conversation_corpus_engine.attribution_rules import (
     append_rows,
     attribute_message,
     eligible_strata,
+    exclusion_digest,
     parse_ledger,
     parse_sample,
     preview_only_reasons,
@@ -284,15 +287,15 @@ def test_rows_from_another_rules_version_or_an_older_schema_are_ignored_not_coun
     assert summary.strata[("typed_prefix", "S")].reviewed == 0
     assert (summary.rows, summary.stale_rows) == (102, 102)
     assert eligible_strata(summary) == frozenset()
-    assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v3"
-    assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v3"
+    assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v4"
+    assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v4"
 
 
-PREVIOUS_VERSION = "cce.attribution-rules@2"
+PREVIOUS_VERSION = "cce.attribution-rules@3"
 
 
 def test_rows_written_under_the_previous_rules_version_are_stale_and_never_counted() -> None:
-    assert RULES_VERSION == "cce.attribution-rules@3"
+    assert RULES_VERSION == "cce.attribution-rules@4"
     old = verdict_rows("typed_prefix", ["yes"] * 100, version=PREVIOUS_VERSION)
     summary = summarize(old)
     assert (summary.rows, summary.stale_rows) == (100, 100)
@@ -651,6 +654,84 @@ def test_a_ledger_locked_by_another_process_is_waited_for_then_refused(tmp_path:
 
 def test_the_default_lock_wait_is_thirty_seconds() -> None:
     assert LEDGER_LOCK_SECONDS == 30.0
+
+
+def test_the_exclusion_digest_names_the_owner_rows_a_draw_excluded_against() -> None:
+    empty = exclusion_digest([], OWNER_ID)
+    assert empty == hashlib.sha256(b"[]").hexdigest() == EMPTY_EXCLUSION_DIGEST
+    rows = verdict_rows("typed_prefix", ["yes", "no", "yes"])
+    digest = exclusion_digest(rows, OWNER_ID)
+    assert digest != empty
+    assert exclusion_digest(list(reversed(rows)), OWNER_ID) == digest  # file order is irrelevant
+    other = [ledger_row(f"{9:032x}", "quote", "yes", "agent:codex", STAMP, stratum="S")]
+    assert exclusion_digest([*rows, *other], OWNER_ID) == digest  # another reviewer hides nothing
+    stale = verdict_rows("typed_prefix", ["yes"], start=40, version=PREVIOUS_VERSION)
+    assert exclusion_digest([*rows, *stale], OWNER_ID) == digest  # another version hides nothing
+    assert (
+        exclusion_digest([*rows, rows[0]], OWNER_ID) != digest
+    )  # a repeated answer is a new state
+    changed = [{**rows[0], "verdict": "no"}, *rows[1:]]
+    assert exclusion_digest(changed, OWNER_ID) != digest  # so is a changed verdict
+    assert exclusion_digest(rows, "someone-else") == empty
+
+
+def test_a_precondition_on_the_existing_rows_can_veto_an_append(tmp_path: Path) -> None:
+    ledger = tmp_path / "ledger.jsonl"
+    append_ledger(ledger, verdict_rows("quote", ["yes"]))
+    before = ledger.read_bytes()
+    seen: list[int] = []
+
+    def refuse(existing: list[dict]) -> None:
+        seen.append(len(existing))
+        raise ValueError("not this ledger")
+
+    with pytest.raises(ValueError, match="not this ledger"):
+        append_rows(ledger, verdict_rows("quote", ["yes"], start=5), precondition=refuse)
+    assert seen == [1] and ledger.read_bytes() == before
+    result = append_rows(
+        ledger, verdict_rows("quote", ["yes"], start=5), precondition=lambda existing: None
+    )
+    assert result.appended == 1
+
+
+def test_the_sample_header_carries_the_ledger_state_it_was_drawn_against() -> None:
+    header, rows = drawn_sample()
+    assert header["exclusion_digest"] == EMPTY_EXCLUSION_DIGEST
+    digest = exclusion_digest(verdict_rows("quote", ["yes"]), OWNER_ID)
+    other = sample_header(
+        rows,
+        library="f" * 64,
+        owner_id=OWNER_ID,
+        seed=SAMPLE_SEED,
+        per_stratum=5,
+        partial=False,
+        exclusion_digest=digest,
+    )
+    assert other["exclusion_digest"] == digest
+    assert parse_sample(sample_lines(other, rows)).header["exclusion_digest"] == digest
+    for bad in ("", "xyz", "A" * 64, 5, None):
+        with pytest.raises(ValueError, match="exclusion_digest"):
+            parse_sample(sample_lines({**header, "exclusion_digest": bad}, rows))
+
+
+def test_the_rules_version_and_schemas_are_at_version_four_and_older_rows_are_stale() -> None:
+    assert RULES_VERSION == "cce.attribution-rules@4"
+    assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v4"
+    assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v4"
+    assert SAMPLE_HEADER_SCHEMA == "cce.attribution-review-sample-header.v4"
+    rows = verdict_rows("typed_prefix", ["yes"] * 100)
+    v3 = [{**row, "schema": "cce.attribution-review-ledger.v3"} for row in rows]
+    assert [validate_ledger_row(row)["schema"] for row in v3] == [row["schema"] for row in v3]
+    summary = summarize(v3)
+    assert (summary.rows, summary.stale_rows) == (100, 100)
+    assert summary.strata[("typed_prefix", "S")].reviewed == 0
+    assert eligible_strata(summary) == frozenset()
+    old_version = verdict_rows("typed_prefix", ["yes"] * 100, version="cce.attribution-rules@3")
+    assert summarize(old_version).stale_rows == 100
+    header, rows_drawn = drawn_sample()
+    v3_header = {**header, "schema": "cce.attribution-review-sample-header.v3"}
+    with pytest.raises(ValueError, match="draw a new sample"):
+        parse_sample(sample_lines(v3_header, rows_drawn))
 
 
 def test_ledger_is_append_only_jsonl_and_refuses_symlinks(tmp_path: Path) -> None:

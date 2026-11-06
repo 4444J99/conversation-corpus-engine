@@ -44,7 +44,9 @@ from conversation_corpus_engine.attribution_rules import (
     SAMPLE_SCHEMA,
     append_ledger,
     drawn_counts,
+    exclusion_digest,
     ledger_row,
+    read_ledger,
     sample_digest,
     sample_text,
 )
@@ -529,14 +531,17 @@ def test_editing_the_text_of_a_message_orphans_every_review_of_it(
     assert counted + report["gate"]["orphan_rows"] == report["gate"]["ledger_rows"]
 
 
-def forge_sample(source: Path, target: Path, rows: list[dict]) -> None:
-    """A sample file with its own consistent header (what a careful forger would write)."""
+def forge_sample(source: Path, target: Path, rows: list[dict], ledger: Path | None = None) -> None:
+    """A sample file with its own consistent header (what a careful forger would write), naming
+    the state of `ledger` as the one it was drawn against."""
     header = {
         **sample_header(source),
         "rows": len(rows),
         "sample_digest": sample_digest(rows),
         "drawn": drawn_counts(rows),
     }
+    if ledger is not None:
+        header["exclusion_digest"] = exclusion_digest(read_ledger(ledger).rows, "rob")
     target.write_text(sample_text(header, rows), encoding="utf-8")
 
 
@@ -554,17 +559,17 @@ def test_a_conflicting_answer_is_refused_and_cannot_brick_the_ledger(
     # A second sample, internally consistent, that names the same span as another rule.
     forged_sample = tmp_path / "forged-sample.jsonl"
     forged_row = {**real, "rule": "note_owner", "claim": "owner", "verdict": None}
-    forge_sample(sample, forged_sample, [forged_row])
+    forge_sample(sample, forged_sample, [forged_row], ledger=ledger)
     answers.write_text(json.dumps({**forged_row, "verdict": "yes"}) + "\n", encoding="utf-8")
     code, _, err = record_answers(capsys, library, ledger, forged_sample, answers)
     assert code == 2 and "conflict" in err and "nothing was written" in err
     assert ledger.read_bytes() == before
 
-    answers.write_text(json.dumps({**real, "verdict": "no"}) + "\n", encoding="utf-8")
-    assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
+    # A sample is recorded once; the ledger itself still keeps the last answer of a span.
+    first = json.loads(ledger.read_text(encoding="utf-8").splitlines()[0])
+    append_ledger(ledger, [{**first, "verdict": "no"}])
     report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
-    # Recording the sample again re-answers every row of it; the last answer counts.
-    assert report["gate"]["superseded_rows"] == len(sample_rows(sample))
+    assert report["gate"]["superseded_rows"] == 1
     assert report["gate"]["quarantined_rows"] == 0
 
 
@@ -756,7 +761,7 @@ def sample_lines(path: Path) -> list[dict]:
 
 def sample_header(path: Path) -> dict:
     header, *_ = sample_lines(path)
-    assert header["schema"] == "cce.attribution-review-sample-header.v3"
+    assert header["schema"] == "cce.attribution-review-sample-header.v4"
     return header
 
 
@@ -830,7 +835,7 @@ def test_review_sample_streams_to_standard_output_and_reports_the_short_span_bia
     assert code == 0
     assert all(json.loads(line)["schema"] for line in out.splitlines())
     header, *body = map(json.loads, out.splitlines())
-    assert header["schema"] == "cce.attribution-review-sample-header.v3"
+    assert header["schema"] == "cce.attribution-review-sample-header.v4"
     summary = json.loads(err.strip().splitlines()[-1])
     assert summary["sampled"] == len(body) == header["rows"]
     assert summary["sample_digest"] == header["sample_digest"] and header["owner_id"] == "rob"
@@ -979,18 +984,18 @@ def test_a_long_pasted_answer_is_not_eligible_until_its_own_stratum_passes(
     assert texts and not any("tokenizes then builds" in text for text in texts)
     assert all(len(text) <= 240 for text in texts)
 
-    # Recording the sample again accounts for every row again: a row left blank is unsure, so the
-    # second round repeats the short answers too.
-    medium_answers = tmp_path / "medium.jsonl"
+    # A sample is recorded once, so the medium answers are given in the one recording of the
+    # same draw into another ledger: a row left blank would have been recorded as unsure.
+    medium_answers, both_ledger = tmp_path / "medium.jsonl", tmp_path / "both-ledger.jsonl"
     answered(sample, medium_answers, 100, stratum="M")
     both = [json.loads(line) for line in medium_answers.read_text(encoding="utf-8").splitlines()]
     short_by_id = {row["span_id"]: row["verdict"] for row in sample_rows(short_answers)}
     for row in both:
         row["verdict"] = row["verdict"] or short_by_id[row["span_id"]]
     medium_answers.write_text("".join(json.dumps(row) + "\n" for row in both), encoding="utf-8")
-    assert record_answers(capsys, library, ledger, sample, medium_answers)[0] == 0
+    assert record_answers(capsys, library, both_ledger, sample, medium_answers)[0] == 0
     entries, result = apply_entries(
-        capsys, library, tmp_path / "two.json", "--ledger", ledger, "--owner-id", "rob"
+        capsys, library, tmp_path / "two.json", "--ledger", both_ledger, "--owner-id", "rob"
     )
     assert result["eligible_strata"] == ["typed_prefix:M", "typed_prefix:S"]
     texts = eligible_owner_texts(library, entries)
@@ -1248,7 +1253,9 @@ def test_review_sample_hides_only_spans_the_owner_already_reviewed(
         again,
     )
     assert code == 0, err
-    assert again.read_bytes() == fresh.read_bytes()
+    # The same rows; only the header's ledger state differs (the owner's orphan rows are in it).
+    assert sample_rows(again) == sample_rows(fresh)
+    assert sample_header(again)["exclusion_digest"] != sample_header(fresh)["exclusion_digest"]
     mine = approve(capsys, library, tmp_path, name="mine")
     later = tmp_path / "later.jsonl"
     run_cli(
@@ -1353,6 +1360,70 @@ def test_a_bigger_or_smaller_batch_of_the_default_draw_can_still_be_recorded(
         assert record_answers(capsys, library, ledger, sample, answers)[0] == 0
 
 
+def test_a_sample_can_be_recorded_once_in_order_into_the_ledger_it_was_drawn_against(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ledger-shopping recipe: draw against a throwaway ledger, record every draw there so
+    the next draw moves on, and record only the good-looking draws into the real ledger."""
+    library = build_library(tmp_path / "store" / "g", typed_records=40)
+    throwaway, real = tmp_path / "throwaway.jsonl", tmp_path / "real.jsonl"
+    first, second, third = (tmp_path / f"s{n}.jsonl" for n in (1, 2, 3))
+    answers = [tmp_path / f"a{n}.jsonl" for n in (1, 2, 3)]
+
+    def draw(sample: Path, *extra: str | Path) -> None:
+        code, _, err = run_cli(
+            capsys,
+            "review-sample",
+            "--owner-id",
+            "rob",
+            "--library",
+            library,
+            "--per-stratum",
+            "2",
+            *extra,
+            "--out",
+            sample,
+        )
+        assert code == 0, err
+
+    draw(first)
+    answers_for(first, answers[0], lambda row: None)
+    assert record_answers(capsys, library, throwaway, first, answers[0])[0] == 0
+    draw(second, "--ledger", throwaway)
+    answers_for(second, answers[1], lambda row: "yes")
+    # The second draw was made against the throwaway ledger: the real one is another state.
+    code, _, err = record_answers(capsys, library, real, second, answers[1])
+    assert code == 2 and "different ledger state" in err and not real.exists()
+    assert record_answers(capsys, library, throwaway, second, answers[1])[0] == 0
+    # Recorded once: the ledger moved on, so the same sample is a draw against an older state.
+    code, _, err = record_answers(capsys, library, throwaway, second, answers[1])
+    assert code == 2 and "different ledger state" in err
+    # The first draw, made against nothing, still fits an empty ledger (and only that).
+    assert record_answers(capsys, library, real, first, answers[0])[0] == 0
+    draw(third, "--ledger", real)
+    answers_for(third, answers[2], lambda row: "yes")
+    code, _, err = record_answers(capsys, library, throwaway, third, answers[2])
+    assert code == 2 and "different ledger state" in err
+    assert record_answers(capsys, library, real, third, answers[2])[0] == 0
+
+
+def test_rows_of_other_reviewers_and_of_other_versions_do_not_change_the_draw(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(tmp_path / "store" / "g", typed_records=20)
+    others = approve(capsys, library, tmp_path, reviewer="agent:codex", name="other")
+    sample, answers = tmp_path / "s.jsonl", tmp_path / "a.jsonl"
+    run_cli(
+        capsys, "review-sample", "--owner-id", "rob", "--library", library, "--ledger", others,
+        "--out", sample,
+    )  # fmt: skip
+    assert sample_header(sample)["exclusion_digest"] == hashlib.sha256(b"[]").hexdigest()
+    answered(sample, answers, 5)
+    fresh = tmp_path / "fresh.jsonl"
+    assert record_answers(capsys, library, fresh, sample, answers)[0] == 0
+    assert record_answers(capsys, library, others, sample, answers, reviewer="rob")[0] == 0
+
+
 def test_review_record_needs_the_sample_it_answers(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -1429,7 +1500,7 @@ def test_ledger_rows_from_the_previous_rules_version_are_reported_as_stale(
     rewritten = tmp_path / "old-ledger.jsonl"
     rewritten.write_text(
         ledger.read_text(encoding="utf-8").replace(
-            "cce.attribution-rules@3", "cce.attribution-rules@2"
+            "cce.attribution-rules@4", "cce.attribution-rules@3"
         ),
         encoding="utf-8",
     )
@@ -1441,7 +1512,7 @@ def test_ledger_rows_from_the_previous_rules_version_are_reported_as_stale(
     )
     assert result["stale_rows"] == result["ledger_rows"] > 100
     assert result["eligible_strata"] == []
-    assert result["rules_version"] == "cce.attribution-rules@3"
+    assert result["rules_version"] == "cce.attribution-rules@4"
 
 
 def test_review_record_rejects_bad_answers_before_writing_anything(
@@ -2020,7 +2091,7 @@ def test_review_record_repairs_a_torn_ledger_and_says_so(
     sample, answers, ledger = (tmp_path / name for name in ("s.jsonl", "a.jsonl", "l.jsonl"))
     run_cli(capsys, "review-sample", "--owner-id", "rob", "--library", library, "--out", sample)
     answered(sample, answers, 1)
-    ledger.write_text('{"schema": "cce.attribution-review-ledger.v3", "rul', encoding="utf-8")
+    ledger.write_text('{"schema": "cce.attribution-review-ledger.v4", "rul', encoding="utf-8")
     code, out, err = record_answers(capsys, library, ledger, sample, answers, "--json")
     assert code == 0, err
     result = json.loads(out)
@@ -2028,7 +2099,13 @@ def test_review_record_repairs_a_torn_ledger_and_says_so(
     report = report_of(capsys, library, "--ledger", ledger, "--owner-id", "rob")
     assert report["gate"]["quarantined_rows"] == 1
     assert report["gate"]["ledger_rows"] == result["appended"]
-    code, out, _ = record_answers(capsys, library, ledger, sample, answers, "--json")
+    again, more = tmp_path / "s2.jsonl", tmp_path / "a2.jsonl"
+    run_cli(
+        capsys, "review-sample", "--owner-id", "rob", "--library", library, "--ledger", ledger,
+        "--out", again,
+    )  # fmt: skip
+    answered(again, more, 1)
+    code, out, _ = record_answers(capsys, library, ledger, again, more, "--json")
     assert code == 0 and json.loads(out)["repaired_torn_line"] is False
 
 

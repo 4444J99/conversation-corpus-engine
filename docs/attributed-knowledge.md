@@ -272,7 +272,7 @@ published library generation. A provider's `user` role is not proof that the own
 span: injected system text, command output and tool results sit inside user turns, pasted logs,
 quotes, tables, emails and code are not the owner's prose, an assistant's answer can be pasted
 back into a turn, and AI-written skill and instruction files are filed under documents. The
-engine (`conversation_corpus_engine.attribution_rules`, version `cce.attribution-rules@3`)
+engine (`conversation_corpus_engine.attribution_rules`, version `cce.attribution-rules@4`)
 therefore labels a span `owner` only when an owner-granting rule claims it and no other rule
 does. When a rule is ambiguous the text becomes `unknown` or a non-owner class, never owner.
 **No rule is profile-eligible until the precision gate below is met**, and every span the
@@ -297,14 +297,14 @@ annotations, the census and the sample; it does not abort the run.
 
 ### Rules version
 
-The version string (`cce.attribution-rules@3`) names the rule semantics and every artifact carries
+The version string (`cce.attribution-rules@4`) names the rule semantics and every artifact carries
 it: span ids (so a span id from another version never matches), the annotation evidence
-(`cce.attribution-rules@3:rule:<id>`), the rows of review samples and the rows of the review
-ledger. When the rules or the gate change meaning the version is bumped (`@3` replaced the
-150-character pasted-back threshold, the row-level gate and the sample format of `@2`). Ledger
-rows of any other version, and rows of an older ledger schema (`cce.attribution-review-ledger.v1`
-and `.v2`, which lack the sample binding), are **stale**: read, reported as `stale_rows` and never
-counted, so reviews must be redone for the new rules. `review-record` refuses a sample drawn under
+(`cce.attribution-rules@4:rule:<id>`), the rows of review samples and the rows of the review
+ledger. When the rules or the gate change meaning the version is bumped (`@4` bound a sample to
+the ledger state it was drawn against; `@3` replaced the 150-character pasted-back threshold, the
+row-level gate and the sample format of `@2`). Ledger rows of any other version, and rows of an
+older ledger schema (`cce.attribution-review-ledger.v1` to `.v3`), are **stale**: read, reported
+as `stale_rows` and never counted, so reviews must be redone for the new rules. `review-record` refuses a sample drawn under
 another version or schema (it has no header, or the wrong one) and asks for a new one.
 
 ### Rule precedence
@@ -414,7 +414,7 @@ already reads: `source` is the exact canonical reference without offsets and `at
 `cce.span-attribution.v1` annotation whose spans are the non-unknown spans (uncovered text is
 unknown by the contract). Messages whose id is empty or not unique in their sequence cannot be
 referenced exactly and are counted, not annotated. The file holds offsets, ids and evidence
-(`cce.attribution-rules@3:rule:<id>`, `stratum:<S|M|L>`, `span:<id>`, and `owner_verdict:<verdict>`
+(`cce.attribution-rules@4:rule:<id>`, `stratum:<S|M|L>`, `span:<id>`, and `owner_verdict:<verdict>`
 for a span the owner answered), no message text. A span the owner answered also carries
 `owner_verdict` as a key of its own. Owner spans carry `--owner-id` as `author_id`; without it no
 span can reach a strict profile.
@@ -470,9 +470,9 @@ which counts as reviewed and not confirmed, and there is no `skip`. Each ledger 
 digest of the sample it answers and how many rows that sample drew for its rule and stratum, and
 precision is over rows drawn: a drawn row the ledger holds no row for also counts as `unsure`
 (reported as `missing_rows`). The next `review-sample` leaves out the spans the owner already
-reviewed, blank ones included, so a blank row is never drawn again to be skipped again. Recording
-a sample again re-answers all of its rows: the last answer wins, so repeat the answers you want to
-keep.
+reviewed, blank ones included, so a blank row is never drawn again to be skipped again. **A sample
+is recorded once**, in order, into the one ledger it was drawn against (see below), so answer every
+row you can in that one recording: a row left blank is recorded as `unsure` for good.
 
 Which ledger rows count, in order: a row is **stale** (another rules version or an older ledger
 schema) and ignored; a row whose reviewer is not the `--owner-id` identity is a **non-owner row**,
@@ -493,21 +493,31 @@ can append rows with real span ids and the owner's name, and the gate cannot tel
 owner's own; the sample digest and the library fingerprint are integrity checks that anyone can
 recompute, not authentication. The gate protects against mistakes, omission and fabrication
 (made-up ids, a rule or text edited in a row, an edited sample, a reviewer that is not the owner,
-blank rows dropped, samples chosen among many draws), not against an adversary holding the
-owner's permissions.
+blank rows dropped, samples chosen among many draws or ledgers), not against an adversary
+holding the owner's permissions.
 
 **No choosing among draws.** If any sample could be recorded, the rows to answer could be chosen
 by drawing under many seeds, record limits or census settings and recording only the good-looking
 draws. So only the default draw over the whole library can be recorded: `review-record` refuses a
 sample whose header says `partial: true` (a `--limit-records` or deadline slice), a `seed` other
 than the default, or `repeat_min_chars` / `repeat_min_occurrences` other than the defaults (200 and
-3). The draw is then fixed by the library, the ledger and the owner, and skipping a recording
-only brings the same rows back. `--seed`, `--limit-records`, `--deadline-seconds` and the
-`--repeat-min-*` options remain for previewing a sample. The batch size (`--per-stratum`) is
-free: a smaller batch is a prefix of a larger one.
+3). `--seed`, `--limit-records`, `--deadline-seconds` and the `--repeat-min-*` options remain for
+previewing a sample. The batch size (`--per-stratum`) is free: a smaller batch is a prefix of a
+larger one.
+
+**One ledger, in order, once.** What a draw offers also depends on which ledger it leaves spans out
+against. If that were not bound, draws could be made against a throwaway ledger (recording each
+there so that the next draw moves on) and only the good-looking draws recorded into the real one.
+So the header carries an `exclusion_digest`: SHA-256 over the sorted (span id, verdict) pairs of the
+owner's current rows in the ledger the draw excluded against (a draw against no ledger, or against
+one with no rows of the owner, carries the digest of the empty list). `review-record` recomputes it
+from the target ledger, while holding the ledger's lock, and refuses a sample whose digest differs
+(`drawn against a different ledger state`). Every recording changes the ledger, so every sample can
+be recorded exactly once, in order, into exactly one ledger; to go on, draw again against the
+ledger as it now stands. Rows of other reviewers and of other versions are not part of the digest.
 
 The ledger is append-only JSONL, one object per line with exactly these keys: `schema`
-(`cce.attribution-review-ledger.v3`), `rules_version`, `span_id`, `rule`, `stratum` (`S`, `M` or
+(`cce.attribution-review-ledger.v4`), `rules_version`, `span_id`, `rule`, `stratum` (`S`, `M` or
 `L`), `verdict` (`yes`, `no` or `unsure`), `reviewer`, `reviewed_at` (a UTC time such as
 `2026-01-02T03:04:05Z`), `sample_digest`, `text_sha256` (the SHA-256 of the full span text the
 owner was shown) and `drawn` (rows that sample drew for the rule and stratum). It holds no text.
@@ -537,8 +547,8 @@ the span text, the SHA-256 of the full span text, the rule and its description, 
 class and the stratum, nothing about the record. The first line of the file is a **header**:
 the row count, a SHA-256 digest over the rows (answers left out), the library fingerprint (a digest
 of every record's uid, version and revision digest), the owner the sample was drawn for, the seed,
-the repeat-census settings, whether the scan was cut short (`partial`) and the number of rows drawn
-per `rule:stratum`. Passing `--ledger` leaves out only the spans the
+the repeat-census settings, whether the scan was cut short (`partial`), the ledger state the draw
+excluded against (`exclusion_digest`) and the number of rows drawn per `rule:stratum`. Passing `--ledger` leaves out only the spans the
 owner (`--owner-id`) already reviewed: a current row of that identity whose rule, stratum and text
 hash match the span in this scan. Rows of other reviewers, rows of other versions and rows naming
 spans that are not in the scan hide nothing. Without `--out` the sample goes to standard
@@ -546,8 +556,8 @@ output. A sample file holds private text: keep it out of version control.
 
 `review-record` requires `--sample` (the file `review-sample` wrote), `--answers` and `--library`
 or `--store-root` (so the ledger is kept out of the store). It re-hashes the sample and refuses one
-that was edited, cut, hand-written or drawn from another library, or for another owner than
-`--reviewer`; it refuses an answer whose span id, rule and stratum are not a row of the sample, a
+that was edited, cut, hand-written, drawn from another library, drawn for another owner than
+`--reviewer` or drawn against another state of the ledger; it refuses an answer whose span id, rule and stratum are not a row of the sample, a
 span answered twice, a verdict other than `yes`, `no` or `unsure`, and a file with JSON nested too
 deeply to read (`unreadable`), all before anything is written. It stamps the current UTC time
 unless `--reviewed-at` is given. The engine's own functions take the time as a parameter and never

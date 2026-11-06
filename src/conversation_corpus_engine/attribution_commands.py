@@ -64,6 +64,7 @@ from .attribution_rules import (
     attribute_message,
     blank_text,
     eligible_strata,
+    exclusion_digest,
     ledger_row,
     load_json_line,
     parse_sample,
@@ -1169,6 +1170,7 @@ def _review_sample(args: argparse.Namespace) -> int:
         partial=partial,
         repeat_min_chars=args.repeat_min_chars,
         repeat_min_occurrences=args.repeat_min_occurrences,
+        exclusion_digest=exclusion_digest(view.rows, owner),
     )
     payload = sample_text(header, rows)
     summary = {
@@ -1286,7 +1288,16 @@ def _review_record(args: argparse.Namespace) -> int:
             )
         )
     private_directories(ledger.parent)
-    appended = append_rows(ledger, rows)
+
+    def drawn_against_this_ledger(existing: list[dict[str, Any]]) -> None:
+        if exclusion_digest(existing, reviewer) != header["exclusion_digest"]:
+            raise ValueError(
+                "this sample was drawn against a different ledger state than the one it would be "
+                "recorded into; draw again against this ledger (a sample can be recorded once, "
+                "in order, into the one ledger it was drawn against)"
+            )
+
+    appended = append_rows(ledger, rows, precondition=drawn_against_this_ledger)
     counts = Counter(f"{row['rule']}:{row['stratum']}" for row in rows)
     result = {
         "ledger": str(args.ledger),
