@@ -5,8 +5,8 @@ every source span. This module only reads the library (through the same validati
 `export_zettels`) and writes to a private directory chosen by the caller; it never writes
 inside the library store and never uses the network. It does not decide who wrote an idea:
 authorship comes from the attribution the reviewed envelope already carries, and the owner is
-credited only when every one of those assertions is explicit, evidenced and made by the person
-who reviewed the note (see `note_authorship`).
+credited only when the title, the idea text and every quote carry an explicit, evidenced
+assertion by the configured owner who also reviewed the note (see `note_authorship`).
 """
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ import html
 import json
 import os
 import re
+import secrets
+import unicodedata
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -104,46 +106,77 @@ def note_id(created: str, caller_id: str) -> str:
     return created.replace("-", "") + "-" + hashlib.sha256(canonical.encode()).hexdigest()[:6]
 
 
+FILE_NAME_BYTES = 255
+AGENT_AUTHOR = "agent"
+
+
 def _title(zettel: dict[str, Any]) -> str:
-    title = " ".join(str(zettel["title"]).split())
+    # NFC, so the same title in another normalisation form is one name on every file system.
+    title = unicodedata.normalize("NFC", " ".join(str(zettel["title"]).split()))
     if not title or len(title) > TITLE_LIMIT:
         raise ValueError(f"title must be 1 to {TITLE_LIMIT} characters")
     if _UNSAFE_TITLE.search(title) or _CONTROL.search(title) or title[0] == "." or title[-1] == ".":
         raise ValueError(
             'title is not file-safe (none of / \\ : * ? " < > | # ^ [ ], no leading or trailing dot)'
         )
+    if len(f"{title}.md".encode()) > FILE_NAME_BYTES:
+        raise ValueError(
+            f"title is too long for a file name ('<title>.md' is at most {FILE_NAME_BYTES} bytes "
+            "in UTF-8)"
+        )
     return title
 
 
-def _owner_assertion(span: dict[str, Any], reviewer: str) -> bool:
-    """An explicit, evidenced, profile-eligible owner assertion made by the note's reviewer."""
+def _name_key(name: str) -> str:
+    """The comparison key of a file name or title: Unicode-normalised, then case-folded."""
+    return unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).casefold())
+
+
+def _owner_assertion(span: dict[str, Any], owner_id: str) -> bool:
+    """An explicit, evidenced, profile-eligible assertion by the configured owner."""
     return (
         span["author"] == "owner"
         and span["assertion_status"] == "asserted"
         and bool(span["evidence"])
         and span["profile_eligible"] is True
-        and span["author_id"] == reviewer
+        and span["author_id"] == owner_id
     )
 
 
-def note_authorship(item: dict[str, Any]) -> tuple[str, str]:
+def _agent_assertion(span: dict[str, Any]) -> bool:
+    return span["author"] == "agent" and span["assertion_status"] == "asserted"
+
+
+def note_authorship(item: dict[str, Any], owner_id: str | None = None) -> tuple[str, str]:
     """The Wiki Standard `authorship` value and the `author` of a validated reviewed Zettel.
 
-    `human` only when the idea text and every quoted word carry an explicit, evidenced owner
-    assertion that is profile-eligible and made by the reviewer (the owner reviewed it).
-    `agent` when every span of the idea text is asserted as agent-written. Anything else
-    (unattributed, mixed, third party, disputed, retracted, or an owner assertion nobody
-    reviewed) is `generated`: the note says it exists but not who wrote it. Unreviewed text is
-    therefore never labelled as owner-written.
+    A note is only as attributed as its weakest part: its title, its idea text and every quoted
+    word must all pass the same test.
+
+    `human` only when `owner_id` (the configured owner) is given, the note's reviewer is that
+    owner, and the title, the idea text and every quoted word each carry an explicit, evidenced,
+    profile-eligible owner assertion by that same owner. Without `owner_id` nothing is `human`.
+    `agent` when the title and every span of the idea text are asserted as agent-written; the
+    author is then the fixed label `agent`, never an identifier copied from the envelope.
+    Anything else (unattributed, mixed, third party, disputed, retracted, or an owner assertion
+    nobody reviewed) is `generated`: the note says it exists but not who wrote it.
     """
+    title = item.get("title_spans") or []
     body = item["body_attribution"]
     reviewer = item["review"]["reviewer"].strip()
     quoted = [span for source in item["sources"] for span in source["attributed_spans"]]
-    if body and quoted and all(_owner_assertion(span, reviewer) for span in (*body, *quoted)):
-        return "human", reviewer
-    if body and all(s["author"] == "agent" and s["assertion_status"] == "asserted" for s in body):
-        ids = {s["author_id"] for s in body}
-        return "agent", (ids.pop() if len(ids) == 1 and None not in ids else "agent")
+    owner = (owner_id or "").strip()
+    if (
+        owner
+        and reviewer == owner
+        and title
+        and body
+        and quoted
+        and all(_owner_assertion(span, owner) for span in (*title, *body, *quoted))
+    ):
+        return "human", owner
+    if title and body and all(_agent_assertion(span) for span in (*title, *body)):
+        return "agent", AGENT_AUTHOR
     return "generated", "unknown"
 
 
@@ -186,11 +219,17 @@ def _plain_wikilink(title: str) -> str:
     return json.dumps(f"[[{title}]]", ensure_ascii=False)
 
 
-def _render(item: dict[str, Any], identity: str, title: str, targets: dict[str, str]) -> Note:
+def _render(
+    item: dict[str, Any],
+    identity: str,
+    title: str,
+    targets: dict[str, str],
+    owner_id: str | None = None,
+) -> Note:
     caller_id = item["id"]
     created = _day(item.get("created"), "created")
     updated = _day(item.get("updated") or created, "updated")
-    label, author = note_authorship(item)
+    label, author = note_authorship(item, owner_id)
     summary = _summary(item["body"])
     links: list[str] = []
     for relationship in item["relationships"]:
@@ -363,11 +402,16 @@ def _check_sources(original: dict[str, Any], item: dict[str, Any], identity: str
     return problems
 
 
-def build_notes(library: Library, zettels: list[dict[str, Any]]) -> list[Note]:
+def build_notes(
+    library: Library, zettels: list[dict[str, Any]], *, owner_id: str | None = None
+) -> list[Note]:
     """Validate the whole envelope against the library, then render every note or none.
 
+    `owner_id` is the configured owner identity; without it no note is labelled `human`.
     Raises `ValueError` listing every refusal; nothing is returned partially.
     """
+    if owner_id is not None and not owner_id.strip():
+        raise ValueError("owner id must show something (not blank)")
     exported = export_zettels(library, zettels)["zettels"]
     problems: list[str] = []
     prepared: list[tuple[dict[str, Any], str, str]] = []
@@ -383,7 +427,7 @@ def build_notes(library: Library, zettels: list[dict[str, Any]]) -> list[Note]:
             continue
         found = _check_sources(original, item, caller_id)
         problems += found
-        titles.setdefault(title.casefold(), []).append(caller_id)
+        titles.setdefault(_name_key(title), []).append(caller_id)
         if not found:
             prepared.append((item, identity, title))
     problems += [
@@ -402,12 +446,12 @@ def build_notes(library: Library, zettels: list[dict[str, Any]]) -> list[Note]:
     if not problems:
         for item, identity, title in prepared:
             try:
-                notes.append(_render(item, identity, title, targets))
+                notes.append(_render(item, identity, title, targets, owner_id))
             except ValueError as error:
                 problems.append(f"{item['id']}: {error}")
     if problems:
         raise ValueError("refused, nothing written:\n  " + "\n  ".join(problems))
-    return sorted(notes, key=lambda note: (note.title.casefold(), note.id))
+    return sorted(notes, key=lambda note: (_name_key(note.title), note.id))
 
 
 def _existing_id(path: Path) -> str | None:
@@ -439,7 +483,7 @@ def write_notes(notes: list[Note], destination: Path) -> dict[str, Any]:
         wanted = present.get(note.filename)
         if wanted is None:
             wanted = next(
-                (p for n, p in present.items() if n.casefold() == note.filename.casefold()), None
+                (p for n, p in present.items() if _name_key(n) == _name_key(note.filename)), None
             )
         if wanted is not None and _existing_id(wanted) != note.id:
             problems.append(f"{note.id}: {wanted.name} already holds a different note")
@@ -457,13 +501,16 @@ def write_notes(notes: list[Note], destination: Path) -> dict[str, Any]:
         if path.is_file() and path.read_bytes() == data:
             unchanged.append(note.id)
             continue
-        temporary = folder / f".{note.id}.tmp"
-        descriptor = os.open(
-            temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600
-        )
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(data)
-        temporary.replace(path)
+        # A name no other run can share, created exclusively, and removed if anything fails.
+        temporary = folder / f".{note.id}.{secrets.token_hex(8)}.tmp"
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(data)
+            temporary.replace(path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
         written.append(note.id)
     warnings = [f"{n.id}: {w}" for n in notes for w in n.warnings]
     if len(notes) > FOLDER_WARN:
@@ -491,12 +538,20 @@ def write_notes(notes: list[Note], destination: Path) -> dict[str, Any]:
 
 
 def export_zettel_notes(
-    library: Library, zettels: list[dict[str, Any]], destination: Path, *, store_root: Path
+    library: Library,
+    zettels: list[dict[str, Any]],
+    destination: Path,
+    *,
+    store_root: Path,
+    owner_id: str | None = None,
 ) -> dict[str, Any]:
-    """Validate, render and write the notes; the destination may not overlap the library store."""
+    """Validate, render and write the notes; the destination may not overlap the library store.
+
+    `owner_id` names the owner whose assertions may be labelled `human`; without it none are.
+    """
     require_git_private(destination)
     target = _absolute(destination).resolve(strict=False)
     store = _absolute(store_root).resolve(strict=False)
     if target == store or store in target.parents or target in store.parents:
         raise ValueError("the notes directory must be outside the library store")
-    return write_notes(build_notes(library, zettels), destination)
+    return write_notes(build_notes(library, zettels, owner_id=owner_id), destination)

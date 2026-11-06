@@ -130,14 +130,16 @@ def source(library: Library, reference: dict, author: str = "agent", **extra: An
 
 def zettel(library: Library, number: int, sources: list[dict], **changes: Any) -> dict:
     body = f"Invented idea number {number} about keeping a careful record."
+    title = changes.get("title", f"Careful records beat memory {number}")
     return {
         "id": f"idea-{number:03d}",
-        "title": f"Careful records beat memory {number}",
+        "title": title,
         "body": body,
         "created": "2026-03-04",
         "review": {"status": "reviewed", "reviewer": "rev", "evidence": ["synthetic check"]},
         "relationships": [],
         "attribution": annotation(body, "agent", "model"),
+        "title_attribution": annotation(title, "agent", "model"),
         "sources": sources,
         **changes,
     }
@@ -274,7 +276,7 @@ def test_each_note_passes_the_wiki_caps_and_has_flat_required_frontmatter(world,
         assert all(meta[key] for key in REQUIRED)
         assert re.fullmatch(r"20260304-[0-9a-f]{6}", meta["id"])
         assert meta["type"] == "zettel" and meta["status"] == "draft"
-        assert meta["authorship"] == "agent" and meta["author"] == "model"
+        assert meta["authorship"] == "agent" and meta["author"] == "agent"
         assert len(meta["summary"]) <= 200 and len(meta["title"]) <= 100
         assert meta["created"] == meta["updated"] == "2026-03-04"
         assert meta["sources"] and "\r" not in note.read_text(encoding="utf-8")
@@ -437,7 +439,11 @@ def test_only_a_fully_asserted_reviewed_owner_text_is_credited_to_the_owner(tmp_
         entry = zettel(library, 1, [source(library, ref(library, "kiln", 1), "owner")])
         entry["review"]["reviewer"] = "rob"
         entry["attribution"] = annotation(entry["body"], "owner", "rob")
-        (note,) = build_notes(library, [entry])
+        entry["title_attribution"] = annotation(entry["title"], "owner", "rob")
+        # Only with the configured owner id; without it nothing is human.
+        (unconfigured,) = build_notes(library, [entry])
+        assert unconfigured.authorship == "generated"
+        (note,) = build_notes(library, [entry], owner_id="rob")
         meta, _ = parse_text(note.text)
         assert (meta["authorship"], meta["author"], meta["status"]) == ("human", "rob", "draft")
 
@@ -573,7 +579,7 @@ def test_top_level_authorship_and_status_in_the_envelope_are_ignored(tmp_path):
         )
         (note,) = build_notes(library, [entry])
         meta, _ = parse_text(note.text)
-        assert (meta["authorship"], meta["status"], meta["author"]) == ("agent", "draft", "model")
+        assert (meta["authorship"], meta["status"], meta["author"]) == ("agent", "draft", "agent")
 
 
 def test_a_directory_inside_the_library_store_is_refused(world, capsys):
