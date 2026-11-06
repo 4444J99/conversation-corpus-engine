@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import random
+
 import pytest
 
 from conversation_corpus_engine.attribution import text_digest
@@ -11,14 +13,18 @@ from conversation_corpus_engine.attribution_rules import (
     AttributedSpan,
     MessageContext,
     RecordInfo,
+    RepeatCensus,
     attribute_message,
+    boilerplate_ranges,
     partition_problems,
     record_info,
     rule_agent_family,
+    rule_boilerplate,
     rule_code,
     rule_document_origin,
     rule_inline_injection,
     rule_log_trace,
+    rule_note_owner,
     rule_quote,
     rule_typed_prefix,
     rule_typed_remainder,
@@ -607,3 +613,340 @@ def test_a_message_mixing_owner_prose_logs_quotes_and_code() -> None:
         ("code", "third_party"),
         ("typed_prefix", "owner"),
     ]
+
+
+# --- f: boilerplate --------------------------------------------------------------------------
+
+TEMPLATE = " ".join(
+    ["You are reviewing a proposal."]
+    + ["Check scope, risks, costs and the schedule with care."] * 5
+)
+
+
+def test_the_template_fixture_is_long_enough() -> None:
+    assert len(TEMPLATE) >= 200
+
+
+def test_the_same_boilerplate_in_four_conversations_leaves_only_the_first_eligible() -> None:
+    texts = [f"{TEMPLATE}\n\nTopic {index}: my own question." for index in range(4)]
+    found = boilerplate_ranges(texts)
+    size = len(TEMPLATE)
+    assert found == [(), ((0, size),), ((0, size),), ((0, size),)]
+    later = attribute_message(
+        texts[2],
+        role="user",
+        channel="typed",
+        typed_chars=len(texts[2]),
+        record=CHAT,
+        boilerplate=found[2],
+    )
+    assert view(texts[2], later) == [
+        ("boilerplate", "third_party", TEMPLATE),
+        ("unattributed", "unknown", "\n\n"),
+        ("typed_prefix", "owner", "Topic 2: my own question."),
+    ]
+    first = attribute_message(
+        texts[0],
+        role="user",
+        channel="typed",
+        typed_chars=len(texts[0]),
+        record=CHAT,
+        boilerplate=found[0],
+    )
+    assert [(span.rule, span.author) for span in first] == [("typed_prefix", "owner")]
+
+
+def test_repeats_are_matched_after_whitespace_normalization() -> None:
+    variants = [TEMPLATE, TEMPLATE.replace(" ", "  "), TEMPLATE.replace(". ", ".\n")]
+    found = boilerplate_ranges(variants)
+    assert found[0] == ()
+    assert found[1] == ((0, len(variants[1])),)
+    assert found[2] == ((0, len(variants[2])),)
+
+
+def test_thresholds_are_configurable_with_the_documented_defaults() -> None:
+    size = len(TEMPLATE)
+    assert boilerplate_ranges([TEMPLATE, TEMPLATE]) == [(), ()]
+    assert boilerplate_ranges([TEMPLATE, TEMPLATE], min_occurrences=2) == [(), ((0, size),)]
+    short = "Same short line repeated."
+    assert boilerplate_ranges([short] * 5) == [()] * 5
+    flagged = boilerplate_ranges([short] * 5, min_chars=10)
+    assert flagged == [(), *[((0, len(short)),)] * 4]
+    for bad in ({"min_chars": 0}, {"min_occurrences": 1}, {"min_chars": True}):
+        with pytest.raises(ValueError, match="positive|at least"):
+            RepeatCensus(**bad)
+
+
+def test_a_paragraph_repeated_inside_one_message_keeps_only_its_first_copy() -> None:
+    text = f"{TEMPLATE}\n\nmiddle words\n\n{TEMPLATE}\n\n{TEMPLATE}"
+    size = len(TEMPLATE)
+    second = text.index(TEMPLATE, size)
+    third = text.index(TEMPLATE, second + size)
+    assert boilerplate_ranges([text]) == [((second, second + size), (third, third + size))]
+
+
+def test_a_repeated_multi_paragraph_message_is_one_unit() -> None:
+    whole = "Alpha " * 20 + "\n\n" + "Beta " * 20
+    whole = whole.replace("Alpha \n", "Alpha\n").rstrip()
+    found = boilerplate_ranges([whole] * 3)
+    assert found == [(), ((0, len(whole)),), ((0, len(whole)),)]
+
+
+def test_first_means_first_in_the_order_the_slice_is_scanned() -> None:
+    texts = [f"{TEMPLATE}\n\nSuffix {index}." for index in range(3)]
+    census = RepeatCensus()
+    for text in texts:
+        census.observe(text)
+    assert census.later_occurrences(texts[1]) == ()
+    assert census.later_occurrences(texts[0]) == ((0, len(TEMPLATE)),)
+    with pytest.raises(RuntimeError, match="observe"):
+        census.observe("late text")
+
+
+def test_text_the_census_never_saw_is_never_boilerplate() -> None:
+    assert RepeatCensus().later_occurrences(TEMPLATE) == ()
+
+
+def test_boilerplate_rule_passes_the_census_ranges_through() -> None:
+    assert rule_boilerplate(ctx("abcdefgh", boilerplate=((0, 4), (6, 8)))) == [
+        (0, 4, "verbatim-repeat"),
+        (6, 8, "verbatim-repeat"),
+    ]
+    assert rule_boilerplate(ctx("abcdefgh")) == []
+
+
+# --- g: notes default ------------------------------------------------------------------------
+
+
+def test_a_note_body_is_owner_by_default_whatever_typed_chars_says() -> None:
+    text = "Buy milk.\nCall the plumber about the leak."
+    for typed in (0, 3, "all", None):
+        assert view(text, run(text, record=NOTE, channel="typed", typed=typed)) == [
+            ("note_owner", "owner", text)
+        ]
+    assert view(text, run(text, record=NOTE, channel="project", typed=0)) == [
+        ("note_owner", "owner", text)
+    ]
+
+
+def test_a_pasted_quote_in_a_note_stays_third_party() -> None:
+    text = "My thoughts.\n\n> pasted from a website\n\nMore thoughts."
+    assert view(text, run(text, record=NOTE)) == [
+        ("note_owner", "owner", "My thoughts."),
+        ("unattributed", "unknown", "\n\n"),
+        ("quote", "third_party", "> pasted from a website"),
+        ("unattributed", "unknown", "\n\n"),
+        ("note_owner", "owner", "More thoughts."),
+    ]
+
+
+def test_code_logs_and_injected_blocks_in_a_note_are_not_owner() -> None:
+    text = (
+        "Setup notes\n```\nmake all\n```\n2026-01-02 03:04:05 INFO done\n"
+        "<system-reminder>x</system-reminder>\nEnd."
+    )
+    claimed = {span.rule for span in run(text, record=NOTE) if span.author != "owner"}
+    assert {"code", "log_trace", "inline_injection"} <= claimed
+
+
+def test_provider_metadata_marking_agent_origin_keeps_a_note_from_the_owner() -> None:
+    text = "Summary an assistant wrote into the note."
+    assert view(text, run(text, record=NOTE, meta={"generated_by": "ChatGPT"})) == [
+        ("agent_family", "agent", text)
+    ]
+    assert rule_note_owner(ctx(text, record=NOTE, meta={"agent_authored": True})) == []
+
+
+def test_note_rule_needs_an_authored_family_note_or_document_user_turn() -> None:
+    text = "Body text."
+    plan = RecordInfo(provider="documents", kind="plan", wing="authored", authored_family=True)
+    assert rule_note_owner(ctx(text, record=plan)) == []
+    assert rule_note_owner(ctx(text, record=CHAT)) == []
+    assert rule_note_owner(ctx(text, record=NOTE, role="assistant")) == []
+    drive = RecordInfo(provider="googledrive", kind="document", authored_family=True)
+    assert rule_note_owner(ctx(text, record=drive)) == [(0, 10, "family=googledrive")]
+
+
+def test_a_chat_user_turn_on_the_written_channel_is_not_owner() -> None:
+    text = "An uploaded knowledge document filed as a user turn."
+    assert view(text, run(text, channel="written", record=CHAT)) == [
+        ("unattributed", "unknown", text)
+    ]
+
+
+def test_ai_written_skill_document_is_machine_and_a_plain_authored_document_is_owner() -> None:
+    skill = record_info(payload(provenance={"source_file": "skills/example/SKILL.md"}))
+    plain = record_info(payload(provenance={"source_file": "writing/essay.md"}))
+    body = "When reviewing a change, check the tests first and summarise the risk."
+    assert view(body, run(body, channel="project", typed=0, record=skill)) == [
+        ("document_origin", "agent", body)
+    ]
+    assert view(body, run(body, channel="project", typed=0, record=plain)) == [
+        ("note_owner", "owner", body)
+    ]
+
+
+def test_the_rule_table_has_one_documented_order() -> None:
+    assert [(rule.id, rule.author) for rule in RULES] == [
+        ("agent_family", "agent"),
+        ("document_origin", "agent"),
+        ("inline_injection", "agent"),
+        ("typed_remainder", "agent"),
+        ("code", "third_party"),
+        ("quote", "third_party"),
+        ("log_trace", "agent"),
+        ("boilerplate", "third_party"),
+        ("typed_prefix", "owner"),
+        ("note_owner", "owner"),
+    ]
+    assert all(rule.description for rule in RULES)
+
+
+# --- the partition property ------------------------------------------------------------------
+
+WORDS = ["alpha", "beta", "gamma", "delta", "budget", "review", "notes", "plan", "cost", "risk"]
+
+
+def prose(rng: random.Random) -> str:
+    sentence = " ".join(rng.choice(WORDS) for _ in range(rng.randint(1, 12)))
+    return sentence + rng.choice([".", "?", "", "!"])
+
+
+def block(rng: random.Random) -> str:
+    body = prose(rng)
+    quoted = " ".join(rng.choice(WORDS) for _ in range(rng.randint(9, 14)))
+    makers = [
+        lambda: body,
+        lambda: body,
+        lambda: body,
+        lambda: body,
+        lambda: f"<system-reminder>{body}</system-reminder>",
+        lambda: f"<command-name>/{rng.choice(WORDS)}</command-name>",
+        lambda: f"<tool_result>{body}</tool_result>",
+        lambda: f"<local-command-stdout>{body}",
+        lambda: "<skill/>",
+        lambda: "\n".join(f"> {prose(rng)}" for _ in range(rng.randint(1, 3))),
+        lambda: f'"{quoted}"',
+        lambda: f"“{quoted}”",
+        lambda: f"```\n{body}\n```",
+        lambda: f"```python\n{body}",
+        lambda: "\n".join(f"    {prose(rng)}" for _ in range(rng.randint(1, 3))),
+        lambda: f"2026-01-0{rng.randint(1, 9)} 03:04:0{rng.randint(0, 9)} INFO {body}",
+        lambda: (
+            'Traceback (most recent call last):\n  File "a.py", line 1\n    x()\nValueError: '
+            + body
+        ),
+        lambda: "\n".join(f"ERROR: {prose(rng)}" for _ in range(rng.randint(1, 4))),
+        lambda: " " * rng.randint(1, 4),
+        lambda: "a < b > c",
+        lambda: "\t" + body,
+        lambda: f"<pasted_content>{body}</pasted_content>",
+        lambda: f"<unknown-tag>{body}</unknown-tag>",
+    ]
+    return rng.choice(makers)()
+
+
+def check_partition(context: MessageContext, spans: list[AttributedSpan]) -> None:
+    text = context.text
+    length = len(text)
+    assert not any(partition_problems(text, spans).values())
+    owner_of = [None] * length
+    covered = [0] * length
+    for span in spans:
+        assert span.profile_eligible is False
+        assert span.text_digest == text_digest(text)
+        for index in range(span.start, span.end):
+            covered[index] += 1
+            owner_of[index] = span
+    assert covered == [1] * length
+    raw = {}
+    for rule in RULES:
+        chars: set[int] = set()
+        for start, end, _ in rule.claims(context):
+            chars.update(range(max(0, start), min(length, end)))
+        raw[rule.id] = chars
+    non_owner = set().union(*(raw[rule.id] for rule in RULES if rule.author != "owner"))
+    owner_raw = set().union(*(raw[rule.id] for rule in RULES if rule.author == "owner"))
+    for span in spans:
+        chars = set(range(span.start, span.end))
+        if span.author == "owner":
+            assert span.rule in {"typed_prefix", "note_owner"}
+            assert not chars & non_owner
+            assert chars <= raw[span.rule]
+            assert text[span.start].strip()
+            assert text[span.end - 1].strip()
+        if span.rule == "unattributed":
+            assert span.author == "unknown"
+            assert not chars & non_owner
+        else:
+            assert chars <= raw[span.rule]
+    for index in range(length):
+        claimed = index in non_owner or index in owner_raw
+        if not claimed:
+            assert owner_of[index].rule == "unattributed"
+        elif index not in non_owner and text[index].strip():
+            assert owner_of[index].author == "owner"
+
+
+def test_partition_covers_every_character_once_and_owner_never_outranks_a_higher_rule() -> None:
+    rng = random.Random(20261105)
+    records = [
+        CHAT,
+        CHAT,
+        CHAT,
+        CLI,
+        NOTE,
+        NOTE,
+        RecordInfo(provider="claudecode", kind="session", session_kind="subagent"),
+        RecordInfo(provider="documents", kind="document", wing="authored", authored_family=True),
+        record_info(payload(provenance={"source_file": "skills/x/SKILL.md"})),
+    ]
+    owner_spans = other_spans = 0
+    for _ in range(200):
+        pieces = [
+            block(rng) + rng.choice(["\n", "\n\n", " ", ""]) for _ in range(rng.randint(1, 9))
+        ]
+        text = "".join(pieces)
+        if not text:
+            continue
+        length = len(text)
+        boilerplate = ()
+        if rng.random() < 0.3:
+            starts = [rng.randrange(length) for _ in range(rng.randint(1, 3))]
+            boilerplate = tuple((s, rng.randint(s + 1, length)) for s in starts)
+        context = MessageContext(
+            text=text,
+            role=rng.choice(["user"] * 16 + ["assistant", "tool", "system", ""]),
+            channel=rng.choice(["typed"] * 10 + ["written", "project", "reply", "system"]),
+            typed_chars=rng.choice(
+                [length, length, length, rng.randint(0, length + 3), None, -1, length // 2]
+            ),
+            meta={"agent_authored": True} if rng.random() < 0.05 else {},
+            record=rng.choice(records),
+            boilerplate=boilerplate,
+        )
+        spans = attribute_message(
+            text,
+            role=context.role,
+            channel=context.channel,
+            typed_chars=context.typed_chars,
+            meta=context.meta,
+            record=context.record,
+            boilerplate=context.boilerplate,
+        )
+        check_partition(context, spans)
+        again = attribute_message(
+            text,
+            role=context.role,
+            channel=context.channel,
+            typed_chars=context.typed_chars,
+            meta=context.meta,
+            record=context.record,
+            boilerplate=context.boilerplate,
+        )
+        assert again == spans
+        owner_spans += sum(span.author == "owner" for span in spans)
+        other_spans += sum(span.author not in {"owner", "unknown"} for span in spans)
+    # The generator must exercise both sides, or the property would pass vacuously.
+    assert owner_spans >= 30
+    assert other_spans >= 100

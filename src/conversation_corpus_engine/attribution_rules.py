@@ -618,6 +618,125 @@ def rule_log_trace(context: MessageContext) -> list[Claim]:
     return claims
 
 
+# --- f: boilerplate (a repeated-span census over the slice being scanned) -----------------------
+
+DEFAULT_REPEAT_MIN_CHARS = 200
+DEFAULT_REPEAT_MIN_OCCURRENCES = 3
+
+
+def _repeat_key(text: str) -> int:
+    return int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:8], "big")
+
+
+def _repeat_units(text: str, min_chars: int) -> list[tuple[int, int, int]]:
+    """(start, end, key) of each paragraph, and of the whole message when it has several, that is
+    at least `min_chars` long after whitespace normalization. Only digests are ever kept."""
+    paragraphs = _paragraphs(_lines(text))
+    spans = list(paragraphs)
+    if len(paragraphs) >= 2:
+        spans.append((paragraphs[0][0], paragraphs[-1][1]))
+    units: list[tuple[int, int, int]] = []
+    for start, end in spans:
+        piece = text[start:end]
+        stripped = piece.strip()
+        if len(stripped) < min_chars:
+            continue
+        normalized = " ".join(stripped.split())
+        if len(normalized) >= min_chars:
+            lead = len(piece) - len(piece.lstrip())
+            units.append((start + lead, start + lead + len(stripped), _repeat_key(normalized)))
+    return units
+
+
+class RepeatCensus:
+    """Finds long text that repeats verbatim (after whitespace normalization) across a slice.
+
+    Feed every message of the slice to `observe`, then call `later_occurrences` for every message
+    in the order the slice is scanned. A unit that occurs `min_occurrences` or more times in the
+    slice is boilerplate; its first occurrence in scan order is left to the other rules and every
+    later occurrence, in the same message, the same conversation or another one, is returned as a
+    range. The answer depends on the slice and its scan order, so a different slice can decide a
+    span differently. Memory holds one 64-bit digest per distinct long unit, never the text.
+    """
+
+    def __init__(
+        self,
+        *,
+        min_chars: int = DEFAULT_REPEAT_MIN_CHARS,
+        min_occurrences: int = DEFAULT_REPEAT_MIN_OCCURRENCES,
+    ) -> None:
+        if isinstance(min_chars, bool) or not isinstance(min_chars, int) or min_chars < 1:
+            raise ValueError("min_chars must be a positive integer")
+        if (
+            isinstance(min_occurrences, bool)
+            or not isinstance(min_occurrences, int)
+            or min_occurrences < 2
+        ):
+            raise ValueError("min_occurrences must be at least 2")
+        self.min_chars = min_chars
+        self.min_occurrences = min_occurrences
+        self._counts: dict[int, int] = {}
+        self._seen: set[int] = set()
+        self._claiming = False
+
+    def observe(self, text: str) -> None:
+        if self._claiming:
+            raise RuntimeError("observe every message before asking for later occurrences")
+        for _, _, key in _repeat_units(text, self.min_chars):
+            self._counts[key] = self._counts.get(key, 0) + 1
+
+    def later_occurrences(self, text: str) -> tuple[Range, ...]:
+        self._claiming = True
+        claimed: list[Range] = []
+        for start, end, key in _repeat_units(text, self.min_chars):
+            if self._counts.get(key, 0) < self.min_occurrences:
+                continue
+            if key in self._seen:
+                claimed.append((start, end))
+            else:
+                self._seen.add(key)
+        return tuple(sorted(claimed))
+
+
+def boilerplate_ranges(
+    texts: Sequence[str],
+    *,
+    min_chars: int = DEFAULT_REPEAT_MIN_CHARS,
+    min_occurrences: int = DEFAULT_REPEAT_MIN_OCCURRENCES,
+) -> list[tuple[Range, ...]]:
+    """The later-occurrence ranges of every text of a slice, aligned with the input."""
+    census = RepeatCensus(min_chars=min_chars, min_occurrences=min_occurrences)
+    for text in texts:
+        census.observe(text)
+    return [census.later_occurrences(text) for text in texts]
+
+
+def rule_boilerplate(context: MessageContext) -> list[Claim]:
+    """Later occurrences of long verbatim-repeated text were copied, not freshly written."""
+    return [(start, end, "verbatim-repeat") for start, end in context.boilerplate]
+
+
+# --- g: notes default ------------------------------------------------------------------------
+
+NOTE_KINDS = frozenset({"note", "document"})
+
+
+def rule_note_owner(context: MessageContext) -> list[Claim]:
+    """The body of a note or document in a family of the person's own writing is owner by
+    default. Every higher rule still takes its spans first (quotes, code, logs, injected blocks,
+    boilerplate, an agent-produced document), and a message whose provider metadata marks an
+    agent origin is not claimed."""
+    record = context.record
+    if (
+        _norm(context.role) != "user"
+        or not record.authored_family
+        or record.kind not in NOTE_KINDS
+        or marks_agent_origin(context.meta)
+    ):
+        return []
+    return [(0, len(context.text), f"family={record.provider}")]
+
+
 # --- the ordered rule table ------------------------------------------------------------------
 
 
@@ -662,7 +781,19 @@ RULES: tuple[Rule, ...] = (
         "timestamped log lines, stack traces and tool-output shaped runs",
         rule_log_trace,
     ),
+    Rule(
+        "boilerplate",
+        THIRD_PARTY,
+        "later occurrences of long text that repeats verbatim across the slice",
+        rule_boilerplate,
+    ),
     Rule("typed_prefix", OWNER, "the characters the person typed", rule_typed_prefix),
+    Rule(
+        "note_owner",
+        OWNER,
+        "the body of a note or document in the person's own authored library",
+        rule_note_owner,
+    ),
 )
 RULE_IDS: tuple[str, ...] = tuple(rule.id for rule in RULES)
 RULE_BY_ID: dict[str, Rule] = {rule.id: rule for rule in RULES}
