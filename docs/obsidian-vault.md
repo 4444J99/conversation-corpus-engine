@@ -13,7 +13,7 @@ uv run --extra obsidian python scripts/package-obsidian-vault.py /private/librar
   --max-seconds 1800
 ```
 
-A generation built with the default `--vault-profile none` has no `vault/` to package; the script then fails naming `--vault-profile`. Build with `--vault-profile cards` (one capped card per record) or `full` (whole records in linked parts), or write a card vault on demand with `cce library export-cards`. Those layouts already keep every note under 64 KiB, every folder under 200 entries and every hub under 100 entries, so this packager is mainly for a legacy bulk vault (see [vault profiles](knowledge-library.md#vault-profiles)); it still accepts a profile vault.
+A generation built with the default `--vault-profile none` has no `vault/` to package; the script then fails naming `--vault-profile`. Write one from the published generation with `cce library export --vault-profile cards --out DIR` (one capped card per record; `full` keeps whole records in linked parts) and package `DIR/vault`, or write a card folder with `cce library export-cards --out DIR`. Building again with another profile does not help while the sources are unchanged, because publication ignores the profile. Those layouts already keep every note under 64 KiB, every folder under 200 entries and every hub under 100 entries, so this packager is mainly for a legacy bulk vault (see [vault profiles](knowledge-library.md#vault-profiles)); it still accepts a profile vault.
 
 The `obsidian` extra installs the required `markdown-it-py==4.2.0`; the boundary mapper refuses other parser versions. The development extra includes the same pin for tests.
 

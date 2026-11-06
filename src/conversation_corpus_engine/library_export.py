@@ -734,7 +734,7 @@ _ENTRY_TAIL = {
         + _PROVIDER_NOTE
         + "\n\n",
         "`library-index.jsonl` is the compact metadata contract for my-knowledge-base and LingFrame; its `path` is null because no notes exist. `graph.jsonl` records parent relationships and repeated-passage references. `records.csv` lists every record.\n\n",
-        "For a small reading vault run `cce library export-cards --out DIR` (one capped card per record) or rebuild with `--vault-profile cards`. This export does not publish or upload private material.\n",
+        "For a small reading vault run `cce library export-cards --out DIR` (one capped card per record) or `cce library export --vault-profile cards --out DIR`. This export does not publish or upload private material.\n",
     ),
     PROFILE_CARDS: (
         "[Human library](vault/Home.md) is a capped card vault (`--vault-profile cards`): one short card per record, most recently updated first, never the full body; its Home note states how many records have no card. `library.sqlite` retains compressed normalized revisions and source observations. "

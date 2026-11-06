@@ -111,8 +111,8 @@ Consumers of the old layout, and what happens to each:
 
 | Consumer | Under the profiles |
 |---|---|
-| `scripts/package-obsidian-vault.py` | Works on the `vault/` of `cards` and `full` (tested). Without a vault it fails with a message naming `--vault-profile` and `export-cards`. It is still the tool for a legacy bulk vault. |
-| `scripts/package-notion-batches.py` | Works on the ZIP of `cards` and `full` (tested). With no ZIP (`none`) it fails with a message naming `--vault-profile`. |
+| `scripts/package-obsidian-vault.py` | Works on the `vault/` of `cards` and `full` (tested). Without a vault it exits with code 2 and a one-line message naming `--vault-profile`, `cce library export --vault-profile cards` and `export-cards` (the routes that work for an already-published generation). It is still the tool for a legacy bulk vault. |
+| `scripts/package-notion-batches.py` | Works on the ZIP of `cards` and `full` (tested). With no ZIP (`none`) it exits with code 2 and a one-line message naming `--vault-profile` and `cce library export --vault-profile cards`. |
 | `library-index.jsonl` and `records.csv` (LingFrame and other index readers) | Same fields; schema `cce.library-index.v2` for the profiles, `path` is the note or null (empty in the CSV). |
 | My Knowledge Base federation provider (`legacy/my-knowledge-base/src/federation/cce-library-provider.ts`) | It indexes the legacy `vault/records/UID.md` and `vault/blocks/DIGEST.md` notes as documents (shared passages are documents of their own), a real dependency on the layout the profiles drop, so it accepts only a v1 manifest and index. A generation built with any profile, the default included, is refused with a message naming `--vault-profile`; earlier generations still scan. |
 | `graph.jsonl` | Record nodes carry `path` only when the record has a note; `block:` nodes never do under a profile. |

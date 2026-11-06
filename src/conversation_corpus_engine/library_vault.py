@@ -74,6 +74,14 @@ MAX_PARENTS = 20
 NOMINAL_FOLDERS = "bucket-all-b000/bucket-all-b000"
 
 
+FULL_ADVICE = (
+    "Use --vault-profile cards for a capped card vault (for a published generation, "
+    "`cce library export --vault-profile cards` or `cce library export-cards` writes one), "
+    "or --vault-profile none"
+)
+CARDS_ADVICE = "Lower --limit-notes, or use --vault-profile none"
+
+
 class VaultRefused(ValueError):
     """The vault would pass a hard cap or a limit that cannot hold it; nothing is written."""
 
@@ -82,7 +90,7 @@ def _refusal(profile: str, what: str, caps: VaultCaps) -> VaultRefused:
     return VaultRefused(
         f"the {profile} vault would pass the vault hard cap ({what}; the caps are "
         f"{caps.vault_notes_fail} notes and {caps.vault_bytes_fail} bytes). Nothing was written. "
-        "Rebuild with --vault-profile cards for a capped card vault, or --vault-profile none"
+        f"{FULL_ADVICE}"
     )
 
 
@@ -492,11 +500,7 @@ def _gate_planned(
     """Measure the rendered notes against every hard cap; raise before anything is written."""
     report = measure_planned(dict(files), caps, root=prefix)
     if not report["ok"]:
-        advice = (
-            "Rebuild with --vault-profile cards for a capped card vault, or --vault-profile none"
-            if profile == PROFILE_FULL
-            else "Lower --limit-notes, or use --vault-profile none"
-        )
+        advice = FULL_ADVICE if profile == PROFILE_FULL else CARDS_ADVICE
         raise VaultRefused(
             f"the {profile} vault would break its hard caps ({'; '.join(hard_cap_problems(report))}). "
             f"Nothing was written. {advice}"

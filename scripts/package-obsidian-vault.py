@@ -19,6 +19,7 @@ import shutil
 import signal
 import sqlite3
 import stat
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -33,6 +34,10 @@ FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})([^\r\n]*)")
 HEADING = re.compile(r"^ {0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 LINK = re.compile(r"\]\((<?)([^\s<>\r\n)]+)(>?)\)")
 BACKTICKS = re.compile(r"`+")
+
+
+class MissingInput(ValueError):
+    """The source vault is absent; the CLI reports it as one line and exits with code 2."""
 
 
 def require(condition, message):
@@ -622,11 +627,13 @@ def package(
     safe_path(output)
     if agent_entry:
         safe_path(agent_entry)
-    require(
-        source.is_dir(),
-        "source vault missing (a generation built with --vault-profile none has no vault; "
-        "rebuild with --vault-profile cards or full, or write one with `cce library export-cards`)",
-    )
+    if not source.is_dir():
+        raise MissingInput(
+            "source vault missing (a generation built with --vault-profile none has no vault; "
+            "write one from the published generation with "
+            "`cce library export --vault-profile cards --out DIR` and package DIR/vault, or "
+            "write a card folder with `cce library export-cards --out DIR`)"
+        )
     require(not output.exists(), "output already exists; replacement refused")
     require(
         not output.is_relative_to(source) and not source.is_relative_to(output),
@@ -860,9 +867,14 @@ def main():
     arguments = parser.parse_args()
     os.umask(0o077)
     os.nice(10)
-    result = package(**vars(arguments))
+    try:
+        result = package(**vars(arguments))
+    except MissingInput as error:
+        print(f"package-obsidian-vault: {error}", file=sys.stderr)
+        return 2
     print(json.dumps(result, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

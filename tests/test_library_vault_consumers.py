@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -40,9 +41,36 @@ def test_the_notion_packager_names_the_profile_when_a_generation_has_no_zip(
 ) -> None:
     with synthetic_library(tmp_path, 3) as library:
         export_library(library, tmp_path / "export", vault_profile="none")
-    with pytest.raises(ValueError, match="--vault-profile"):
+    with pytest.raises(ValueError, match="--vault-profile") as raised:
         notion.package(tmp_path / "export" / "notion-import.zip", tmp_path / "batches")
+    assert "cce library export --vault-profile cards" in str(raised.value)
+    assert "rebuild" not in str(raised.value).lower()
     assert not (tmp_path / "batches").exists()
+
+
+def test_the_notion_packager_exits_with_one_clean_line_and_code_two(
+    notion: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with synthetic_library(tmp_path, 3) as library:
+        export_library(library, tmp_path / "export", vault_profile="none")
+    monkeypatch.setattr(os, "nice", lambda increment: 0)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "package-notion-batches.py",
+            str(tmp_path / "export" / "notion-import.zip"),
+            "--output",
+            str(tmp_path / "batches"),
+        ],
+    )
+    assert notion.main() == 2
+    error = capsys.readouterr().err
+    assert len(error.strip().splitlines()) == 1 and "Traceback" not in error
+    assert "cce library export --vault-profile" in error
 
 
 def test_the_obsidian_packager_names_the_profile_when_a_generation_has_no_vault(
@@ -50,9 +78,37 @@ def test_the_obsidian_packager_names_the_profile_when_a_generation_has_no_vault(
 ) -> None:
     with synthetic_library(tmp_path, 3) as library:
         export_library(library, tmp_path / "export", vault_profile="none")
-    with pytest.raises(ValueError, match="--vault-profile"):
+    with pytest.raises(ValueError, match="--vault-profile") as raised:
         obsidian.package(tmp_path / "export" / "vault", tmp_path / "derived")
+    assert "cce library export --vault-profile cards" in str(raised.value)
+    assert "export-cards" in str(raised.value) and "rebuild" not in str(raised.value).lower()
     assert not (tmp_path / "derived").exists()
+
+
+def test_the_obsidian_packager_exits_with_one_clean_line_and_code_two(
+    obsidian: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with synthetic_library(tmp_path, 3) as library:
+        export_library(library, tmp_path / "export", vault_profile="none")
+    monkeypatch.setattr(os, "nice", lambda increment: 0)
+    monkeypatch.setattr(os, "umask", lambda mask: mask)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "package-obsidian-vault.py",
+            str(tmp_path / "export" / "vault"),
+            "--output",
+            str(tmp_path / "derived"),
+        ],
+    )
+    assert obsidian.main() == 2
+    error = capsys.readouterr().err
+    assert len(error.strip().splitlines()) == 1 and "Traceback" not in error
+    assert "cce library export --vault-profile" in error
 
 
 @pytest.mark.parametrize("profile", ["cards", "full"])

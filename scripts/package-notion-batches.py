@@ -16,6 +16,7 @@ import re
 import shutil
 import signal
 import stat
+import sys
 import threading
 import time
 import zipfile
@@ -30,6 +31,10 @@ FAILURE_RESERVE = 16384
 MAX_ENTRIES = 5000
 MAX_BATCH_BYTES = 250 * 1024**2
 SCHEMA = "cce.notion-batches.v1"
+
+
+class MissingInput(ValueError):
+    """The canonical ZIP is absent; the CLI reports it as one line and exits with code 2."""
 
 
 def compatibility(size: int) -> dict[str, bool]:
@@ -318,9 +323,11 @@ def package(
     _safe_path(source)
     _safe_path(output)
     if not source.is_file():
-        raise ValueError(
+        raise MissingInput(
             f"canonical ZIP not found: {source}. A generation built with --vault-profile none "
-            "writes no notion-import.zip; rebuild with --vault-profile cards or full"
+            "writes no notion-import.zip; write one from the published generation with "
+            "`cce library export --vault-profile cards --out DIR` (or full) and package "
+            "DIR/notion-import.zip"
         )
     if output.exists():
         raise FileExistsError(output)
@@ -589,16 +596,20 @@ def main() -> int:
     parser.add_argument("--wrapper", default="library")
     args = parser.parse_args()
     os.nice(10)
-    result = package(
-        args.source,
-        args.output,
-        max_entries=args.max_entries,
-        max_batch_bytes=args.max_batch_bytes,
-        max_output_bytes=args.max_output_bytes,
-        max_seconds=args.max_seconds,
-        wrapper=args.wrapper,
-        progress=lambda value: print(json.dumps(value), flush=True),
-    )
+    try:
+        result = package(
+            args.source,
+            args.output,
+            max_entries=args.max_entries,
+            max_batch_bytes=args.max_batch_bytes,
+            max_output_bytes=args.max_output_bytes,
+            max_seconds=args.max_seconds,
+            wrapper=args.wrapper,
+            progress=lambda value: print(json.dumps(value), flush=True),
+        )
+    except MissingInput as error:
+        print(f"package-notion-batches: {error}", file=sys.stderr)
+        return 2
     print(
         json.dumps(
             {
