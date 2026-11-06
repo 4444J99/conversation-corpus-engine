@@ -43,7 +43,17 @@ def typed(identifier: str, text: str, **kwargs: object) -> Message:
     return Message(role="user", channel="typed", id=identifier, text=text, **kwargs)
 
 
-def conversations(typed_records: int = 0) -> list[Conversation]:
+PASTED_ANSWER = (
+    "Here is what I found after reviewing the repository, as the assistant wrote it.\n\n"
+    + "The parser module handles three cases and tokenizes then builds an AST then validates it. "
+    * 4
+    + "\n\nI recommend splitting the validator into its own module. Let me know to proceed."
+)
+
+
+def conversations(
+    typed_records: int = 0, medium_records: int = 0, pasted_answer: bool = False
+) -> list[Conversation]:
     items = [
         _chat(
             "owner-chat",
@@ -143,13 +153,34 @@ def conversations(typed_records: int = 0) -> list[Conversation]:
         )
         for index in range(typed_records)
     )
+    items.extend(
+        _chat(
+            f"medium-{index:03d}",
+            [
+                typed(
+                    "t0",
+                    f"Medium typed note number {index}: "
+                    + "alpha beta gamma delta epsilon zeta eta theta. " * 8,
+                )
+            ],
+        )
+        for index in range(medium_records)
+    )
+    if pasted_answer:
+        items.append(_chat("zz-paste", [typed("t0", "Can you check this?\n\n" + PASTED_ANSWER)]))
     return items
 
 
-def build_library(directory: Path, *, typed_records: int = 0) -> Path:
+def build_library(
+    directory: Path,
+    *,
+    typed_records: int = 0,
+    medium_records: int = 0,
+    pasted_answer: bool = False,
+) -> Path:
     """Create `directory/library.sqlite` and return its path; the generation is closed again."""
     directory.mkdir(parents=True, exist_ok=True)
     with Library.create(directory / "library.sqlite") as library:
-        for conversation in conversations(typed_records):
+        for conversation in conversations(typed_records, medium_records, pasted_answer):
             library.put(conversation)
     return directory / "library.sqlite"

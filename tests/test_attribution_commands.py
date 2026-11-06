@@ -23,7 +23,6 @@ from conversation_corpus_engine.attribution_commands import (
 )
 from conversation_corpus_engine.attribution_rules import (
     RULES,
-    SAMPLE_MAX_CHARS,
     append_ledger,
     ledger_row,
 )
@@ -36,10 +35,14 @@ SAMPLE_KEYS = {
     "rules_version",
     "span_id",
     "rule",
+    "stratum",
     "claim",
     "rule_description",
+    "length",
+    "excerpted",
     "text",
     "verdict",
+    "partial",
 }
 
 
@@ -116,8 +119,13 @@ def test_report_has_no_eligible_rule_without_a_ledger(
     library_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     report = report_of(capsys, library_path)
-    assert report["profile_eligible_rules"] == []
-    assert all(row["eligible"] is False and row["reviewed"] == 0 for row in report["rules"])
+    assert report["profile_eligible"] == []
+    for row in report["rules"]:
+        assert row["eligible_strata"] == []
+        assert set(row["strata"]) == {"S", "M", "L"}
+        assert all(
+            item["eligible"] is False and item["reviewed"] == 0 for item in row["strata"].values()
+        )
     assert report["gate"] == {
         "min_reviewed": 100,
         "min_precision_percent": 95,
@@ -149,7 +157,7 @@ def test_report_text_is_the_default_and_names_the_gate(
     assert "largest categories:" in out
     for rule in RULES:
         assert rule.id in out
-    assert "profile-eligible rules: none" in out
+    assert "profile-eligible: none" in out
     assert not out.lstrip().startswith("{")
 
 
@@ -378,7 +386,10 @@ def test_apply_output_feeds_the_strict_profile_with_no_owner_text_until_the_gate
     ledger = tmp_path / "ledger.jsonl"
     append_ledger(
         ledger,
-        [ledger_row(f"{index:032x}", "typed_prefix", "yes", "rob", STAMP) for index in range(100)],
+        [
+            ledger_row(f"{index:032x}", "typed_prefix", "yes", "rob", STAMP, stratum="S")
+            for index in range(100)
+        ],
     )
     gated, result = apply_entries(
         capsys,
@@ -389,7 +400,7 @@ def test_apply_output_feeds_the_strict_profile_with_no_owner_text_until_the_gate
         "--ledger",
         ledger,
     )
-    assert result["eligible_rules"] == ["typed_prefix"]
+    assert result["eligible_strata"] == ["typed_prefix:S"]
     expected: list[str] = []
     with Library(library_path) as library:
         for entry in gated:
@@ -410,10 +421,13 @@ def test_apply_without_an_owner_id_never_marks_a_span_eligible(
     ledger = tmp_path / "ledger.jsonl"
     append_ledger(
         ledger,
-        [ledger_row(f"{index:032x}", "typed_prefix", "yes", "rob", STAMP) for index in range(100)],
+        [
+            ledger_row(f"{index:032x}", "typed_prefix", "yes", "rob", STAMP, stratum="S")
+            for index in range(100)
+        ],
     )
     _, result = apply_entries(capsys, library_path, tmp_path / "a.json", "--ledger", ledger)
-    assert result["eligible_rules"] == ["typed_prefix"]
+    assert result["eligible_strata"] == ["typed_prefix:S"]
     assert result["profile_eligible_spans"] == 0
 
 
@@ -455,15 +469,19 @@ def test_review_sample_is_deterministic_bounded_and_shows_only_the_span_and_its_
     assert run_cli(capsys, "review-sample", "--library", library, "--out", second)[0] == 0
     assert first.read_bytes() == second.read_bytes()
     rows = sample_rows(first)
-    per_rule = Counter(row["rule"] for row in rows)
-    assert per_rule["typed_prefix"] == 100 and max(per_rule.values()) <= 100
+    per_stratum = Counter((row["rule"], row["stratum"]) for row in rows)
+    assert per_stratum[("typed_prefix", "S")] == 100 and max(per_stratum.values()) <= 100
     assert all(set(row) == SAMPLE_KEYS and row["verdict"] is None for row in rows)
-    assert all(0 < len(row["text"]) <= SAMPLE_MAX_CHARS for row in rows)
+    assert all(0 < len(row["text"]) <= 240 for row in rows if row["stratum"] == "S")
+    assert all(0 < len(row["text"]) < 400 for row in rows)
     blob = first.read_text(encoding="utf-8")
     assert "chatgpt-" not in blob and "claudecode" not in blob and "owner-chat" not in blob
     few = tmp_path / "few.jsonl"
     run_cli(capsys, "review-sample", "--library", library, "--out", few, "--per-rule", "4")
-    assert max(Counter(row["rule"] for row in sample_rows(few)).values()) == 4
+    assert max(Counter((r["rule"], r["stratum"]) for r in sample_rows(few)).values()) == 4
+    also = tmp_path / "also.jsonl"
+    run_cli(capsys, "review-sample", "--library", library, "--out", also, "--per-stratum", "4")
+    assert also.read_bytes() == few.read_bytes()
 
 
 def test_review_sample_streams_to_standard_output_and_reports_the_short_span_bias(
@@ -473,14 +491,18 @@ def test_review_sample_streams_to_standard_output_and_reports_the_short_span_bia
     assert code == 0
     assert all(json.loads(line)["schema"] for line in out.splitlines())
     summary = json.loads(err.strip().splitlines()[-1])
-    assert summary["spans_too_long_to_review"] >= 1
     assert summary["sampled"] == len(out.splitlines())
+    strata = {key.split(":")[1] for key in summary["per_stratum"]}
+    assert strata == {"S", "M"}
+    medium = [row for row in map(json.loads, out.splitlines()) if row["stratum"] == "M"]
+    assert medium and all(240 < row["length"] <= 2000 for row in medium)
+    assert all(row["excerpted"] is (row["length"] > 360) for row in medium)
 
 
-def answered(sample: Path, target: Path, yes: int) -> None:
+def answered(sample: Path, target: Path, yes: int, stratum: str = "S") -> None:
     lines, seen = [], 0
     for row in sample_rows(sample):
-        if row["rule"] == "typed_prefix":
+        if row["rule"] == "typed_prefix" and row["stratum"] == stratum:
             row["verdict"] = "yes" if seen < yes else "no"
             seen += 1
         lines.append(json.dumps(row))
@@ -511,11 +533,13 @@ def test_sampling_answering_and_reporting_close_the_gate_loop(
     assert code == 0, err
     recorded = json.loads(out)
     assert recorded["appended"] == 100 and recorded["unanswered"] > 0
-    assert recorded["rules"]["typed_prefix"]["eligible"] is eligible
+    assert recorded["strata"]["typed_prefix:S"]["eligible"] is eligible
     report = report_of(capsys, library, "--ledger", ledger)
     row = next(item for item in report["rules"] if item["rule"] == "typed_prefix")
-    assert (row["reviewed"], row["confirmed"], row["eligible"]) == (100, yes, eligible)
-    assert report["profile_eligible_rules"] == (["typed_prefix"] if eligible else [])
+    short = row["strata"]["S"]
+    assert (short["reviewed"], short["confirmed"], short["eligible"]) == (100, yes, eligible)
+    assert not row["strata"]["M"]["eligible"] and not row["strata"]["L"]["eligible"]
+    assert report["profile_eligible"] == (["typed_prefix:S"] if eligible else [])
     assert report["gate"]["ledger_rows"] == 100
     _, result = apply_entries(
         capsys, library, tmp_path / "out.json", "--ledger", ledger, "--owner-id", "rob"
@@ -523,8 +547,55 @@ def test_sampling_answering_and_reporting_close_the_gate_loop(
     assert (result["profile_eligible_spans"] > 0) is eligible
     again = tmp_path / "again.jsonl"
     run_cli(capsys, "review-sample", "--library", library, "--ledger", ledger, "--out", again)
-    reviewed = {row["span_id"] for row in sample_rows(sample) if row["rule"] == "typed_prefix"}
+    reviewed = {row["span_id"] for row in sample_rows(answers) if row["verdict"]}
+    assert len(reviewed) == 100
     assert reviewed.isdisjoint(row["span_id"] for row in sample_rows(again))
+
+
+def eligible_owner_texts(library_path: Path, entries: list[dict]) -> list[str]:
+    texts: list[str] = []
+    with Library(library_path) as library:
+        for entry in entries:
+            text = message_text(library, entry["source"])
+            texts.extend(
+                span["text"]
+                for span in attributed_spans(text, entry["attribution"])
+                if owner_profile_eligible(span, "rob")
+            )
+    return texts
+
+
+def test_a_long_pasted_answer_is_not_eligible_until_its_own_stratum_passes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    library = build_library(
+        tmp_path / "g", typed_records=110, medium_records=105, pasted_answer=True
+    )
+    sample, ledger = tmp_path / "sample.jsonl", tmp_path / "ledger.jsonl"
+    run_cli(capsys, "review-sample", "--library", library, "--out", sample)
+    record = ("review-record", "--ledger", ledger, "--reviewer", "rob", "--reviewed-at", STAMP)
+
+    short_answers = tmp_path / "short.jsonl"
+    answered(sample, short_answers, 100, stratum="S")
+    assert run_cli(capsys, *record, "--answers", short_answers)[0] == 0
+    entries, result = apply_entries(
+        capsys, library, tmp_path / "one.json", "--ledger", ledger, "--owner-id", "rob"
+    )
+    assert result["eligible_strata"] == ["typed_prefix:S"]
+    texts = eligible_owner_texts(library, entries)
+    assert texts and not any("tokenizes then builds" in text for text in texts)
+    assert all(len(text) <= 240 for text in texts)
+
+    medium_answers = tmp_path / "medium.jsonl"
+    answered(sample, medium_answers, 100, stratum="M")
+    assert run_cli(capsys, *record, "--answers", medium_answers)[0] == 0
+    entries, result = apply_entries(
+        capsys, library, tmp_path / "two.json", "--ledger", ledger, "--owner-id", "rob"
+    )
+    assert result["eligible_strata"] == ["typed_prefix:M", "typed_prefix:S"]
+    texts = eligible_owner_texts(library, entries)
+    assert any("tokenizes then builds" in text for text in texts)
+    assert max(len(text) for text in texts) <= 2000
 
 
 def test_review_record_rejects_bad_answers_before_writing_anything(
@@ -532,7 +603,7 @@ def test_review_record_rejects_bad_answers_before_writing_anything(
 ) -> None:
     ledger = tmp_path / "ledger.jsonl"
     answers = tmp_path / "answers.jsonl"
-    good = {"span_id": "a" * 32, "rule": "quote", "verdict": "yes"}
+    good = {"span_id": "a" * 32, "rule": "quote", "stratum": "S", "verdict": "yes"}
     answers.write_text(
         json.dumps(good) + "\n" + json.dumps({**good, "verdict": "maybe"}) + "\n", encoding="utf-8"
     )
@@ -561,7 +632,7 @@ def test_review_record_stamps_the_current_utc_time_only_when_none_is_given(
     ledger = tmp_path / "ledger.jsonl"
     answers = tmp_path / "answers.jsonl"
     answers.write_text(
-        json.dumps({"span_id": "b" * 32, "rule": "quote", "verdict": "YES"}) + "\n",
+        json.dumps({"span_id": "b" * 32, "rule": "quote", "stratum": "S", "verdict": "YES"}) + "\n",
         encoding="utf-8",
     )
     code, _, _ = run_cli(

@@ -208,6 +208,24 @@ class AttributedSpan:
     def span_id(self) -> str:
         return span_id(self.rule, self.text_digest, self.start, self.end)
 
+    @property
+    def stratum(self) -> str:
+        return stratum_of(self.end - self.start)
+
+
+# Length strata. The precision gate judges each (rule, stratum) on its own, so reviews of short
+# spans never vouch for long ones.
+STRATA = ("S", "M", "L")
+STRATUM_S_MAX = 240
+STRATUM_M_MAX = 2000
+
+
+def stratum_of(length: int) -> str:
+    """S for up to 240 characters, M for 241 to 2000, L for more."""
+    if length <= STRATUM_S_MAX:
+        return "S"
+    return "M" if length <= STRATUM_M_MAX else "L"
+
 
 def span_id(rule: str, digest: str, start: int, end: int) -> str:
     """Stable identity of a span: bound to the rules version, the rule, the text and the range."""
@@ -953,13 +971,14 @@ def to_annotation(
     spans: Sequence[AttributedSpan],
     *,
     owner_id: str | None = None,
-    eligible: Collection[str] = frozenset(),
+    eligible: Collection[tuple[str, str]] = frozenset(),
 ) -> dict[str, Any]:
     """The `cce.span-attribution.v1` annotation of one message (see `attribution.py`).
 
     Unknown spans are left out (the contract fills uncovered text as unknown). Evidence names the
-    rules version, the deciding rule and the span id. `profile_eligible` is False unless the span
-    is the owner's, its rule passed the precision gate (`eligible`) and an `owner_id` binds it.
+    rules version, the deciding rule, the length stratum and the span id. `profile_eligible` is
+    False unless the span is the owner's, its (rule, stratum) passed the precision gate
+    (`eligible`) and an `owner_id` binds it.
     """
     digest = text_digest(text)
     problems = partition_problems(text, spans, digest)
@@ -970,7 +989,11 @@ def to_annotation(
         if span.author == UNKNOWN:
             continue
         is_owner = span.author == OWNER
-        evidence = [f"{RULES_VERSION}:rule:{span.rule}", f"span:{span.span_id}"]
+        evidence = [
+            f"{RULES_VERSION}:rule:{span.rule}",
+            f"stratum:{span.stratum}",
+            f"span:{span.span_id}",
+        ]
         if span.detail:
             evidence.append(f"detail:{span.detail}")
         entries.append(
@@ -981,7 +1004,9 @@ def to_annotation(
                 "author_id": owner_id if is_owner else None,
                 "evidence": evidence,
                 "assertion_status": "asserted",
-                "profile_eligible": bool(is_owner and owner_id and span.rule in eligible),
+                "profile_eligible": bool(
+                    is_owner and owner_id and (span.rule, span.stratum) in eligible
+                ),
             }
         )
     return {"schema": ATTRIBUTION_SCHEMA, "text_digest": digest, "spans": entries}
@@ -989,20 +1014,26 @@ def to_annotation(
 
 # --- the owner-review ledger and the precision gate ------------------------------------------
 
-LEDGER_SCHEMA = "cce.attribution-review-ledger.v1"
-SAMPLE_SCHEMA = "cce.attribution-review-sample.v1"
+LEDGER_SCHEMA = "cce.attribution-review-ledger.v2"
+# Rows of an earlier ledger version carry no stratum; they are read but never counted.
+LEGACY_LEDGER_SCHEMAS = frozenset({"cce.attribution-review-ledger.v1"})
+SAMPLE_SCHEMA = "cce.attribution-review-sample.v2"
 VERDICTS = ("yes", "no", "unsure")
-# A rule may be profile-eligible only when at least this many of its spans were reviewed by the
-# owner and at least this share of them (counting unsure and no as not confirmed) was confirmed.
+# A (rule, stratum) may be profile-eligible only when at least this many of its spans were
+# reviewed by the owner and at least this share of them (counting unsure and no as not confirmed)
+# was confirmed.
 GATE_MIN_REVIEWED = 100
 GATE_MIN_PRECISION_PERCENT = 95
-SAMPLE_PER_RULE = 100
-SAMPLE_MAX_CHARS = 240
-SAMPLE_SEED = "cce-attribution-review-v1"
+SAMPLE_PER_STRATUM = 100
+SAMPLE_SEED = "cce-attribution-review-v2"
+# A long span is shown to the owner as a bounded excerpt plus its exact length.
+EXCERPT_HEAD = 240
+EXCERPT_TAIL = 120
 
 _LEDGER_KEYS = frozenset(
-    {"schema", "rules_version", "span_id", "rule", "verdict", "reviewer", "reviewed_at"}
+    {"schema", "rules_version", "span_id", "rule", "stratum", "verdict", "reviewer", "reviewed_at"}
 )
+_LEGACY_LEDGER_KEYS = _LEDGER_KEYS - {"stratum"}
 _SPAN_ID = re.compile(r"[0-9a-f]{32}")
 UTC_STAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
@@ -1018,9 +1049,11 @@ def validate_ledger_row(row: Any) -> dict[str, Any]:
     """A copy of a ledger row, or ValueError: nothing malformed is ever skipped silently."""
     if not isinstance(row, dict):
         raise ValueError("ledger row must be an object")
-    if set(row) != _LEDGER_KEYS:
-        raise ValueError(f"ledger row keys must be exactly {sorted(_LEDGER_KEYS)}")
-    if row["schema"] != LEDGER_SCHEMA:
+    legacy = row.get("schema") in LEGACY_LEDGER_SCHEMAS
+    expected = _LEGACY_LEDGER_KEYS if legacy else _LEDGER_KEYS
+    if set(row) != expected:
+        raise ValueError(f"ledger row keys must be exactly {sorted(expected)}")
+    if row["schema"] != LEDGER_SCHEMA and not legacy:
         raise ValueError(f"ledger row schema must be {LEDGER_SCHEMA}")
     version = row["rules_version"]
     if not isinstance(version, str) or not version.strip():
@@ -1034,6 +1067,8 @@ def validate_ledger_row(row: Any) -> dict[str, Any]:
         or (version == RULES_VERSION and rule not in RULE_BY_ID)
     ):
         raise ValueError(f"ledger row names an unknown rule: {rule!r}")
+    if not legacy and row["stratum"] not in STRATA:
+        raise ValueError(f"ledger row stratum must be one of {list(STRATA)}")
     if row["verdict"] not in VERDICTS:
         raise ValueError(f"ledger row verdict must be one of {list(VERDICTS)}")
     reviewer = row["reviewer"]
@@ -1058,6 +1093,7 @@ def ledger_row(
     reviewer: str,
     reviewed_at: str,
     *,
+    stratum: str,
     rules_version: str = RULES_VERSION,
 ) -> dict[str, Any]:
     """One owner verdict on one span. The time is a parameter: no clock is read here."""
@@ -1067,6 +1103,7 @@ def ledger_row(
             "rules_version": rules_version,
             "span_id": span_id,
             "rule": rule,
+            "stratum": stratum,
             "verdict": verdict,
             "reviewer": reviewer,
             "reviewed_at": reviewed_at,
@@ -1077,7 +1114,7 @@ def ledger_row(
 def parse_ledger(lines: Iterable[str]) -> list[dict[str, Any]]:
     """Rows of a JSONL ledger; blank lines are ignored, anything else malformed raises."""
     rows: list[dict[str, Any]] = []
-    rule_of: dict[tuple[str, str], str] = {}
+    kind_of: dict[tuple[str, str], tuple[str, str | None]] = {}
     for number, line in enumerate(lines, start=1):
         if not line.strip():
             continue
@@ -1087,10 +1124,11 @@ def parse_ledger(lines: Iterable[str]) -> list[dict[str, Any]]:
             detail = str(error).removeprefix("ledger row: ")
             raise ValueError(f"ledger line {number}: {detail}") from error
         key = (row["rules_version"], row["span_id"])
-        if rule_of.setdefault(key, row["rule"]) != row["rule"]:
+        kind = (row["rule"], row.get("stratum"))
+        if kind_of.setdefault(key, kind) != kind:
             raise ValueError(
-                f"ledger line {number}: span {row['span_id']} was reviewed under rule "
-                f"{rule_of[key]} and cannot also be reviewed under {row['rule']}"
+                f"ledger line {number}: span {row['span_id']} was reviewed as {kind_of[key]} "
+                f"and cannot also be reviewed as {kind}"
             )
         rows.append(row)
     return rows
@@ -1123,10 +1161,11 @@ def append_ledger(path: Path, rows: Sequence[dict[str, Any]]) -> int:
 
 
 @dataclass(frozen=True)
-class RuleReview:
-    """What the ledger says about one rule at the current rules version."""
+class StratumReview:
+    """What the ledger says about one (rule, stratum) at the current rules version."""
 
     rule: str
+    stratum: str
     reviewed: int
     confirmed: int
     rejected: int
@@ -1137,38 +1176,47 @@ class RuleReview:
 
 @dataclass(frozen=True)
 class ReviewSummary:
-    rules: dict[str, RuleReview]
+    strata: dict[tuple[str, str], StratumReview]
     rows: int
     stale_rows: int
+
+    def for_rule(self, rule: str) -> list[StratumReview]:
+        return [self.strata[(rule, stratum)] for stratum in STRATA]
 
 
 def review_statistics(
     rows: Iterable[dict[str, Any]], *, rules_version: str = RULES_VERSION
 ) -> ReviewSummary:
-    """Per-rule review counts and eligibility from ledger rows.
+    """Per-(rule, stratum) review counts and eligibility from ledger rows.
 
-    A span counts once, by its last verdict in file order. Only rows of `rules_version` count;
-    rows of any other version are reported as stale and ignored. `unsure` and `no` both count as
-    reviewed and not confirmed. The precision test is integer arithmetic.
+    A span counts once, by its last verdict in file order. Only current-schema rows of
+    `rules_version` count; rows of another version or of an older schema (no stratum) are reported
+    as stale and ignored. `unsure` and `no` both count as reviewed and not confirmed. The
+    precision test is integer arithmetic.
     """
     latest: dict[str, dict[str, Any]] = {}
     total = stale = 0
     for raw in rows:
         row = validate_ledger_row(raw)
         total += 1
-        if row["rules_version"] != rules_version:
+        if row["rules_version"] != rules_version or row["schema"] != LEDGER_SCHEMA:
             stale += 1
             continue
         latest[row["span_id"]] = row
-    counts = {rule.id: {verdict: 0 for verdict in VERDICTS} for rule in RULES}
+    counts = {
+        (rule.id, stratum): {verdict: 0 for verdict in VERDICTS}
+        for rule in RULES
+        for stratum in STRATA
+    }
     for row in latest.values():
-        counts[row["rule"]][row["verdict"]] += 1
-    reviews: dict[str, RuleReview] = {}
-    for rule_id, tally in counts.items():
+        counts[(row["rule"], row["stratum"])][row["verdict"]] += 1
+    reviews: dict[tuple[str, str], StratumReview] = {}
+    for (rule_id, stratum), tally in counts.items():
         reviewed = sum(tally.values())
         confirmed = tally["yes"]
-        reviews[rule_id] = RuleReview(
+        reviews[(rule_id, stratum)] = StratumReview(
             rule=rule_id,
+            stratum=stratum,
             reviewed=reviewed,
             confirmed=confirmed,
             rejected=tally["no"],
@@ -1177,92 +1225,98 @@ def review_statistics(
             eligible=reviewed >= GATE_MIN_REVIEWED
             and confirmed * 100 >= GATE_MIN_PRECISION_PERCENT * reviewed,
         )
-    return ReviewSummary(rules=reviews, rows=total, stale_rows=stale)
+    return ReviewSummary(strata=reviews, rows=total, stale_rows=stale)
 
 
-def eligible_rules(summary: ReviewSummary) -> frozenset[str]:
-    return frozenset(rule for rule, review in summary.rules.items() if review.eligible)
+def eligible_strata(summary: ReviewSummary) -> frozenset[tuple[str, str]]:
+    return frozenset(key for key, review in summary.strata.items() if review.eligible)
 
 
 # --- the review sample -----------------------------------------------------------------------
 
 
-class ReviewSampler:
-    """A deterministic stratified sample of short spans for the owner to confirm or reject.
+def review_excerpt(text: str) -> tuple[str, bool]:
+    """What the owner is shown for a span: the whole text up to 360 characters, else its first
+    240 characters, a statement of how many characters are omitted, and its last 120."""
+    if len(text) <= EXCERPT_HEAD + EXCERPT_TAIL:
+        return text, False
+    omitted = len(text) - EXCERPT_HEAD - EXCERPT_TAIL
+    return f"{text[:EXCERPT_HEAD]} [...{omitted} chars omitted...] {text[-EXCERPT_TAIL:]}", True
 
-    One stratum per rule. Within a rule the sample is the `per_rule` distinct span texts with the
-    smallest seeded hash, so it does not depend on the order spans are offered. A span longer than
-    `max_chars` is never offered for review (it is counted, not truncated), so the measured
-    precision describes short spans only. Rows show the span text, its rule and the claim, nothing
-    about the record it came from.
+
+class ReviewSampler:
+    """A deterministic stratified sample of spans for the owner to confirm or reject.
+
+    One stratum per (rule, length stratum). Within it the sample is the `per_stratum` distinct
+    span texts with the smallest seeded hash, so it does not depend on the order spans are
+    offered. A span of up to 360 characters is shown whole; a longer one as a bounded excerpt with
+    its exact length, so the owner can judge the whole span. Rows show nothing about the record a
+    span came from.
     """
 
     def __init__(
         self,
         *,
-        per_rule: int = SAMPLE_PER_RULE,
-        max_chars: int = SAMPLE_MAX_CHARS,
+        per_stratum: int = SAMPLE_PER_STRATUM,
         seed: str = SAMPLE_SEED,
         exclude: Collection[str] = (),
     ) -> None:
-        if isinstance(per_rule, bool) or not isinstance(per_rule, int) or per_rule < 1:
-            raise ValueError("per_rule must be a positive integer")
-        if (
-            isinstance(max_chars, bool)
-            or not isinstance(max_chars, int)
-            or not 1 <= max_chars <= SAMPLE_MAX_CHARS
-        ):
-            raise ValueError(f"max_chars must be an integer from 1 to {SAMPLE_MAX_CHARS}")
-        self.per_rule = per_rule
-        self.max_chars = max_chars
+        if isinstance(per_stratum, bool) or not isinstance(per_stratum, int) or per_stratum < 1:
+            raise ValueError("per_stratum must be a positive integer")
+        self.per_stratum = per_stratum
         self.seed = seed
         self.exclude = frozenset(exclude)
-        self.skipped_long = 0
-        self._heaps: dict[str, list[int]] = {}
-        self._members: dict[str, dict[int, tuple[str, str]]] = {}
+        self._heaps: dict[tuple[str, str], list[int]] = {}
+        self._members: dict[tuple[str, str], dict[int, tuple[str, int, str, bool]]] = {}
 
     def offer(self, span: AttributedSpan, text: str) -> None:
         """Consider one span; `text` is exactly the span's own characters."""
         if span.rule not in RULE_BY_ID or span.author == UNKNOWN or not text.strip():
             return
-        if len(text) > self.max_chars:
-            self.skipped_long += 1
-            return
         identifier = span.span_id
         if identifier in self.exclude:
             return
+        stratum = span.stratum
         normalized = " ".join(text.split())
-        digest = hashlib.sha256(f"{self.seed}\n{span.rule}\n{normalized}".encode()).digest()
+        digest = hashlib.sha256(
+            f"{self.seed}\n{span.rule}\n{stratum}\n{normalized}".encode()
+        ).digest()
         key = int.from_bytes(digest[:8], "big")
-        heap = self._heaps.setdefault(span.rule, [])
-        members = self._members.setdefault(span.rule, {})
+        slot = (span.rule, stratum)
+        heap = self._heaps.setdefault(slot, [])
+        members = self._members.setdefault(slot, {})
         if key in members:
             if identifier < members[key][0]:
-                members[key] = (identifier, text)
-        elif len(heap) < self.per_rule:
+                members[key] = (identifier, len(text), *review_excerpt(text))
+        elif len(heap) < self.per_stratum:
             heapq.heappush(heap, -key)
-            members[key] = (identifier, text)
+            members[key] = (identifier, len(text), *review_excerpt(text))
         elif key < -heap[0]:
             evicted = -heapq.heapreplace(heap, -key)
             del members[evicted]
-            members[key] = (identifier, text)
+            members[key] = (identifier, len(text), *review_excerpt(text))
 
-    def rows(self) -> list[dict[str, Any]]:
+    def rows(self, *, partial: bool = False) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
         for rule in RULES:
-            members = self._members.get(rule.id, {})
-            for key in sorted(members):
-                identifier, text = members[key]
-                result.append(
-                    {
-                        "schema": SAMPLE_SCHEMA,
-                        "rules_version": RULES_VERSION,
-                        "span_id": identifier,
-                        "rule": rule.id,
-                        "claim": rule.author,
-                        "rule_description": rule.description,
-                        "text": text,
-                        "verdict": None,
-                    }
-                )
+            for stratum in STRATA:
+                members = self._members.get((rule.id, stratum), {})
+                for key in sorted(members):
+                    identifier, length, text, excerpted = members[key]
+                    result.append(
+                        {
+                            "schema": SAMPLE_SCHEMA,
+                            "rules_version": RULES_VERSION,
+                            "span_id": identifier,
+                            "rule": rule.id,
+                            "stratum": stratum,
+                            "claim": rule.author,
+                            "rule_description": rule.description,
+                            "length": length,
+                            "excerpted": excerpted,
+                            "text": text,
+                            "verdict": None,
+                            "partial": partial,
+                        }
+                    )
         return result

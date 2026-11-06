@@ -42,8 +42,9 @@ from .attribution_rules import (
     GATE_MIN_REVIEWED,
     RULES,
     RULES_VERSION,
-    SAMPLE_PER_RULE,
+    SAMPLE_PER_STRATUM,
     SAMPLE_SEED,
+    STRATA,
     UNATTRIBUTED,
     UNKNOWN,
     VERDICTS,
@@ -54,7 +55,7 @@ from .attribution_rules import (
     ReviewSummary,
     append_ledger,
     attribute_message,
-    eligible_rules,
+    eligible_strata,
     ledger_row,
     partition_problems,
     read_ledger,
@@ -204,6 +205,8 @@ class Tally:
     def __init__(self) -> None:
         self.spans: Counter[str] = Counter()
         self.characters: Counter[str] = Counter()
+        self.stratum_spans: Counter[tuple[str, str]] = Counter()
+        self.stratum_characters: Counter[tuple[str, str]] = Counter()
         self.messages = 0
         self.total_characters = 0
         self.covered_characters = 0
@@ -216,6 +219,8 @@ class Tally:
         for span in spans:
             self.spans[span.rule] += 1
             self.characters[span.rule] += span.end - span.start
+            self.stratum_spans[(span.rule, span.stratum)] += 1
+            self.stratum_characters[(span.rule, span.stratum)] += span.end - span.start
             self.covered_characters += span.end - span.start
             if span.rule == UNATTRIBUTED and not text[span.start : span.end].strip():
                 self.unattributed_whitespace += span.end - span.start
@@ -277,7 +282,19 @@ def build_report(
     rows: list[dict[str, Any]] = []
     for rule in (*RULES, None):
         rule_id = rule.id if rule else UNATTRIBUTED
-        review = summary.rules.get(rule_id)
+        strata: dict[str, dict[str, Any]] = {}
+        for stratum in STRATA:
+            review = summary.strata.get((rule_id, stratum))
+            strata[stratum] = {
+                "spans": tally.stratum_spans[(rule_id, stratum)],
+                "characters": tally.stratum_characters[(rule_id, stratum)],
+                "reviewed": review.reviewed if review else 0,
+                "confirmed": review.confirmed if review else 0,
+                "precision": None
+                if review is None or review.precision is None
+                else round(review.precision, 6),
+                "eligible": bool(review and review.eligible),
+            }
         rows.append(
             {
                 "rule": rule_id,
@@ -285,12 +302,8 @@ def build_report(
                 "spans": tally.spans[rule_id],
                 "characters": tally.characters[rule_id],
                 "share": _share(tally.characters[rule_id], total),
-                "reviewed": review.reviewed if review else 0,
-                "confirmed": review.confirmed if review else 0,
-                "precision": None
-                if review is None or review.precision is None
-                else round(review.precision, 6),
-                "eligible": bool(review and review.eligible),
+                "strata": strata,
+                "eligible_strata": [name for name, item in strata.items() if item["eligible"]],
             }
         )
     authors: dict[str, dict[str, Any]] = {}
@@ -347,7 +360,9 @@ def build_report(
             "ledger_rows": summary.rows,
             "stale_rows": summary.stale_rows,
         },
-        "profile_eligible_rules": sorted(eligible_rules(summary)),
+        "profile_eligible": sorted(
+            f"{rule}:{stratum}" for rule, stratum in eligible_strata(summary)
+        ),
     }
 
 
@@ -362,16 +377,27 @@ def render_report(report: dict[str, Any]) -> str:
         f"({partition['coverage'] * 100:.2f}%), {partition['overlaps']} overlaps, "
         f"{partition['gaps']} gaps" + ("" if partition["ok"] else "  ** PARTITION CHECK FAILED **"),
         "",
-        f"{'rule':<18}{'class':<13}{'spans':>9}{'characters':>13}{'share':>9}"
+        f"{'rule':<18}{'class':<13}{'stratum':>8}{'spans':>9}{'characters':>13}{'share':>9}"
         f"{'reviewed':>10}{'precision':>11}{'eligible':>10}",
     ]
+    total_characters = max(partition["characters"], 1)
     for row in report["rules"]:
-        precision = "-" if row["precision"] is None else f"{row['precision'] * 100:.1f}%"
-        lines.append(
-            f"{row['rule']:<18}{row['author']:<13}{row['spans']:>9}{row['characters']:>13}"
-            f"{row['share'] * 100:>8.2f}%{row['reviewed']:>10}{precision:>11}"
-            f"{'yes' if row['eligible'] else 'no':>10}"
-        )
+        shown = [
+            (name, item)
+            for name, item in row["strata"].items()
+            if item["spans"] or item["reviewed"]
+        ] or [("-", None)]
+        for name, item in shown:
+            if item is None:
+                cells = f"{0:>9}{0:>13}{0.0:>8.2f}%{0:>10}{'-':>11}{'no':>10}"
+            else:
+                precision = "-" if item["precision"] is None else f"{item['precision'] * 100:.1f}%"
+                share = item["characters"] / total_characters * 100
+                cells = (
+                    f"{item['spans']:>9}{item['characters']:>13}{share:>8.2f}%"
+                    f"{item['reviewed']:>10}{precision:>11}{'yes' if item['eligible'] else 'no':>10}"
+                )
+            lines.append(f"{row['rule']:<18}{row['author']:<13}{name:>8}{cells}")
     lines.append("")
     lines.append(
         "largest categories: "
@@ -384,11 +410,11 @@ def render_report(report: dict[str, Any]) -> str:
         )
     )
     gate = report["gate"]
-    eligible = report["profile_eligible_rules"]
+    eligible = report["profile_eligible"]
     lines.append(
-        f"gate: a rule needs {gate['min_reviewed']} owner-reviewed spans at "
-        f"{gate['min_precision_percent']}% precision; profile-eligible rules: "
-        + (", ".join(eligible) if eligible else "none")
+        f"gate: a rule and length stratum (S up to 240 characters, M up to 2000, L more) needs "
+        f"{gate['min_reviewed']} owner-reviewed spans at {gate['min_precision_percent']}% "
+        "precision; profile-eligible: " + (", ".join(eligible) if eligible else "none")
     )
     return "\n".join(lines)
 
@@ -559,7 +585,14 @@ def add_attribute_parser(library_actions: Any) -> None:
         help="Draw the deterministic sample of short spans the owner confirms or rejects",
     )
     _scan_arguments(sample, nested=True)
-    sample.add_argument("--per-rule", type=_positive_int, default=SAMPLE_PER_RULE)
+    sample.add_argument(
+        "--per-stratum",
+        "--per-rule",
+        dest="per_stratum",
+        type=_positive_int,
+        default=SAMPLE_PER_STRATUM,
+        help="Spans drawn for each rule and length stratum (S, M, L)",
+    )
     sample.add_argument("--seed", default=SAMPLE_SEED)
     sample.add_argument("--out", type=Path, help="New JSONL file (default: standard output)")
     record = sub.add_parser(
@@ -636,7 +669,7 @@ def _apply(args: argparse.Namespace) -> int:
     if args.owner_id is not None and not args.owner_id.strip():
         raise ValueError("--owner-id must be nonempty")
     summary, ledger = _summary(args)
-    eligible = eligible_rules(summary)
+    eligible = eligible_strata(summary)
     deadline = Deadline(args.deadline_seconds)
     library, database = _open_target(args)
     with library:
@@ -682,13 +715,13 @@ def _apply(args: argparse.Namespace) -> int:
         "messages_without_annotation": counts["messages_without_annotation"],
         "owner_spans": counts["owner_spans"],
         "profile_eligible_spans": counts["profile_eligible_spans"],
-        "eligible_rules": sorted(eligible),
+        "eligible_strata": sorted(f"{rule}:{stratum}" for rule, stratum in eligible),
         "ledger": str(ledger) if ledger else None,
     }
     text = (
         f"wrote {writer.count} annotations for {tally.messages} messages to {written}"
         f" ({counts['owner_spans']} owner spans, {counts['profile_eligible_spans']} profile-eligible"
-        f"; eligible rules: {', '.join(sorted(eligible)) or 'none'})"
+        f"; eligible: {', '.join(result['eligible_strata']) or 'none'})"
     )
     _emit(result, text, args.json)
     if stats.deadline_reached:
@@ -710,7 +743,7 @@ def _review_sample(args: argparse.Namespace) -> int:
         }
     deadline = Deadline(args.deadline_seconds)
     library, _ = _open_target(args)
-    sampler = ReviewSampler(per_rule=args.per_rule, seed=args.seed, exclude=exclude)
+    sampler = ReviewSampler(per_stratum=args.per_stratum, seed=args.seed, exclude=exclude)
     with library:
         census = _census(library, args, deadline)
         stats, _ = scan(
@@ -727,8 +760,7 @@ def _review_sample(args: argparse.Namespace) -> int:
     summary = {
         "rules_version": RULES_VERSION,
         "sampled": len(rows),
-        "per_rule": dict(Counter(row["rule"] for row in rows)),
-        "spans_too_long_to_review": sampler.skipped_long,
+        "per_stratum": dict(Counter(f"{row['rule']}:{row['stratum']}" for row in rows)),
         "complete": stats.complete,
     }
     if args.out is None:
@@ -777,6 +809,7 @@ def _review_record(args: argparse.Namespace) -> int:
                     verdict,
                     args.reviewer,
                     reviewed_at,
+                    stratum=str(answer.get("stratum")),
                     rules_version=str(answer.get("rules_version") or RULES_VERSION),
                 )
             )
@@ -788,13 +821,13 @@ def _review_record(args: argparse.Namespace) -> int:
         "ledger": str(args.ledger),
         "appended": appended,
         "unanswered": skipped,
-        "rules": {
-            rule: {
+        "strata": {
+            f"{rule}:{stratum}": {
                 "reviewed": review.reviewed,
                 "confirmed": review.confirmed,
                 "eligible": review.eligible,
             }
-            for rule, review in summary.rules.items()
+            for (rule, stratum), review in summary.strata.items()
             if review.reviewed
         },
     }
