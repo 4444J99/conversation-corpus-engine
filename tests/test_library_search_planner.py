@@ -23,7 +23,16 @@ from conversation_corpus_engine.library_store import (
     validate_max_seconds,
 )
 
-ADDITIVE_KEYS = {"plan", "partial", "ranked", "elapsed_s", "total_exact", "total_label"}
+ADDITIVE_KEYS = {
+    "plan",
+    "partial",
+    "ranked",
+    "elapsed_s",
+    "total_exact",
+    "total_label",
+    "unit",
+    "total_unit",
+}
 
 
 def legacy_fts_query(text: str) -> str:

@@ -190,10 +190,12 @@ What that leaves broken is measured, not argued. In the isolated splitter, with 
 
 ### Progressive disclosure through the MCP tools
 
-The two MCP tools support a locate-then-read flow that stays inside a token budget. Defaults keep the previous output (new fields are additive).
+The two MCP tools support a locate-then-read flow that stays inside a token budget.
+Search defaults to automatic unit selection; `unit: "conversation"` keeps the previous
+retrieval unit. The existing response fields remain available, with additive unit metadata.
 
 - `cce_library_search`: `depth: "L0"` returns only `uid`, a one-line `title` (80 characters at most), `score` (bm25, higher is better) and `read`, within `budget_tokens` (default 900, at most 1200 at L0; at most 20000 at L1). Tokens are estimated as UTF-8 bytes / 4 of the compact JSON text, and the response states the estimate (`token_estimate`, or `tk` in compact mode). Hits that do not fit are left for `next_offset` and `truncated` is true; a budget too small for a single hit is an error. The budget holds for a response with no hit as well: a budgeted L1 response echoes at most 120 characters of the query (a longer one ends with a `...[query truncated, N characters]` marker), and a budget too small for even the empty envelope is an error. `compact: true` shortens keys (the tool schema lists them). Every response states `total` with `total_exact` and `total_label` (the number itself while the count is exact, and `1000+` once more than 1000 records match), and, additively, the `plan` that answered, `partial`, `ranked` and `elapsed_s` (see [search planning](#search-planning-time-budget-and-capped-totals)). `wing` must be `ai` or `authored`, as the tool schema lists it; any other value is a tool error (`isError`), not an empty page.
-- Passage handoff: every hit carries `read`, the exact `cce_library_read` arguments (`uid`, `message`, `offset`, `limit`, plus `sequence` when the best match is in the alternate branch) for the first message that holds every query term, falling back to the first message holding any. `read` holds nothing else, so it can be passed to `cce_library_read` as it is (in compact mode `r` carries the short keys `m`, `o`, `l`, `sq` and the hit's `i` is the uid). Stemming is approximated, so a stemmed-only match, or a match only in the title, can fall back to the start of the record; the hit then carries `located: false` beside `read` (`lc` in compact mode), never inside it. A record whose stored shape cannot be interpreted (for example a malformed alternate sequence) never fails the page that lists it: its hit keeps every normal field, its `read` is the start-of-record arguments, and the hit carries `located: false` and a short content-free `locator_error` (`le` in compact mode), while a direct read of that record raises an error that names it.
+- Conversation handoff: each conversation hit carries `read`, the exact `cce_library_read` arguments (`uid`, `message`, `offset`, `limit`, plus `sequence` when the best match is in the alternate branch) for the first message that holds every query term, falling back to the first message holding any. `read` holds nothing else, so it can be passed to `cce_library_read` as it is (in compact mode `r` carries the short keys `m`, `o`, `l`, `sq` and the hit's `i` is the uid). Stemming is approximated, so a stemmed-only match, or a match only in the title, can fall back to the start of the record; the hit then carries `located: false` beside `read` (`lc` in compact mode), never inside it. A record whose stored shape cannot be interpreted (for example a malformed alternate sequence) never fails the page that lists it: its hit keeps every normal field, its `read` is the start-of-record arguments, and the hit carries `located: false` and a short content-free `locator_error` (`le` in compact mode), while a direct read of that record raises an error that names it.
 - `cce_library_read`: `around_query` centres the passage on the first match at or after `message` and reports `match` (`message`, `start`, `end`, or null); `message_end` reads a message range under a total character `limit` and returns `next_message` / `next_offset` to resume (at most 200 messages per call); `toc: true` lists markdown headings with message and character offsets (or a per-message index when there are none): the ATX headings (`#` to `######`) that open a line outside fenced code, found the way CommonMark finds them (fences open indented 0-3 spaces, or further only inside a list item, and close only on their own character and length; a tab, four spaces, U+2028, form feed or a no-break space before backticks makes indented code or text, not a fence; lines end at `\n`, `\r\n` or `\r` only), so a quoted heading, a setext heading, a heading inside a list item and a `#` line inside a code fence are not entries, paged by `toc_offset` / `toc_limit` with an exact `toc_total`; `compact: true` drops the envelope metadata and shortens keys. Block quotes and list items are tracked the way markdown-it-py reads them: a marker followed by five or more spaces makes its first line indented code (which a following unindented line cannot continue, so a heading indented 1-3 spaces after it is top level), an item that starts empty ends at the next blank line, and a quote line is never a lazy continuation of an item. A test pins 3,000 generated documents (list markers followed by one to five columns or a tab, quotes holding fences and empty lines, empty items; no HTML) to markdown-it-py's entries in offset, level and title, whitespace stripped. HTML blocks and link reference definitions are not modelled (a document that has them can differ), a no-break space at the edge of a title is kept, and containers nested more than 32 deep are read as text.
 
 ## Where private text may be written
@@ -225,7 +227,62 @@ Run the check where the export will run, and with the environment it will run in
 
 **Not covered by this guard.** `aps_bridge` (`python -m conversation_corpus_engine.aps_bridge --out`) writes the matched threads as notes into the directory the caller names and is not guarded: its documentation names the canonical `--out` as a sealed `_*-private` store that is tracked, not ignored, which this guard would refuse, so the destination is the operator's responsibility (it has no entry point and no test). `import_chatgpt_local_session_corpus` has no command line of its own; the provider pipeline that calls it passes custody. `cce provider import --output-root` is not an instance of the same gap: it is checked by `authorize_corpus_write`, which requires a strict descendant of the registered private store that Git ignores. `cce project route --destination` only records a path, and `cce project sync` then delivers the project into that routed destination: the destination is an organ or repo checkout by design (the `--organ` and `--repo` fields), so the guard is not applied there and the destination is the operator's responsibility.
 
-### Search planning, time budget and capped totals
+## Search planning, time budget and capped totals
+
+### Search units and source passages
+
+The CLI (`--unit`) and MCP (`unit`) accept `auto`, `passage` and `conversation`.
+They default to `auto`: queries of up to three words, or queries containing a quoted
+phrase, try the passage index first within each query plan. Longer unquoted queries
+use the conversation index. Auto tries passage phrase, conversation phrase, passage
+AND, conversation AND, then the OR alternatives. A stronger conversation match in
+short text therefore takes precedence over a partial passage match. All attempts use
+the same deadline; explicit `passage` does not fall back. The Python `Library.search`
+defaults to `unit="conversation"` to preserve existing callers. Unit selection is
+separate from the `plan` option described below.
+
+The passage index contains one FTS5 row per distinct eligible prose block from the
+current main-message sequence. Eligibility uses the existing block rules: at least
+120 characters of canonical prose, excluding code and paragraphs containing inline
+backticks. Only the block's canonical text is ranked, so a focused paragraph is not
+diluted by the length of the surrounding conversation. Facets select the eligible
+source occurrences before one deterministic occurrence is returned for each block.
+Repeated copies retain all their provenance but occupy one result slot. Titles,
+short text, code and alternate sequences remain searchable through `conversation`.
+
+Responses state the selected `unit`. `total`, `total_exact` and `total_label` always
+count matching conversations and are explicitly labelled `total_unit: conversation`.
+For passage results, `unit_total` and `unit_total_exact` count the distinct matching
+blocks. Both counts use the configured cap. A passage page's `offset` and
+`next_offset` refer to blocks, not conversations; always follow `next_offset`, since
+many passages can belong to one conversation or one passage can occur in many.
+If a timeout prevents the conversation count, its reported lower bound is the number
+of distinct returned conversation identities, with `total_exact: false`.
+
+Each passage hit carries its block digest and original message `start`/`end` range,
+plus executable `read` arguments pinned to the retained source `version`. Offsets
+are Python character indices in the original normalized message, including Unicode
+and CRLF spelling. They are never UTF-8 byte offsets or offsets in the canonical
+block used by the index. Reads return at most 1500 characters; the MCP and CLI place
+that window around a query match when a paragraph is longer. Compact responses use
+`u` for unit, `nu` for total unit, `un` for passage count and `unx` for its exactness.
+Ranking, representative occurrence selection, excerpts and counts share one SQLite
+read snapshot.
+
+The store schema is `cce.knowledge-library.v2`. Builds maintain the passage index
+alongside the existing blocks and occurrences, including incremental rebuilds.
+`Library.create(new_path, previous=old_path)` upgrades a copied v1 candidate directly
+from its stored blocks, without re-importing sources. Build migrations obey the
+candidate's byte and time limits. Published v1 stores still open read-only and use
+conversation search; explicit passage search asks for a new candidate. Export-only
+resume preserves its qualified seed without a schema write. `verify` checks passage
+coverage, row alignment, eligible current occurrences and character-range validity;
+full verification also compares indexed text with the compressed block and digest,
+and binds every occurrence to its exact source message partition, offsets and
+normalization. Publication identity includes the derived library schema, so a
+verified schema-only upgrade can publish even when all source evidence is unchanged.
+
+### Query plans
 
 Ranking every match by bm25 means reading the position lists of each matching record, so the cost grows with the number of matches and with how common the words are, not with the size of the page. On a large library a query of several common words can match thousands of records and take many seconds to minutes, while the same words as a quoted phrase, or one rare word, answer almost at once. Search therefore plans the query, bounds its time and caps its count.
 
@@ -267,3 +324,18 @@ The planner stops at the first plan that matches at least one record in the filt
 `scripts/bench_mcp.py --library PATH --queries FILE` calls the library MCP tool handlers in-process for a fixed query file and prints one JSON report: per call wall time, response bytes, estimated tokens (`ceil(bytes / 4)`), calls to reach the expected record or passage, and the partial flag, with p50 and p95 per level (search is reported at the depth the harness requests, which is `L0` asked for explicitly because a search that names no depth is answered at L1; read is L2) for the cold first call, the first pass and warm repeats. The exit code is 0 when every threshold holds, 1 when one fails and 2 when the run is invalid. Thresholds are flags with these defaults: `--max-warm-l0-p95-s 1.0`, `--max-cold-first-call-s 3.0`, `--max-l0-tokens 900`, and the expected unit within `--max-unit-calls 2` and `--max-unit-tokens 2500` on at least `--min-unit-rate 0.9` of queries.
 
 `PATH` is a `library.sqlite` file or a published store root that you own. The harness is read-only: the engine opens the database with SQLite `mode=ro`, only the three read tools are called, and the harness compares the size and mtime of every entry beside the library (plus a SHA-256 of `library.sqlite*` with `--hash`) before and after, exiting 2 if anything changed. The report prints query ids, never query text or paths. Cold means a fresh process and connection; the operating system page cache is not dropped. `tests/bench/queries.json` is a synthetic query set for the synthetic library that `tests/test_bench_harness.py` builds; write your own query file to measure a library you own, and keep that file and its report private.
+
+The harness follows each hit's actual `read` arguments, including message, character
+offset, sequence and revision. `expected_message` is retained as legacy fixture
+metadata and never supplies a locator. Continuation follows the returned cursors.
+
+`tests/test_library_passage_benchmark.py` documents and generates a second synthetic
+acceptance library with 660 conversations, 980 distinct eligible blocks and a length
+range of 199 to 64,425 characters. Twenty long conversations contain a late, focused
+target paragraph; each target has twelve medium-length distractors containing the
+same two query words in a longer paragraph, and 400 short records provide background.
+The queries contain real word pairs and no source identifier or message hint. The
+regression proves conversation ranking misses the first target at rank one while
+passage ranking finds it, then runs the MCP benchmark with the two-call, 2500-token,
+90-percent known-item and warm-p95-under-one-second gates. These are reproducible
+synthetic acceptance measurements, not measurements of an installed private archive.

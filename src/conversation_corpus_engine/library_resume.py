@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .library_store import Library, canonical_json, digest_json
+from .library_store import Library, candidate_evidence_fingerprint, canonical_json, digest_json
 
 
 def _safe(path: Path) -> None:
@@ -175,15 +175,7 @@ def prepare_resume(
             )
             if record_fingerprint != report.get("record_fingerprint"):
                 raise ValueError("resume record fingerprint differs from database")
-            evidence_fingerprint = digest_json(
-                {
-                    "library": library.evidence_fingerprint(),
-                    "sources": report["sources"],
-                    "findings": report["findings"],
-                    "manifest": report["source_manifest_hash"],
-                    "resume_source": report.get("resume_source"),
-                }
-            )
+            evidence_fingerprint = candidate_evidence_fingerprint(library, report)
             if evidence_fingerprint != report.get("evidence_fingerprint"):
                 raise ValueError("resume evidence fingerprint differs from database")
     digest = hashlib.sha256()

@@ -23,7 +23,14 @@ from .corpus_store import authorize_corpus_write
 from .library_documents import iter_documents
 from .library_native import iter_estate
 from .library_resume import DISK_FLOOR, copy_qualified_database, prepare_resume
-from .library_store import LIBRARY_SCHEMA, SCHEMA_SQL, Library, digest_json
+from .library_store import (
+    EVIDENCE_FINGERPRINT_SCHEMA,
+    LIBRARY_SCHEMA,
+    SCHEMA_SQL,
+    Library,
+    candidate_evidence_fingerprint,
+    digest_json,
+)
 from .library_vault import PROFILE_NONE, VAULT_PROFILES
 
 DEFAULT_VAULT_PROFILE = PROFILE_NONE
@@ -438,6 +445,8 @@ def build_library(
                 destination / "library.sqlite",
                 previous=database_source,
                 compact_previous=resume is not None,
+                max_bytes=working_budget - receipt_bytes,
+                check_callback=check_bound,
             )
         with candidate as library, candidate.sql_progress(check_bound):
             source_hashes_after_copy = assert_resume_unchanged()
@@ -452,6 +461,9 @@ def build_library(
                 library.connection.execute(
                     f"PRAGMA max_page_count={max(1, (working_budget - receipt_bytes) // page_size)}"
                 )
+                if library.schema != LIBRARY_SCHEMA:
+                    # Indexed resume also copies its seed before any derived-schema migration.
+                    library.migrate_passages(check_callback=check_bound)
 
             if resume_mode == "export":
                 report["sources"] = [{"kind": "documents", "report": {"counts": {}}}]
@@ -576,15 +588,8 @@ def build_library(
                     for row in library.rows()
                 ]
             )
-            report["evidence_fingerprint"] = digest_json(
-                {
-                    "library": library.evidence_fingerprint(),
-                    "sources": report["sources"],
-                    "findings": report["findings"],
-                    "manifest": report["source_manifest_hash"],
-                    "resume_source": report.get("resume_source"),
-                }
-            )
+            report["evidence_fingerprint_schema"] = EVIDENCE_FINGERPRINT_SCHEMA
+            report["evidence_fingerprint"] = candidate_evidence_fingerprint(library, report)
             problems = []
             if resume_mode != "export":
                 emit({"stage": "verify", "records": report["status"]["records"]})

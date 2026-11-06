@@ -15,6 +15,7 @@ from typing import Any
 
 from .library_commands import (
     PASSAGE_LIMIT,
+    indexed_passage_handoff,
     open_library,
     passage_handoff,
     read_arguments,
@@ -27,6 +28,7 @@ from .library_store import (
     DEFAULT_SEARCH_SECONDS,
     MAX_SEARCH_SECONDS,
     SEARCH_PLANS,
+    SEARCH_UNITS,
     Library,
     bounded_int,
     plan_locator_query,
@@ -66,6 +68,12 @@ LOCATOR_ERRORS = (
 COMPACT_KEYS = {
     "total": "n",
     "total_exact": "nx",
+    "unit": "u",
+    "total_unit": "nu",
+    "unit_total": "un",
+    "unit_total_exact": "unx",
+    "passage": "ps",
+    "digest": "d",
     "plan": "pn",
     "partial": "pt",
     "ranked": "rk",
@@ -169,6 +177,15 @@ def tool_definitions() -> list[dict[str, Any]]:
                 "lane": {"type": "string"},
                 "provider": {"type": "array", "items": {"type": "string"}},
                 "kind": {"type": "array", "items": {"type": "string"}},
+                "unit": {
+                    "enum": list(SEARCH_UNITS),
+                    "description": "auto (default): passage first for up to three query words "
+                    "or a quoted phrase, conversation otherwise. Passage searches deduplicated "
+                    "eligible prose blocks. Within each query plan, auto tries passages then "
+                    "conversations before widening the plan. Explicit "
+                    "passage never falls back. total counts conversations; unit_total counts "
+                    "passages and offset pages those passages when unit is passage.",
+                },
                 "plan": {
                     "enum": list(SEARCH_PLANS),
                     "description": "auto (default) plans several unquoted words as phrase, then "
@@ -202,6 +219,7 @@ def tool_definitions() -> list[dict[str, Any]]:
                     "type": "boolean",
                     "description": "Short keys: n total, nx total exact, o offset, c returned, "
                     "no next offset, h hits, tr truncated, tk estimated tokens, pn plan, "
+                    "u selected unit, nu total unit, un passage total, unx passage total exact, "
                     "pt partial, rk ranked, es elapsed seconds, tq terms truncated, ht hint, "
                     "nt notice, i uid, t title, s score, r read locator (exactly the read "
                     "arguments: m message, o offset, l limit, sq sequence; the hit's i is its "
@@ -420,13 +438,14 @@ def _search(
         providers=arguments.get("provider"),
         kinds=arguments.get("kind"),
         plan=plan,
+        unit=arguments.get("unit", "auto"),
         max_seconds=seconds,
     )
     hits = found["hits"]
     # Scores and passage locators follow the plan that answered; an abandoned ranking has none.
     scores = (
         _scores(library, query, [hit["uid"] for hit in hits], found["plan"])
-        if found["ranked"]
+        if found["ranked"] and found["unit"] == "conversation"
         else {}
     )
     locator_query = plan_locator_query(query, found["plan"])
@@ -436,17 +455,33 @@ def _search(
     echo_characters = QUERY_ECHO_CHARS if budget is not None else None
     planned = {
         key: found[key]
-        for key in ("plan", "partial", "ranked", "elapsed_s", "terms_truncated", "notice", "hint")
+        for key in (
+            "plan",
+            "partial",
+            "ranked",
+            "elapsed_s",
+            "terms_truncated",
+            "notice",
+            "hint",
+            "unit",
+            "total_unit",
+            "unit_total",
+            "unit_total_exact",
+        )
         if key in found
     }
 
     def entry(hit: dict[str, Any]) -> dict[str, Any]:
-        arguments, flags = _locator(library, hit["uid"], locator_query)
-        read = {"uid": hit["uid"], **arguments}
+        if found["unit"] == "passage":
+            read, flags = indexed_passage_handoff(library, hit, locator_query), {}
+        else:
+            arguments, flags = _locator(library, hit["uid"], locator_query)
+            read = {"uid": hit["uid"], **arguments}
         if compact:
             read.pop("uid")
         base = {"uid": hit["uid"], "title": _one_line(hit["title"])} if depth == "L0" else dict(hit)
-        return {**base, "score": scores.get(hit["uid"]), "read": read, **flags}
+        score = hit.get("score") if found["unit"] == "passage" else scores.get(hit["uid"])
+        return {**base, "score": score, "read": read, **flags}
 
     def assemble(
         kept: list[dict[str, Any]], truncated: bool, tokens: int, echo: int | None

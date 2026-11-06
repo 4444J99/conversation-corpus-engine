@@ -73,7 +73,7 @@ def synthetic_queries() -> dict:
         elif shape == 2:
             entry = {"query": f"fu{index:04d}q"}
         else:
-            # No message hint: the reader starts at message 0, where this passage lives.
+            # No message hint: the reader follows the actual search hit's handoff.
             entry = {
                 "query": f"{topic} ma{index:04d}q",
                 "expected_text": f"Marker ma{index:04d}q",
@@ -331,9 +331,9 @@ def test_calls_to_unit_counts_search_then_reads(bench, synthetic, capsys, tmp_pa
     assert by_id["record-only"]["reached"] is True and by_id["record-only"]["calls_to_unit"] == 1
     assert by_id["hinted-passage"]["calls_to_unit"] == 2
     assert by_id["hinted-passage"]["within_budget"] is True
-    # No hint: the reader starts at message 0 and follows next_message, one call per message.
+    # The hit locates message 1; the desired follow-up is one next_message beyond it.
     assert by_id["scanned-passage"]["reached"] is True
-    assert by_id["scanned-passage"]["calls_to_unit"] == 4
+    assert by_id["scanned-passage"]["calls_to_unit"] == 3
     assert by_id["scanned-passage"]["within_budget"] is False
     assert by_id["absent"]["reached"] is False and by_id["absent"]["within_budget"] is False
     assert report["units"]["reached"] == 3 and report["units"]["within_budget"] == 2
@@ -343,6 +343,87 @@ def test_calls_to_unit_counts_search_then_reads(bench, synthetic, capsys, tmp_pa
         library_mcp.SEARCH_TOOL,
         library_mcp.READ_TOOL,
     }
+
+
+def test_reader_follows_returned_passage_handoff_without_a_ground_truth_locator(bench):
+    handoff = {
+        "uid": "chatgpt-target",
+        "message": 7,
+        "offset": 2400,
+        "limit": 180,
+        "sequence": "alternate",
+    }
+    seen = []
+
+    class Server:
+        def call_tool(self, tool, arguments):
+            seen.append((tool, dict(arguments)))
+            if tool == library_mcp.SEARCH_TOOL:
+                result = {"hits": [{"uid": "chatgpt-target", "read": handoff}]}
+            else:
+                assert arguments == handoff
+                result = {"text": "the exact late passage"}
+            return {
+                "content": [{"type": "text", "text": json.dumps(result)}],
+                "structuredContent": result,
+            }
+
+    args = bench.build_parser().parse_args(["--library", "x", "--queries", "y"])
+    calls, outcome = bench.run_query(
+        Server(),
+        {
+            "id": "late",
+            "query": "exact late passage",
+            "expected_uid": "chatgpt-target",
+            "expected_text": "the exact late passage",
+            "expected_message": 91,  # Legacy metadata cannot override the measured locator.
+        },
+        args,
+        "warm",
+    )
+    assert len(calls) == len(seen) == outcome["calls_to_unit"] == 2
+    assert outcome["within_budget"] is True
+
+
+def test_reader_continues_from_the_actual_around_query_window(bench):
+    read_calls = []
+
+    class Server:
+        def call_tool(self, tool, arguments):
+            if tool == library_mcp.SEARCH_TOOL:
+                result = {
+                    "hits": [
+                        {"uid": "chatgpt-target", "read": {"message": 2, "around_query": "needle"}}
+                    ]
+                }
+            else:
+                read_calls.append(dict(arguments))
+                result = (
+                    {"text": "a first window", "message": 7, "next_offset": 222}
+                    if len(read_calls) == 1
+                    else {"text": "the target passage"}
+                )
+            return {
+                "content": [{"type": "text", "text": json.dumps(result)}],
+                "structuredContent": result,
+            }
+
+    args = bench.build_parser().parse_args(["--library", "x", "--queries", "y"])
+    _, outcome = bench.run_query(
+        Server(),
+        {
+            "id": "around",
+            "query": "needle",
+            "expected_uid": "chatgpt-target",
+            "expected_text": "the target passage",
+        },
+        args,
+        "warm",
+    )
+    assert read_calls[0]["around_query"] == "needle"
+    assert (read_calls[1]["message"], read_calls[1]["offset"]) == (7, 222)
+    assert "around_query" not in read_calls[1]
+    assert outcome["calls_to_unit"] == 3
 
 
 def test_partial_flag_is_recorded_per_call_and_counted(bench, synthetic, capsys, monkeypatch):

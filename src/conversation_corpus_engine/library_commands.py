@@ -23,12 +23,14 @@ from .library_build import (
 )
 from .library_cards import export_cards, is_card_folder, verify_cards
 from .library_export import EXPORT_PROFILES, LEGACY_PROFILE, export_library, verify_export
+from .library_passages import PASSAGE_LIMIT
 from .library_read_metadata import MAX_ATTACHMENTS, message_metadata, sequence_attachment_count
 from .library_store import (
     BROAD_QUERY_HINT,
     DEFAULT_SEARCH_SECONDS,
     MAX_SEARCH_SECONDS,
     SEARCH_PLANS,
+    SEARCH_UNITS,
     Library,
     bounded_int,
     validate_search_seconds,
@@ -80,7 +82,6 @@ def open_library(store_root: Path) -> tuple[Path, Library]:
     return generation, Library(generation / "library.sqlite")
 
 
-PASSAGE_LIMIT = 1500
 MAX_RANGE_MESSAGES = 200
 MAX_TOC_ENTRIES = 500
 PREVIEW_CHARS = 80
@@ -179,6 +180,20 @@ def passage_handoff(
     if sequence != "main":
         handoff["sequence"] = sequence
     return handoff, True
+
+
+def indexed_passage_handoff(library: Library, hit: dict[str, Any], query: str) -> dict[str, Any]:
+    """Use the indexed occurrence; locate a bounded window only for an oversized paragraph."""
+    read = dict(hit["read"])
+    passage = hit["passage"]
+    if passage["end"] - passage["start"] > read["limit"]:
+        payload = library.record(hit["uid"], version=read["version"])
+        original = str(payload["messages"][read["message"]].get("text", ""))
+        text = original[passage["start"] : passage["end"]]
+        match, _ = locate_match([{"text": text}], query)
+        if match is not None:
+            read["offset"] = passage["start"] + passage_window(match, len(text), read["limit"])
+    return read
 
 
 def _check_cursor(message: int, offset: int, limit: int, sequence: str) -> None:
@@ -750,6 +765,13 @@ def add_library_parser(subparsers: Any) -> Any:
     search.add_argument("--provider", action="append")
     search.add_argument("--kind", action="append")
     search.add_argument(
+        "--unit",
+        choices=SEARCH_UNITS,
+        default="auto",
+        help="auto (default): passage first for up to three words or a quoted phrase, "
+        "conversation otherwise; passage searches deduplicated eligible prose blocks",
+    )
+    search.add_argument(
         "--plan",
         choices=SEARCH_PLANS,
         default="auto",
@@ -1085,9 +1107,13 @@ def handle_library(args: argparse.Namespace) -> int:
                         providers=args.provider,
                         kinds=args.kind,
                         plan=args.plan,
+                        unit=args.unit,
                         max_seconds=args.max_seconds,
                     )
                     result["generation"] = str(generation)
+                    if result["unit"] == "passage":
+                        for hit in result["hits"]:
+                            hit["read"] = indexed_passage_handoff(library, hit, args.query)
                     for line in (result.get("notice"), result.get("hint")):
                         if line:
                             prefix = "hint: " if line == BROAD_QUERY_HINT else ""
