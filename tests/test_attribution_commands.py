@@ -2115,8 +2115,9 @@ def test_a_sample_drawn_under_the_previous_rules_version_is_refused(
     assert not ledger.exists()
 
 
+@pytest.mark.parametrize("previous_version", ["cce.attribution-rules@7", "cce.attribution-rules@8"])
 def test_ledger_rows_from_the_previous_rules_version_are_reported_as_stale(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], previous_version: str
 ) -> None:
     library = build_library(tmp_path / "store" / "g", typed_records=110)
     ledger = approve(capsys, library, tmp_path)
@@ -2125,9 +2126,7 @@ def test_ledger_rows_from_the_previous_rules_version_are_reported_as_stale(
     ] == ["typed_prefix:S"]
     rewritten = tmp_path / "old-ledger.jsonl"
     rewritten.write_text(
-        ledger.read_text(encoding="utf-8").replace(
-            "cce.attribution-rules@8", "cce.attribution-rules@7"
-        ),
+        ledger.read_text(encoding="utf-8").replace("cce.attribution-rules@9", previous_version),
         encoding="utf-8",
     )
     report = report_of(capsys, library, "--ledger", rewritten, "--owner-id", "rob")
@@ -2138,7 +2137,7 @@ def test_ledger_rows_from_the_previous_rules_version_are_reported_as_stale(
     )
     assert result["stale_rows"] == result["ledger_rows"] > 100
     assert result["eligible_strata"] == []
-    assert result["rules_version"] == "cce.attribution-rules@8"
+    assert result["rules_version"] == "cce.attribution-rules@9"
 
 
 def test_review_record_rejects_bad_answers_before_writing_anything(
