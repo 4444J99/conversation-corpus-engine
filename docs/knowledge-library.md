@@ -127,13 +127,13 @@ A capture tool that fetches saved web pages writes *shards*: JSONL files with on
 |---|---|
 | `schema` | the string `capture-shard.v1` |
 | `id` | `pg_` and the first 24 hex characters of the SHA-256 of `key` |
-| `key` | the normalized URL the page is identified by (nonempty) |
+| `key` | the normalized URL the page is identified by (nonempty). It must name the same page as `requested_url` or `final_url`: the same host and path, compared case-folded, ignoring scheme, default port, query, fragment and a trailing slash; a scheme-less key such as `example.com/a` is read as `http://example.com/a` |
 | `requested_url` | the URL that was asked for, `http` or `https`, no whitespace |
 | `final_url` | the URL after redirects, or null when no response arrived |
 | `status` | `captured` or `failed` |
 | `http_status` | an integer of at least 100, or null |
 | `content_digest` | `sha256:` and the SHA-256 (64 hex) of the UTF-8 `text`; null on a failed row |
-| `captured_at` | the fetch time as a UTC stamp, `2026-01-02T03:04:05Z` |
+| `captured_at` | the fetch time as a UTC stamp in ASCII digits, `2026-01-02T03:04:05Z`; a time more than five minutes after the building machine's clock is refused |
 | `extractor` | an object with a nonempty `name` and `version` |
 | `text` | the extracted text; empty on a failed row |
 | `failure_class` | null on a captured row; on a failed row one of `dead_link`, `login_wall`, `paywall`, `non_html`, `rendered_empty`, `timeout`, `blocked` |
@@ -149,9 +149,10 @@ A capture tool that fetches saved web pages writes *shards*: JSONL files with on
 
 **Duplicates, failures and refusals.**
 
-- Several rows for one page (the same `id`, in one shard or many) keep one winner: a capture beats a failure, then the latest `captured_at`, then the larger `content_digest`, so the result does not depend on which shard is read first. The folded rows are counted as `duplicates` in the build report.
+- Several rows for one page (the same `id`, in one shard or many) keep one winner: a capture beats a failure, then the latest `captured_at` (compared as a time), then the larger `content_digest`, then the larger SHA-256 of the canonical row (sorted keys, compact JSON), so the result does not depend on which shard is read first or on how the shards are named. Only two byte-identical rows tie completely; the record then names the first shard in name order as its `source_file`. The folded rows are counted as `duplicates` in the build report. The best three rows of each page are kept: if the winner's shard changed or became unreadable between the two passes of the read, the next row is used and the loss is a `malformed_row` finding; a page with no readable row yields `page_unavailable`.
 - A `failed` row is kept as a record without a body (body status `metadata_only`, `body_reason` the failure class), so a page that could not be fetched stays visible. It makes `coverage_complete` false, like any other record without a body.
-- A row that cannot be trusted is refused with a finding in the build report (`scope: web_captures`, the shard, the line number, a code and a reason that never repeats page text), and the build continues. The codes are `malformed_row` (not JSON, not an object, a field of the wrong shape, an `id` that does not follow the `key`, a `content_digest` that does not match the `text`, a captured row without text or with a failure class, a failed row with a body, text with a NUL or invalid Unicode), `row_too_large`, `symlink_not_followed`, `missing_source`, `unreadable_file` and `source_changed_during_read`.
+- A row that cannot be trusted is refused with a finding in the build report (`scope: web_captures`, the shard, the line number, a code and a fixed reason that never repeats row-supplied text: an unknown field is reported as a count, not by name), and the build continues. The codes are `malformed_row` (not JSON, not an object, a field of the wrong shape or type, an `id` that does not follow the `key`, a `key` that does not follow the URLs, a `captured_at` that is not ASCII-digit UTC or lies in the future, a `content_digest` that does not match the `text`, a captured row without text or with a failure class, a failed row with a body, text with a NUL or invalid Unicode), `row_too_large`, `symlink_not_followed`, `missing_source`, `unreadable_file` (a shard or a folder that cannot be opened or listed; either makes `coverage_complete` false), `source_changed_during_read` and `page_unavailable`.
+- A report stores at most 1000 findings per read (`sources[].report.findings`). Refusals stay counted exactly in `counts.refused`; the findings beyond the cap are counted in `findings_overflow`, and the build report carries one `findings_truncated` finding with that `count`.
 - The report lists every shard with its SHA-256, size and row count (`sources[].report.shards`).
 
 ## Preservation and condensation

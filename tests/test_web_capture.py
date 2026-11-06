@@ -367,7 +367,7 @@ def broken_rows() -> dict[str, Any]:
     return {
         "content_digest does not match the text": digest,
         "id does not follow the key": identity,
-        "unexpected field: surprise": extra_field,
+        "row has 1 unexpected field": extra_field,
         "schema must be capture-shard.v1": wrong_schema,
         "text holds a NUL character": nul,
         "a captured row needs text": blank,
