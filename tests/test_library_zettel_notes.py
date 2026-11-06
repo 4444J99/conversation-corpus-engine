@@ -551,11 +551,16 @@ def test_a_changed_envelope_updates_only_the_changed_note(world, capsys):
     report = json.loads(run(out, store, path, capsys)[1])
     after = snapshot(out)
     assert report["written"] == 1 and report["unchanged"] == 4
-    changed = [name for name in after if after[name] != before[name]]
+    changed = [name for name in before if after[name] != before[name]]
     assert changed == [
         library_zettel_files.MANIFEST_NAME,
         "notes/zettel/Careful records beat memory 0.md",
     ]
+    new_paths = set(after) - set(before)
+    assert len(new_paths) == 2 and all(
+        name.startswith(".cce-zettel-recovery/") for name in new_paths
+    )
+    assert len(report["recovery"]["created"]) == report["recovery"]["retained"] == 1
 
 
 def test_git_visible_directory_is_refused_before_the_library_is_opened(
@@ -1061,6 +1066,259 @@ def test_file_created_by_an_editor_after_preflight_is_never_overwritten(world, c
     assert code == 2 and "appeared during export" in error
     assert len(raced) == 1 and raced[0].read_bytes() == foreign
     assert list((out / "notes/zettel").glob("*.md")) == raced
+
+
+def _updated_first_note(world, capsys):
+    _library, payload, path, store, out = world
+    assert run(out, store, path, capsys)[0] == 0
+    item = payload["zettels"][0]
+    note = out / "notes/zettel" / f"{item['title']}.md"
+    original = note.read_bytes()
+    item["body"] += " An intentional source update."
+    item["attribution"] = annotation(item["body"], "agent", "model")
+    path.write_text(json.dumps(payload))
+    return note, original
+
+
+def test_editor_file_appearing_during_owned_update_is_preserved(world, capsys, monkeypatch):
+    _library, _payload, path, store, out = world
+    note, original = _updated_first_note(world, capsys)
+    atomic = library_zettel_files._atomic_write
+    foreign = b"Editor bytes written after the owned-file preflight.\n"
+
+    def edit_before_publish(destination, data, **kwargs):
+        if destination == note:
+            destination.write_bytes(foreign)
+        return atomic(destination, data, **kwargs)
+
+    monkeypatch.setattr(library_zettel_files, "_atomic_write", edit_before_publish)
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "recovery" in error
+    assert note.read_bytes() == foreign
+    recovered = list((out / ".cce-zettel-recovery").glob("*/previous.bin"))
+    assert len(recovered) == 1 and recovered[0].read_bytes() == original
+
+
+def test_open_editor_descriptor_remains_reachable_after_successful_update(world, capsys):
+    _library, _payload, path, store, out = world
+    note, original = _updated_first_note(world, capsys)
+    late = b"Late bytes through the editor's previously open inode.\n"
+    with note.open("ab") as editor:
+        original_inode = os.fstat(editor.fileno()).st_ino
+        code, stdout, _ = run(out, store, path, capsys)
+        assert code == 0
+        editor.write(late)
+        editor.flush()
+    report = json.loads(stdout)
+    recovered = list((out / ".cce-zettel-recovery").glob("*/previous.bin"))
+    assert len(recovered) == 1
+    assert recovered[0].stat().st_ino == original_inode
+    assert recovered[0].read_bytes() == original + late
+    assert note.read_bytes() != original and late not in note.read_bytes()
+    assert report["recovery"]["created"] == [str(recovered[0].relative_to(out))]
+    assert report["recovery"]["retained"] == 1
+    receipt = json.loads((recovered[0].parent / "receipt.json").read_text())
+    assert receipt["captured_sha256"] == hashlib.sha256(original).hexdigest()
+    assert receipt["captured_sha256"] != hashlib.sha256(recovered[0].read_bytes()).hexdigest()
+    assert not list((out / ".cce-zettel-recovery").rglob("*.md"))
+
+
+def test_changed_bytes_captured_after_preflight_are_restored_and_retained(
+    world, capsys, monkeypatch
+):
+    _library, _payload, path, store, out = world
+    note, _original = _updated_first_note(world, capsys)
+    rename = Path.rename
+    foreign = b"Editor changed the owned inode immediately before capture.\n"
+
+    def edit_then_capture(source_path, target):
+        if source_path == note:
+            source_path.write_bytes(foreign)
+        return rename(source_path, target)
+
+    monkeypatch.setattr(Path, "rename", edit_then_capture)
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "captured note changed" in error and "restored" in error
+    retained = next((out / ".cce-zettel-recovery").glob("*/previous.bin"))
+    assert retained.read_bytes() == note.read_bytes() == foreign
+    assert retained.stat().st_ino == note.stat().st_ino
+
+
+@pytest.mark.parametrize("conflicting_editor", [False, True])
+def test_owned_update_interruption_restores_only_a_free_name(
+    world, capsys, monkeypatch, conflicting_editor
+):
+    _library, _payload, path, store, out = world
+    note, original = _updated_first_note(world, capsys)
+    atomic = library_zettel_files._atomic_write
+    foreign = b"A separate editor replacement must stay at the note path.\n"
+
+    def interrupted(destination, data, **kwargs):
+        if destination == note:
+            if conflicting_editor:
+                destination.write_bytes(foreign)
+            raise OSError("synthetic interruption after capture")
+        return atomic(destination, data, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(library_zettel_files, "_atomic_write", interrupted)
+        code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "recovery" in error and "synthetic interruption" in error
+    retained = next((out / ".cce-zettel-recovery").glob("*/previous.bin"))
+    assert retained.read_bytes() == original
+    assert note.read_bytes() == (foreign if conflicting_editor else original)
+    if not conflicting_editor:
+        assert run(out, store, path, capsys)[0] == 0
+        before = snapshot(out)
+        code, stdout, _ = run(out, store, path, capsys)
+        assert code == 0 and json.loads(stdout)["written"] == 0
+        assert snapshot(out) == before
+
+
+def test_failure_after_capture_rename_lands_still_restores_the_retained_inode(
+    world, capsys, monkeypatch
+):
+    _library, _payload, path, store, out = world
+    note, original = _updated_first_note(world, capsys)
+    rename = Path.rename
+
+    def late_failure(source_path, target):
+        result = rename(source_path, target)
+        if source_path == note:
+            raise OSError("synthetic failure after rename landed")
+        return result
+
+    monkeypatch.setattr(Path, "rename", late_failure)
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "recovery" in error and "restored" in error
+    retained = next((out / ".cce-zettel-recovery").glob("*/previous.bin"))
+    assert retained.read_bytes() == note.read_bytes() == original
+    assert retained.stat().st_ino == note.stat().st_ino
+
+
+@pytest.mark.parametrize("limit", ["slots", "bytes"])
+def test_recovery_capacity_is_reserved_for_the_whole_batch_before_mutation(
+    world, capsys, monkeypatch, limit
+):
+    _library, payload, path, store, out = world
+    _updated_first_note(world, capsys)
+    second = payload["zettels"][1]
+    second["body"] += " A second source update in the same batch."
+    second["attribution"] = annotation(second["body"], "agent", "model")
+    path.write_text(json.dumps(payload))
+    before = snapshot(out)
+    if limit == "slots":
+        monkeypatch.setattr(library_zettel_files, "RECOVERY_SLOTS", 1)
+    else:
+        one_payload = max(
+            (out / "notes/zettel" / f"{z['title']}.md").stat().st_size
+            for z in payload["zettels"][:2]
+        )
+        monkeypatch.setattr(
+            library_zettel_files,
+            "RECOVERY_BYTES",
+            one_payload + library_zettel_files.RECOVERY_RECEIPT_BYTES,
+        )
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "recovery capacity" in error
+    assert snapshot(out) == before
+    assert not (out / ".cce-zettel-recovery").exists()
+
+
+def test_retained_recovery_slots_are_never_pruned_to_make_room(world, capsys, monkeypatch):
+    _library, payload, path, store, out = world
+    _updated_first_note(world, capsys)
+    monkeypatch.setattr(library_zettel_files, "RECOVERY_SLOTS", 1)
+    assert run(out, store, path, capsys)[0] == 0
+    before = snapshot(out)
+    assert run(out, store, path, capsys)[0] == 0
+    assert snapshot(out) == before
+    payload["zettels"][0]["body"] += " A further source update."
+    payload["zettels"][0]["attribution"] = annotation(
+        payload["zettels"][0]["body"], "agent", "model"
+    )
+    path.write_text(json.dumps(payload))
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "recovery capacity" in error
+    assert snapshot(out) == before
+
+
+def test_actual_recovery_git_worktree_is_refused_before_source_reads(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "wiki"
+    recovery = out / ".cce-zettel-recovery"
+    recovery.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(recovery), "init", "-q"], check=True, capture_output=True)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("sources were read before the actual recovery folder was authorized")
+
+    monkeypatch.setattr(library_commands, "open_library", forbidden)
+    monkeypatch.setattr(library_commands, "_load_zettel_envelope", forbidden)
+    code, _, error = run(out, tmp_path / "store", tmp_path / "input.json", capsys)
+    assert code == 2 and "Git-visible" in error
+    with make_library(tmp_path) as library, pytest.raises(CorpusStoreError, match="Git-visible"):
+        export_zettel_notes(
+            library, envelope(library)["zettels"], out, store_root=tmp_path / "store"
+        )
+    assert sorted(p.name for p in out.iterdir()) == [".cce-zettel-recovery"]
+
+
+def test_hard_interruption_keeps_recovery_reachable_and_a_retry_can_complete(tmp_path):
+    root = tmp_path / "wiki"
+    name = "Synthetic.md"
+    old = {"id": "20260304-aaaaaa", "data": b"old note", "sha256": sha("old note")}
+    new = {"id": old["id"], "data": b"new note", "sha256": sha("new note")}
+    library_zettel_files.write_owned_notes(root, {name: old}, max_entries=1000)
+    script = """
+import json, os, sys
+from pathlib import Path
+from conversation_corpus_engine import library_zettel_files as files
+root = Path(sys.argv[1])
+name, entry = json.loads(sys.stdin.read())
+entry['data'] = entry['data'].encode()
+atomic = files._atomic_write
+def stopped(destination, data, **kwargs):
+    if destination == root / files.NOTES_FOLDER / name:
+        os._exit(17)
+    return atomic(destination, data, **kwargs)
+files._atomic_write = stopped
+files.write_owned_notes(root, {name: entry}, max_entries=1000)
+"""
+    done = subprocess.run(
+        [sys.executable, "-c", script, str(root)],
+        input=json.dumps([name, {**new, "data": new["data"].decode()}]),
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    assert done.returncode == 17
+    retained = next((root / ".cce-zettel-recovery").glob("*/previous.bin"))
+    assert retained.read_bytes() == old["data"]
+    assert not (root / "notes/zettel" / name).exists()
+    report = library_zettel_files.write_owned_notes(root, {name: new}, max_entries=1000)
+    assert report["written"] == 1 and report["recovery"]["retained"] == 1
+    assert (root / "notes/zettel" / name).read_bytes() == new["data"]
+    assert retained.read_bytes() == old["data"]
+
+
+@pytest.mark.parametrize("original_title,new_title", [("Test", "test"), ("Café", "Cafe\u0301")])
+def test_deleted_owned_name_remains_reserved_in_the_manifest(tmp_path, original_title, new_title):
+    root = tmp_path / "wiki"
+    old_name, new_name = original_title + ".md", new_title + ".md"
+    old = {"id": "20260304-aaaaaa", "data": b"old note", "sha256": sha("old note")}
+    new = {"id": "20260304-bbbbbb", "data": b"new note", "sha256": sha("new note")}
+    library_zettel_files.write_owned_notes(root, {old_name: old}, max_entries=1000)
+    (root / "notes/zettel" / old_name).unlink()
+    before = snapshot(root)
+    with pytest.raises(ValueError, match="filename conflicts"):
+        library_zettel_files.write_owned_notes(root, {new_name: new}, max_entries=1000)
+    assert snapshot(root) == before
+    # A refusal leaves the original manifest valid and its exact spelling usable.
+    assert (
+        library_zettel_files.write_owned_notes(root, {old_name: old}, max_entries=1000)["written"]
+        == 1
+    )
 
 
 @pytest.mark.parametrize("with_reader", [False, True])

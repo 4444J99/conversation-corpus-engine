@@ -24,6 +24,11 @@ NOTES_FOLDER = "notes/zettel"
 MANIFEST_NAME = "cce-zettel-notes-manifest.json"
 MANIFEST_SCHEMA = "cce.zettel-note-manifest.v1"
 LOCK_NAME = ".cce-zettel-notes.lock"
+RECOVERY_FOLDER = ".cce-zettel-recovery"
+RECOVERY_SCHEMA = "cce.zettel-note-recovery.v1"
+RECOVERY_SLOTS = 1000
+RECOVERY_BYTES = 64 * 1024 * 1024
+RECOVERY_RECEIPT_BYTES = 4096
 FILENAME_BYTES = 255
 MANIFEST_BYTES = 1024 * 1024
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
@@ -35,12 +40,15 @@ def folded(name: str) -> str:
 
 
 def authorize_destination(destination: Path) -> Path:
-    """Check both the receipt root and the actual note folder before reading text."""
+    """Authorize the receipt, notes and retained recovery surfaces before reading text."""
     root = _absolute(destination)
     folder = root / NOTES_FOLDER
     _no_symlinks(folder)
     require_git_private(root)
     require_git_private(folder)
+    recovery = root / RECOVERY_FOLDER
+    _no_symlinks(recovery)
+    require_git_private(recovery)
     return root
 
 
@@ -52,8 +60,15 @@ def _digest(path: Path) -> str | None:
     if not path.is_file():
         raise ValueError(f"{path.name} is not a regular file")
     digest = hashlib.sha256()
-    with path.open("rb") as source:
-        for block in iter(lambda: source.read(65536), b""):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise ValueError(f"{path.name} is not a regular file")
+        consumed = 0
+        while block := source.read(min(65536, RECOVERY_BYTES - consumed + 1)):
+            consumed += len(block)
+            if consumed > RECOVERY_BYTES:
+                raise ValueError(f"{path.name} exceeds the Zettel recovery byte cap; preserving it")
             digest.update(block)
     return digest.hexdigest()
 
@@ -144,7 +159,10 @@ def _plan(
             raise ValueError(
                 f"{entry['id']}: already written as {by_id[entry['id']]}; keep its title"
             )
-        collisions = [other for other in entries if folded(other) == folded(name) and other != name]
+        reserved = set(entries) | set(previous["files"]) | set(planned)
+        collisions = sorted(
+            other for other in reserved if folded(other) == folded(name) and other != name
+        )
         if collisions:
             raise ValueError(f"{name}: filename conflicts with {collisions[0]}; keep its title")
         found = _digest(folder / name)
@@ -198,16 +216,160 @@ def _atomic_write(path: Path, data: bytes, *, exclusive: bool = False) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def _recovery_inventory(root: Path) -> dict[str, int]:
+    """Count retained slots and observed bytes without reading or deleting their payloads."""
+    recovery = root / RECOVERY_FOLDER
+    _no_symlinks(recovery)
+    require_git_private(recovery)
+    if not recovery.exists():
+        return {"retained": 0, "bytes": 0}
+    if not recovery.is_dir():
+        raise ValueError("Zettel recovery surface is not a directory")
+    count = size = 0
+    for slot in recovery.iterdir():
+        count += 1
+        if count > RECOVERY_SLOTS:
+            raise ValueError(
+                "Zettel recovery slot cap exceeded; retain and review the existing slots"
+            )
+        _no_symlinks(slot)
+        if not slot.is_dir() or not re.fullmatch(r"capture-[a-z0-9_]{8}", slot.name):
+            raise ValueError("unrecognized Zettel recovery entry; preserving it")
+        require_git_private(slot)
+        for path in slot.iterdir():
+            _no_symlinks(path)
+            if path.name not in {"previous.bin", "receipt.json"} or not path.is_file():
+                raise ValueError("unrecognized Zettel recovery payload; preserving it")
+            observed = path.stat().st_size
+            if path.name == "receipt.json" and observed > RECOVERY_RECEIPT_BYTES:
+                raise ValueError("Zettel recovery receipt exceeds its byte cap")
+            size += observed
+            if size > RECOVERY_BYTES:
+                raise ValueError(
+                    "Zettel recovery byte cap exceeded; retain and review the existing slots"
+                )
+    return {"retained": count, "bytes": size}
+
+
+def _reserve_recovery(root: Path, paths: list[Path]) -> dict[str, int]:
+    """Reserve observed payload bytes plus a complete receipt for every update in the batch."""
+    inventory = _recovery_inventory(root)
+    reserved_bytes = inventory["bytes"]
+    for path in paths:
+        _no_symlinks(path)
+        info = path.stat()
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{path.name} is not a regular file")
+        reserved_bytes += info.st_size + RECOVERY_RECEIPT_BYTES
+    if inventory["retained"] + len(paths) > RECOVERY_SLOTS or reserved_bytes > RECOVERY_BYTES:
+        raise ValueError(
+            "Zettel recovery capacity would be exceeded by this batch; "
+            "existing notes and recovery slots are preserved"
+        )
+    return inventory
+
+
+def _sync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW | os.O_NONBLOCK
+    )
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise ValueError("Zettel publication directory is no longer a directory")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _restore_captured(captured: Path, target: Path) -> str:
+    """Reattach the retained inode only to a free name; never replace an editor's file."""
+    try:
+        os.link(captured, target, follow_symlinks=False)
+    except FileExistsError:
+        return "the current note was preserved"
+    except OSError:
+        return "the prior file remains in recovery"
+    try:
+        _sync_directory(target.parent)
+    except (OSError, ValueError):
+        return "the prior file was restored but directory sync failed"
+    return "the prior file was restored"
+
+
+def _update_owned(root: Path, path: Path, entry: dict[str, Any], expected: str) -> str:
+    """Capture the displaced inode, then publish exclusively; keep the inode indefinitely.
+
+    An editor can keep writing through a descriptor opened before the capture. Its
+    inode remains reachable in recovery even after a successful replacement. A
+    receipt hash is only an observation, never authority to discard that inode.
+    """
+    recovery = root / RECOVERY_FOLDER
+    _no_symlinks(recovery)
+    require_git_private(recovery)
+    recovery.mkdir(mode=0o700, exist_ok=True)
+    _sync_directory(root)
+    slot = Path(tempfile.mkdtemp(prefix="capture-", dir=recovery))
+    _sync_directory(recovery)
+    captured = slot / "previous.bin"
+    relative = captured.relative_to(root).as_posix()
+    receipt = {
+        "schema": RECOVERY_SCHEMA,
+        "filename": path.name,
+        "id": entry["id"],
+        "previous_sha256": expected,
+        "proposed_sha256": entry["sha256"],
+        "captured_sha256": None,
+    }
+    _atomic_write(slot / "receipt.json", _bytes(receipt), exclusive=True)
+    _sync_directory(slot)
+    displaced = False
+    try:
+        # The destination is inside an exclusively created private slot. Moving
+        # captures whichever inode is at the note path, including a raced edit.
+        path.rename(captured)
+        displaced = True
+        _sync_directory(slot)
+        _sync_directory(path.parent)
+        receipt["captured_sha256"] = _digest(captured)
+        _atomic_write(slot / "receipt.json", _bytes(receipt))
+        _sync_directory(slot)
+        if receipt["captured_sha256"] != expected:
+            raise ValueError("captured note changed during export")
+        _atomic_write(path, entry["data"], exclusive=True)
+        _sync_directory(path.parent)
+    except BaseException as error:
+        # A signal or late filesystem error can arrive after rename landed but
+        # before Python records the return. The unique retained path is evidence.
+        captured_exists = displaced or captured.exists() or captured.is_symlink()
+        outcome = (
+            _restore_captured(captured, path) if captured_exists else "the note was not captured"
+        )
+        message = f"{path.name}: recovery at {relative}; {outcome}"
+        if isinstance(error, (ValueError, OSError)):
+            raise ValueError(f"{message}; {error}") from error
+        error.add_note(message)
+        raise
+    return relative
+
+
 def write_owned_notes(
     destination: Path, planned: dict[str, dict[str, Any]], *, max_entries: int
-) -> dict[str, int]:
-    """Preflight every target, record ownership, then atomically replace only owned bytes.
+) -> dict[str, Any]:
+    """Preflight the whole batch, retain displaced inodes, then publish new names exclusively.
 
     A pending manifest permits an interrupted write to resume from either recorded hash.
     Files absent from the current batch are retained; no output is deleted.
     """
     root = authorize_destination(destination)
-    _plan(root, planned, max_entries)  # ordinary refusal does not create any output
+    _previous, _owners, initial, _count = _plan(root, planned, max_entries)
+    _reserve_recovery(
+        root,
+        [
+            root / NOTES_FOLDER / name
+            for name in planned
+            if initial[name] is not None and initial[name] != planned[name]["sha256"]
+        ],
+    )  # ordinary refusal does not create any output
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_path = root / LOCK_NAME
     _no_symlinks(lock_path)
@@ -237,17 +399,37 @@ def write_owned_notes(
         }
         final_bytes = _bytes(complete)
         changed = [name for name in planned if observed[name] != planned[name]["sha256"]]
+        retained = _reserve_recovery(
+            root, [root / NOTES_FOLDER / name for name in changed if observed[name] is not None]
+        )
+        captured = []
         if changed:
             pending = {"schema": MANIFEST_SCHEMA, "state": "writing", "files": owners}
             _atomic_write(root / MANIFEST_NAME, _bytes(pending))
             folder = root / NOTES_FOLDER
             folder.mkdir(parents=True, exist_ok=True, mode=0o700)
             for name in changed:
-                if _digest(folder / name) != observed[name]:
+                previous_digest = observed[name]
+                if _digest(folder / name) != previous_digest:
                     raise ValueError(f"{name} changed during export; refusing overwrite")
-                _atomic_write(
-                    folder / name, planned[name]["data"], exclusive=observed[name] is None
-                )
+                if previous_digest is None:
+                    _atomic_write(folder / name, planned[name]["data"], exclusive=True)
+                else:
+                    captured.append(
+                        _update_owned(root, folder / name, planned[name], previous_digest)
+                    )
         if previous != complete or changed or not (root / MANIFEST_NAME).exists():
             _atomic_write(root / MANIFEST_NAME, final_bytes)
-        return {"written": len(changed), "unchanged": len(planned) - len(changed), "entries": count}
+        retained = _recovery_inventory(root) if captured else retained
+        return {
+            "written": len(changed),
+            "unchanged": len(planned) - len(changed),
+            "entries": count,
+            "recovery": {
+                "directory": RECOVERY_FOLDER,
+                "created": captured,
+                **retained,
+                "slot_limit": RECOVERY_SLOTS,
+                "byte_limit": RECOVERY_BYTES,
+            },
+        }

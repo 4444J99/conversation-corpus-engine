@@ -456,6 +456,11 @@ def write_notes(notes: list[Note], destination: Path) -> dict[str, Any]:
         warnings.append(
             f"{result['entries']} retained and incoming entries in one folder is over {FOLDER_WARN}"
         )
+    if result["recovery"]["retained"]:
+        warnings.append(
+            f"{result['recovery']['retained']} recovery slots retained in "
+            f"{result['recovery']['directory']}; inspect receipts before any manual recovery cleanup"
+        )
     return {
         "schema": NOTES_SCHEMA,
         "format": "obsidian-md",
@@ -477,6 +482,7 @@ def write_notes(notes: list[Note], destination: Path) -> dict[str, Any]:
         "written": result["written"],
         "unchanged": result["unchanged"],
         "folder_entries": result["entries"],
+        "recovery": result["recovery"],
         "warnings": warnings,
     }
 

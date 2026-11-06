@@ -354,14 +354,42 @@ text itself.
 **Re-running.** Output is deterministic: the same envelope gives the same bytes, and a second run
 rewrites nothing (the report shows `written: 0`). The `cce-zettel-notes-manifest.json` receipt
 owns each filename, idea ID and exact output hash. A changed idea updates only its owned note
-and the receipt. An existing file without that ownership record is never adopted, even if its
+and the receipt, and retains the displaced inode in the recovery surface described below.
+An existing file without that ownership record is never adopted, even if its
 ID or bytes match, and a manually edited owned file is preserved with an explicit refusal.
-Renaming an existing idea also refuses. Notes omitted from a later envelope are retained;
+Renaming an existing idea also refuses. Retained manifest names remain reserved even when
+their file is absent, so a deleted `Test.md` cannot acquire a conflicting `test.md` identity.
+Notes omitted from a later envelope are retained;
 no output is deleted. The manifest records pending old/new hashes before writes, so an
 interrupted run can resume without losing ownership or guessing which files it created.
 Concurrent writers are refused using a per-destination lock. The flat `notes/zettel` folder
 warns above 200 entries and refuses above 1,000, counting retained entries and incoming files
 together, with updates to an existing file counted once.
+
+**Concurrent edits and recovery.** Before an owned update, the current file is moved into an
+exclusively created private slot under `.cce-zettel-recovery/` at the output root. Its
+`previous.bin` payload stays outside `notes/zettel` and cannot be indexed as a second Markdown
+note. A `receipt.json` records the original filename and identity, the previously expected and
+proposed hashes, and the hash observed after capture. That last hash is an observation, not an
+immutable promise: an editor with an already-open descriptor may later change the retained
+inode. The exporter verifies the captured bytes before publishing the new note exclusively.
+It never deletes the captured inode after success, so those later editor writes remain reachable.
+
+On a capture or publication failure, the exporter reattaches the retained inode only if the
+original name is still free. If an editor has created a replacement there, both files are kept
+and the operation refuses with the recovery path. A hard process stop can leave the prior file
+only in its recovery slot; its receipt and the pending ownership manifest remain available, and
+a rerun can complete the requested notes. Inspect recovery receipts for an interrupted note
+omitted from the next batch.
+
+Recovery is limited to 1,000 retained slots and 64 MiB of observed payload/receipt bytes. The
+whole batch reserves existing file sizes plus a 4-KiB receipt allowance per update before any
+mutation. Further updates refuse at the cap; recovery slots are never automatically pruned.
+External writes through old descriptors can increase retained bytes after that observation;
+the next operation detects the observed excess and preserves the data. The JSON `recovery`
+report lists new payload paths, retained counts, observed bytes and limits, and warnings point
+to retained slots. The actual recovery folder is checked for Git visibility and symlinks before
+source reads, just like the actual note folder.
 
 This produces source-bound reading notes at the caller's explicit destination. It does not
 select a canonical wiki home, install a native adapter, deploy the Domus schema, or establish
