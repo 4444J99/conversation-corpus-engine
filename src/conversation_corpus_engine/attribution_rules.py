@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import itertools
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -412,6 +413,211 @@ def rule_typed_prefix(context: MessageContext) -> list[Claim]:
     return [(0, limit, f"typed_chars={limit}/{len(context.text)}")]
 
 
+def _lines(text: str) -> list[tuple[int, int, str]]:
+    """(start, end, content) of every line; `end` excludes the line break."""
+    lines: list[tuple[int, int, str]] = []
+    position = 0
+    for content in text.split("\n"):
+        end = position + len(content)
+        lines.append((position, end, content))
+        position = end + 1
+    return lines
+
+
+def _paragraphs(lines: list[tuple[int, int, str]]) -> list[Range]:
+    """Maximal runs of lines that hold a non-whitespace character."""
+    result: list[Range] = []
+    first = None
+    last = 0
+    for start, end, content in lines:
+        if content.strip():
+            if first is None:
+                first = start
+            last = end
+        elif first is not None:
+            result.append((first, last))
+            first = None
+    if first is not None:
+        result.append((first, last))
+    return result
+
+
+# --- c: quotes -------------------------------------------------------------------------------
+
+# A passage inside quotation marks is only treated as pasted when it is long enough to be one.
+MIN_QUOTED_CHARS = 40
+PASTE_TAGS = frozenset({"pasted_content", "pasted-content", "paste"})
+_QUOTE_LINE = re.compile(r"^ {0,3}>")
+_MARKED_QUOTES = tuple(
+    re.compile(f"{opening}([^{opening}{closing}]{{{MIN_QUOTED_CHARS},}}){closing}")
+    for opening, closing in (("“", "”"), ("«", "»"), ("„", "“"))
+)
+_BLANK_LINE = re.compile(r"\n[ \t]*\n")
+
+
+def rule_quote(context: MessageContext) -> list[Claim]:
+    """Markdown blockquote lines, long passages inside matching quotation marks and pasted-content
+    wrappers are text a turn quotes from elsewhere: third party, not the owner's own words."""
+    text = context.text
+    lines = _lines(text)
+    claims: list[Claim] = []
+    first: int | None = None
+    for index, (_, _, content) in enumerate([*lines, (0, 0, "")]):
+        if index < len(lines) and _QUOTE_LINE.match(content):
+            first = index if first is None else first
+        elif first is not None:
+            claims.append((lines[first][0], lines[index - 1][1], "blockquote"))
+            first = None
+    for pattern in _MARKED_QUOTES:
+        claims.extend(
+            (match.start(), match.end(), "quotation-marks")
+            for match in pattern.finditer(text)
+            if not _BLANK_LINE.search(match.group(1))
+        )
+    for start, end in _paragraphs(lines):
+        marks = [start + offset for offset, char in enumerate(text[start:end]) if char == '"']
+        if len(marks) % 2:
+            continue
+        claims.extend(
+            (opening, closing + 1, "quotation-marks")
+            for opening, closing in zip(marks[0::2], marks[1::2], strict=True)
+            if closing - opening - 1 >= MIN_QUOTED_CHARS
+        )
+    claims.extend(_tag_blocks(text, lambda name: name.lower() in PASTE_TAGS))
+    return claims
+
+
+# --- d: code ---------------------------------------------------------------------------------
+
+_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+
+
+def _fenced_blocks(lines: list[tuple[int, int, str]]) -> list[Claim]:
+    claims: list[Claim] = []
+    index = 0
+    while index < len(lines):
+        start, _, content = lines[index]
+        opened = _FENCE_OPEN.match(content)
+        if not opened or (opened.group(1)[0] == "`" and "`" in opened.group(2)):
+            index += 1
+            continue
+        marker = opened.group(1)
+        closer = re.compile(rf"^ {{0,3}}{re.escape(marker[0])}{{{len(marker)},}}[ \t]*$")
+        close = index + 1
+        while close < len(lines) and not closer.match(lines[close][2]):
+            close += 1
+        claims.append((start, lines[min(close, len(lines) - 1)][1], "fenced"))
+        index = close + 1
+    return claims
+
+
+def _is_indented(content: str) -> bool:
+    return bool(content.strip()) and content.startswith(("\t", "    "))
+
+
+def _indented_blocks(lines: list[tuple[int, int, str]]) -> list[Claim]:
+    """Runs of at least two indented lines that start after a blank line (or the text start)."""
+    claims: list[Claim] = []
+    index = 0
+    while index < len(lines):
+        if not _is_indented(lines[index][2]) or (index and lines[index - 1][2].strip()):
+            index += 1
+            continue
+        probe, last, count = index, index, 0
+        while probe < len(lines):
+            content = lines[probe][2]
+            if _is_indented(content):
+                last, count = probe, count + 1
+            elif content.strip():
+                break
+            probe += 1
+        if count >= 2:
+            claims.append((lines[index][0], lines[last][1], "indented"))
+        index = max(probe, index + 1)
+    return claims
+
+
+def rule_code(context: MessageContext) -> list[Claim]:
+    """Fenced code blocks and indented code are pasted content, not owner prose. The class is
+    third party because who wrote the code cannot be told from the text."""
+    lines = _lines(context.text)
+    return [*_fenced_blocks(lines), *_indented_blocks(lines)]
+
+
+# --- e: logs and traces ----------------------------------------------------------------------
+
+# A line that is a log line on its own (a timestamp with seconds).
+_STRONG_LOG = (
+    re.compile(r"^\s*[\[(]?\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"),
+    re.compile(r"^\s*\[\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\]"),
+    re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2}\s\d{2}:\d{2}:\d{2}\s"),
+)
+# A line shaped like tool output, which counts only inside a run of three or more such lines.
+_WEAK_LOG = (
+    re.compile(r"^\s*\[?(?:TRACE|DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)\]?(?:[:\s|-]|$)"),
+    re.compile(r"^[\w./\\-]*\w\.\w{1,6}:\d+(?::\d+)?:\s?"),
+    re.compile(r"^\$ \S"),
+    re.compile(r"^(?:@@ -\d|diff --git |index [0-9a-f]{7,}\.\.[0-9a-f]{7,}|\+\+\+ \S|--- \S)"),
+    re.compile(r"^[d\-l][rwx\-]{9}[@+.]?\s+\d+\s+\S"),
+    re.compile(r"^(?:npm|yarn) (?:ERR!|WARN|error|warn)"),
+    re.compile(r"^\s+at\s+\S.*(?:\([^()]*\)|:\d+(?::\d+)?)\s*$"),
+    re.compile(
+        r"^(?:Exception in thread\b|Caused by:|(?:[\w$]+\.)*[\w$]*(?:Exception|Error)\b[:\s])"
+    ),
+)
+_TRACE_HEADER = re.compile(r"^\s*Traceback \(most recent call last\):\s*$")
+_TRACE_LAST = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Interrupt|Exit|Warning)\b(?::.*)?$")
+MIN_WEAK_RUN = 3
+
+
+def _traceback_blocks(lines: list[tuple[int, int, str]]) -> list[Claim]:
+    claims: list[Claim] = []
+    for index, (start, _, content) in enumerate(lines):
+        if not _TRACE_HEADER.match(content):
+            continue
+        stop = index + 1
+        while stop < len(lines) and lines[stop][2].startswith((" ", "\t")):
+            stop += 1
+        if stop < len(lines) and _TRACE_LAST.match(lines[stop][2]):
+            stop += 1
+        claims.append((start, lines[stop - 1][1], "traceback"))
+    return claims
+
+
+def rule_log_trace(context: MessageContext) -> list[Claim]:
+    """Timestamped log lines, Python tracebacks and runs of three or more tool-output shaped
+    lines (log levels, grep hits, diffs, shell prompts, stack frames) are machine output."""
+    lines = _lines(context.text)
+    claims = _traceback_blocks(lines)
+    kinds: list[str] = []
+    for _, _, content in lines:
+        if any(pattern.match(content) for pattern in _STRONG_LOG):
+            kinds.append("strong")
+        elif any(pattern.match(content) for pattern in _WEAK_LOG):
+            kinds.append("weak")
+        else:
+            kinds.append("")
+    index = 0
+    while index < len(lines):
+        if not kinds[index]:
+            index += 1
+            continue
+        stop = index
+        while stop < len(lines) and kinds[stop]:
+            stop += 1
+        if stop - index >= MIN_WEAK_RUN:
+            claims.append((lines[index][0], lines[stop - 1][1], "tool-output-run"))
+        else:
+            strong = [i for i in range(index, stop) if kinds[i] == "strong"]
+            for _, group in itertools.groupby(
+                enumerate(strong), key=lambda pair: pair[1] - pair[0]
+            ):
+                members = [item[1] for item in group]
+                claims.append((lines[members[0]][0], lines[members[-1]][1], "timestamped-log"))
+        index = stop
+    return claims
+
+
 # --- the ordered rule table ------------------------------------------------------------------
 
 
@@ -442,6 +648,19 @@ RULES: tuple[Rule, ...] = (
         AGENT,
         "text after the characters the person typed",
         rule_typed_remainder,
+    ),
+    Rule("code", THIRD_PARTY, "fenced or indented code pasted into the turn", rule_code),
+    Rule(
+        "quote",
+        THIRD_PARTY,
+        "blockquotes, long quoted passages and pasted-content wrappers",
+        rule_quote,
+    ),
+    Rule(
+        "log_trace",
+        AGENT,
+        "timestamped log lines, stack traces and tool-output shaped runs",
+        rule_log_trace,
     ),
     Rule("typed_prefix", OWNER, "the characters the person typed", rule_typed_prefix),
 )
@@ -501,6 +720,18 @@ def _subtract(free: list[Range], pieces: list[Claim]) -> list[Range]:
     return result
 
 
+def _trimmed(text: str, pieces: list[Claim]) -> list[Claim]:
+    """An owner span never starts or ends with whitespace, and is never only whitespace."""
+    result: list[Claim] = []
+    for start, end, detail in pieces:
+        segment = text[start:end]
+        lead = len(segment) - len(segment.lstrip())
+        trail = len(segment) - len(segment.rstrip())
+        if lead + trail < len(segment):
+            result.append((start + lead, end - trail, detail))
+    return result
+
+
 def partition_problems(
     text: str, spans: Sequence[AttributedSpan], digest: str | None = None
 ) -> dict[str, int]:
@@ -556,7 +787,7 @@ def attribute_message(
     for rule in RULES:
         pieces = _intersect(free, _normalize(rule.claims(context), length))
         if rule.author == OWNER:
-            pieces = [piece for piece in pieces if text[piece[0] : piece[1]].strip()]
+            pieces = _trimmed(text, pieces)
         if not pieces:
             continue
         free = _subtract(free, pieces)

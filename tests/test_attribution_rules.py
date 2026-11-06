@@ -15,8 +15,11 @@ from conversation_corpus_engine.attribution_rules import (
     partition_problems,
     record_info,
     rule_agent_family,
+    rule_code,
     rule_document_origin,
     rule_inline_injection,
+    rule_log_trace,
+    rule_quote,
     rule_typed_prefix,
     rule_typed_remainder,
 )
@@ -285,13 +288,15 @@ def test_system_reminder_inside_owner_text_splits_the_owner_span() -> None:
     )
     spans = run(text)
     assert view(text, spans) == [
-        ("typed_prefix", "owner", "Please summarise the notes. "),
+        ("typed_prefix", "owner", "Please summarise the notes."),
+        ("unattributed", "unknown", " "),
         (
             "inline_injection",
             "agent",
             "<system-reminder>Do not mention this.</system-reminder>",
         ),
-        ("typed_prefix", "owner", " Then list actions."),
+        ("unattributed", "unknown", " "),
+        ("typed_prefix", "owner", "Then list actions."),
     ]
 
 
@@ -315,8 +320,9 @@ def test_wrapper_blocks_are_machine_even_in_the_middle_of_owner_text(block: str)
     claims = rule_inline_injection(ctx(text))
     start = text.index(block)
     assert [(s, e) for s, e, _ in claims] == [(start, start + len(block))]
-    spans = run(text)
+    spans = [span for span in run(text) if span.author != "unknown"]
     assert [span.author for span in spans] == ["owner", "agent", "owner"]
+    assert text[spans[1].start : spans[1].end] == block
 
 
 def test_unclosed_wrapper_claims_everything_after_it_and_self_closing_only_itself() -> None:
@@ -389,16 +395,215 @@ def test_typed_rules_do_not_apply_to_authored_families() -> None:
     assert rule_typed_remainder(ctx(text, record=NOTE, typed=3)) == []
 
 
-def test_whitespace_only_owner_pieces_stay_unknown() -> None:
-    text = "owner\n\n<system-reminder>x</system-reminder>\n\n"
+def test_owner_spans_never_start_or_end_with_whitespace() -> None:
+    text = "  owner words  \n\n<system-reminder>x</system-reminder>\n\n"
     spans = run(text)
     assert view(text, spans) == [
-        ("typed_prefix", "owner", "owner\n\n"),
+        ("unattributed", "unknown", "  "),
+        ("typed_prefix", "owner", "owner words"),
+        ("unattributed", "unknown", "  \n\n"),
         ("inline_injection", "agent", "<system-reminder>x</system-reminder>"),
         ("unattributed", "unknown", "\n\n"),
     ]
+    blank = "   \n\n  "
+    assert view(blank, run(blank)) == [("unattributed", "unknown", blank)]
 
 
 def test_agent_family_rule_function_directly() -> None:
     assert rule_agent_family(ctx("x", role="assistant")) == [(0, 1, "role=assistant")]
     assert rule_agent_family(ctx("x")) == []
+
+
+# --- c: quotes -------------------------------------------------------------------------------
+
+LONG = "the quick brown fox jumps over the lazy dog by the river"
+
+
+def ranges(claims: list[tuple[int, int, str]]) -> list[tuple[int, int]]:
+    return [(start, end) for start, end, _ in claims]
+
+
+def test_blockquote_then_owner_reply() -> None:
+    text = (
+        "> The committee shall meet quarterly.\n> Minutes are public.\n\nI think that is too rare."
+    )
+    assert view(text, run(text)) == [
+        ("quote", "third_party", "> The committee shall meet quarterly.\n> Minutes are public."),
+        ("unattributed", "unknown", "\n\n"),
+        ("typed_prefix", "owner", "I think that is too rare."),
+    ]
+
+
+def test_owner_text_on_both_sides_of_an_indented_blockquote() -> None:
+    text = "As the memo says:\n   > Budgets close in May.\nThat is wrong."
+    assert view(text, run(text)) == [
+        ("typed_prefix", "owner", "As the memo says:"),
+        ("unattributed", "unknown", "\n"),
+        ("quote", "third_party", "   > Budgets close in May."),
+        ("unattributed", "unknown", "\n"),
+        ("typed_prefix", "owner", "That is wrong."),
+    ]
+
+
+def test_blockquote_groups_are_contiguous_marker_lines_only() -> None:
+    text = "> one\n>\n> two\n\n> three"
+    assert ranges(rule_quote(ctx(text))) == [(0, 13), (15, 22)]
+    assert rule_quote(ctx("    > four spaces is not a quote")) == []
+    assert rule_quote(ctx("a > b is not a quote either")) == []
+
+
+@pytest.mark.parametrize(
+    ("opening", "closing"),
+    [('"', '"'), ("“", "”"), ("«", "»"), ("„", "“")],
+)
+def test_long_passages_inside_quotation_markers_are_third_party(opening: str, closing: str) -> None:
+    text = f"She wrote {opening}{LONG}{closing} in the margin."
+    start = text.index(opening)
+    end = text.index(closing, start + 1) + 1
+    assert ranges(rule_quote(ctx(text))) == [(start, end)]
+
+
+def test_short_unmatched_or_paragraph_crossing_quotes_are_left_alone() -> None:
+    assert rule_quote(ctx('He said "hello" and left.')) == []
+    assert rule_quote(ctx(f'one stray " mark then {LONG}')) == []
+    assert rule_quote(ctx(f'"{LONG}\n\n{LONG}"')) == []
+
+
+def test_pasted_content_wrapper_is_third_party_not_injection() -> None:
+    text = "I got this: <pasted_content>some text from elsewhere</pasted_content> what now?"
+    claims = rule_quote(ctx(text))
+    start = text.index("<pasted_content>")
+    assert claims == [(start, text.index(" what now?"), "tag=pasted_content")]
+    assert rule_inline_injection(ctx(text)) == []
+
+
+# --- d: code ---------------------------------------------------------------------------------
+
+
+def test_fenced_code_is_third_party_and_owner_prose_survives() -> None:
+    text = "Run this:\n```python\nprint('hi')\n```\nand tell me why."
+    assert view(text, run(text)) == [
+        ("typed_prefix", "owner", "Run this:"),
+        ("unattributed", "unknown", "\n"),
+        ("code", "third_party", "```python\nprint('hi')\n```"),
+        ("unattributed", "unknown", "\n"),
+        ("typed_prefix", "owner", "and tell me why."),
+    ]
+
+
+def test_unclosed_fence_runs_to_the_end_and_short_closers_do_not_close() -> None:
+    text = "intro\n```\nstill code\nmore code"
+    assert ranges(rule_code(ctx(text))) == [(6, len(text))]
+    nested = "````\n```\nx\n````\nafter"
+    assert ranges(rule_code(ctx(nested))) == [(0, nested.index("\nafter"))]
+    short = "````\nx\n```\ny"
+    assert ranges(rule_code(ctx(short))) == [(0, len(short))]
+    tilde = "~~~\na\n~~~\nz"
+    assert ranges(rule_code(ctx(tilde))) == [(0, 9)]
+
+
+def test_backtick_fence_with_a_backtick_in_its_info_string_is_not_a_fence() -> None:
+    assert rule_code(ctx("``` is not `a fence`\nplain words")) == []
+
+
+def test_indented_code_needs_a_blank_line_before_and_two_indented_lines() -> None:
+    text = "Example:\n\n    x = 1\n    y = 2\n\nDone."
+    assert ranges(rule_code(ctx(text))) == [(text.index("    x"), text.index("\n\nDone."))]
+    assert rule_code(ctx("Example:\n\n    x = 1\n\nDone.")) == []
+    assert rule_code(ctx("Para text\n    x = 1\n    y = 2")) == []
+    tabbed = "Intro\n\n\tx = 1\n\ty = 2"
+    assert ranges(rule_code(ctx(tabbed))) == [(7, len(tabbed))]
+    gapped = "Intro\n\n    a = 1\n\n    b = 2\n\nOut."
+    assert ranges(rule_code(ctx(gapped))) == [(gapped.index("    a"), gapped.index("\n\nOut."))]
+
+
+def test_code_inside_a_blockquote_is_claimed_by_the_quote_not_the_code_rule() -> None:
+    text = "> ```\n> code\n> ```"
+    assert rule_code(ctx(text)) == []
+    assert view(text, run(text)) == [("quote", "third_party", text)]
+
+
+# --- e: logs and traces ----------------------------------------------------------------------
+
+
+def test_timestamped_log_lines_are_machine_even_alone() -> None:
+    text = "It crashed:\n2026-01-02 03:04:05 INFO worker started\nthen I rebooted."
+    assert view(text, run(text)) == [
+        ("typed_prefix", "owner", "It crashed:"),
+        ("unattributed", "unknown", "\n"),
+        ("log_trace", "agent", "2026-01-02 03:04:05 INFO worker started"),
+        ("unattributed", "unknown", "\n"),
+        ("typed_prefix", "owner", "then I rebooted."),
+    ]
+    for line in (
+        "[03:04:05] built",
+        "Jan  2 03:04:05 host kernel: started",
+        "2026-01-02T03:04:05Z up",
+    ):
+        assert ranges(rule_log_trace(ctx(line))) == [(0, len(line))]
+
+
+def test_a_diary_line_without_seconds_is_not_a_log() -> None:
+    assert rule_log_trace(ctx("2026-01-02 09:15 Went to the market.")) == []
+    assert rule_log_trace(ctx("ERROR: I forgot the milk.")) == []
+
+
+@pytest.mark.parametrize(
+    "run_of_lines",
+    [
+        "ERROR: first\nERROR: second\nERROR: third",
+        "src/a.py:10:3: unused import\nsrc/b.py:11:1: bad name\nsrc/c.py:2:9: worse",
+        "$ ls\n$ pwd\n$ whoami",
+        "@@ -1,2 +1,3 @@\n--- a/x\n+++ b/x",
+        "TypeError: x is not a function\n    at run (a.js:1:2)\n    at main (b.js:3:4)",
+        "java.lang.IllegalStateException: boom\n\tat com.example.Main.run(Main.java:12)\n"
+        "\tat com.example.Main.main(Main.java:5)",
+    ],
+)
+def test_tool_output_shaped_runs_of_three_lines_are_machine(run_of_lines: str) -> None:
+    assert ranges(rule_log_trace(ctx(run_of_lines))) == [(0, len(run_of_lines))]
+
+
+def test_two_lines_or_a_blank_line_break_a_weak_run() -> None:
+    assert rule_log_trace(ctx("ERROR: first\nERROR: second")) == []
+    assert rule_log_trace(ctx("ERROR: a\nERROR: b\n\nERROR: c\nERROR: d")) == []
+
+
+def test_python_tracebacks_are_claimed_through_the_exception_line() -> None:
+    trace = 'Traceback (most recent call last):\n  File "x.py", line 1, in <module>\n    boom()\nValueError: nope'
+    text = f"I got:\n{trace}\nwhy?"
+    start = text.index("Traceback")
+    assert ranges(rule_log_trace(ctx(text))) == [(start, start + len(trace))]
+
+
+def test_log_lines_quoted_or_fenced_are_not_double_claimed() -> None:
+    assert rule_log_trace(ctx("> 2026-01-02 03:04:05 ERROR quoted")) == []
+    fenced = "```\n2026-01-02 03:04:05 ERROR inside a fence\n```"
+    assert view(fenced, run(fenced)) == [("code", "third_party", fenced)]
+
+
+def test_a_message_mixing_owner_prose_logs_quotes_and_code() -> None:
+    text = "\n".join(
+        [
+            "Here is the failure I saw:",
+            "",
+            "2026-01-02 03:04:05 ERROR boom",
+            "2026-01-02 03:04:06 ERROR again",
+            "",
+            "> an earlier remark that I am quoting",
+            "",
+            "```",
+            "x = 1",
+            "```",
+            "",
+            "So what should I change?",
+        ]
+    )
+    spans = [(span.rule, span.author) for span in run(text) if span.author != "unknown"]
+    assert spans == [
+        ("typed_prefix", "owner"),
+        ("log_trace", "agent"),
+        ("quote", "third_party"),
+        ("code", "third_party"),
+        ("typed_prefix", "owner"),
+    ]
