@@ -182,7 +182,7 @@ def parse(path: Path) -> tuple[dict[str, Any], str]:
         if line.startswith("  - "):
             meta[key].append(json.loads(line[4:]))
         else:
-            assert re.fullmatch(r"[a-z]+:( .*)?", line), f"nested or odd frontmatter: {line!r}"
+            assert re.fullmatch(r"[a-z_]+:( .*)?", line), f"nested or odd frontmatter: {line!r}"
             key, _, rest = line.partition(":")
             meta[key] = [] if rest.strip() in ("", "[]") else json.loads(rest)
     return meta, "\n".join(lines[close + 1 :])

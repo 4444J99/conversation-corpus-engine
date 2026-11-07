@@ -295,7 +295,8 @@ What a note holds, in plain words:
 
 - **Frontmatter** in the Wiki Standard v1 order, flat, no nested properties: `id`, `type: zettel`,
   `title`, `summary` (at most 200 characters), `created`, `updated`, `author`, `authorship`,
-  `status`, `sources`, `links`, `aliases`, `tags`.
+  `authorship_basis`, `authorship_rules`, `authorship_note`, `status`, `sources`, `links`,
+  `aliases`, `tags`.
 - **`sources`** holds one tuple per quote,
   `cce:library-<evidence-sha256>/<uid>@<version>#m<message>:<start>-<end> sha256:<message-digest>`
   (`#a` for an alternate message). The library ID is the existing `Library.evidence_fingerprint()`:
@@ -322,19 +323,70 @@ What a note holds, in plain words:
   KiB, a warning above 16 KiB, a refusal above 64 KiB), plus line, long-line, base64 and
   quote-count checks. Warnings are listed in the printed report. The idea text is never clipped.
 
-**Who wrote it.** `authorship` describes the title and idea text using the supplied attribution;
-source quotation attribution is recorded separately and is never inherited from the note's label.
-`status` is always `draft`; this command never marks an idea `stable`.
+**Who wrote it.** Nobody types an owner id or a reviewer name to be credited: the system works out
+who wrote the quoted words, and the typed claims in the envelope (owner ids, reviewer strings,
+eligibility flags, owner annotations) are never believed. `authorship` describes the title and
+idea text. `status` is always `draft`; this command never marks an idea `stable`.
+
+For every quote the exporter re-runs the deterministic attribution rules (see
+[Deterministic authorship rules](#deterministic-authorship-rules)) on the stored message, with its
+real role, channel, typed-character count, record family and wrappers, the library-wide repeat
+census and the earlier assistant turns of the same conversation, exactly as `cce library
+attribute` does. It reads the author class of every visible character of the quoted range. A
+quote is `owner` only when every visible character is the owner's. Otherwise it takes the
+weakest class present (`third_party` or `agent`, then `unknown`, then `owner`). A quote of a
+revision that is no longer the record's current one, whose message digest no longer names the
+scanned text, or whose derivation misses its deadline, is `unknown`.
+
+The idea text and title are credited by their declared origin, in the optional envelope field
+`text_origin`:
+
+| `text_origin` | Result |
+|---|---|
+| `quoted` | The code checks that the idea text is exactly the quotes in order and the title is a piece of them. If so, the weakest derived quote class decides: `human` when every quote is the owner's, `agent` when the weakest is agent, `generated` otherwise (third party or unknown). If the text is not made of the quotes, `generated`. This is the only way to `human`. |
+| `agent`, or absent with every title and text span asserted as agent-written | `agent`, whatever the quotes are. The note's `author` is the fixed label `agent`, never a supplied name or account ID. `agent` without asserted agent attribution of the title and text is `generated`. |
+| `owner`, or any typed owner assertion | Never believed: `generated`, `author: unknown`, basis `unverified`. |
 
 | `authorship` | When |
 |---|---|
-| `agent` | Every span of the title and idea text is asserted as agent-written. The note's `author` is the fixed label `agent`, never a supplied name or account ID. |
-| `human` | Never emitted by this command. A typed reviewer, author ID, evidence string or eligibility flag does not authenticate owner review. |
-| `generated` | Other validated title/idea text, including owner claims, mixed authorship, third-party text, disputed or retracted claims, and attribution gaps. The note's `author` is `unknown`. |
+| `human` | `text_origin: quoted`, the text is made of the quotes, and every visible quoted character is derived as the owner's. `author` is the fixed label `owner`. |
+| `agent` | Agent origin (above), or a quoted text whose weakest quote is agent. |
+| `generated` | Everything else: third-party or unknown quotes, owner claims, text that is not made of its quotes, stale revisions, missed deadlines, attribution gaps. `author` is `unknown`. |
 
-Unreviewed text is never labelled as owner-written. Actual owner review and the precision gate
-remain separate requirements; this exporter does not yet validate evidence that could authorize
-human credit. Supplied assertions remain visible in the evidence section without being promoted.
+Three flat frontmatter keys say how the label was reached. `authorship_basis` is `derived` (from the
+stored messages by the rules), `declared` (an asserted agent draft in the envelope) or `unverified`
+(nothing established who wrote the text). `authorship_rules` is the rules version in force, read
+from the engine (for example `cce.attribution-rules@9`), never copied from the envelope.
+`authorship_note` states that the credit is **rules-derived, not owner-reviewed**: the engine's
+precision gate has not been met, so its output is not profile-eligible, and this exporter does not
+read the owner's review ledger. A reader who needs owner-reviewed authorship must use that
+ledger; this note is a derived label, not an owner's sign-off. The reviewer string, when given, is
+printed as provenance only and grants or blocks nothing.
+
+Limits, stated plainly:
+
+- An idea the owner wrote that is not made of quotes cannot be verified by the exporter, so it
+  degrades to `generated`. Quote the owner's own words to have them credited.
+- The derivation runs live on every export, per quoted conversation: each quoted conversation is
+  read once by its uid and attributed with the per-message rules (agent family, document origin,
+  injected wrappers, typed remainder, code, quote, log trace, pasted block, third-party origin,
+  typed prefix, note owner) plus the assistant-echo check over that conversation's own earlier
+  assistant turns. The cost is proportional to the quoted conversations, not to the library.
+  Bounds: one wall-clock `deadline_seconds` for the whole export (default 900), a
+  per-conversation cap of 2 MiB of message text and 50,000 messages, and a per-quote message cap of
+  1 MiB; a quote over any budget is `unknown` with a reason, and a quote the deadline cut off is
+  `unknown`. The Python API `build_notes`/`export_zettel_notes` takes `deadline_seconds`.
+  The library keeps no stored annotations to read back instead.
+- The library-wide repeat census (the boilerplate rule that re-labels long verbatim-repeated
+  templates as third party) is **not** run by default; `authorship_note` says "per-conversation
+  derivation; library-wide repeat census not used". It is an explicit opt-in, API only
+  (`repeat_census=True` on `build_notes`/`export_zettel_notes`/`derive_quote_authors`; there is no
+  command-line flag), and costs one full pass over the whole library (the same pass as
+  `cce library attribute`, which can run for many minutes on a large library; the conversation
+  budgets do not apply to it). The note then says "library-wide repeat census used".
+- The rules are heuristics with a published precision gate that is not met; a derived `owner` can
+  be wrong in the cases the rules section lists.
+
 An agent-written idea can quote an unattributed source; its quote stays explicitly `unknown`.
 Wiki Standard v1 has no `unreviewed` authorship enum, so the exporter uses `generated`/`unknown`
 with draft status for titles or bodies it cannot credit to an agent. Optional `title_attribution`
