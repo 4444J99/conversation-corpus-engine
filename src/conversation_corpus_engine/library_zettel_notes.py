@@ -44,6 +44,7 @@ from .library_zettel_files import (
     folded,
     write_owned_notes,
 )
+from .origin_hints import OriginHints
 
 NOTES_SCHEMA = "cce.zettel-notes.v1"
 QUOTE_LIMIT = 400
@@ -567,6 +568,7 @@ def build_notes(
     *,
     deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
     repeat_census: bool = False,
+    origin_hints: OriginHints | None = None,
 ) -> list[Note]:
     """Validate the whole envelope against the library, then render every note or none.
 
@@ -577,6 +579,8 @@ def build_notes(
     whole library.
     Raises `ValueError` listing every refusal; nothing is returned partially.
     """
+    if origin_hints is not None:
+        origin_hints.refuse_findings()
     if isinstance(deadline_seconds, bool) or not (
         isinstance(deadline_seconds, int | float) and deadline_seconds > 0
     ):
@@ -635,6 +639,7 @@ def build_notes(
                 [source["source"] for item, _, _ in prepared for source in item["sources"]],
                 deadline_seconds=deadline_seconds,
                 repeat_census=repeat_census,
+                origin_hints=origin_hints,
             )
         )
         for item, identity, title in prepared:
@@ -712,6 +717,7 @@ def export_zettel_notes(
     store_root: Path,
     deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
     repeat_census: bool = False,
+    origin_hints: OriginHints | None = None,
 ) -> dict[str, Any]:
     """Validate, render and write the notes; the destination may not overlap the library store.
 
@@ -722,6 +728,10 @@ def export_zettel_notes(
     if target == store or store in target.parents or target in store.parents:
         raise ValueError("the notes directory must be outside the library store")
     notes = build_notes(
-        library, zettels, deadline_seconds=deadline_seconds, repeat_census=repeat_census
+        library,
+        zettels,
+        deadline_seconds=deadline_seconds,
+        repeat_census=repeat_census,
+        origin_hints=origin_hints,
     )
     return write_notes(notes, destination)
