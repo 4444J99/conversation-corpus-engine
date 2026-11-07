@@ -49,6 +49,7 @@ from .attribution_rules import (
     record_info,
 )
 from .library_store import Library
+from .origin_hints import OriginHints
 
 if TYPE_CHECKING:
     from .attribution_commands import ScannedMessage
@@ -124,6 +125,7 @@ def derive_quote_authors(
     max_conversation_chars: int = DEFAULT_MAX_CONVERSATION_CHARS,
     max_conversation_messages: int = DEFAULT_MAX_CONVERSATION_MESSAGES,
     max_quote_message_chars: int = DEFAULT_MAX_QUOTE_MESSAGE_CHARS,
+    origin_hints: OriginHints | None = None,
 ) -> list[QuoteAuthorship]:
     """The derived author class of each validated source reference, in order.
 
@@ -137,6 +139,8 @@ def derive_quote_authors(
     derivation did not finish inside the deadline (one for the whole call), is `unknown`: nothing
     is credited that was not derived.
     """
+    if origin_hints is not None:
+        origin_hints.refuse_findings()
     if isinstance(deadline_seconds, bool) or not (
         isinstance(deadline_seconds, int | float) and deadline_seconds > 0
     ):
@@ -165,7 +169,7 @@ def derive_quote_authors(
     if wanted:
         if repeat_census:
             spans: dict[Key, tuple[str, list[AttributedSpan]] | str] = dict(
-                _spans_of(library, set(wanted), deadline_seconds)
+                _spans_of(library, set(wanted), deadline_seconds, origin_hints)
             )
         else:
             spans = _conversation_spans(
@@ -175,6 +179,7 @@ def derive_quote_authors(
                 max_conversation_chars,
                 max_conversation_messages,
                 max_quote_message_chars,
+                origin_hints,
             )
         for key, numbers in wanted.items():
             found = spans.get(key)
@@ -223,6 +228,7 @@ def _conversation_spans(
     max_chars: int,
     max_messages: int,
     max_quote_chars: int,
+    origin_hints: OriginHints | None = None,
 ) -> dict[Key, tuple[str, list[AttributedSpan]] | str]:
     """Attribute the wanted messages from their own conversation only, one read per conversation.
 
@@ -265,7 +271,7 @@ def _conversation_spans(
                 )
                 found.update(dict.fromkeys(keys, reason))
                 continue
-            info = record_info(payload)
+            info = record_info(payload, origin_hints)
             for sequence, messages in sequences.items():
                 wanted_here = {key for key in keys if key[1] == sequence}
                 if wanted_here and isinstance(messages, list):
@@ -366,7 +372,10 @@ def _attribute_sequence(
 
 
 def _spans_of(
-    library: Library, wanted: set[Key], deadline_seconds: float
+    library: Library,
+    wanted: set[Key],
+    deadline_seconds: float,
+    origin_hints: OriginHints | None = None,
 ) -> dict[Key, tuple[str, list[AttributedSpan]]]:
     """Attribute the wanted messages exactly as `cce library attribute` would, no others.
 
@@ -425,7 +434,9 @@ def _spans_of(
             waiting = 0
 
         previous = None
-        for message in iter_messages(library, ScanStats(), limit_records=None, deadline=deadline):
+        for message in iter_messages(
+            library, ScanStats(), limit_records=None, deadline=deadline, origin_hints=origin_hints
+        ):
             if previous is not None and message.uid != previous:
                 release()
                 left.discard(previous)

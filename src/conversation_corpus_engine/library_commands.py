@@ -39,6 +39,7 @@ from .library_vault import VAULT_PROFILES
 from .library_vault_gate import describe_findings, measure_vault
 from .library_zettel_files import authorize_destination as authorize_zettel_destination
 from .library_zettel_notes import export_zettel_notes
+from .origin_hints import load_origin_hints
 from .paths import default_project_root
 from .persona_extract import extract_persona_lexicon
 
@@ -691,6 +692,11 @@ def add_library_parser(subparsers: Any) -> Any:
         "Wiki Standard v1 note per idea (obsidian-md, needs --out)",
     )
     zettels.add_argument(
+        "--origin-hints",
+        type=Path,
+        help="Git-history origin hints for obsidian-md quote authorship; only remove owner credit",
+    )
+    zettels.add_argument(
         "--out",
         type=Path,
         help="obsidian-md only: private notes directory, outside the library store and "
@@ -1035,6 +1041,12 @@ def handle_library(args: argparse.Namespace) -> int:
             # authorise where it lands before the library or the reviewed envelope is read.
             require_git_private(args.out)
         if args.action == "zettels":
+            hints = None
+            if getattr(args, "origin_hints", None) is not None:
+                if args.format != "obsidian-md":
+                    raise ValueError("--origin-hints goes only with --format obsidian-md")
+                hints = load_origin_hints(args.origin_hints.expanduser())
+                hints.refuse_findings()
             if (args.format == "obsidian-md") != (args.out is not None):
                 raise ValueError("--out goes with --format obsidian-md, and only with it")
             if args.out is not None:
@@ -1091,7 +1103,11 @@ def handle_library(args: argparse.Namespace) -> int:
                     envelope = _load_zettel_envelope(args.input)
                     if args.format == "obsidian-md":
                         result = export_zettel_notes(
-                            library, envelope.get("zettels"), args.out, store_root=store
+                            library,
+                            envelope.get("zettels"),
+                            args.out,
+                            store_root=store,
+                            origin_hints=hints,
                         )
                     else:
                         exporter = zettel_atoms if args.format == "atoms-jsonl" else export_zettels

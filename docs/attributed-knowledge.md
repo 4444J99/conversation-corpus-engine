@@ -1080,3 +1080,14 @@ rule and stratum are not a row of the sample, a span answered twice, a verdict o
 anything is written. It stamps the current UTC time unless `--reviewed-at` is given: the time is read once, at
 the command, and the engine's functions take timestamps as parameters (the ledger lock's
 30-second wait uses a monotonic timer, not a wall clock).
+
+## Git-history hints for Zettel notes
+
+`cce library zettels --format obsidian-md --origin-hints hints.jsonl` uses the
+same validated git-history hints as `library attribute`. Pass `origin_hints`
+to `build_notes`, `export_zettel_notes`, or `derive_quote_authors` for the Python
+API, including when opting into the repeated-text census. Hints affect only
+document records: agent history removes owner credit, mixed or conflicting
+history makes it unknown, and a human hint never adds owner credit. Malformed
+hints refuse the export before notes are written. The original record and
+quoted text are unchanged.
