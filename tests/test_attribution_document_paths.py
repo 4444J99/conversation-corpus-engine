@@ -43,8 +43,10 @@ def outcome(source: str | None, text: str = BODY, **kwargs) -> tuple[str, str, s
     return spans[0].rule, spans[0].author, spans[0].detail
 
 
-def test_the_rules_version_names_the_new_path_semantics() -> None:
-    assert RULES_VERSION == "cce.attribution-rules@10"
+def test_the_rules_version_names_the_current_semantics() -> None:
+    # @10 added these path conventions; @11 added git-history hints on top (see
+    # test_origin_hints.py) without changing them.
+    assert RULES_VERSION == "cce.attribution-rules@11"
 
 
 # --- agent paths: skills, intake memory, TASKS.md, AI names ------------------------------------

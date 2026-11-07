@@ -472,7 +472,7 @@ published library generation. A provider's `user` role is not proof that the own
 span: injected system text, command output and tool results sit inside user turns, pasted logs,
 quotes, tables, emails and code are not the owner's prose, an assistant's answer can be pasted
 back into a turn, and AI-written skill and instruction files are filed under documents. The
-engine (`conversation_corpus_engine.attribution_rules`, version `cce.attribution-rules@10`)
+engine (`conversation_corpus_engine.attribution_rules`, version `cce.attribution-rules@11`)
 therefore labels a span `owner` only when an owner-granting rule claims it and no other rule
 does. When a rule is ambiguous the text becomes `unknown` or a non-owner class, never owner.
 **No rule is profile-eligible until the precision gate below is met**, and every span the
@@ -497,10 +497,12 @@ annotations, the census and the sample; it does not abort the run.
 
 ### Rules version
 
-The version string (`cce.attribution-rules@10`) names the rule semantics and every artifact carries
+The version string (`cce.attribution-rules@11`) names the rule semantics and every artifact carries
 it: span ids (so a span id from another version never matches), the annotation evidence
-(`cce.attribution-rules@10:rule:<id>`), the rows of review samples and the rows of the review
-ledger. When the rules or the gate change meaning the version is bumped (`@10` extends the
+(`cce.attribution-rules@11:rule:<id>`), the rows of review samples and the rows of the review
+ledger. When the rules or the gate change meaning the version is bumped (`@11` lets git-history
+hints decide a document's origin, see [Git history hints](#git-history-hints); they only remove
+owner credit; `@10` extends the
 document path conventions, see [Document path conventions](#document-path-conventions); it only
 removes owner credit; `@9` makes the
 third-party guard depend on the stripped, case-folded provider alone, including direct rule
@@ -525,7 +527,7 @@ so no higher rule can lose a character to an owner claim.
 
 | # | Rule id | Class | Decides |
 |---|---------|-------|---------|
-| 0 | `third_party_origin` | third_party | every message of a record from a third-party provider: the fetched web pages of the `webcapture` family ([web captures](knowledge-library.md#web-captures)). The stripped, case-folded provider alone decides, including a directly constructed rule input; kind and wing cannot bypass it. It runs before every other rule, whatever the role, channel, typed count, URL or text, so nothing of a saved page is ever `owner` or `agent`. Current semantics are `cce.attribution-rules@10`; earlier review rows remain preserved and are reported as stale |
+| 0 | `third_party_origin` | third_party | every message of a record from a third-party provider: the fetched web pages of the `webcapture` family ([web captures](knowledge-library.md#web-captures)). The stripped, case-folded provider alone decides, including a directly constructed rule input; kind and wing cannot bypass it. It runs before every other rule, whatever the role, channel, typed count, URL or text, so nothing of a saved page is ever `owner` or `agent`. Current semantics are `cce.attribution-rules@11`; earlier review rows remain preserved and are reported as stale |
 | 1 | `agent_family` | agent | assistant, model, tool and system turns of every provider; user turns on a machine channel; provider metadata naming an agent; a coding CLI's subagent prompts and turns that `archive_provenance.classify_user_turn` calls harness text |
 | 2 | `document_origin` | agent | a record whose provenance says an agent produced it (`agent_authored`, `generated_by`, ...), the agent memory and plan families, agent instruction or skill files by file name or folder (base names such as `SKILL.md`, `CLAUDE.md`, `AGENTS.md`, `*.mdc`; agent dot-folders; and since `@10` a `skills` folder, `intake/memory`, `TASKS.md` and a file name that holds an AI name, see [Document path conventions](#document-path-conventions)), and for documents, notes and plans a generated-by footer, co-author line or skill frontmatter anywhere in the text |
 | 3 | `inline_injection` | agent | wrapper blocks inside a turn: the archive's injected tags (`system-reminder`, `local-command-*`, ...), `command-name`, `command-message`, `command-args`, tool-result and attachment blocks. Same-name tags nest (a depth counter), quoted attribute values may hold angle brackets, and an unclosed block runs to the end |
@@ -720,6 +722,81 @@ to be stored under such a path. Because unknown is decided by `ambiguous` (rule 
 logs and injected blocks inside such a record keep the stronger class of the rule that took them.
 Review rows written under `@9` or earlier are stale and are reported as `stale_rows`.
 
+### Git history hints
+
+Many library documents are files that came out of software repositories, and the library's backup
+copies carry no `.git`. Who wrote such a file is only knowable from its git history: a commit with a
+`Co-Authored-By: Claude`-style trailer, a bot author or an agent footer is agent-written text. A
+**hint** is one row of a `cce.origin-hints.v1` file saying what the history of one file shows.
+Since `@11`, `cce library attribute` (and `apply`, `review-sample` and `review-record`) take
+`--origin-hints FILE` and let the hints decide a document's origin.
+
+Making the file. `scripts/git_origin_hints.py` (stdlib only) reads a directory of history-only
+clones (bare or blobless, each `<name>.git` or `<name>/`) with one streaming `git log` pass per
+repository and writes one row per file, sorted:
+
+```text
+python scripts/git_origin_hints.py --repos-dir /path/to/clones --wanted wanted.jsonl --out hints.jsonl
+python scripts/git_origin_hints.py --repos-dir /path/to/clones --all --out hints.jsonl
+```
+
+`wanted.jsonl` has `{"repo": "<name>", "path": "<repo-relative posix path>"}` lines. A row is
+`{"schema": "cce.origin-hints.v1", "repo", "path", "origin", "commits": {"total", "agent", "human"},
+"signals": [...], "basis": "git-log"}`. `--max-commits-per-repo N` reads only the newest commits
+(the rows then carry the signal `window:max-commits`). Progress on standard error holds counts,
+never a commit message, an author name or an address. A requested repository that is missing makes
+the tool exit 2 naming it (nothing is written).
+
+The three origins. A commit is **agent-signed** when a `Co-authored-by:` line (any letter case,
+anywhere in the message, so the trailers a squash message carries count), the author or the committer (name or address) names an AI
+by a whole word (claude, anthropic, gemini, chatgpt, openai, copilot, codex, opencode, cursor,
+antigravity, aider, devin, jules, dependabot, renovate, `github` `actions`, anything with
+`[bot]`, `noreply@anthropic.com`), or the message ends with the agent footer (`Generated with
+[Claude Code]`, or a line starting with the robot emoji and `Generated with`). A file is:
+
+| Origin | Meaning | Effect on a document record |
+|--------|---------|-----------------------------|
+| `agent` | every commit touching the file is agent-signed | the whole document is `agent` (rule 2, detail `origin=git:agent-commits`) |
+| `mixed` | some commits are, some are not | the whole document is `unknown` (rule 11 `ambiguous`, detail `origin=git:mixed`): section boundaries cannot be proven, so never owner |
+| `human` | none is | **none**. A human hint never grants owner credit; the other rules decide exactly as without it |
+
+No hint means no effect. Two matching hints of equal length that disagree make the record
+`unknown` (`origin=git:ambiguous`). Hints apply only to records of document kinds (document, note,
+plan, artifact, memory, page), never to chats, and only when no older check has settled the
+record: an agent path convention, a text marker or a `.github`/non-prose path keeps its own reason.
+The hints only subtract owner credit. A hints file with any malformed row, or one over 256 MiB or
+two million rows, is refused (exit 2) instead of silently giving credit back.
+
+What git cannot see. Renames are not followed (a renamed file starts its history at the rename
+commit). A human squash or hand-rewrite can contain agent text and counts as human. A human
+committing agent output without a trailer, footer or agent identity counts as human, and an agent
+committing under a person's identity does too. A commit that deletes a file counts as touching it,
+so a person removing or moving an agent's file makes it `mixed`. Text from before the file entered git, or kept
+outside git, has no history. Files whose history was rewritten show only the rewritten history.
+Only commits reachable from `HEAD` are read, and merge commits are excluded. A person whose name
+or address holds one of the AI words as a whole word (a first name such as Jules or Claude) is read
+as that AI; the `signals` show which word matched. So `human` means "no agent signal found", not
+"proved human", which is why it never grants anything.
+
+The matching rule. A record names its file by its provenance `source_file`, `source_path` or
+`source_ref`. Each is read as a path: `\` becomes `/`, empty and `.` components are dropped, text is
+NFC-normalised, a `file://` prefix is removed and, for `source_ref` only, a `#fragment` or `?query`
+is cut. A hint names its file by the components of `repo` followed by those of `path`. A hint
+matches when its components are the last components of the record's path, whole and
+case-sensitive: `/backup/<repo>/<path>` and `<repo>/<path>` match, `<path>` alone (without the
+repository name), `x<repo>/<path>` and `<repo>/<path>/more` do not. The hint with the most
+components wins. If two matches of the same length disagree (two rows for one file, or two of the
+record's own paths) the record is ambiguous and therefore unknown, never owner; equal matches that
+agree are not ambiguous. The document reader stores `source_path` as the full path of the file and
+`source_file` relative to the configured source root, so a hint matches through whichever of them
+still holds the repository's folder name; a record whose paths no longer name the repository gets
+no hint.
+
+A sample drawn with `--origin-hints` can only be recorded with `review-record --origin-hints` and
+the same file, because `review-record` draws the sample again to check it. The report, `apply` and
+`review-sample` outputs carry `origin_hints.rows` when hints were used. Review rows written under
+`@10` or earlier are stale and are reported as `stale_rows`.
+
 ### Reports, annotations and bounds
 
 ```bash
@@ -757,7 +834,7 @@ already reads: `source` is the exact canonical reference without offsets and `at
 `cce.span-attribution.v1` annotation whose spans are the non-unknown spans (uncovered text is
 unknown by the contract). Messages whose id is empty or not unique in their sequence cannot be
 referenced exactly and are counted, not annotated. The file holds offsets, ids and evidence
-(`cce.attribution-rules@10:rule:<id>`, `stratum:<S|M|L>`, `span:<id>`, and `owner_verdict:<verdict>`
+(`cce.attribution-rules@11:rule:<id>`, `stratum:<S|M|L>`, `span:<id>`, and `owner_verdict:<verdict>`
 for a span the owner answered), no message text. A span the owner answered also carries
 `owner_verdict` as a key of its own. Owner spans carry `--owner-id` as `author_id`; without it no
 span can reach a strict profile.

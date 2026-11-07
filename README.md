@@ -118,6 +118,21 @@ and byte-limit failures include measured numbers for sizing retries. See [docs/k
 
 `cce library attribute` labels who wrote each span of each message (owner, agent, third party or unknown) with deterministic rules, and nothing is profile-eligible until the owner has reviewed a sample and the precision gate is met; see [docs/attributed-knowledge.md](docs/attributed-knowledge.md).
 
+Documents that came out of software repositories can only be told apart by their git history.
+`scripts/git_origin_hints.py` (stdlib only) reads history-only clones (bare or blobless, one
+`git log` pass per repository) and writes one `cce.origin-hints.v1` row per file: `agent` when every
+commit touching it is agent-signed (a `Co-Authored-By: Claude`-style trailer, a bot or agent author,
+the agent footer), `human` when none is, `mixed` otherwise.
+
+```bash
+python scripts/git_origin_hints.py --repos-dir /path/to/clones --wanted wanted.jsonl --out hints.jsonl
+cce library attribute --report --origin-hints hints.jsonl --library /path/to/library
+```
+
+Git cannot see renames (not followed), a human squash that holds agent text, a human committing agent
+output, text from before git, or rewritten history; a `human` hint never grants owner credit and a
+`mixed` hint withholds it. See [docs/attributed-knowledge.md](docs/attributed-knowledge.md#git-history-hints).
+
 Example:
 
 ```bash

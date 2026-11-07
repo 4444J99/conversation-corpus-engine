@@ -44,13 +44,16 @@ from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, S
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .archive_provenance import INJECTED_TAGS, classify_user_turn
 from .archive_read_library import FAMILIES
 from .attribution import ATTRIBUTION_SCHEMA, text_digest
 
-RULES_VERSION = "cce.attribution-rules@10"
+if TYPE_CHECKING:
+    from .origin_hints import OriginHints
+
+RULES_VERSION = "cce.attribution-rules@11"
 
 OWNER = "owner"
 AGENT = "agent"
@@ -150,6 +153,12 @@ DATA_EXTENSIONS = frozenset({".json", ".jsonl", ".csv", ".xml"})
 # The bundle layout of a package document: `Name.pages/Data/...`, `Name.pages/metadata/...`.
 PACKAGE_SUFFIX = ".pages"
 PACKAGE_METADATA_FILE = "documentidentifier"
+
+
+# Git-history hints (rules @11): the evidence reasons they leave on a record.
+GIT_AGENT_ORIGIN = "git:agent-commits"
+GIT_MIXED_ORIGIN = "git:mixed"
+GIT_AMBIGUOUS_ORIGIN = "git:ambiguous"
 
 
 def _path_parts(value: Any) -> tuple[str, ...]:
@@ -261,8 +270,14 @@ def third_party_origin_of(provider: Any) -> str:
     )
 
 
-def record_info(payload: Mapping[str, Any]) -> RecordInfo:
-    """Derive the rule inputs from a library record payload (a `Conversation.to_dict()`)."""
+def record_info(payload: Mapping[str, Any], origin_hints: OriginHints | None = None) -> RecordInfo:
+    """Derive the rule inputs from a library record payload (a `Conversation.to_dict()`).
+
+    `origin_hints` (git history, see `origin_hints.py`) only ever subtract owner credit from a
+    document-kind record that no older check has already settled: an `agent` hint makes the whole
+    record agent (`git:agent-commits`), a `mixed` or ambiguous hint makes it unknown
+    (`git:mixed`, `git:ambiguous`). A `human` hint and the lack of a hint change nothing, and a
+    chat is never touched."""
     extra = payload.get("extra") if isinstance(payload.get("extra"), Mapping) else {}
     provenance = payload.get("provenance") if isinstance(payload.get("provenance"), Mapping) else {}
     provider = str(payload.get("provider") or "")
@@ -292,9 +307,21 @@ def record_info(payload: Mapping[str, Any]) -> RecordInfo:
                 origin = f"text:{marker}" if marker else ""
             if authored and kind in NOTE_KINDS and not ai_marker:
                 ai_marker = _ai_marker(body)
+    hinted = ""
+    if origin_hints is not None and not origin and kind in DOCUMENT_KINDS:
+        verdict = origin_hints.match(provenance)
+        if verdict == "agent":
+            origin = GIT_AGENT_ORIGIN
+        elif verdict == "mixed":
+            hinted = GIT_MIXED_ORIGIN
+        elif verdict == "ambiguous":
+            hinted = GIT_AMBIGUOUS_ORIGIN
     unknown = ""
     if not origin and kind in DOCUMENT_KINDS:
-        unknown = _unattributable_path_reason(provenance, notes_family=authored and kind == "note")
+        unknown = (
+            _unattributable_path_reason(provenance, notes_family=authored and kind == "note")
+            or hinted
+        )
     third_party = third_party_origin_of(provider)
     return RecordInfo(
         provider=provider,
