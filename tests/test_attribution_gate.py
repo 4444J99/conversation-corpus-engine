@@ -298,16 +298,22 @@ def test_rows_from_another_rules_version_or_an_older_schema_are_ignored_not_coun
     assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v6"
 
 
-PREVIOUS_VERSION = "cce.attribution-rules@8"
+PREVIOUS_VERSION = "cce.attribution-rules@9"
 
 
 @pytest.mark.parametrize(
-    "previous_version", ["cce.attribution-rules@6", "cce.attribution-rules@7", PREVIOUS_VERSION]
+    "previous_version",
+    [
+        "cce.attribution-rules@6",
+        "cce.attribution-rules@7",
+        "cce.attribution-rules@8",
+        PREVIOUS_VERSION,
+    ],
 )
 def test_rows_written_under_the_previous_rules_version_are_stale_and_never_counted(
     previous_version: str,
 ) -> None:
-    assert RULES_VERSION == "cce.attribution-rules@9"
+    assert RULES_VERSION == "cce.attribution-rules@10"
     old = verdict_rows("typed_prefix", ["yes"] * 100, version=previous_version)
     summary = summarize(old)
     assert (summary.rows, summary.stale_rows) == (100, 100)
@@ -929,7 +935,7 @@ def test_the_exclusion_digest_also_names_the_text_hashes_of_the_excluded_rows() 
 
 
 def test_current_rules_keep_v6_schemas_and_reject_older_evidence() -> None:
-    assert RULES_VERSION == "cce.attribution-rules@9"
+    assert RULES_VERSION == "cce.attribution-rules@10"
     assert LEDGER_SCHEMA == "cce.attribution-review-ledger.v6"
     assert SAMPLE_SCHEMA == "cce.attribution-review-sample.v6"
     assert SAMPLE_HEADER_SCHEMA == "cce.attribution-review-sample-header.v6"
@@ -949,6 +955,7 @@ def test_current_rules_keep_v6_schemas_and_reject_older_evidence() -> None:
     for previous_version in (
         "cce.attribution-rules@6",
         "cce.attribution-rules@7",
+        "cce.attribution-rules@8",
         PREVIOUS_VERSION,
     ):
         old_version = verdict_rows("typed_prefix", ["yes"] * 100, version=previous_version)
