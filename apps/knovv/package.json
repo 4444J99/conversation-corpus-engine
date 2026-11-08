@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "tsc --noEmit && vite build && esbuild server/worker.ts --bundle --format=esm --platform=browser --target=es2022 --external:cloudflare:workers --loader:.sql=text --outfile=build/worker.mjs && esbuild agent/main.ts --bundle --format=esm --platform=node --target=node22 --outfile=build/agent.mjs",
+    "build": "tsc --noEmit && vite build && esbuild server/worker.ts --bundle --format=esm --platform=browser --target=es2022 --external:cloudflare:workers --loader:.sql=text --outfile=build/worker.mjs && esbuild agent/main.ts --bundle --format=esm --platform=node --target=node22 --outfile=build/agent.mjs && esbuild bench/publication.ts --bundle --format=esm --platform=node --target=node22 --outfile=build/benchmark.mjs",
+    "benchmark": "node build/benchmark.mjs",
     "test": "vitest run",
     "check": "tsc --noEmit"
   },

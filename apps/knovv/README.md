@@ -31,6 +31,15 @@ reopening. This harness bypasses Access only on loopback; production imports onl
 Python interoperability tests use `KNOVV_PYTHON` when provided, otherwise the
 repository's `.venv/bin/python`. CI runs the Python suite and a separate KNOVV job.
 
+After building, `npm run benchmark -- "$PRIVATE_CONFIG"` measures the browser
+reader and search code in Node against an actual encrypted publication. The
+mode-0600 configuration supplies `bundle`, `package`, `unlock`, `grant` and a new
+`output` file. Inputs remain local; the report records hashed queries, cold and
+warm timings, exact known-passage checks, memory, and a fresh cached offline
+reopening. This measures the reader engine with local file transport. Browser
+rendering, Access login, hosted network latency and physical-phone performance
+remain separate measurements.
+
 ## Publication and device custody
 
 Keep credentials, passphrase files, device packages, publication bundles and

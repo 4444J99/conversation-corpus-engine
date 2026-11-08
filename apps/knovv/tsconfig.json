@@ -18,6 +18,7 @@
     "tests",
     "vite.config.ts",
     "cloudflare.config.ts",
-    "agent"
+    "agent",
+    "bench"
   ]
 }
