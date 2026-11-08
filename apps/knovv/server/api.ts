@@ -1,8 +1,9 @@
 import { canonical, encoder, sha256, verify, MAX_OBJECT } from "../src/crypto";
 import type { DeviceGrant, Revision, Publication } from "../src/contracts";
+import type { Database } from "./database";
 
 export interface Env {
-  DB: D1Database;
+  DB: Database;
   BUCKET: R2Bucket;
   ASSETS: Fetcher;
   OWNER_PUBLIC_KEY: string;
