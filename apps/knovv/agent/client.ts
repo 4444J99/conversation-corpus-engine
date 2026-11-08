@@ -45,6 +45,8 @@ export async function executeAgent(
     "source_url",
     "relationships",
     "status",
+    "logical_id",
+    "provenance",
   ] as const) {
     if (input[key] !== undefined) (fields as any)[key] = input[key];
   }

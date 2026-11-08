@@ -60,6 +60,7 @@ def _notes(document: dict[str, Any], revision: dict, home: Path) -> None:
             "tags",
             "logical_id",
             "last_editor",
+            "provenance",
         )
     }
     metadata.update(knovv_revision=revision["id"], knovv_device=revision["device"])

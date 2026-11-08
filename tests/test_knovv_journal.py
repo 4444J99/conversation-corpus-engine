@@ -46,6 +46,8 @@ def fixture(attachment=False, revisions=1):
         "updated": "2026-01-01",
         "source_url": "https://example.invalid/captured-evidence",
         "relationships": [{"type": "contradicts", "target": "d" * 64}],
+        "logical_id": "project-snapshot:synthetic-source",
+        "provenance": {"source_authorship": "unknown", "source_sha256": "f" * 64},
     }
     objects = {}
     if attachment:
@@ -178,6 +180,8 @@ def test_authenticated_edits_are_idempotent_source_inputs_without_rewriting_orig
     assert list((tmp_path / "authoring" / "history").rglob("*.json"))
     assert "https://example.invalid/captured-evidence" in notes[0].read_text()
     assert "contradicts" in notes[0].read_text()
+    assert 'logical_id: "project-snapshot:synthetic-source"' in notes[0].read_text()
+    assert '"source_authorship": "unknown"' in notes[0].read_text()
     from conversation_corpus_engine.library_documents import iter_documents  # noqa: PLC0415
 
     ingested = list(iter_documents(manifest["documents"]))

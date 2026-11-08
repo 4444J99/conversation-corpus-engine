@@ -179,12 +179,24 @@ describe("independently enrolled devices", () => {
           title: "Agent authored",
           body: "PRIVATE AGENT CANARY",
           kind: "zettel",
+          logical_id: "project-snapshot:synthetic-source",
+          provenance: {
+            source_authorship: "unknown",
+            source_sha256: "f".repeat(64),
+          },
         },
       });
       await phone.sync();
       const agentRead = await phone.open(agentCreated.document.id);
       expect(agentRead.document.author).toBe("agent");
       expect(agentRead.document.last_editor).toBe("agent:synthetic-codex");
+      expect(agentRead.document.logical_id).toBe(
+        "project-snapshot:synthetic-source",
+      );
+      expect(agentRead.document.provenance).toEqual({
+        source_authorship: "unknown",
+        source_sha256: "f".repeat(64),
+      });
       await executeAgent(phone, {
         action: "save",
         agent: "synthetic-second",

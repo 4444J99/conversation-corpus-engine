@@ -51,6 +51,7 @@ export interface Document {
   links: string[];
   tags: string[];
   logical_id?: string;
+  provenance?: Record<string, unknown>;
   source_url?: string;
   relationships?: { type: string; target: string }[];
   source_history?: { version: string; id: string }[];
