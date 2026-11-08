@@ -34,6 +34,8 @@ sealed = ["cryptography>=46,<51"]
 [project.scripts]
 cce = "conversation_corpus_engine.cli:main"
 cce-mcp = "conversation_corpus_engine.mcp_server:main"
+cce-knovv = "conversation_corpus_engine.knovv_cli:main"
+cce-knovv-cloudflare = "conversation_corpus_engine.knovv_cloudflare:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

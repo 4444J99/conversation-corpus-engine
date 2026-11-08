@@ -34,3 +34,27 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[dev]"
       - run: python -c "from conversation_corpus_engine.schema_validation import list_schemas, load_schema; [load_schema(s['name']) for s in list_schemas()]"
+
+  knovv:
+    runs-on: ubuntu-24.04
+    env:
+      KNOVV_PYTHON: python
+    defaults:
+      run:
+        working-directory: apps/knovv
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: apps/knovv/package-lock.json
+      - run: python -m pip install -e '.[dev,sealed]'
+        working-directory: .
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - run: npm run build
+      - run: KNOVV_CF_BUILD=1 node_modules/.bin/cf build --mode staging

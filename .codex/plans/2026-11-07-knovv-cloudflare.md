@@ -35,3 +35,24 @@ Retain originals, existing worktrees, current site and independent backups throu
 - Writer lease and host admission unmeasured: retired Limen is not activated. This branch and
   checkout are unique to this chat.
 - Ruling: use the current approved design with task-level test cycles; no repeated design gate.
+- Encryption, API, browser workspace and CCE bridge are implemented with synthetic coverage.
+  The TypeScript suite reports 18 passing tests, including real local D1/R2 and two-device
+  synchronization, conflicts, revocation, rotation, offline reopening and exact attachment bytes.
+  Python bridge tests cover publication/restore, packed ciphertext reuse, source citation checks,
+  protected enrollment, monotonic grant updates and journal/attachment recovery.
+- Browser QA previously observed search/open/capture/save/lock/reopen in the synthetic preview.
+  Final visual and phone checks are pending: Chrome currently blocks automation while another
+  extension UI is open. Do not substitute synthetic checks for real-material acceptance.
+- Ruling: pack application objects and shard their encrypted locators after measuring the
+  canonical corpus. Per-page padding and a monolithic content map would not scale. Keep the
+  default 512 MiB budget, require explicit larger budgets, and fail before a partial head.
+  Cost if wrong: cold-read and publication performance need further measured tuning.
+- Ruling: preserve the existing Pages application and Sites atlas during the transition.
+  The new Worker remains closed without Access identity and an exact pinned audience.
+  Cost if wrong: transition retains multiple visible entrypoints until acceptance.
+- Production deployment is blocked by the Cloudflare account's D1 database-count limit.
+  A dedicated R2 bucket was created; no private publication or credentials were uploaded.
+  No other application's database was reused or deleted, and no paid upgrade was enabled.
+- Full Python regression, final builds, real-data export/restore and the single fresh branch
+  review are tracked in the owning chat and private verification receipt. They remain separate
+  from deployment, two physical device acceptance and production performance measurements.
