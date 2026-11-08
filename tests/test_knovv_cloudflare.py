@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import threading
 from dataclasses import asdict, replace
 
 import pytest
@@ -32,6 +33,66 @@ class Transport:
     def get(self, oid, path):
         path.write_bytes(self.objects[oid])
         path.chmod(0o600)
+
+
+class ParallelTransport(Transport):
+    def __init__(self, workers=3):
+        super().__init__()
+        self.db.close()
+        self.db = sqlite3.connect(":memory:", check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        self.mutex = threading.RLock()
+        self.barrier = threading.Barrier(workers)
+        self.workers = workers
+        self.active = self.peak = self.reads = self.closed = 0
+        self.verified = set()
+        self.fail = False
+
+    def query(self, sql, params=()):
+        with self.mutex:
+            if sql.startswith("INSERT OR IGNORE INTO publications"):
+                assert self.verified == set(self.objects)
+            return super().query(sql, params)
+
+    def schema(self, sql):
+        with self.mutex:
+            return super().schema(sql)
+
+    def put(self, oid, path):
+        with self.mutex:
+            return super().put(oid, path)
+
+    def get(self, oid, path):
+        with self.mutex:
+            self.active += 1
+            self.reads += 1
+            self.peak = max(self.active, self.peak)
+            synchronize = self.reads <= self.workers and not self.fail
+        try:
+            if self.fail:
+                raise TimeoutError("synthetic-readback-interruption")
+            if synchronize:
+                self.barrier.wait(timeout=5)
+            super().get(oid, path)
+            with self.mutex:
+                self.verified.add(oid)
+        finally:
+            with self.mutex:
+                self.active -= 1
+
+    def fork(self):
+        parent = self
+
+        class Child:
+            query = parent.query
+            put = parent.put
+            get = parent.get
+
+            def close(self):
+                with parent.mutex:
+                    parent.closed += 1
+
+        return Child()
 
 
 def setup(tmp_path):
@@ -76,6 +137,44 @@ def test_seed_is_idempotent_and_snapshot_contains_independently_verifiable_ciphe
         for path in (target / "objects").iterdir()
     )
     assert json.loads((target / "journal.json").read_bytes())["grants"] == [grant]
+
+
+def test_parallel_ciphertext_transfer_is_bounded_and_publishes_after_every_readback(tmp_path):
+    config, bundle, grant, _ = setup(tmp_path)
+    transport = ParallelTransport()
+    result = seed(config, bundle, [grant], transport, workers=3)
+    assert transport.peak == 3 and transport.closed == 3
+    assert len(transport.verified) == result["objects"]
+    transport.reads = transport.peak = 0
+    target = tmp_path / "parallel-snapshot"
+    receipt = snapshot(config, target, transport, workers=3)
+    assert receipt["objects"] == result["objects"]
+    assert transport.peak == 3 and transport.closed == 6
+    assert (target / "HEAD.knovv").read_bytes() == (bundle / "HEAD.knovv").read_bytes()
+
+
+def test_interrupted_parallel_upload_never_publishes_and_remains_resumable(tmp_path):
+    config, bundle, grant, _ = setup(tmp_path)
+    transport = ParallelTransport()
+    transport.fail = True
+    with pytest.raises(TimeoutError, match="synthetic-readback-interruption"):
+        seed(config, bundle, [grant], transport, workers=3)
+    assert not transport.query("SELECT digest FROM publications")
+    assert transport.active == 0 and transport.closed > 0
+    transport.fail = False
+    transport.reads = 0
+    result = seed(config, bundle, [grant], transport, workers=3)
+    assert len(transport.verified) == result["objects"]
+
+
+@pytest.mark.parametrize("workers", [0, 5, True])
+def test_invalid_parallelism_cannot_mutate_remote_storage(tmp_path, workers):
+    config, bundle, grant, _ = setup(tmp_path)
+    transport = Transport()
+    with pytest.raises(ValueError, match="invalid-transfer-workers"):
+        seed(config, bundle, [grant], transport, workers=workers)
+    assert not transport.objects
+    assert not transport.query("SELECT name FROM sqlite_master WHERE type='table'")
 
 
 def test_seed_refuses_unrelated_database_and_corrupt_objects_before_remote_writes(tmp_path):

@@ -19,8 +19,11 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event, Lock, local
 
 from .archive_sealed import load_identity, safe_path
 from .archive_sealed_crypto import authenticate, canonical, digest, sign
@@ -29,6 +32,62 @@ from .knovv_projection import DEFAULT_BUDGET, MAX_BUDGET, _object
 
 HEX = re.compile(r"[0-9a-f]{64}\Z")
 SCHEMA = Path(__file__).resolve().parents[2] / "apps/knovv/server/schema.sql"
+
+
+class _ObjectPool:
+    """At most four independent CLI clients; no unbounded future queue or new deadline."""
+
+    def __init__(self, transport, workers):
+        if type(workers) is not int or not 1 <= workers <= 4:
+            raise ValueError("invalid-transfer-workers")
+        if workers > 1 and not callable(getattr(transport, "fork", None)):
+            raise ValueError("transport-cannot-fork")
+        self.transport, self.workers = transport, workers
+        self.children = []
+        self.mutex = Lock()
+        self.local = local()
+        self.executor = None
+
+    def __enter__(self):
+        if self.workers > 1:
+            self.executor = ThreadPoolExecutor(max_workers=self.workers)
+        return self
+
+    def __exit__(self, *_args):
+        if self.executor:
+            self.executor.shutdown(wait=True, cancel_futures=True)
+        with ExitStack() as cleanup:
+            for child in self.children:
+                cleanup.callback(child.close)
+
+    def run(self, action, items):
+        if self.workers == 1:
+            for item in items:
+                action(self.transport, item)
+            return
+        iterator, stopped = iter(items), Event()
+
+        def consume():
+            while not stopped.is_set():
+                with self.mutex:
+                    try:
+                        item = next(iterator)
+                    except StopIteration:
+                        return
+                try:
+                    if not hasattr(self.local, "transport"):
+                        child = self.transport.fork()
+                        with self.mutex:
+                            self.children.append(child)
+                        self.local.transport = child
+                    action(self.local.transport, item)
+                except BaseException:
+                    stopped.set()
+                    raise
+
+        futures = [self.executor.submit(consume) for _ in range(self.workers)]
+        for future in futures:
+            future.result()
 
 
 @dataclass(frozen=True)
@@ -86,6 +145,7 @@ class Cloudflare:
         self._process = None
         self._owner = owner
         self._access = None
+        self._access_credentials = access_credentials
         if config.journal_origin:
             if (
                 owner is None
@@ -103,6 +163,16 @@ class Cloudflare:
                 )
             ):
                 raise ValueError("invalid-access-credentials")
+
+    def fork(self):
+        child = Cloudflare(
+            self.config,
+            seconds=max(0, self.deadline - time.monotonic()),
+            owner=self._owner,
+            access_credentials=self._access_credentials,
+        )
+        child.deadline = self.deadline
+        return child
 
     def __enter__(self):
         return self
@@ -261,7 +331,10 @@ class Cloudflare:
             os.fsync(stream.fileno())
 
 
-def seed(config: Config, bundle: Path, grants: list[dict], transport, *, schema: Path = SCHEMA):
+def seed(
+    config: Config, bundle: Path, grants: list[dict], transport, *, schema: Path = SCHEMA, workers=1
+):
+    pool = _ObjectPool(transport, workers)
     bundle = safe_path(bundle)
     raw = (bundle / "HEAD.knovv").read_bytes()
     if len(raw) > 256 * 1024:
@@ -322,22 +395,27 @@ def seed(config: Config, bundle: Path, grants: list[dict], transport, *, schema:
         raise ValueError("initial-publication-required")
     with tempfile.TemporaryDirectory(prefix="knovv-readback-", dir=bundle.parent) as temporary:
         Path(temporary).chmod(0o700)
-        for oid, length, path in objects:
-            transport.query(
+
+        def upload(client, item):
+            oid, length, path = item
+            client.query(
                 "INSERT OR IGNORE INTO objects(id,size) SELECT ?,? WHERE (SELECT bytes FROM usage WHERE id=1)+?<=?",
                 [oid, length, length, config.max_cipher_bytes],
             )
-            reserved = transport.query("SELECT size,uploaded FROM objects WHERE id=?", [oid])
+            reserved = client.query("SELECT size,uploaded FROM objects WHERE id=?", [oid])
             if not reserved or reserved[0]["size"] != length:
                 raise ValueError("storage-budget-or-object-conflict")
             if not reserved[0]["uploaded"]:
-                transport.put(oid, path)
+                client.put(oid, path)
             check = Path(temporary) / oid
-            transport.get(oid, check)
+            client.get(oid, check)
             if check.stat().st_size != length or digest(check.read_bytes()) != oid:
                 raise ValueError("remote-ciphertext-readback-mismatch")
             check.unlink()
-            transport.query("UPDATE objects SET uploaded=1 WHERE id=?", [oid])
+            client.query("UPDATE objects SET uploaded=1 WHERE id=?", [oid])
+
+        with pool:
+            pool.run(upload, objects)
     for grant in grants:
         transport.query(
             "INSERT INTO devices(id,signing_public,generation,revoked,envelope) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET generation=excluded.generation,revoked=excluded.revoked,envelope=excluded.envelope WHERE excluded.generation>devices.generation AND excluded.signing_public=devices.signing_public",
@@ -375,7 +453,8 @@ def seed(config: Config, bundle: Path, grants: list[dict], transport, *, schema:
     return {"publication": checksum, "objects": len(objects), "cipher_bytes": size}
 
 
-def snapshot(config: Config, destination: Path, transport, *, page_entries: int = 256):
+def snapshot(config: Config, destination: Path, transport, *, page_entries: int = 256, workers=1):
+    pool = _ObjectPool(transport, workers)
     if not 1 <= page_entries <= 1000:
         raise ValueError("invalid-page-bound")
     from .knovv_journal import _atomic  # noqa: PLC0415
@@ -437,39 +516,44 @@ def snapshot(config: Config, destination: Path, transport, *, page_entries: int 
         safe_path(destination / name).mkdir(mode=0o700, exist_ok=True)
     size = count = 0
     after = ""
-    while True:
-        objects = transport.query(
-            "SELECT id,size FROM objects WHERE uploaded=1 AND id>? ORDER BY id LIMIT ?",
-            [after, page_entries],
+
+    def download(client, item):
+        path = destination / "objects" / item["id"]
+        safe_path(path)
+        complete = (
+            path.is_file()
+            and path.stat().st_size == item["size"]
+            and digest(path.read_bytes()) == item["id"]
         )
-        if not objects:
-            break
-        for item in objects:
-            if (
-                not HEX.fullmatch(item.get("id", ""))
-                or item["id"] <= after
-                or type(item.get("size")) is not int
-                or not 0 <= item["size"] <= 48 * 1024 * 1024
-            ):
-                raise ValueError("snapshot-storage-bound")
-            size += item["size"]
-            if size > config.max_cipher_bytes:
-                raise ValueError("snapshot-storage-bound")
-            path = destination / "objects" / item["id"]
-            safe_path(path)
-            complete = (
-                path.is_file()
-                and path.stat().st_size == item["size"]
-                and digest(path.read_bytes()) == item["id"]
+        if not complete:
+            if path.exists():
+                path.rename(destination / "partials" / (item["id"] + "-" + uuid.uuid4().hex))
+            client.get(item["id"], path)
+            if path.stat().st_size != item["size"] or digest(path.read_bytes()) != item["id"]:
+                raise ValueError("snapshot-ciphertext-mismatch")
+
+    with pool:
+        while True:
+            objects = transport.query(
+                "SELECT id,size FROM objects WHERE uploaded=1 AND id>? ORDER BY id LIMIT ?",
+                [after, page_entries],
             )
-            if not complete:
-                if path.exists():
-                    path.rename(destination / "partials" / (item["id"] + "-" + uuid.uuid4().hex))
-                transport.get(item["id"], path)
-                if path.stat().st_size != item["size"] or digest(path.read_bytes()) != item["id"]:
-                    raise ValueError("snapshot-ciphertext-mismatch")
-            after = item["id"]
-            count += 1
+            if not objects:
+                break
+            for item in objects:
+                if (
+                    not HEX.fullmatch(item.get("id", ""))
+                    or item["id"] <= after
+                    or type(item.get("size")) is not int
+                    or not 0 <= item["size"] <= 48 * 1024 * 1024
+                ):
+                    raise ValueError("snapshot-storage-bound")
+                size += item["size"]
+                if size > config.max_cipher_bytes:
+                    raise ValueError("snapshot-storage-bound")
+                after = item["id"]
+            pool.run(download, objects)
+            count += len(objects)
     pages = []
     cursor = revisions = 0
     while cursor < cutoff:
@@ -540,6 +624,7 @@ def main(argv=None):
     parser.add_argument("--owner-key", type=Path)
     parser.add_argument("--owner-passphrase-file", type=Path)
     parser.add_argument("--access-credentials", type=Path)
+    parser.add_argument("--workers", type=int, default=1, choices=range(1, 5))
     args = parser.parse_args(argv)
     config = Config(**json.loads(safe_path(args.config).read_bytes()))
     if args.action == "environment":
@@ -576,6 +661,7 @@ def _main_action(args, config, transport):
                     [json.loads(safe_path(p).read_bytes()) for p in args.grant],
                     transport,
                     schema=args.schema,
+                    workers=args.workers,
                 ),
                 sort_keys=True,
             )
@@ -583,7 +669,11 @@ def _main_action(args, config, transport):
     else:
         if not args.output:
             raise ValueError("snapshot requires --output")
-        print(json.dumps(snapshot(config, args.output, transport), sort_keys=True))
+        print(
+            json.dumps(
+                snapshot(config, args.output, transport, workers=args.workers), sort_keys=True
+            )
+        )
 
 
 if __name__ == "__main__":
