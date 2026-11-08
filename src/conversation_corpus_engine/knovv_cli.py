@@ -103,6 +103,8 @@ def main(argv=None) -> None:
     _publication(restore)
     restore.add_argument("--checkpoint", type=Path, required=True)
     restore.add_argument("--output", type=Path, required=True)
+    restore.add_argument("--format", choices=["directory", "jsonl"], default="directory")
+    restore.add_argument("--deadline-seconds", type=float, default=3600)
     ingest = sub.add_parser(
         "import-journal", help="Validate encrypted browser edits and create source-owned CCE inputs"
     )
@@ -221,7 +223,13 @@ def main(argv=None) -> None:
             result = {"device_package": str(args.output)}
         elif args.action == "restore":
             result = restore_bundle(
-                args.bundle, args.output, device, args.owner_public, checkpoint=checkpoint
+                args.bundle,
+                args.output,
+                device,
+                args.owner_public,
+                checkpoint=checkpoint,
+                layout=args.format,
+                deadline_seconds=args.deadline_seconds,
             )
         else:
             journal = json.loads(_private(args.journal, 64 * 1024 * 1024))

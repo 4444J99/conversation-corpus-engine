@@ -85,22 +85,34 @@ Remove the revoked recipient and rotate before publishing new private material.
 
 ## Cloudflare activation
 
-Use a dedicated D1 database, a dedicated R2 bucket and owner-only Cloudflare Access.
-The configuration file for the control CLI contains `account`, `database` (UUID),
-`bucket`, `owner_public`, `owner_email`, `audience` (Access AUD), and
-`max_cipher_bytes`. It contains no decryption key. The default application budget is
-512 MiB; an explicitly supplied budget may be at most 8 GiB. Account-wide included
-allowances and request usage must be measured before increasing a production budget.
-Local export does not establish account capacity or authorize additional charges.
+Use a dedicated SQLite Durable Object journal, a dedicated R2 bucket and owner-only
+Cloudflare Access. This backend does not consume a D1 database slot. A dedicated D1
+journal remains supported by supplying its explicit UUID as `database`.
+
+For the Durable Object backend the control configuration contains `account`,
+`database` (empty string), `journal_origin` (HTTPS origin), `bucket`, `owner_public`,
+`owner_email`, `audience` (Access AUD), `access_issuer` (the pinned
+`https://<team>.cloudflareaccess.com` issuer), `publisher_client_id`, and
+`max_cipher_bytes`. These are public trust pins, not decryption credentials.
+Keep the app-scoped Access service credential in a separate mode-0600 JSON file
+with exactly `client_id` and `client_secret`. The publisher reads it and the
+protected owner key from files; credentials never enter command arguments.
+
+The default application budget is 512 MiB; an explicitly supplied budget may be
+at most 8 GiB. Account-wide included allowances and request usage must be measured
+before increasing a production budget. Local export does not establish account
+capacity or authorize additional charges.
 
 `cce-knovv-cloudflare environment --config "$DEPLOY_CONFIG"` prints the validated
 environment values expected by `cloudflare.config.ts`. Supply those values to the
 build/deploy process using the existing environment owner. The Worker remains
-closed when identity, audience, database or bucket configuration is missing.
+closed when identity, audience, journal or bucket configuration is missing.
 
 ```sh
 cce-knovv-cloudflare seed --config "$DEPLOY_CONFIG" --bundle "$BUNDLE" \
-  --grant "$ENROLLMENT/grant.json"
+  --grant "$ENROLLMENT/grant.json" \
+  --owner-key "$OWNER_KEY" --owner-passphrase-file "$OWNER_UNLOCK" \
+  --access-credentials "$PUBLISHER_ACCESS_CREDENTIALS"
 ```
 
 Seeding verifies the entire local ciphertext inventory before any remote mutation.
@@ -111,15 +123,23 @@ upload retains a bounded reservation and can be retried. Never repurpose or dele
 another application's database to resolve capacity.
 
 Build staging with `KNOVV_CF_BUILD=1 node_modules/.bin/cf build --mode staging`,
-then deploy its build output with `node_modules/.bin/cf deploy --prebuilt --no-provision`.
-Explicit IDs prevent automatic resource provisioning. Keep the current atlas and
+then deploy its build output with
+`node_modules/.bin/cf deploy --mode staging --prebuilt --provision=false`.
+The journal export uses SQLite storage; the R2 binding names its dedicated bucket. Keep the current atlas and
 legacy Pages application available during acceptance.
 
 Use [Worker-level Access](https://developers.cloudflare.com/workers/configuration/cloudflare-access/#protect-one-worker)
 with an exact owner-email allow policy and an all-traffic `worker` destination.
 This protects every route and hostname associated with that Worker. Pin its AUD
 in `KNOVV_ACCESS_AUD`; the Worker checks the platform-provided `ctx.access` identity
-and the owner email before serving either API responses or assets. Do not add a
+and the owner email before serving either API responses or assets. Static Assets
+currently omit `ctx.access` at the application Worker, so this app also verifies
+the Access JWT using issuer-pinned keys, audience, expiry and signature checks.
+A separately pinned service token may access only `/api/control`; every control
+request additionally needs the owner signature, exact origin and a five-minute
+validity window. The control protocol selects a fixed operation, never client SQL.
+Use an Access `non_identity` policy restricted to that one service-token resource.
+Do not add a
 development identity to production configuration. A first bootstrap deployment
 with an empty audience denies all traffic until Access is attached and the real
 AUD is configured.
@@ -133,7 +153,9 @@ configuration. Deployment and real-material acceptance are distinct outcomes.
 ## Independent recovery and CCE import
 
 ```sh
-cce-knovv-cloudflare snapshot --config "$DEPLOY_CONFIG" --output "$SNAPSHOT"
+cce-knovv-cloudflare snapshot --config "$DEPLOY_CONFIG" --output "$SNAPSHOT" \
+  --owner-key "$OWNER_KEY" --owner-passphrase-file "$OWNER_UNLOCK" \
+  --access-credentials "$PUBLISHER_ACCESS_CREDENTIALS"
 
 cce-knovv restore --bundle "$SNAPSHOT" --owner-public "$OWNER_PUBLIC" \
   --device-key "$DEVICE_KEY" --device-passphrase-file "$DEVICE_UNLOCK" \
@@ -145,7 +167,7 @@ cce-knovv import-journal --bundle "$SNAPSHOT" --owner-public "$OWNER_PUBLIC" \
   --authoring-home "$AUTHORING_HOME"
 ```
 
-The snapshot fixes its publication, grants and journal cutoff in one D1 observation,
+The snapshot fixes its publication, grants and journal cutoff in one journal observation,
 pages immutable objects and revisions, downloads uploaded ciphertext,
 checks every object digest and writes its head only after readback completes.
 Its receipt distinguishes verified ciphertext from decrypted content restoration.
@@ -174,7 +196,9 @@ The ciphertext cache is bounded to 32 MiB; cold reads and uncached offline reads
 are different cases. Search decodes postings in a worker and reports bounded result
 counts. Reader data slabs are bounded to 32 MiB uncompressed. Decoded body, metadata, locator
 and search caches have separate byte budgets; two encrypted bootstrap catalogs are pinned for reopening.
-New search catalogs shard token hashes across four hex digits; two-digit catalogs remain readable. Journal import resumes in
+New search catalogs shard token hashes across four hex digits; two-digit catalogs remain readable. Shared conversation titles use compact ordinal
+ranges; browser intersections preserve exact result counts without expanding millions
+of matching ordinals. Journal import resumes in
 batches of at most 256 new entries and 64 MiB decoded content, with no lifetime entry ceiling.
 Version 2 snapshots use integrity-checked JSONL pages of at most 8 MiB; legacy snapshots remain readable. Cloud control
 operations have a one-hour wall and per-command timeouts. Publication has a default

@@ -72,10 +72,13 @@ self.onmessage = async (event: MessageEvent) => {
       manifest!.search_prefix ?? 2,
     );
     self.postMessage({ id, result });
-  } catch {
+  } catch (error) {
     self.postMessage({
       id,
-      error: "Search is unavailable. Your sources have not changed.",
+      error:
+        error instanceof Error && error.message === "search-query-memory-bound"
+          ? "This query is too broad. Use fewer or more specific terms."
+          : "Search is unavailable. Your sources have not changed.",
     });
   }
 };

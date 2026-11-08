@@ -2,12 +2,13 @@
 
 import json
 import sqlite3
+from dataclasses import asdict, replace
 
 import pytest
 from test_knovv_projection import fixture
 
-from conversation_corpus_engine.archive_sealed_crypto import digest, sign
-from conversation_corpus_engine.knovv_cloudflare import Config, seed, snapshot
+from conversation_corpus_engine.archive_sealed_crypto import authenticate, canonical, digest, sign
+from conversation_corpus_engine.knovv_cloudflare import Cloudflare, Config, main, seed, snapshot
 from conversation_corpus_engine.knovv_projection import export_bundle
 
 
@@ -135,3 +136,121 @@ def test_snapshot_pages_a_stable_cutoff_without_a_lifetime_limit(tmp_path):
         assert digest(raw) == page["sha256"] and len(raw) == page["bytes"]
         sequences.extend(json.loads(line)["seq"] for line in raw.splitlines())
     assert sequences == [1, 2, 3, 4, 5]
+
+
+def test_interrupted_snapshot_resumes_verified_ciphertext_under_its_original_cutoff(tmp_path):
+    config, bundle, grant, owner = setup(tmp_path)
+
+    class Interrupted(Transport):
+        interrupt = False
+        calls = []
+
+        def get(self, oid, path):
+            self.calls.append(oid)
+            if self.interrupt and len(self.calls) == 2:
+                path.write_bytes(b"partial ciphertext")
+                raise TimeoutError("interrupted")
+            return super().get(oid, path)
+
+    transport = Interrupted()
+    seed(config, bundle, [grant], transport)
+    transport.calls = []
+    transport.interrupt = True
+    target = tmp_path / "resume"
+    with pytest.raises(TimeoutError):
+        snapshot(config, target, transport, page_entries=2)
+    first = transport.calls[0]
+    assert not (target / "HEAD.knovv").exists()
+    transport.interrupt = False
+    head = json.loads((bundle / "HEAD.knovv").read_bytes())
+    updated = sign(
+        {
+            key: value
+            for key, value in {**head, "generation": 2, "parent": digest(canonical(head))}.items()
+            if key != "signature"
+        },
+        owner,
+    )
+    transport.query("UPDATE publications SET envelope=? WHERE id=1", [canonical(updated).decode()])
+    snapshot(config, target, transport, page_entries=2)
+    assert transport.calls.count(first) == 1
+    assert (target / "HEAD.knovv").read_bytes() == (bundle / "HEAD.knovv").read_bytes()
+    assert any((target / "partials").iterdir())
+
+
+def test_durable_control_transport_signs_only_allowlisted_operations(tmp_path, monkeypatch):
+
+    config, _, _, owner = setup(tmp_path)
+    config = replace(
+        config,
+        database="",
+        journal_origin="https://knovv.example.test",
+        publisher_client_id="synthetic-client",
+    )
+    credentials = tmp_path / "access.json"
+    credentials.write_text(
+        json.dumps({"client_id": "synthetic-client", "client_secret": "synthetic-secret"})
+    )
+    credentials.chmod(0o600)
+    requests = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self, n):
+            return b'{"success":true,"results":[{"owner":"verified"}]}'
+
+    def open_request(request, **kwargs):
+        requests.append(request)
+        assert request.full_url == config.journal_origin + "/api/control"
+        assert request.get_header("Cf-access-client-id") == "synthetic-client"
+        value = json.loads(request.data)
+        authenticate(value, config.owner_public)
+        assert value["operation"] == "owner" and value["params"] == []
+        assert value["origin"] == config.journal_origin
+        return Response()
+
+    monkeypatch.setattr(
+        "urllib.request.build_opener",
+        lambda *_args: type("Opener", (), {"open": staticmethod(open_request)})(),
+    )
+    transport = Cloudflare(config, owner=owner, access_credentials=credentials)
+    assert transport.query("SELECT owner FROM knovv_identity WHERE id=1") == [{"owner": "verified"}]
+    with pytest.raises(ValueError, match="unsupported-control-query"):
+        transport.query("DELETE FROM devices")
+    assert len(requests) == 1
+    credentials.chmod(0o644)
+    with pytest.raises(ValueError, match="credential-permissions"):
+        Cloudflare(config, owner=owner, access_credentials=credentials)
+    with pytest.raises(ValueError, match="owner-control-credentials-required"):
+        Cloudflare(config)
+
+
+def test_cloudflare_cli_runner_reuses_one_process_and_rejects_other_commands(tmp_path):
+    config, _, _, _ = setup(tmp_path)
+    with Cloudflare(config, seconds=90) as transport:
+        assert b"1.0.0-beta" in transport._run("--version")
+        process = transport._process
+        assert b"1.0.0-beta" in transport._run("--version")
+        assert transport._process is process
+        with pytest.raises(ValueError, match="cloudflare-command-failed"):
+            transport._run("r2", "buckets", "delete", "unrelated")
+    assert process.poll() is not None
+
+
+def test_environment_output_needs_only_public_configuration(tmp_path, capsys):
+    config, _, _, _ = setup(tmp_path)
+    config = replace(
+        config,
+        database="",
+        journal_origin="https://knovv.example.test",
+        access_issuer="https://team.cloudflareaccess.com",
+    )
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(asdict(config)))
+    main(["environment", "--config", str(path)])
+    assert json.loads(capsys.readouterr().out)["KNOVV_D1_ID"] == ""

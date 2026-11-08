@@ -1,16 +1,26 @@
 """Synthetic publication fixtures; never read operator stores or device credentials."""
 
+import base64
 import json
 import os
+import sqlite3
 
 import pytest
 
 from conversation_corpus_engine.archive_model import Conversation, Message
 from conversation_corpus_engine.archive_sealed_crypto import (
     Identity,
+    canonical,
 )
 from conversation_corpus_engine.attribution import text_digest
-from conversation_corpus_engine.knovv_projection import export_bundle, read_bundle, restore_bundle
+from conversation_corpus_engine.knovv_projection import (
+    _postings,
+    _Reader,
+    _Writer,
+    export_bundle,
+    read_bundle,
+    restore_bundle,
+)
 from conversation_corpus_engine.library_store import Library
 
 
@@ -195,4 +205,96 @@ def test_export_deadline_retains_sources_without_publishing_an_incomplete_head(t
         )
     assert not (tmp_path / "bounded" / "HEAD.knovv").exists()
     assert (wiki / "Lattice.md").exists()
+    library.close()
+
+
+def test_bulk_writer_defers_random_indexing_and_preserves_exact_deduplication(tmp_path):
+    owner_key = os.urandom(32)
+    root = tmp_path / "bulk"
+    (root / "objects").mkdir(parents=True)
+    connection = sqlite3.connect(":memory:")
+    trace = []
+    connection.set_trace_callback(trace.append)
+    writer = _Writer(root, owner_key, "b" * 64, 1, 64 * 1024 * 1024, None, {}, connection)
+    values = [{"body": f"Kept bulk value {i}"} for i in range(500)]
+    keys = [writer.put(v) for v in values]
+    writer.flush()
+    writer.recent_keys.clear()
+    assert writer.put(values[0]) == keys[0]
+    writer.bloom[:] = b"\xff" * len(writer.bloom)
+    values.append({"body": "A bloom positive must not discard a new value"})
+    keys.append(writer.put(values[-1]))
+    # Before finalization the build must use sequential heap inserts, not a random key B-tree.
+    schema = connection.execute("SELECT sql FROM sqlite_master WHERE name='packed'").fetchone()[0]
+    assert "PRIMARY KEY" not in schema and "WITHOUT ROWID" not in schema
+    resolution = writer.resolution()
+    reader = _Reader(root, {"vault": "b" * 64, "epoch": 1, "resolve": resolution}, owner_key)
+    assert [reader.value(k) for k in keys] == values
+    assert connection.execute("SELECT COUNT(*) FROM packed").fetchone()[0] == len(values)
+    connection.close()
+
+
+def test_dense_postings_are_lossless_and_fit_the_existing_plaintext_bound():
+    # A frequent term's seven million ordinals cannot fit the existing JSON-array object bound.
+    count = 7_000_000
+    value = _postings([("common", 0, count - 1)])
+    encoded = value["common"]
+    assert encoded["count"] == count
+    raw = base64.b64decode(encoded["ranges"])
+    assert len(raw) < 8
+    assert len(json.dumps(value)) < 32 * 1024 * 1024
+
+
+def test_streaming_jsonl_restore_retains_every_source_coordinate_without_small_files(tmp_path):
+    library, wiki, owner = fixture(tmp_path)
+    bundle = tmp_path / "bundle"
+    export_bundle(library, wiki, bundle, owner, [owner.recipient()])
+    target = tmp_path / "jsonl-restore"
+    result = restore_bundle(bundle, target, owner, owner.signing_public(), layout="jsonl")
+    receipt = json.loads((target / "restore.json").read_text())
+    docs = [
+        json.loads(line)
+        for path in target.glob("documents-*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    assert result["documents"] == receipt["documents"] == len(docs) == 3
+    source = next(d for d in docs if d["kind"] == "source")
+    assert source["body"] == "A lattice remembers its sources."
+    assert source["sources"][0]["message"] == 0
+    assert not list(target.glob("[a-f0-9]" * 64 + ".json"))
+    library.close()
+
+
+def test_streaming_restore_rejects_a_bad_locator_before_creating_output(tmp_path, monkeypatch):
+    library, wiki, owner = fixture(tmp_path)
+    bundle = tmp_path / "bundle"
+    export_bundle(library, wiki, bundle, owner, [owner.recipient()])
+    _, manifest, _ = read_bundle(bundle, owner, owner.signing_public())
+    locators = set(manifest["resolve"].values())
+    original = _Reader.direct
+
+    def malformed(self, oid):
+        raw = original(self, oid)
+        if oid in locators:
+            mapping = json.loads(raw)
+            next(iter(mapping.values()))[1] += 1
+            return canonical(mapping)
+        return raw
+
+    monkeypatch.setattr(_Reader, "direct", malformed)
+    with pytest.raises(ValueError, match="invalid-packed-address"):
+        restore_bundle(bundle, tmp_path / "rejected", owner, owner.signing_public(), layout="jsonl")
+    assert not (tmp_path / "rejected").exists()
+    library.close()
+
+
+def test_publication_receipt_does_not_reparse_unrelated_full_status(tmp_path, monkeypatch):
+    library, wiki, owner = fixture(tmp_path)
+
+    def forbidden_status(*args, **kwargs):
+        raise AssertionError("full corpus status reparse is outside publication")
+
+    monkeypatch.setattr(library, "status", forbidden_status)
+    result = export_bundle(library, wiki, tmp_path / "bounded-count", owner, [owner.recipient()])
+    assert result["documents"] > 0
     library.close()

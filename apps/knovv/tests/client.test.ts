@@ -205,3 +205,108 @@ describe("browser knowledge workflow", () => {
     expect((await searchIndex("constructor", async () => ({}))).total).toBe(0);
   });
 });
+
+it("searches dense delta postings with exact counts and bounded result storage", async () => {
+  const dense = {
+    count: 20000,
+    delta: btoa(String.fromCharCode(...new Uint8Array(20000).fill(1))),
+  };
+  const index: any = { common: dense, rare: [2, 100, 19999], absent: [] };
+  const both = await searchIndex("common rare", async () => index);
+  expect(both).toMatchObject({
+    ordinals: [2, 100, 19999],
+    total: 3,
+    plan: "and",
+  });
+  const one = await searchIndex("common", async () => index);
+  expect(one.total).toBe(20000);
+  expect(one.ordinals).toHaveLength(1000);
+  expect(one.truncated).toBe(true);
+  const fallback = await searchIndex("common absent", async () => index);
+  expect(fallback.total).toBe(20000);
+  expect(fallback.plan).toBe("or");
+  await expect(
+    searchIndex("bad", async () => ({
+      bad: { count: 2, delta: btoa("\x01") },
+    })),
+  ).rejects.toThrow("invalid-search-index");
+});
+
+it("matches exact intersection and ranked fallback results across mixed posting formats", async () => {
+  let state = 123456789;
+  const next = () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 0x100000000;
+  };
+  const encode = (values: number[]) => {
+    const bytes: number[] = [];
+    let prior = -1;
+    for (const ordinal of values) {
+      let delta = ordinal - prior;
+      while (delta >= 128) {
+        bytes.push((delta & 127) | 128);
+        delta = Math.floor(delta / 128);
+      }
+      bytes.push(delta);
+      prior = ordinal;
+    }
+    return {
+      count: values.length,
+      delta: Buffer.from(bytes).toString("base64"),
+    };
+  };
+  for (let run = 0; run < 50; run++) {
+    const lists = Array.from({ length: 3 }, () =>
+      Array.from({ length: 200 }, (_, n) => n).filter(() => next() < 0.15),
+    );
+    const raw: any = {
+      alpha: encode(lists[0]),
+      beta: lists[1],
+      gamma: encode(lists[2]),
+    };
+    const hits = Array.from({ length: 200 }, (_, id) => ({
+      id,
+      count: lists.reduce((n, l) => n + Number(l.includes(id)), 0),
+    }));
+    const exact = hits.filter((h) => h.count === 3),
+      ranked = exact.length
+        ? exact
+        : hits
+            .filter((h) => h.count)
+            .sort((a, b) => b.count - a.count || a.id - b.id);
+    const result = await searchIndex("alpha beta gamma", async () => raw, 4);
+    expect(result.ordinals).toEqual(ranked.map((h) => h.id));
+    expect(result.total).toBe(ranked.length);
+    expect(result.plan).toBe(exact.length ? "and" : "or");
+  }
+});
+
+it("intersects and ranks multi-million-message ranges without expanding the ordinal space", async () => {
+  const encode = (numbers: number[]) => {
+    const out: number[] = [];
+    for (let n of numbers) {
+      while (n >= 128) {
+        out.push((n & 127) | 128);
+        n = Math.floor(n / 128);
+      }
+      out.push(n);
+    }
+    return Buffer.from(out).toString("base64");
+  };
+  const index: any = {
+    common: { count: 7_000_000, ranges: encode([1, 7_000_000]) },
+    rare: [2, 100, 6_999_999],
+    absent: [],
+  };
+  expect(await searchIndex("common rare", async () => index)).toMatchObject({
+    ordinals: [2, 100, 6_999_999],
+    total: 3,
+    plan: "and",
+  });
+  const one = await searchIndex("common", async () => index);
+  expect(one.total).toBe(7_000_000);
+  expect(one.ordinals).toHaveLength(1000);
+  const fallback = await searchIndex("common absent", async () => index);
+  expect(fallback.total).toBe(7_000_000);
+  expect(fallback.plan).toBe("or");
+});

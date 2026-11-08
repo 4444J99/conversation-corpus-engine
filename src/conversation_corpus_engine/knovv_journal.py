@@ -346,7 +346,9 @@ def import_snapshot(
         raise ValueError("invalid-journal")
     total = 0
     result = {"imported": 0, "cursor": 0, "has_more": False}
+    processed = False
     for batch in batches:
+        processed = True
         prior = -1
         while True:
             result = import_journal(batch, read_object, secret, owner_public, home, **bounds)
@@ -356,4 +358,19 @@ def import_snapshot(
             if result["cursor"] <= prior or not result["imported"]:
                 raise ValueError("journal-import-no-progress")
             prior = result["cursor"]
+    if not processed:
+        result = import_journal(
+            {
+                "schema": "knovv-journal.v1",
+                "vault": journal["vault"],
+                "epoch": journal["epoch"],
+                "grants": journal["grants"],
+                "revisions": [],
+            },
+            read_object,
+            secret,
+            owner_public,
+            home,
+            **bounds,
+        )
     return {**result, "imported": total}

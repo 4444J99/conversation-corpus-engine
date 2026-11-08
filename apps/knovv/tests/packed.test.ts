@@ -53,6 +53,16 @@ describe("packed canonical application publications", () => {
       expect(source.document.body).toContain(
         "A lattice remembers its sources.",
       );
+      const shared = await vault.baseSearch("shared heading");
+      expect(shared.total).toBe(3);
+      const numbers = [];
+      for (const n of shared.ordinals) {
+        const meta = await vault.meta(n),
+          item = await vault.open(meta.id);
+        numbers.push(item.document.sources[0].message);
+        expect(Object.hasOwn(item.document, "_index_shared")).toBe(false);
+      }
+      expect(numbers.sort()).toEqual([0, 1, 2]);
       vault.lock();
     } finally {
       await rm(root, { recursive: true, force: true });

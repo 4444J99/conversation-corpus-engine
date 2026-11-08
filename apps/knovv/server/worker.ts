@@ -1,34 +1,40 @@
 import { api, type Env, json, type Principal } from "./api";
-type AccessContext = ExecutionContext & {
-  access?: {
-    aud: string;
-    getIdentity: () => Promise<{ email?: string } | null>;
-  };
+import { authenticate } from "./auth";
+import type { KnovvJournal } from "./durable";
+export { KnovvJournal } from "./durable";
+export { authenticate } from "./auth";
+type WorkerEnv = Omit<Env, "DB"> & {
+  DB?: Env["DB"];
+  PUBLISHER_CLIENT_ID?: string;
+  ACCESS_ISSUER?: string;
+  JOURNAL?: DurableObjectNamespace<KnovvJournal>;
 };
-export async function authenticate(
-  env: Env,
-  ctx: AccessContext,
-): Promise<Principal | null> {
-  if (!env.ACCESS_AUD || !ctx.access || ctx.access.aud !== env.ACCESS_AUD)
-    return null;
-  const identity = await ctx.access.getIdentity();
-  return identity?.email === env.OWNER_EMAIL ? { email: identity.email } : null;
-}
+type AccessContext = Parameters<typeof authenticate>[1];
 export default {
   async fetch(
     request: Request,
-    env: Env,
+    env: WorkerEnv,
     ctx: AccessContext,
   ): Promise<Response> {
     let principal: Principal | null = null;
     try {
-      principal = await authenticate(env, ctx);
+      principal = await authenticate(
+        env,
+        ctx,
+        new URL(request.url).pathname,
+        request,
+      );
     } catch {
       return json({ error: "authentication-unavailable" }, 503);
     }
     if (!principal) return json({ error: "not-authorized" }, 403);
     const path = new URL(request.url).pathname;
-    if (path.startsWith("/api/")) return api(request, env, principal);
+    if (path.startsWith("/api/")) {
+      if (env.JOURNAL)
+        return env.JOURNAL.getByName(env.OWNER_PUBLIC_KEY).serve(request);
+      if (env.DB) return api(request, { ...env, DB: env.DB }, principal);
+      return json({ error: "storage-not-configured" }, 503);
+    }
     const response = await env.ASSETS.fetch(request);
     const headers = new Headers(response.headers);
     headers.set(

@@ -21,6 +21,7 @@ owner = Identity("knovv", "synthetic-publisher", os.urandom(32), os.urandom(32))
 device = Identity("knovv", "synthetic-browser", os.urandom(32), os.urandom(32))
 with Library.create(root / "library.sqlite") as library:
     library.put(Conversation(provider="chatgpt", source_id="fixture", title="Lattice inquiry", messages=[Message(role="user", text="A lattice remembers its sources. Every knowledge claim should preserve the passage that supports it.", id="m1", channel="typed"), Message(role="assistant", text="A derived explanation should remain connected to the original material.", id="m2", channel="reply")], provenance={"source_file":"synthetic.json", "source_sha256":"a"*64}))
+    library.put(Conversation(provider="chatgpt",source_id="range-fixture",title="Shared heading",messages=[Message(role="user",text="rare",id="r1"),Message(role="user",text="shared heading",id="r2"),Message(role="user",text="",id="r3")],provenance={"source_file":"range-synthetic.json","source_sha256":"b"*64}))
     export_bundle(library, wiki, root / "bundle", owner, [owner.recipient(), device.recipient()])
 head = json.loads((root / "bundle" / "HEAD.knovv").read_bytes())
 grant = sign({"schema":"knovv-device.v1", "id":digest(device.signing_public().encode()), "signing_public":device.signing_public(), "generation":1, "revoked":False},owner)

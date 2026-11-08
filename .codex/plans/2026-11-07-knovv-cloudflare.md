@@ -8,11 +8,11 @@ Code and synthetic fixtures are public; private content and deployment receipts 
 
 ## Tasks and checks
 
-- [ ] 1. Encryption and contracts: interoperate with CCE sealed v1/v2; protected device keys,
+- [x] 1. Encryption and contracts: interoperate with CCE sealed v1/v2; protected device keys,
   signed enrollment and revision contracts. Test wrong keys, tampering, bounds and Python parity.
-- [ ] 2. Cloudflare API: Access authentication, R2 immutable objects, D1 atomic revision journal,
+- [x] 2. Cloudflare API: Access authentication, R2 immutable objects, D1 atomic revision journal,
   device enrollment/revocation, cursor sync, conflict and idempotency behavior. Real local D1/R2 tests.
-- [ ] 3. Browser workspace: wiki, atomic notes, source citations, backlinks, history, encrypted cache,
+- [x] 3. Browser workspace: wiki, atomic notes, source citations, backlinks, history, encrypted cache,
   search worker, capture/editor, conflict recovery and two-device synchronization. Build/typecheck/UI QA.
 - [ ] 4. CCE bridge: read-only canonical export, sealed publication, journal import and recovery;
   maintain attribution, source revisions and capture receipts. Synthetic and private real-data validation.
@@ -76,3 +76,23 @@ construction. Locators store full binary hashes internally, preserving their ful
 published identifiers and unchanged cache, plaintext, storage and deadline bounds.
 The existing account still has ten D1 databases and no KNOVV database as of the
 latest live read. No paid capacity change or private upload has been made.
+
+
+### November 8 capacity and hosted validation
+
+Ruling: use a dedicated SQLite Durable Object for the opaque signed journal after
+fresh D1 creation again hit the ten-database account limit. The owner's steering
+was to fit the current account; no new paid capacity or unrelated database change
+is authorized. D1 remains an optional dedicated backend. Cost if wrong: Durable
+Object storage/runtime limits need their own production measurements.
+
+Staging now deploys successfully with Worker Assets, R2 and its SQLite journal.
+Worker-level Access protects all traffic; the app verifies Access JWTs because
+Static Assets omit the platform context. A 24-hour publisher token is scoped to
+owner-signed fixed maintenance operations. Synthetic seed, 88-object independent
+readback and an eight-document enrolled-device restore pass. The full private
+publication is still pending after its default one-hour export deadline failed.
+Physical-device and real-data performance acceptance remain unchecked.
+
+The verification report carries the current tests and exact remaining predicates;
+older counts and the D1-only blocker above are historical ledger entries.

@@ -8,17 +8,23 @@ publishing a head; interrupted uploads can be resumed without replacing original
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
+import selectors
 import subprocess
 import tempfile
 import time
+import urllib.error
+import urllib.request
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from .archive_sealed import safe_path
-from .archive_sealed_crypto import authenticate, canonical, digest
+from .archive_sealed import load_identity, safe_path
+from .archive_sealed_crypto import authenticate, canonical, digest, sign
+from .knovv_cli import _private
 from .knovv_projection import DEFAULT_BUDGET, MAX_BUDGET, _object
 
 HEX = re.compile(r"[0-9a-f]{64}\Z")
@@ -34,11 +40,22 @@ class Config:
     owner_email: str
     audience: str
     max_cipher_bytes: int = DEFAULT_BUDGET
+    journal_origin: str = ""
+    publisher_client_id: str = ""
+    access_issuer: str = ""
 
     def __post_init__(self):
         if (
             not re.fullmatch(r"[0-9a-f]{32}", self.account)
-            or not re.fullmatch(r"[0-9a-f-]{36}", self.database)
+            or (
+                not re.fullmatch(r"[0-9a-f-]{36}", self.database)
+                if not self.journal_origin
+                else bool(self.database)
+            )
+            or (
+                self.journal_origin
+                and not re.fullmatch(r"https://[a-z0-9.-]+(?::[0-9]+)?", self.journal_origin)
+            )
             or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,61}[a-z0-9]", self.bucket)
             or not HEX.fullmatch(self.owner_public)
             or not HEX.fullmatch(self.audience)
@@ -52,6 +69,8 @@ class Config:
         return {
             "CLOUDFLARE_ACCOUNT_ID": self.account,
             "KNOVV_D1_ID": self.database,
+            "KNOVV_PUBLISHER_CLIENT_ID": self.publisher_client_id,
+            "KNOVV_ACCESS_ISSUER": self.access_issuer,
             "KNOVV_R2_BUCKET": self.bucket,
             "KNOVV_OWNER_PUBLIC_KEY": self.owner_public,
             "KNOVV_OWNER_EMAIL": self.owner_email,
@@ -61,32 +80,144 @@ class Config:
 
 
 class Cloudflare:
-    def __init__(self, config: Config, *, seconds=3600):
+    def __init__(self, config: Config, *, seconds=3600, owner=None, access_credentials=None):
         self.config = config
         self.deadline = time.monotonic() + seconds
+        self._process = None
+        self._owner = owner
+        self._access = None
+        if config.journal_origin:
+            if (
+                owner is None
+                or owner.signing_public() != config.owner_public
+                or access_credentials is None
+            ):
+                raise ValueError("owner-control-credentials-required")
+            self._access = json.loads(_private(access_credentials))
+            if (
+                set(self._access) != {"client_id", "client_secret"}
+                or self._access["client_id"] != config.publisher_client_id
+                or not all(
+                    isinstance(v, str) and v and "\n" not in v and "\r" not in v
+                    for v in self._access.values()
+                )
+            ):
+                raise ValueError("invalid-access-credentials")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+    def close(self):
+        if self._process is not None:
+            if self._process.poll() is None:
+                self._process.terminate()
+                try:
+                    self._process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self._process.kill()
+                    self._process.wait(timeout=5)
+            for stream in (self._process.stdin, self._process.stdout):
+                stream.close()
+            self._process = None
 
     def _run(self, *args: str, output=None):
-        remaining = self.deadline - time.monotonic()
+        remaining = min(60, self.deadline - time.monotonic())
         if remaining <= 0:
             raise ValueError("cloudflare-operation-deadline")
-        result = subprocess.run(
-            ["cf", *args],
-            env={**os.environ, **self.config.environment()},
-            stdout=output if output is not None else subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=min(60, remaining),
-            check=False,
+        if self._process is None:
+            runner = Path(__file__).resolve().parents[2] / "apps/knovv/agent/cf-runner.mjs"
+            self._process = subprocess.Popen(
+                ["node", str(runner)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ, **self.config.environment()},
+            )
+        request = {"args": list(args)}
+        if output is not None:
+            if not isinstance(output, Path):
+                output.flush()
+            request["output"] = str(output if isinstance(output, Path) else output.name)
+        process = self._process
+        try:
+            process.stdin.write(canonical(request) + b"\n")
+            process.stdin.flush()
+            raw = bytearray()
+            until = time.monotonic() + remaining
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while not raw.endswith(b"\n"):
+                    timeout = until - time.monotonic()
+                    if timeout <= 0 or not selector.select(timeout):
+                        raise ValueError("cloudflare-operation-deadline")
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if not chunk or len(raw) + len(chunk) > 90 * 1024 * 1024:
+                        raise ValueError("cloudflare-response-bound")
+                    raw.extend(chunk)
+            response = json.loads(raw)
+            if response.get("ok") is not True:
+                raise ValueError("cloudflare-command-failed:" + args[0])
+            return base64.b64decode(response["stdout"], validate=True) if output is None else b""
+        except Exception:
+            self.close()
+            raise
+
+    def _control(self, operation, params):
+        remaining = min(60, self.deadline - time.monotonic())
+        if remaining <= 0:
+            raise ValueError("cloudflare-operation-deadline")
+        value = sign(
+            {
+                "schema": "knovv-control.v1",
+                "operation": operation,
+                "params": list(params),
+                "origin": self.config.journal_origin,
+                "issued": int(time.time()),
+                "nonce": os.urandom(32).hex(),
+            },
+            self._owner,
         )
-        if result.returncode:
-            # Provider errors may contain request payloads. Keep them out of logs.
-            raise ValueError("cloudflare-command-failed:" + args[0] + ":" + args[1])
-        if output is None:
-            if len(result.stdout) > 64 * 1024 * 1024:
-                raise ValueError("cloudflare-response-bound")
-            return result.stdout
-        return b""
+        request = urllib.request.Request(
+            self.config.journal_origin + "/api/control",
+            data=canonical(value),
+            headers={
+                "content-type": "application/json",
+                "user-agent": "KNOVV-Publisher/0.1",
+                "origin": self.config.journal_origin,
+                "CF-Access-Client-Id": self._access["client_id"],
+                "CF-Access-Client-Secret": self._access["client_secret"],
+            },
+        )
+        try:
+            # Redirects must never forward this app-scoped credential elsewhere.
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, *_args):
+                    raise ValueError("control-redirect-refused")
+
+            response = urllib.request.build_opener(NoRedirect()).open(request, timeout=remaining)
+            with response:
+                raw = response.read(8 * 1024 * 1024 + 1)
+            if len(raw) > 8 * 1024 * 1024:
+                raise ValueError("control-response-bound")
+            result = json.loads(raw)
+            if result.get("success") is not True or not isinstance(result.get("results"), list):
+                raise ValueError("invalid-control-response")
+            return result["results"]
+        except urllib.error.HTTPError as error:
+            raise ValueError(f"cloudflare-control-http-{error.code}") from None
+        except Exception:
+            raise ValueError("cloudflare-control-failed") from None
 
     def query(self, sql: str, params=()):
+        if self.config.journal_origin:
+            queries = json.loads((SCHEMA.parent / "control-queries.json").read_bytes())
+            operation = next((name for name, query in queries.items() if query == sql), None)
+            if operation is None:
+                raise ValueError("unsupported-control-query")
+            return self._control(operation, params)
         value = json.loads(
             self._run(
                 "d1",
@@ -109,6 +240,11 @@ class Cloudflare:
         return value["results"]
 
     def schema(self, sql: str):
+        if self.config.journal_origin:
+            if sql != SCHEMA.read_text():
+                raise ValueError("unsupported-control-schema")
+            self._control("initialize", [])
+            return
         self._run("d1", "query", self.config.database, "--sql", sql)
 
     def put(self, oid: str, path: Path):
@@ -120,9 +256,7 @@ class Cloudflare:
         safe_path(path)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as stream:
-            self._run(
-                "r2", "objects", "get", oid, "--bucket-name", self.config.bucket, output=stream
-            )
+            self._run("r2", "objects", "get", oid, "--bucket-name", self.config.bucket, output=path)
             stream.flush()
             os.fsync(stream.fileno())
 
@@ -244,23 +378,63 @@ def seed(config: Config, bundle: Path, grants: list[dict], transport, *, schema:
 def snapshot(config: Config, destination: Path, transport, *, page_entries: int = 256):
     if not 1 <= page_entries <= 1000:
         raise ValueError("invalid-page-bound")
-    # One statement fixes the publication, grants and journal high-water mark.
-    rows = transport.query(
-        "SELECT 'publication' kind,envelope value FROM publications UNION ALL SELECT 'device',envelope FROM devices UNION ALL SELECT 'cutoff',CAST(COALESCE(MAX(seq),0) AS TEXT) FROM revisions"
-    )
-    heads = [json.loads(r["value"]) for r in rows if r["kind"] == "publication"]
-    if len(heads) != 1:
-        raise ValueError("snapshot-publication-unavailable")
-    head = heads[0]
+    from .knovv_journal import _atomic  # noqa: PLC0415
+
+    destination = safe_path(destination)
+    marker = destination / "snapshot-plan.json"
+    configuration = digest(canonical(config.environment()))
+
+    def store(path, raw):
+        safe_path(path)
+        if path.exists():
+            if path.stat().st_size != len(raw) or path.read_bytes() != raw:
+                raise ValueError("snapshot-local-conflict")
+        else:
+            _atomic(path, raw)
+
+    if destination.exists():
+        if not marker.is_file() or marker.stat().st_size > 8 * 1024 * 1024:
+            raise ValueError("unowned-snapshot-directory")
+        if (destination / "HEAD.knovv").exists():
+            raise ValueError("snapshot-already-complete-use-new-destination")
+        plan = json.loads(marker.read_bytes())
+        if plan.get("schema") != "knovv-snapshot-plan.v1" or plan.get("config") != configuration:
+            raise ValueError("wrong-snapshot-owner")
+        head, cutoff, grants = plan["head"], plan["cutoff"], plan["grants"]
+        page_entries = plan["page_entries"]
+        if (
+            type(cutoff) is not int
+            or cutoff < 0
+            or type(page_entries) is not int
+            or not 1 <= page_entries <= 1000
+        ):
+            raise ValueError("invalid-snapshot-plan")
+    else:
+        # One statement fixes publication, grants and high-water mark for every retry.
+        rows = transport.query(
+            "SELECT 'publication' kind,envelope value FROM publications UNION ALL SELECT 'device',envelope FROM devices UNION ALL SELECT 'cutoff',CAST(COALESCE(MAX(seq),0) AS TEXT) FROM revisions"
+        )
+        heads = [json.loads(r["value"]) for r in rows if r["kind"] == "publication"]
+        if len(heads) != 1:
+            raise ValueError("snapshot-publication-unavailable")
+        head = heads[0]
+        cutoff = int(next(r["value"] for r in rows if r["kind"] == "cutoff"))
+        grants = [json.loads(r["value"]) for r in rows if r["kind"] == "device"]
+        plan = {
+            "schema": "knovv-snapshot-plan.v1",
+            "config": configuration,
+            "head": head,
+            "cutoff": cutoff,
+            "grants": grants,
+            "page_entries": page_entries,
+        }
     authenticate(head, config.owner_public)
-    cutoff = int(next(r["value"] for r in rows if r["kind"] == "cutoff"))
-    grants = [json.loads(r["value"]) for r in rows if r["kind"] == "device"]
     for grant in grants:
         authenticate(grant, config.owner_public)
-    destination = safe_path(destination)
-    destination.mkdir(mode=0o700, parents=True, exist_ok=False)
-    (destination / "objects").mkdir(mode=0o700)
-    (destination / "journal-pages").mkdir(mode=0o700)
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    store(marker, canonical(plan))
+    for name in ("objects", "journal-pages", "partials"):
+        safe_path(destination / name).mkdir(mode=0o700, exist_ok=True)
     size = count = 0
     after = ""
     while True:
@@ -282,13 +456,20 @@ def snapshot(config: Config, destination: Path, transport, *, page_entries: int 
             if size > config.max_cipher_bytes:
                 raise ValueError("snapshot-storage-bound")
             path = destination / "objects" / item["id"]
-            transport.get(item["id"], path)
-            if path.stat().st_size != item["size"] or digest(path.read_bytes()) != item["id"]:
-                raise ValueError("snapshot-ciphertext-mismatch")
+            safe_path(path)
+            complete = (
+                path.is_file()
+                and path.stat().st_size == item["size"]
+                and digest(path.read_bytes()) == item["id"]
+            )
+            if not complete:
+                if path.exists():
+                    path.rename(destination / "partials" / (item["id"] + "-" + uuid.uuid4().hex))
+                transport.get(item["id"], path)
+                if path.stat().st_size != item["size"] or digest(path.read_bytes()) != item["id"]:
+                    raise ValueError("snapshot-ciphertext-mismatch")
             after = item["id"]
             count += 1
-    from .knovv_cli import _write  # noqa: PLC0415
-
     pages = []
     cursor = revisions = 0
     while cursor < cutoff:
@@ -311,11 +492,7 @@ def snapshot(config: Config, destination: Path, transport, *, page_entries: int 
             raise ValueError("snapshot-page-bound")
         name = f"journal-pages/{len(pages):08}.jsonl"
         path = destination / name
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
+        store(path, raw)
         pages.append(
             {
                 "file": name,
@@ -335,7 +512,7 @@ def snapshot(config: Config, destination: Path, transport, *, page_entries: int 
         "cutoff": cutoff,
         "pages": pages,
     }
-    _write(destination / "journal.json", journal)
+    store(destination / "journal.json", canonical(journal))
     receipt = {
         "schema": "knovv-ciphertext-snapshot.v2",
         "publication": digest(canonical(head)),
@@ -346,9 +523,9 @@ def snapshot(config: Config, destination: Path, transport, *, page_entries: int 
         "verified_ciphertext": True,
         "content_restore": "requires-enrolled-device",
     }
-    _write(destination / "receipt.json", receipt)
+    store(destination / "receipt.json", canonical(receipt))
     # HEAD is the completion marker and appears only after every readback succeeds.
-    _write(destination / "HEAD.knovv", head)
+    store(destination / "HEAD.knovv", canonical(head))
     return receipt
 
 
@@ -360,14 +537,37 @@ def main(argv=None):
     parser.add_argument("--grant", type=Path, action="append", default=[])
     parser.add_argument("--output", type=Path)
     parser.add_argument("--schema", type=Path, default=SCHEMA)
+    parser.add_argument("--owner-key", type=Path)
+    parser.add_argument("--owner-passphrase-file", type=Path)
+    parser.add_argument("--access-credentials", type=Path)
     args = parser.parse_args(argv)
     config = Config(**json.loads(safe_path(args.config).read_bytes()))
-    transport = Cloudflare(config)
+    if args.action == "environment":
+        print(json.dumps(config.environment(), sort_keys=True))
+        return None
+    owner = None
+    if config.journal_origin:
+        if not args.owner_key or not args.owner_passphrase_file or not args.access_credentials:
+            parser.error(
+                "journal transport requires owner key, passphrase file and Access credentials"
+            )
+        owner = load_identity(
+            args.owner_key,
+            passphrase=_private(args.owner_passphrase_file),  # allow-secret: protected file input
+        )
+    transport = Cloudflare(config, owner=owner, access_credentials=args.access_credentials)
+    try:
+        return _main_action(args, config, transport)
+    finally:
+        transport.close()
+
+
+def _main_action(args, config, transport):
     if args.action == "environment":
         print(json.dumps(config.environment(), sort_keys=True))
     elif args.action == "seed":
         if not args.bundle or not args.grant:
-            parser.error("seed requires --bundle and --grant")
+            raise ValueError("seed requires --bundle and --grant")
         print(
             json.dumps(
                 seed(
@@ -382,7 +582,7 @@ def main(argv=None):
         )
     else:
         if not args.output:
-            parser.error("snapshot requires --output")
+            raise ValueError("snapshot requires --output")
         print(json.dumps(snapshot(config, args.output, transport), sort_keys=True))
 
 

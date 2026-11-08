@@ -9,7 +9,9 @@ in plaintext. The only plaintext index is an automatically removed private scrat
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -30,6 +32,7 @@ from .archive_sealed_crypto import (
     authenticate,
     canonical,
     decrypt,
+    derive,
     digest,
     encrypt,
     sign,
@@ -73,6 +76,64 @@ def _object(root: Path, oid: str) -> bytes:
     if digest(raw) != oid:
         raise ValueError("projection-object-digest")
     return raw
+
+
+def _postings(rows) -> dict:
+    """Lossless interval varints, including very dense title-derived postings."""
+    result = {}
+    term = None
+    previous = -1
+    pending = None
+    encoded = bytearray()
+    count = 0
+
+    def emit(start, end):
+        nonlocal previous, count
+        for component in (start - previous, end - start + 1):
+            value = component
+            while value >= 128:
+                encoded.append((value & 127) | 128)
+                value >>= 7
+            encoded.append(value)
+        previous = end
+        count += end - start + 1
+
+    def finish():
+        if term is not None:
+            if pending is not None:
+                emit(*pending)
+            result[term] = {"count": count, "ranges": base64.b64encode(encoded).decode("ascii")}
+
+    prior_start = -1
+    for row in rows:
+        current, start = row[:2]
+        end = row[2] if len(row) > 2 else start
+        if current != term:
+            finish()
+            term, previous, pending, encoded, count, prior_start = (
+                current,
+                -1,
+                None,
+                bytearray(),
+                0,
+                -1,
+            )
+        if (
+            type(start) is not int
+            or type(end) is not int
+            or not 0 <= start <= end <= 0xFFFFFFFF
+            or start < prior_start
+        ):
+            raise ValueError("invalid-search-posting")
+        prior_start = start
+        if pending is not None and start <= pending[1] + 1:
+            pending = (pending[0], max(end, pending[1]))
+        else:
+            if pending is not None:
+                emit(*pending)
+            pending = (start, end)
+    finish()
+    return result
 
 
 def _context(vault: str, epoch: int) -> str:
@@ -125,14 +186,18 @@ class _Writer:
         connection: sqlite3.Connection,
     ):
         self.root, self.secret, self.vault, self.epoch = root, secret, vault, epoch
+        self.address_key = derive(secret, b"address")
         self.budget, self.previous, self.reused = budget, previous, reused
         self.bytes = 0
         self.seen: set[str] = set()
         self.connection = connection
         self.slab = bytearray()
-        self.slab_keys: list[str] = []
+        self.slab_refs: dict[bytes, tuple[int, int]] = {}
+        self.recent_keys: OrderedDict[bytes, None] = OrderedDict()
+        self.bloom = bytearray(64 * 1024)
+        self.bloom_entries = 0
         connection.execute(
-            "CREATE TABLE packed(logical BLOB PRIMARY KEY, object BLOB, offset INTEGER, length INTEGER) WITHOUT ROWID"
+            "CREATE TABLE packed(logical BLOB, object BLOB, offset INTEGER, length INTEGER)"
         )
         connection.execute(
             "CREATE TABLE previous_packed(logical BLOB PRIMARY KEY, object BLOB, offset INTEGER, length INTEGER) WITHOUT ROWID"
@@ -172,25 +237,31 @@ class _Writer:
             if _inflate(decrypt(self.secret, cipher, _context(self.vault, self.epoch))) == raw:
                 return self._land(cipher)
         return self._land(
-            encrypt(self.secret, zlib.compress(raw), _context(self.vault, self.epoch))
+            encrypt(self.secret, zlib.compress(raw, level=1), _context(self.vault, self.epoch))
         )
 
     def flush(self) -> None:
         if not self.slab:
             return
         cipher = encrypt(
-            self.secret, zlib.compress(bytes(self.slab)), _context(self.vault, self.epoch)
+            self.secret, zlib.compress(bytes(self.slab), level=1), _context(self.vault, self.epoch)
         )
         oid = self._land(cipher)
         self.connection.executemany(
-            "UPDATE packed SET object=? WHERE logical=?",
-            ((bytes.fromhex(oid), bytes.fromhex(key)) for key in self.slab_keys),
+            "INSERT INTO packed VALUES (?,?,?,?)",
+            (
+                (key, bytes.fromhex(oid), offset, length)
+                for key, (offset, length) in self.slab_refs.items()
+            ),
         )
         self.slab.clear()
-        self.slab_keys.clear()
+        self.slab_refs.clear()
 
     def resolution(self) -> dict[str, str]:
         self.flush()
+        self.bloom.clear()
+        self.recent_keys.clear()
+        self.connection.execute("CREATE INDEX packed_order ON packed(logical,object,offset,length)")
         result = {}
         for first in range(256):
             prefix = f"{first:02x}"
@@ -205,36 +276,75 @@ class _Writer:
                 result[prefix] = self.direct(mapping, self.reused.get(prefix))
         return result
 
+    @staticmethod
+    def _bits(key: bytes, mask: int):
+        return (int.from_bytes(key[start : start + 4], "big") & mask for start in range(0, 28, 4))
+
+    def _mark(self, key: bytes):
+        for bit in self._bits(key, len(self.bloom) * 8 - 1):
+            self.bloom[bit >> 3] |= 1 << (bit & 7)
+
+    def _remember(self, key: bytes):
+        self.recent_keys[key] = None
+        self.recent_keys.move_to_end(key)
+        if len(self.recent_keys) > 4096:
+            self.recent_keys.popitem(last=False)
+
+    def _grow(self):
+        if self.bloom_entries < len(self.bloom) // 4 or len(self.bloom) >= 64 * 1024 * 1024:
+            return
+        self.bloom = bytearray(min(64 * 1024 * 1024, len(self.bloom) * 16))
+        for (key,) in self.connection.execute("SELECT logical FROM packed"):
+            self._mark(key)
+        for key in self.slab_refs:
+            self._mark(key)
+
     def put(self, value: Any) -> str:
         raw = canonical(value)
         if len(raw) > PLAIN_LIMIT - 8:
             raise ValueError("projection-object-bound")
-        key = address(self.secret, raw)
-        if self.connection.execute(
-            "SELECT 1 FROM packed WHERE logical=?", (bytes.fromhex(key),)
-        ).fetchone():
+        key = hmac.new(self.address_key, raw, hashlib.sha256).hexdigest()
+        binary = bytes.fromhex(key)
+        if binary in self.recent_keys or binary in self.slab_refs:
+            self._remember(binary)
             return key
-        old = self.connection.execute(
-            "SELECT object,offset,length FROM previous_packed WHERE logical=?",
-            (bytes.fromhex(key),),
-        ).fetchone()
+        self._grow()
+        # A bounded filter avoids random reads for new objects. Positives always
+        # receive an exact SQL check; it can never authorize a false deduplication.
+        if (
+            all(
+                self.bloom[bit >> 3] & (1 << (bit & 7))
+                for bit in self._bits(binary, len(self.bloom) * 8 - 1)
+            )
+            and self.connection.execute(
+                "SELECT 1 FROM packed WHERE logical=? LIMIT 1", (binary,)
+            ).fetchone()
+        ):
+            self._remember(binary)
+            return key
+        old = (
+            self.connection.execute(
+                "SELECT object,offset,length FROM previous_packed WHERE logical=?",
+                (binary,),
+            ).fetchone()
+            if self.previous
+            else None
+        )
         if old and self.previous:
             self._land(_object(self.previous, old[0].hex()))
-            self.connection.execute(
-                "INSERT INTO packed VALUES (?,?,?,?)", (bytes.fromhex(key), *old)
-            )
-            return key
-        if self.slab and len(self.slab) + 8 + len(raw) > PACK_BYTES:
-            self.flush()
-        offset = len(self.slab) + 8
-        self.slab.extend(len(raw).to_bytes(8, "big"))
-        self.slab.extend(raw)
-        self.slab_keys.append(key)
-        self.connection.execute(
-            "INSERT INTO packed VALUES (?,?,?,?)", (bytes.fromhex(key), b"", offset, len(raw))
-        )
-        if len(self.slab) >= PACK_BYTES:
-            self.flush()
+            self.connection.execute("INSERT INTO packed VALUES (?,?,?,?)", (binary, *old))
+        else:
+            if self.slab and len(self.slab) + 8 + len(raw) > PACK_BYTES:
+                self.flush()
+            offset = len(self.slab) + 8
+            self.slab.extend(len(raw).to_bytes(8, "big"))
+            self.slab.extend(raw)
+            self.slab_refs[binary] = (offset, len(raw))
+            if len(self.slab) >= PACK_BYTES:
+                self.flush()
+        self._mark(binary)
+        self.bloom_entries += 1
+        self._remember(binary)
         return key
 
 
@@ -370,6 +480,9 @@ def _source_candidates(library: Library, id_key: bytes) -> Iterator[dict]:
 def _revision_sources(
     row: dict, payload: dict, version: str, history: list, id_key: bytes
 ) -> Iterator[dict]:
+    address_key = derive(id_key, b"address")
+    title = payload.get("title", row["uid"])
+    shared = (row["uid"] + "@" + version, frozenset(TOKEN.findall(title.lower())))
     for sequence, messages in (
         ("main", payload.get("messages", []) or [{"text": ""}]),
         ("alternate", payload.get("extra", {}).get("alternate_messages", [])),
@@ -391,10 +504,12 @@ def _revision_sources(
                 logical = f"cce:{row['uid']}@{version}#{sequence}:{number}:{start}"
                 spans = message.get("meta", {}).get("attribution", {})
                 yield {
-                    "id": address(id_key, logical.encode()),
+                    "id": hmac.new(address_key, logical.encode(), hashlib.sha256).hexdigest(),
                     "logical_id": logical,
                     "kind": "source",
-                    "title": payload.get("title", row["uid"]) + f" · {number + 1}",
+                    "title": title + f" · {number + 1}",
+                    "_index_shared": shared,
+                    "_index_number": str(number + 1),
                     "body": part,
                     "summary": part[:200],
                     "author": "unknown",
@@ -424,6 +539,15 @@ def _sources(
     for _, group in groupby(
         _source_candidates(library, id_key), key=lambda doc: doc["sources"][0]["uid"]
     ):
+        if attribution_deadline is not None and time.monotonic() >= attribution_deadline:
+            for document in group:
+                document.update(
+                    author="unknown",
+                    authorship_basis="unmeasured",
+                    authorship_note="global attribution deadline reached",
+                )
+                yield document
+            continue
         documents = list(group)
         eligible = [d for d in documents if d["body"] and d["sources"][0]["sequence"] == "main"]
         refs = [{**d["sources"][0], "text_digest": d["sources"][0]["digest"]} for d in eligible]
@@ -505,11 +629,11 @@ def export_bundle(
     with tempfile.TemporaryDirectory(prefix="knovv-index-", dir=destination.parent) as scratch:
         Path(scratch).chmod(0o700)
         connection = sqlite3.connect(str(Path(scratch) / "tokens.sqlite"))
-        connection.execute("PRAGMA cache_size=-8192")
+        connection.execute("PRAGMA cache_size=-4096")
         connection.execute("PRAGMA temp_store=FILE")
         connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
         packed_connection = sqlite3.connect(str(Path(scratch) / "packed.sqlite"))
-        packed_connection.execute("PRAGMA cache_size=-65536")
+        packed_connection.execute("PRAGMA cache_size=-4096")
         packed_connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
         writer = _Writer(
             destination,
@@ -521,10 +645,26 @@ def export_bundle(
             {} if rotate else manifest.get("resolve", {}),
             packed_connection,
         )
-        connection.execute("CREATE TABLE postings(bucket TEXT, term TEXT, ordinal INTEGER)")
+        connection.execute(
+            "CREATE TABLE postings(bucket TEXT, term TEXT, start INTEGER, end INTEGER)"
+        )
         connection.execute("CREATE TABLE locators(id TEXT, ordinal INTEGER)")
         try:
             from itertools import chain  # noqa: PLC0415
+
+            shared_key = None
+            shared_terms = frozenset()
+            shared_start = 0
+
+            def flush_shared():
+                if shared_key is not None:
+                    connection.executemany(
+                        "INSERT INTO postings VALUES (?,?,?,?)",
+                        (
+                            (hashlib.sha256(t.encode()).hexdigest()[:4], t, shared_start, count - 1)
+                            for t in shared_terms
+                        ),
+                    )
 
             for doc in chain(
                 _wiki(wiki_root, id_key, library),
@@ -532,6 +672,14 @@ def export_bundle(
             ):
                 if time.monotonic() > deadline:
                     raise ValueError("publication-deadline")
+                shared = doc.pop("_index_shared", None)
+                number = doc.pop("_index_number", None)
+                key = shared[0] if shared else None
+                if key != shared_key:
+                    flush_shared()
+                    shared_key = key
+                    shared_terms = shared[1] if shared else frozenset()
+                    shared_start = count
                 object_id = writer.put(doc)
                 meta = {k: v for k, v in doc.items() if k != "body"}
                 meta.update(ordinal=count, object=object_id)
@@ -539,33 +687,38 @@ def export_bundle(
                 page.append(meta)
                 if doc["kind"] != "source":
                     navigation.append(meta)
-                terms = set(TOKEN.findall((doc["title"] + " " + doc["body"]).lower()))
+                if shared is not None:
+                    terms = (set(TOKEN.findall(doc["body"].lower())) | {number}) - shared_terms
+                else:
+                    terms = set(TOKEN.findall((doc["title"] + " " + doc["body"]).lower()))
                 connection.executemany(
-                    "INSERT INTO postings VALUES (?,?,?)",
-                    [(hashlib.sha256(t.encode()).hexdigest()[:4], t, count) for t in terms],
+                    "INSERT INTO postings VALUES (?,?,?,?)",
+                    [(hashlib.sha256(t.encode()).hexdigest()[:4], t, count, count) for t in terms],
                 )
                 count += 1
                 if len(page) == METADATA_PAGE:
                     metadata.append(writer.put(page))
                     page = []
+            flush_shared()
             if page:
                 metadata.append(writer.put(page))
-            connection.execute("CREATE INDEX postings_order ON postings(bucket,term,ordinal)")
+            connection.execute("CREATE INDEX postings_order ON postings(bucket,term,start,end)")
             search = {}
             for (bucket,) in connection.execute(
                 "SELECT DISTINCT bucket FROM postings ORDER BY bucket"
             ):
                 if time.monotonic() > deadline:
                     raise ValueError("publication-deadline")
-                terms = {}
-                for term, ordinal in connection.execute(
-                    "SELECT term,ordinal FROM postings WHERE bucket=? ORDER BY term,ordinal",
-                    (bucket,),
-                ):
-                    terms.setdefault(term, []).append(ordinal)
-                search[bucket] = writer.put(terms)
-            connection.execute("CREATE UNIQUE INDEX locators_order ON locators(id)")
+                postings = _postings(
+                    connection.execute(
+                        "SELECT term,start,end FROM postings WHERE bucket=? ORDER BY term,start,end",
+                        (bucket,),
+                    )
+                )
+                search[bucket] = writer.put(postings)
+            connection.execute("CREATE INDEX locators_order ON locators(id,ordinal)")
             lookup = {}
+            locator_count = 0
             for first in range(256):
                 if time.monotonic() > deadline:
                     raise ValueError("publication-deadline")
@@ -576,8 +729,11 @@ def export_bundle(
                         (prefix, f"{first + 1:02x}" if first < 255 else "g"),
                     )
                 )
+                locator_count += len(locators)
                 if locators:
                     lookup[prefix] = writer.put(locators)
+            if locator_count != count:
+                raise ValueError("projection-duplicate-document-id")
             resolution = writer.resolution()
             if time.monotonic() > deadline:
                 raise ValueError("publication-deadline")
@@ -594,12 +750,13 @@ def export_bundle(
         "lookup": lookup,
         "search": search,
         "search_prefix": 4,
+        "search_encoding": "ranges-u32.v1",
         "navigation": navigation,
         "receipts": [
             {
                 "source": "canonical-library",
                 "status": "projected",
-                "records": library.status()["records"],
+                "records": library.connection.execute("SELECT COUNT(*) FROM records").fetchone()[0],
             },
             {"source": "wiki", "status": "projected", "pages": len(navigation)},
             {"source": "capture-adapters", "status": "not-refreshed-by-publication"},
@@ -624,6 +781,8 @@ def export_bundle(
     raw = canonical(head)
     if writer.bytes + len(raw) > budget:
         raise ValueError("projection-storage-budget")
+    if time.monotonic() > deadline:
+        raise ValueError("publication-deadline")
     fd = os.open(destination / "HEAD.knovv", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as handle:
         handle.write(raw)
@@ -641,6 +800,7 @@ def export_bundle(
 class _Reader:
     def __init__(self, root: Path, manifest: dict, secret: bytes):  # allow-secret: runtime-only
         self.root, self.manifest, self.secret = root, manifest, secret  # allow-secret: runtime-only
+        self.address_key = derive(secret, b"address")
         self.context = _context(manifest["vault"], manifest["epoch"])
         self.maps: OrderedDict[str, dict] = OrderedDict()
         self.slab_id = None
@@ -687,7 +847,7 @@ class _Reader:
         ):
             raise ValueError("invalid-packed-frame")
         raw = self.slab[offset : offset + length]
-        if address(self.secret, raw) != key:
+        if hmac.new(self.address_key, raw, hashlib.sha256).hexdigest() != key:
             raise ValueError("invalid-packed-address")
         return raw
 
@@ -696,11 +856,33 @@ class _Reader:
 
 
 def restore_bundle(
-    root: Path, destination: Path, identity: Identity, owner: str, *, checkpoint: dict | None = None
+    root: Path,
+    destination: Path,
+    identity: Identity,
+    owner: str,
+    *,
+    checkpoint: dict | None = None,
+    layout: str = "directory",
+    deadline_seconds: float = 3600.0,
 ) -> dict:
     head, manifest, secret = read_bundle(  # allow-secret: runtime-only
         root, identity, owner, checkpoint=checkpoint
     )  # allow-secret: runtime-only
+    if layout not in {"directory", "jsonl"} or not 0 < deadline_seconds <= 86400:
+        raise ValueError("invalid-restore-configuration")
+    if "resolve" in manifest:
+        from .knovv_restore import restore_packed  # noqa: PLC0415
+
+        return restore_packed(
+            root,
+            destination,
+            manifest,
+            secret,
+            layout=layout,
+            deadline=time.monotonic() + deadline_seconds,
+        )
+    if layout != "directory":
+        raise ValueError("legacy-unpacked-restore-requires-directory-layout")
     reader = _Reader(root, manifest, secret)
     documents = []
     seen = set()

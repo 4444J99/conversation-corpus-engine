@@ -1,3 +1,4 @@
+import { control } from "./control";
 import { canonical, encoder, sha256, verify, MAX_OBJECT } from "../src/crypto";
 import type { DeviceGrant, Revision, Publication } from "../src/contracts";
 import type { Database } from "./database";
@@ -134,6 +135,19 @@ export async function api(
       request.headers.get("origin") !== url.origin
     )
       fail(403, "origin-refused");
+    if (path === "/control" && method === "POST") {
+      return control(request, env, await body(request), (operation, value) =>
+        api(
+          new Request(new URL("/api/" + operation, url), {
+            method: "POST",
+            headers: { origin: url.origin, "content-type": "application/json" },
+            body: canonical(value),
+          }),
+          env,
+          principal,
+        ),
+      );
+    }
     if (path === "/status" && method === "GET") {
       const usage = await env.DB.prepare(
         "SELECT bytes FROM usage WHERE id=1",
