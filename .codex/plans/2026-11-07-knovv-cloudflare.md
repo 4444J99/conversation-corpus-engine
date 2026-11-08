@@ -96,3 +96,25 @@ Physical-device and real-data performance acceptance remain unchecked.
 
 The verification report carries the current tests and exact remaining predicates;
 older counts and the D1-only blocker above are historical ledger entries.
+
+
+### November 8 operator correction: remote ownership
+
+The operator requires durable code, corpus data, indexes, journal state and evidence
+on remote services. KNOVV must operate without a Mac or an external drive as a
+service or publication dependency. Local copies do not establish durable ownership.
+
+The Mac-based bulk-publication path is stopped. Its default one-hour run and the
+separate two-hour initial migration both failed; neither produced a complete head
+or uploaded a private corpus. These failures remain failures.
+
+The immediate prerequisite is live reconciliation of the existing private remote
+archives with the accepted CCE generation. Encrypted conversation archives exist
+in GitHub, but current-generation parity has not been established. The newly
+created KNOVV recovery repository is empty and provides no preservation evidence.
+
+Reuse verified remote material. Any necessary derived-format conversion or search
+index build must have a remote execution owner and remote outputs, preserve the
+approved encryption and enrolled-device trust boundary, and retain source identities
+and history. Do not restart local bulk export, assume an archive is current, move
+decryption keys into hosted infrastructure, or remove originals to make this pass.
