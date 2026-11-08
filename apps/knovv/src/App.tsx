@@ -176,6 +176,7 @@ export function App() {
       setEditing(false);
       setDirty(false);
       setPackText("");
+      setScreen("home");
       navigationVersion.current++;
       adoptPublicationWorker();
       setUnlocked(true);
@@ -427,6 +428,7 @@ export function App() {
           revision: result.revision,
           local: result.state === "local",
         });
+        if (result.state === "remote") location.hash = "/document/" + doc.id;
         setNotice(
           !unchanged
             ? "Earlier changes synced. Your newer edits remain in the editor."

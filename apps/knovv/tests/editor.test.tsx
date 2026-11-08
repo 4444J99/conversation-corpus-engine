@@ -199,4 +199,29 @@ describe("editor async completion boundaries", () => {
       ),
     );
   });
+  it("returns to the workspace when unlocking after a new page without a saved route", async () => {
+    await edit();
+    fireEvent.click(screen.getByRole("button", { name: "＋ Capture" }));
+    await screen.findByLabelText("Page content");
+    expect(location.hash).toBe("#/document");
+    fireEvent.click(screen.getByRole("button", { name: /Lock workspace/ }));
+    await screen.findByRole("button", { name: /Unlock workspace/ });
+    fireEvent.change(screen.getByLabelText("Passphrase"), {
+      target: { value: "fixture passphrase" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Unlock workspace/ }));
+    await screen.findByRole("heading", { name: "Pick up a thread." });
+  });
+  it("gives a newly saved page a document route that survives reopening", async () => {
+    const resolve = pendingSave();
+    await edit();
+    fireEvent.click(screen.getByRole("button", { name: "＋ Capture" }));
+    fireEvent.change(await screen.findByLabelText("Page content"), {
+      target: { value: "A newly saved note" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /Save and sync/ }));
+    await waitFor(() => expect(fixture.vault.save).toHaveBeenCalled());
+    await act(async () => resolve());
+    expect(location.hash).toBe("#/document/" + "a".repeat(64));
+  });
 });
