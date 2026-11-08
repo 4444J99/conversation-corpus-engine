@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 from .archive_sealed import create_identity, load_identity, safe_path
 from .archive_sealed_crypto import authenticate, canonical, digest, sign
-from .knovv_journal import import_journal
+from .knovv_journal import import_snapshot
 from .knovv_projection import DEFAULT_BUDGET, _object, export_bundle, read_bundle, restore_bundle
 
 
@@ -42,8 +44,18 @@ def _publication(parser):
 
 
 def main(argv=None) -> None:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == "agent":
+        entry = Path(__file__).resolve().parents[2] / "apps/knovv/build/agent.mjs"
+        if not entry.is_file():
+            raise ValueError("build-agent-client-first-with-npm-run-build")
+        raise SystemExit(
+            subprocess.run(
+                ["node", str(entry), *arguments[1:]], timeout=180, check=False
+            ).returncode
+        )
     parser = argparse.ArgumentParser(
-        description="KNOVV protected-device and canonical-source bridge"
+        description="KNOVV protected-device and canonical-source bridge; agent --help for enrolled agent writes"
     )
     sub = parser.add_subparsers(dest="action", required=True)
     grant_parser = sub.add_parser("grant", help="Sign a monotonic enrollment or revocation update")
@@ -215,8 +227,9 @@ def main(argv=None) -> None:
             journal = json.loads(_private(args.journal, 64 * 1024 * 1024))
             if journal.get("vault") != head["vault"] or journal.get("epoch") != head["epoch"]:
                 raise ValueError("journal-publication-mismatch")
-            result = import_journal(
+            result = import_snapshot(
                 journal,
+                args.journal.parent,
                 lambda oid: (
                     _object(args.objects.parent, oid)
                     if args.objects.name == "objects"

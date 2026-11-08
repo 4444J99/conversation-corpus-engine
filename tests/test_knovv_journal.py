@@ -13,10 +13,10 @@ from conversation_corpus_engine.archive_sealed_crypto import (
     encrypt,
     sign,
 )
-from conversation_corpus_engine.knovv_journal import import_journal
+from conversation_corpus_engine.knovv_journal import import_journal, import_snapshot
 
 
-def fixture(attachment=False):
+def fixture(attachment=False, revisions=1):
     owner = Identity("knovv", "owner", os.urandom(32), os.urandom(32))
     signer = Identity("knovv", "browser", os.urandom(32), os.urandom(32))
     key = os.urandom(32)
@@ -44,6 +44,8 @@ def fixture(attachment=False):
         "status": "draft",
         "created": "2026-01-01",
         "updated": "2026-01-01",
+        "source_url": "https://example.invalid/captured-evidence",
+        "relationships": [{"type": "contradicts", "target": "d" * 64}],
     }
     objects = {}
     if attachment:
@@ -83,7 +85,46 @@ def fixture(attachment=False):
         "revisions": [{"seq": 1, "envelope": revision}],
     }
     objects[digest(raw)] = raw
+    for number in range(1, revisions):
+        document["body"] = f"A retained revision {number}."
+        raw = encrypt(
+            key, zlib.compress(canonical(document)), "knovv-revision-object:" + "b" * 64 + ":1"
+        )
+        updated = sign(
+            {
+                key: value
+                for key, value in {
+                    **revision,
+                    "id": digest(f"revision-{number}".encode()),
+                    "parent": revision["id"],
+                    "object": digest(raw),
+                }.items()
+                if key != "signature"
+            },
+            signer,
+        )
+        journal["revisions"].append({"seq": number + 1, "envelope": updated})
+        objects[digest(raw)] = raw
+        revision = updated
     return owner, key, journal, objects
+
+
+def test_journal_history_resumes_in_bounded_batches_without_a_lifetime_entry_limit(tmp_path):
+    owner, key, journal, objects = fixture(revisions=5)
+    counts = []
+    for _ in range(3):
+        result = import_journal(
+            journal,
+            objects.__getitem__,
+            key,
+            owner.signing_public(),
+            tmp_path / "authoring",
+            max_entries=2,
+        )
+        counts.append(result["imported"])
+    assert counts == [2, 2, 1] and result["cursor"] == 5 and result["has_more"] is False
+    assert len(list((tmp_path / "authoring" / "history").rglob("*.json"))) == 5
+    assert "revision 4" in next((tmp_path / "authoring" / "notes").glob("*.md")).read_text()
 
 
 def test_attachment_originals_are_restored_and_tampering_cannot_create_partial_inputs(tmp_path):
@@ -135,6 +176,17 @@ def test_authenticated_edits_are_idempotent_source_inputs_without_rewriting_orig
     manifest = json.loads((tmp_path / "authoring" / "source.json").read_text())
     assert manifest["documents"][0]["id"].startswith("knovv-")
     assert list((tmp_path / "authoring" / "history").rglob("*.json"))
+    assert "https://example.invalid/captured-evidence" in notes[0].read_text()
+    assert "contradicts" in notes[0].read_text()
+    from conversation_corpus_engine.library_documents import iter_documents  # noqa: PLC0415
+
+    ingested = list(iter_documents(manifest["documents"]))
+    assert any(
+        "https://example.invalid/captured-evidence" in message.text
+        and "contradicts" in message.text
+        for record in ingested
+        for message in record.messages
+    )
 
 
 def test_bad_signature_or_missing_parent_cannot_modify_the_current_note(tmp_path):
@@ -158,3 +210,50 @@ def test_a_browser_cannot_rewrite_an_immutable_source_record(tmp_path):
             journal, objects.__getitem__, key, owner.signing_public(), tmp_path / "authoring"
         )
     assert not (tmp_path / "authoring").exists()
+
+
+def test_paged_snapshot_import_verifies_pages_and_resumes(tmp_path):
+    owner, key, journal, objects = fixture(revisions=5)
+    pages = []
+    root = tmp_path / "snapshot"
+    root.mkdir(mode=0o700)
+    for number, start in enumerate(range(0, 5, 2)):
+        entries = journal["revisions"][start : start + 2]
+        raw = b"".join(canonical(e) + b"\n" for e in entries)
+        name = f"journal-pages/{number:08}.jsonl"
+        (root / "journal-pages").mkdir(exist_ok=True)
+        (root / name).write_bytes(raw)
+        pages.append(
+            {
+                "file": name,
+                "sha256": digest(raw),
+                "bytes": len(raw),
+                "entries": len(entries),
+                "first": entries[0]["seq"],
+                "last": entries[-1]["seq"],
+            }
+        )
+    manifest = {**journal, "schema": "knovv-journal.v2", "cutoff": 5, "pages": pages}
+    manifest.pop("revisions")
+    result = import_snapshot(
+        manifest,
+        root,
+        objects.__getitem__,
+        key,
+        owner.signing_public(),
+        tmp_path / "home",
+        max_entries=1,
+    )
+    assert result["imported"] == 5 and result["cursor"] == 5 and result["has_more"] is False
+    assert (
+        import_snapshot(
+            manifest, root, objects.__getitem__, key, owner.signing_public(), tmp_path / "home"
+        )["imported"]
+        == 0
+    )
+    (root / pages[0]["file"]).write_bytes(b"corrupt")
+    with pytest.raises(ValueError, match="journal-page-integrity"):
+        import_snapshot(
+            manifest, root, objects.__getitem__, key, owner.signing_public(), tmp_path / "bad"
+        )
+    assert not (tmp_path / "bad").exists()

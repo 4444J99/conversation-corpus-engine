@@ -16,6 +16,7 @@
     "server",
     "tests",
     "vite.config.ts",
-    "cloudflare.config.ts"
+    "cloudflare.config.ts",
+    "agent"
   ]
 }

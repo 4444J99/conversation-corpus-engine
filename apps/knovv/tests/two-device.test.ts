@@ -15,6 +15,7 @@ import {
   canonical,
   sha256,
 } from "../src/crypto";
+import { executeAgent } from "../agent/client";
 import { Vault, MemoryStorage, compress, ApiError } from "../src/vault";
 import type { DevicePackage } from "../src/contracts";
 
@@ -171,6 +172,40 @@ describe("independently enrolled devices", () => {
         phone = new Vault(storeB, fetcher);
       await desktop.unlock(packA, "synthetic desktop passphrase");
       await phone.unlock(packB, "synthetic phone passphrase");
+      const agentCreated = await executeAgent(desktop, {
+        action: "new",
+        agent: "synthetic-codex",
+        input: {
+          title: "Agent authored",
+          body: "PRIVATE AGENT CANARY",
+          kind: "zettel",
+        },
+      });
+      await phone.sync();
+      const agentRead = await phone.open(agentCreated.document.id);
+      expect(agentRead.document.author).toBe("agent");
+      expect(agentRead.document.last_editor).toBe("agent:synthetic-codex");
+      await executeAgent(phone, {
+        action: "save",
+        agent: "synthetic-second",
+        id: agentRead.document.id,
+        parent: agentRead.revision!.id,
+        input: { body: "Second agent change" },
+      });
+      await expect(
+        executeAgent(desktop, {
+          action: "save",
+          agent: "synthetic-codex",
+          id: agentRead.document.id,
+          parent: agentRead.revision!.id,
+          input: { body: "Retained agent conflict" },
+        }),
+      ).rejects.toMatchObject({ code: "revision-conflict" });
+      expect(
+        (await desktop.drafts()).some(
+          (d) => d.document.body === "Retained agent conflict",
+        ),
+      ).toBe(true);
       const doc = desktop.newDocument("wiki");
       doc.title = "PRIVATE WORKFLOW CANARY";
       doc.body = "A durable private thought.";
@@ -212,9 +247,10 @@ describe("independently enrolled devices", () => {
           first.revision.id,
         ),
       ).rejects.toMatchObject({ code: "revision-conflict" });
-      expect((await desktop.drafts())[0].document.body).toBe(
-        "A competing retained draft.",
-      );
+      expect(
+        (await desktop.drafts()).find((d) => d.document.id === doc.id)!.document
+          .body,
+      ).toBe("A competing retained draft.");
       expect((await desktop.open(doc.id)).document.body).toBe(
         "Changed on the second enrolled device.",
       );

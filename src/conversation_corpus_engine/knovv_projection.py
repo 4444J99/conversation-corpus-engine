@@ -132,11 +132,10 @@ class _Writer:
         self.slab = bytearray()
         self.slab_keys: list[str] = []
         connection.execute(
-            "CREATE TABLE packed(logical TEXT PRIMARY KEY, object TEXT, offset INTEGER, length INTEGER, prefix TEXT) WITHOUT ROWID"
+            "CREATE TABLE packed(logical BLOB PRIMARY KEY, object BLOB, offset INTEGER, length INTEGER) WITHOUT ROWID"
         )
-        connection.execute("CREATE INDEX packed_prefix ON packed(prefix,logical)")
         connection.execute(
-            "CREATE TABLE previous_packed(logical TEXT PRIMARY KEY, object TEXT, offset INTEGER, length INTEGER) WITHOUT ROWID"
+            "CREATE TABLE previous_packed(logical BLOB PRIMARY KEY, object BLOB, offset INTEGER, length INTEGER) WITHOUT ROWID"
         )
         if previous:
             for oid in reused.values():
@@ -145,7 +144,10 @@ class _Writer:
                 )
                 connection.executemany(
                     "INSERT INTO previous_packed VALUES (?,?,?,?)",
-                    ((key, *ref) for key, ref in mapping.items()),
+                    (
+                        (bytes.fromhex(key), bytes.fromhex(ref[0]), *ref[1:])
+                        for key, ref in mapping.items()
+                    ),
                 )
 
     def _land(self, cipher: bytes) -> str:
@@ -181,7 +183,8 @@ class _Writer:
         )
         oid = self._land(cipher)
         self.connection.executemany(
-            "UPDATE packed SET object=? WHERE logical=?", ((oid, key) for key in self.slab_keys)
+            "UPDATE packed SET object=? WHERE logical=?",
+            ((bytes.fromhex(oid), bytes.fromhex(key)) for key in self.slab_keys),
         )
         self.slab.clear()
         self.slab_keys.clear()
@@ -189,19 +192,17 @@ class _Writer:
     def resolution(self) -> dict[str, str]:
         self.flush()
         result = {}
-        prefixes = [
-            row[0]
-            for row in self.connection.execute("SELECT DISTINCT prefix FROM packed ORDER BY prefix")
-        ]
-        for prefix in prefixes:
+        for first in range(256):
+            prefix = f"{first:02x}"
             mapping = {
-                row[0]: list(row[1:])
+                row[0].hex(): [row[1].hex(), *row[2:]]
                 for row in self.connection.execute(
-                    "SELECT logical,object,offset,length FROM packed WHERE prefix=? ORDER BY logical",
-                    (prefix,),
+                    "SELECT logical,object,offset,length FROM packed WHERE logical>=? AND logical<? ORDER BY logical",
+                    (bytes([first]), bytes([first + 1]) if first < 255 else b"\xff" * 33),
                 )
             }
-            result[prefix] = self.direct(mapping, self.reused.get(prefix))
+            if mapping:
+                result[prefix] = self.direct(mapping, self.reused.get(prefix))
         return result
 
     def put(self, value: Any) -> str:
@@ -209,14 +210,19 @@ class _Writer:
         if len(raw) > PLAIN_LIMIT - 8:
             raise ValueError("projection-object-bound")
         key = address(self.secret, raw)
-        if self.connection.execute("SELECT 1 FROM packed WHERE logical=?", (key,)).fetchone():
+        if self.connection.execute(
+            "SELECT 1 FROM packed WHERE logical=?", (bytes.fromhex(key),)
+        ).fetchone():
             return key
         old = self.connection.execute(
-            "SELECT object,offset,length FROM previous_packed WHERE logical=?", (key,)
+            "SELECT object,offset,length FROM previous_packed WHERE logical=?",
+            (bytes.fromhex(key),),
         ).fetchone()
         if old and self.previous:
-            self._land(_object(self.previous, old[0]))
-            self.connection.execute("INSERT INTO packed VALUES (?,?,?,?,?)", (key, *old, key[:2]))
+            self._land(_object(self.previous, old[0].hex()))
+            self.connection.execute(
+                "INSERT INTO packed VALUES (?,?,?,?)", (bytes.fromhex(key), *old)
+            )
             return key
         if self.slab and len(self.slab) + 8 + len(raw) > PACK_BYTES:
             self.flush()
@@ -225,7 +231,7 @@ class _Writer:
         self.slab.extend(raw)
         self.slab_keys.append(key)
         self.connection.execute(
-            "INSERT INTO packed VALUES (?,?,?,?,?)", (key, "", offset, len(raw), key[:2])
+            "INSERT INTO packed VALUES (?,?,?,?)", (bytes.fromhex(key), b"", offset, len(raw))
         )
         if len(self.slab) >= PACK_BYTES:
             self.flush()
@@ -370,12 +376,13 @@ def _revision_sources(
     ):
         for number, message in enumerate(messages):
             text = message.get("text", "")
+            source_digest = text_digest(text)
             for start in range(0, max(1, len(text)), PAGE_CHARS):
                 part = text[start : start + PAGE_CHARS]
                 ref = {
                     "uid": row["uid"],
                     "version": version,
-                    "digest": text_digest(text),
+                    "digest": source_digest,
                     "message": number,
                     "start": start,
                     "end": start + len(part),
@@ -498,6 +505,12 @@ def export_bundle(
     with tempfile.TemporaryDirectory(prefix="knovv-index-", dir=destination.parent) as scratch:
         Path(scratch).chmod(0o700)
         connection = sqlite3.connect(str(Path(scratch) / "tokens.sqlite"))
+        connection.execute("PRAGMA cache_size=-8192")
+        connection.execute("PRAGMA temp_store=FILE")
+        connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
+        packed_connection = sqlite3.connect(str(Path(scratch) / "packed.sqlite"))
+        packed_connection.execute("PRAGMA cache_size=-65536")
+        packed_connection.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
         writer = _Writer(
             destination,
             secret,
@@ -506,14 +519,10 @@ def export_bundle(
             budget,
             None if rotate else previous,
             {} if rotate else manifest.get("resolve", {}),
-            connection,
+            packed_connection,
         )
-        connection.execute(
-            "CREATE TABLE postings(bucket TEXT, term TEXT, ordinal INTEGER, PRIMARY KEY(bucket,term,ordinal)) WITHOUT ROWID"
-        )
-        connection.execute(
-            "CREATE TABLE locators(id TEXT PRIMARY KEY, ordinal INTEGER) WITHOUT ROWID"
-        )
+        connection.execute("CREATE TABLE postings(bucket TEXT, term TEXT, ordinal INTEGER)")
+        connection.execute("CREATE TABLE locators(id TEXT, ordinal INTEGER)")
         try:
             from itertools import chain  # noqa: PLC0415
 
@@ -533,7 +542,7 @@ def export_bundle(
                 terms = set(TOKEN.findall((doc["title"] + " " + doc["body"]).lower()))
                 connection.executemany(
                     "INSERT INTO postings VALUES (?,?,?)",
-                    [(hashlib.sha256(t.encode()).hexdigest()[:2], t, count) for t in terms],
+                    [(hashlib.sha256(t.encode()).hexdigest()[:4], t, count) for t in terms],
                 )
                 count += 1
                 if len(page) == METADATA_PAGE:
@@ -541,10 +550,13 @@ def export_bundle(
                     page = []
             if page:
                 metadata.append(writer.put(page))
+            connection.execute("CREATE INDEX postings_order ON postings(bucket,term,ordinal)")
             search = {}
             for (bucket,) in connection.execute(
                 "SELECT DISTINCT bucket FROM postings ORDER BY bucket"
             ):
+                if time.monotonic() > deadline:
+                    raise ValueError("publication-deadline")
                 terms = {}
                 for term, ordinal in connection.execute(
                     "SELECT term,ordinal FROM postings WHERE bucket=? ORDER BY term,ordinal",
@@ -552,8 +564,11 @@ def export_bundle(
                 ):
                     terms.setdefault(term, []).append(ordinal)
                 search[bucket] = writer.put(terms)
+            connection.execute("CREATE UNIQUE INDEX locators_order ON locators(id)")
             lookup = {}
             for first in range(256):
+                if time.monotonic() > deadline:
+                    raise ValueError("publication-deadline")
                 prefix = f"{first:02x}"
                 locators = dict(
                     connection.execute(
@@ -568,6 +583,7 @@ def export_bundle(
                 raise ValueError("publication-deadline")
         finally:
             connection.close()
+            packed_connection.close()
     catalog = {
         "schema": CATALOG,
         "vault": vault,
@@ -577,6 +593,7 @@ def export_bundle(
         "metadata": metadata,
         "lookup": lookup,
         "search": search,
+        "search_prefix": 4,
         "navigation": navigation,
         "receipts": [
             {

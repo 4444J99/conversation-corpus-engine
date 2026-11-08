@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
-    "build": "tsc --noEmit && vite build && esbuild server/worker.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=build/worker.mjs",
+    "build": "tsc --noEmit && vite build && esbuild server/worker.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=build/worker.mjs && esbuild agent/main.ts --bundle --format=esm --platform=node --target=node22 --outfile=build/agent.mjs",
     "test": "vitest run",
     "check": "tsc --noEmit"
   },
@@ -23,12 +23,14 @@
   "devDependencies": {
     "@cloudflare/vite-plugin": "^2.0.0-beta.v.12",
     "@cloudflare/workers-types": "5.20261107.1",
+    "@testing-library/react": "^16.3.3",
     "@types/node": "^24.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^5.0.0",
     "cf": "^1.0.0-beta.28",
     "esbuild": "^0.25.0",
+    "jsdom": "^31.0.0",
     "miniflare": "^4.0.0",
     "prettier": "^3.9.10",
     "typescript": "^5.9.0",

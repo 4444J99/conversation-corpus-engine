@@ -9,7 +9,7 @@ export function EvidencePicker({
 }: {
   vault: Vault;
   value: Document;
-  onChange: (value: Document) => void;
+  onChange: (update: (current: Document) => Document) => void;
 }) {
   const [query, setQuery] = useState(""),
     [results, setResults] = useState<DocumentMeta[]>([]),
@@ -24,7 +24,14 @@ export function EvidencePicker({
       const pages = await Promise.all(
         found.ordinals.slice(0, 20).map((id) => vault.meta(id)),
       );
-      setResults(pages.filter((p) => p.id !== value.id));
+      const overlays = await vault.overlaySearch(query),
+        changed = vault.changedIds ?? new Set(overlays.map((p) => p.id));
+      const merged = new Map<string, DocumentMeta>(
+        pages.filter((p) => !changed.has(p.id)).map((p) => [p.id, p]),
+      );
+      for (const doc of overlays)
+        merged.set(doc.id, { ...doc, ordinal: -1, object: "" });
+      setResults([...merged.values()].filter((p) => p.id !== value.id));
     } catch {
       setError(
         "Evidence search is unavailable. Existing citations are retained.",
@@ -42,23 +49,45 @@ export function EvidencePicker({
         if (!ref) throw new Error("missing-source");
         const body = source.document.body,
           term = (query.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])[0] ?? "";
-        const offset = Math.max(0, body.toLowerCase().indexOf(term) - 120),
-          length = Math.min(400, body.length - offset);
+        const points = Array.from(body),
+          positions: number[] = [];
+        let folded = "";
+        for (let i = 0; i < points.length; i++) {
+          const lower = points[i].toLowerCase();
+          folded += lower;
+          for (let j = 0; j < lower.length; j++) positions.push(i);
+        }
+        if (
+          !Number.isSafeInteger(ref.start) ||
+          !Number.isSafeInteger(ref.end) ||
+          ref.start < 0 ||
+          ref.end - ref.start !== points.length
+        )
+          throw new Error("invalid-source-span");
+        const offset = Math.max(
+            0,
+            (positions[Math.max(0, folded.indexOf(term))] ?? 0) - 120,
+          ),
+          length = Math.min(400, points.length - offset);
+        if (length <= 0) throw new Error("empty-source-span");
         const citation = {
           ...ref,
           start: ref.start + offset,
           end: ref.start + offset + length,
         };
-        onChange({ ...value, sources: [...value.sources, citation] });
+        onChange((current) => ({
+          ...current,
+          sources: [...current.sources, citation],
+        }));
       } else {
-        onChange({
-          ...value,
-          links: [...new Set([...value.links, meta.id])],
+        onChange((current) => ({
+          ...current,
+          links: [...new Set([...current.links, meta.id])],
           relationships: [
-            ...(value.relationships ?? []),
+            ...(current.relationships ?? []),
             { type: relation, target: meta.id },
           ],
-        });
+        }));
       }
       setResults([]);
       setQuery("");

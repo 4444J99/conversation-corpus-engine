@@ -1,9 +1,10 @@
 import { address, decoder, decrypt } from "./crypto";
+import { ByteCache } from "./byte-cache";
 const ID = /^[0-9a-f]{64}$/;
 type Ref = [string, number, number];
-/** On-device decoded cache: sixteen locator pages and one bounded data slab. */
+/** On-device decoded cache: an 8 MiB locator budget and one bounded data slab. */
 export class PackedReader {
-  private maps = new Map<string, Record<string, Ref>>();
+  private maps = new ByteCache<string, Record<string, Ref>>(8 * 1024 * 1024);
   private slab: { id: string; bytes: Uint8Array } | null = null;
   private closed = false;
   constructor(
@@ -44,11 +45,11 @@ export class PackedReader {
     if (!ID.test(key)) throw new Error("invalid-object-locator");
     if (!this.resolve) return this.direct(key);
     const prefix = key.slice(0, 2);
-    if (!this.maps.has(prefix)) {
+    let mapping = this.maps.get(prefix);
+    if (!mapping) {
       const oid = this.resolve[prefix];
       if (!oid) throw new Error("missing-object-locator");
       const plain = await this.direct(oid);
-      let mapping: Record<string, Ref>;
       try {
         mapping = JSON.parse(decoder.decode(plain));
       } finally {
@@ -56,12 +57,9 @@ export class PackedReader {
       }
       if (!mapping || typeof mapping !== "object" || Array.isArray(mapping))
         throw new Error("invalid-object-locator");
-      if (this.maps.size >= 16)
-        this.maps.delete(this.maps.keys().next().value!);
       this.maps.set(prefix, mapping);
     }
-    const mapping = this.maps.get(prefix)!,
-      ref = Object.hasOwn(mapping, key) ? mapping[key] : null;
+    const ref = Object.hasOwn(mapping, key) ? mapping[key] : null;
     if (
       !Array.isArray(ref) ||
       ref.length !== 3 ||

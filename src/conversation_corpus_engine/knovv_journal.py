@@ -55,6 +55,11 @@ def _notes(document: dict[str, Any], revision: dict, home: Path) -> None:
             "sources",
             "links",
             "attachments",
+            "source_url",
+            "relationships",
+            "tags",
+            "logical_id",
+            "last_editor",
         )
     }
     metadata.update(knovv_revision=revision["id"], knovv_device=revision["device"])
@@ -85,6 +90,8 @@ def import_journal(
     home: Path,
     *,
     epoch_keys: dict[str, str] | None = None,
+    max_entries: int = 256,
+    max_bytes: int = 64 * 1024 * 1024,
 ) -> dict:
     if (
         journal.get("schema") != "knovv-journal.v1"
@@ -129,14 +136,17 @@ def import_journal(
         if grant["id"] in grants:
             raise ValueError("duplicate-device-grant")
         grants[grant["id"]] = grant
-    if not isinstance(journal.get("revisions"), list) or len(journal["revisions"]) > 10000:
+    if not isinstance(journal.get("revisions"), list):
         raise ValueError("journal-bound")
+    if not 1 <= max_entries <= 1000 or not 1 <= max_bytes <= 64 * 1024 * 1024:
+        raise ValueError("invalid-batch-bound")
     planned = []
     attachments: dict[str, bytes] = {}
     planned_bytes = 0
     heads = dict(state["heads"])
     cursor = state["cursor"]
     seen = set()
+    has_more = False
     for entry in journal.get("revisions", []):
         revision = entry.get("envelope", {})
         sequence = entry.get("seq")
@@ -160,6 +170,9 @@ def import_journal(
             raise ValueError("revoked-device-review-required")
         if sequence <= cursor or revision["parent"] != heads.get(revision["doc"]):
             raise ValueError("journal-chain-conflict")
+        if len(planned) >= max_entries:
+            has_more = True
+            break
         raw = read_object(revision["object"])
         if len(raw) > 48 * 1024 * 1024 or digest(raw) != revision["object"]:
             raise ValueError("journal-object-digest")
@@ -181,12 +194,13 @@ def import_journal(
         refs = document.get("attachments", [])
         if not isinstance(refs, list) or len(refs) > 8:
             raise ValueError("attachment-bound")
-        planned_bytes += len(body)
+        entry_bytes = len(body)
+        entry_attachments: dict[str, bytes] = {}
         for ref in refs:
             oid = ref.get("object", "")
             if not HEX.fullmatch(oid):
                 raise ValueError("invalid-attachment")
-            if oid in attachments:
+            if oid in attachments or oid in entry_attachments:
                 continue
             cipher = read_object(oid)
             if len(cipher) > 5 * 1024 * 1024 or digest(cipher) != oid:
@@ -201,16 +215,21 @@ def import_journal(
             )
             if len(plain) != ref.get("size"):
                 raise ValueError("attachment-size")
-            attachments[oid] = plain
-            planned_bytes += len(plain)
-        if planned_bytes > 64 * 1024 * 1024:
-            raise ValueError("journal-import-batch-bound")
+            entry_attachments[oid] = plain
+            entry_bytes += len(plain)
+        if planned_bytes + entry_bytes > max_bytes:
+            if not planned:
+                raise ValueError("journal-import-entry-bound")
+            has_more = True
+            break
+        planned_bytes += entry_bytes
+        attachments.update(entry_attachments)
         planned.append((entry, document))
         heads[revision["doc"]] = revision["id"]
         cursor = sequence
     # Validation completes before creating or changing anything in the authoring home.
     if not planned and not home.exists():
-        return {"imported": 0, "cursor": cursor}
+        return {"imported": 0, "cursor": cursor, "has_more": has_more}
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not marker.exists():
         _atomic(marker, canonical(state))
@@ -258,5 +277,83 @@ def import_journal(
     return {
         "imported": len(planned),
         "cursor": state["cursor"],
+        "has_more": has_more,
         "source_manifest": str(home / "source.json"),
     }
+
+
+def import_snapshot(
+    journal: dict,
+    root: Path,
+    read_object,
+    secret: bytes,  # allow-secret: runtime-only
+    owner_public: str,
+    home: Path,
+    **bounds,
+) -> dict:
+    """Import legacy or paged snapshots using bounded, restartable accepted batches."""
+    if journal.get("schema") == "knovv-journal.v1":
+        batches = [journal]
+    elif journal.get("schema") == "knovv-journal.v2":
+        if (
+            type(journal.get("cutoff")) is not int
+            or journal["cutoff"] < 0
+            or not isinstance(journal.get("pages"), list)
+        ):
+            raise ValueError("invalid-journal-manifest")
+
+        def pages():
+            prior = 0
+            for number, page in enumerate(journal["pages"]):
+                if (
+                    page.get("file") != f"journal-pages/{number:08}.jsonl"
+                    or not HEX.fullmatch(page.get("sha256", ""))
+                    or type(page.get("bytes")) is not int
+                    or not 0 < page["bytes"] <= 8 * 1024 * 1024
+                    or type(page.get("entries")) is not int
+                    or not 1 <= page["entries"] <= 1000
+                ):
+                    raise ValueError("invalid-journal-page")
+                path = safe_path(root / page["file"])
+                if not path.is_file() or path.stat().st_size != page["bytes"]:
+                    raise ValueError("journal-page-integrity")
+                raw = path.read_bytes()
+                if digest(raw) != page["sha256"]:
+                    raise ValueError("journal-page-integrity")
+                entries = [json.loads(line) for line in raw.splitlines()]
+                seqs = [entry.get("seq") for entry in entries]
+                if (
+                    len(entries) != page["entries"]
+                    or seqs != list(range(prior + 1, prior + len(entries) + 1))
+                    or page.get("first") != seqs[0]
+                    or page.get("last") != seqs[-1]
+                    or seqs[-1] > journal["cutoff"]
+                ):
+                    raise ValueError("journal-page-order")
+                prior = seqs[-1]
+                yield {
+                    "schema": "knovv-journal.v1",
+                    "vault": journal["vault"],
+                    "epoch": journal["epoch"],
+                    "grants": journal["grants"],
+                    "revisions": entries,
+                }
+            if prior != journal["cutoff"]:
+                raise ValueError("journal-cutoff-mismatch")
+
+        batches = pages()
+    else:
+        raise ValueError("invalid-journal")
+    total = 0
+    result = {"imported": 0, "cursor": 0, "has_more": False}
+    for batch in batches:
+        prior = -1
+        while True:
+            result = import_journal(batch, read_object, secret, owner_public, home, **bounds)
+            total += result["imported"]
+            if not result["has_more"]:
+                break
+            if result["cursor"] <= prior or not result["imported"]:
+                raise ValueError("journal-import-no-progress")
+            prior = result["cursor"]
+    return {**result, "imported": total}

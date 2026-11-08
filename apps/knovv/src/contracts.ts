@@ -42,6 +42,7 @@ export interface Document {
   body: string;
   summary: string;
   author: string;
+  last_editor?: string;
   authorship_basis: string;
   status: string;
   created: string;
@@ -75,6 +76,7 @@ export interface Manifest {
   metadata: string[];
   lookup: Record<string, string>;
   search: Record<string, string>;
+  search_prefix?: 2 | 4;
   resolve?: Record<string, string>;
   epoch_keys?: Record<string, string>;
   navigation: DocumentMeta[];

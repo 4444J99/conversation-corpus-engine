@@ -56,3 +56,23 @@ Retain originals, existing worktrees, current site and independent backups throu
 - Full Python regression, final builds, real-data export/restore and the single fresh branch
   review are tracked in the owning chat and private verification receipt. They remain separate
   from deployment, two physical device acceptance and production performance measurements.
+
+
+### Review repair and measured validation
+
+The single fresh independent branch review is complete. All thirteen important
+findings were accepted, reproduced and repaired in one pass. The durable disposition
+ledger is `docs/verification/knovv-implementation-20261107.md`; minor deferred items
+and operational acceptance rulings remain visible there.
+
+Current completed checks: 31 application tests, 21 Python bridge tests, the implicated
+95-test projection/Zettel suite, production browser/Worker/agent builds, native
+Cloudflare build, Ruff/format and the commit secret scan. A final full Python run
+and bounded real-corpus export measurement are still in progress; do not infer
+production acceptance from these component checks.
+
+Export scratch work now separates the sequential token stream from packed locator
+construction. Locators store full binary hashes internally, preserving their full
+published identifiers and unchanged cache, plaintext, storage and deadline bounds.
+The existing account still has ten D1 databases and no KNOVV database as of the
+latest live read. No paid capacity change or private upload has been made.

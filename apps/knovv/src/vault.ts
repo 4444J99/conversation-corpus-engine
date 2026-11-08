@@ -29,6 +29,7 @@ import type {
 } from "./contracts";
 import type { StoragePort } from "./storage";
 import { PackedReader } from "./packed";
+import { ByteCache } from "./byte-cache";
 export { MemoryStorage } from "./storage";
 export const PLAIN_LIMIT = 32 * 1024 * 1024;
 export async function readStream(
@@ -62,6 +63,7 @@ export async function readStream(
   return result;
 }
 export async function compress(bytes: Uint8Array): Promise<Uint8Array> {
+  if (bytes.length > PLAIN_LIMIT) throw new Error("plaintext-too-large");
   return readStream(
     new Blob([new Uint8Array(bytes).buffer])
       .stream()
@@ -110,11 +112,23 @@ export class Vault {
   private device: Device | null = null;
   private secret: Uint8Array | null = null; // allow-secret: runtime-only
   private pack: DevicePackage | null = null;
-  private metadata = new Map<number, DocumentMeta[]>();
-  private locators = new Map<string, Record<string, number>>();
+  private metadata = new ByteCache<number, DocumentMeta[]>(8 * 1024 * 1024);
+  private locators = new ByteCache<string, Record<string, number>>(
+    8 * 1024 * 1024,
+  );
   private grants = new Map<string, DeviceGrant>();
   private overlays = new Map<string, Revision>();
-  private overlayDocs = new Map<string, Document>();
+  private overlayDocs = new ByteCache<string, DocumentMeta>(8 * 1024 * 1024);
+  private bodies = new ByteCache<
+    string,
+    { revision: string; document: Document }
+  >(16 * 1024 * 1024);
+  private known = new Map<string, JournalEntry>();
+  private sequences = new Map<number, string>();
+  private adoptions = new Map<string, Promise<unknown>>();
+  private checkpoints: Promise<void> = Promise.resolve();
+  private enrollmentUpdates: Promise<void> = Promise.resolve();
+  private publicationUpdates: Promise<void> = Promise.resolve();
   private cursor = 0;
   manifest: Manifest | null = null;
   publication: Publication | null = null;
@@ -130,6 +144,17 @@ export class Vault {
   }
   get deviceId() {
     return this.device?.id ?? "";
+  }
+  get changedIds() {
+    return new Set(this.overlays.keys());
+  }
+  get decodedCacheBytes() {
+    return (
+      this.bodies.bytes +
+      this.overlayDocs.bytes +
+      this.metadata.bytes +
+      this.locators.bytes
+    );
   }
   get recent() {
     return [...this.overlayDocs.values()].sort((a, b) =>
@@ -278,25 +303,27 @@ export class Vault {
         this.storage.get<{
           cursor: number;
           heads: Revision[];
+          known?: JournalEntry[];
         }>("journal:" + pub.vault),
         ticket,
       );
       if (retained) {
+        if (!Number.isSafeInteger(retained.cursor) || retained.cursor < 0)
+          throw new Error("invalid-cached-cursor");
         this.cursor = retained.cursor;
+        for (const entry of retained.known ?? []) this.record(entry);
         for (const revision of retained.heads) {
           const grant = this.grants.get(revision.device);
           if (!grant || !verify(revision, grant.signing_public))
             throw new Error("invalid-cached-revision");
           this.overlays.set(revision.doc, revision);
+          if (!this.known.has(revision.id))
+            this.record({ seq: 0, envelope: revision });
           if (
-            await this.wait(
-              this.storage.get("object:" + revision.object),
-              ticket,
-            )
-          ) {
-            const doc = await this.wait(this.revisionDoc(revision), ticket);
-            this.overlayDocs.set(doc.id, doc);
-          }
+            !(await this.wait(this.retainedMeta(revision), ticket)) &&
+            !this.offline
+          )
+            await this.wait(this.adopt(revision), ticket);
         }
       }
       await this.wait(this.sync(), ticket);
@@ -320,6 +347,13 @@ export class Vault {
     this.grants.clear();
     this.overlays.clear();
     this.overlayDocs.clear();
+    this.bodies.clear();
+    this.known.clear();
+    this.sequences.clear();
+    this.adoptions.clear();
+    this.checkpoints = Promise.resolve();
+    this.enrollmentUpdates = Promise.resolve();
+    this.publicationUpdates = Promise.resolve();
     this.cursor = 0;
   }
   async raw(oid: string): Promise<Uint8Array> {
@@ -327,6 +361,13 @@ export class Vault {
     if (!/^[0-9a-f]{64}$/.test(oid)) throw new Error("invalid-object");
     const key = "object:" + oid;
     let bytes = await this.wait(this.storage.get<Uint8Array>(key), ticket);
+    if (!bytes && this.publication?.manifest === oid)
+      bytes = await this.wait(
+        this.storage.get<Uint8Array>(
+          `bootstrap:${this.publication.vault}:${oid}`,
+        ),
+        ticket,
+      );
     if (!bytes) {
       const r = await this.wait(
         this.fetcher("/api/objects/" + oid, {
@@ -344,7 +385,29 @@ export class Vault {
       }
     }
     if (sha256(bytes) !== oid) throw new Error("ciphertext-digest-mismatch");
+    if (this.publication?.manifest === oid)
+      await this.wait(this.pinBootstrap(oid, bytes), ticket);
     return bytes;
+  }
+  private async pinBootstrap(oid: string, bytes: Uint8Array) {
+    const ticket = this.session,
+      vault = this.publication!.vault;
+    await this.wait(
+      this.storage.set(`bootstrap:${vault}:${oid}`, bytes),
+      ticket,
+    );
+    const order =
+      (await this.wait(
+        this.storage.get<string[]>("bootstrap-order:" + vault),
+        ticket,
+      )) ?? [];
+    const next = [...order.filter((id) => id !== oid), oid];
+    while (next.length > 2)
+      await this.wait(
+        this.storage.remove(`bootstrap:${vault}:${next.shift()!}`),
+        ticket,
+      );
+    await this.wait(this.storage.set("bootstrap-order:" + vault, next), ticket);
   }
   async object<T>(
     oid: string,
@@ -375,32 +438,38 @@ export class Vault {
       ordinal >= this.manifest!.count
     )
       throw new Error("invalid-locator");
-    if (!this.metadata.has(page))
-      this.metadata.set(
-        page,
-        await this.wait(
-          this.object<DocumentMeta[]>(this.manifest!.metadata[page]),
-          ticket,
-        ),
+    let entries = this.metadata.get(page);
+    if (!entries) {
+      entries = await this.wait(
+        this.object<DocumentMeta[]>(this.manifest!.metadata[page]),
+        ticket,
       );
-    const result = this.metadata.get(page)!.find((m) => m.ordinal === ordinal);
+      this.metadata.set(page, entries);
+    }
+    const result = entries.find((m) => m.ordinal === ordinal);
     if (!result) throw new Error("missing-locator");
     return result;
   }
   async metaForId(id: string): Promise<DocumentMeta | null> {
     const ticket = this.session;
-    const overlay = this.overlayDocs.get(id);
+    let overlay = this.overlayDocs.get(id);
+    const head = this.overlays.get(id);
+    if (!overlay && head)
+      overlay = (await this.wait(this.retainedMeta(head), ticket)) ?? undefined;
     if (overlay)
       return { ...overlay, ordinal: -1, object: this.overlays.get(id)!.object };
     const prefix = id.slice(0, 2),
       shard = this.manifest!.lookup[prefix];
     if (!shard) return null;
-    if (!this.locators.has(prefix))
-      this.locators.set(
-        prefix,
-        await this.wait(this.object<Record<string, number>>(shard), ticket),
+    let mapping = this.locators.get(prefix);
+    if (!mapping) {
+      mapping = await this.wait(
+        this.object<Record<string, number>>(shard),
+        ticket,
       );
-    const ordinal = this.locators.get(prefix)![id];
+      this.locators.set(prefix, mapping);
+    }
+    const ordinal = mapping[id];
     return ordinal === undefined ? null : this.meta(ordinal);
   }
   private validate(doc: Document, id: string) {
@@ -420,6 +489,8 @@ export class Vault {
     const grant = this.grants.get(revision.device);
     if (!grant || !verify(revision, grant.signing_public))
       throw new Error("invalid-revision-signature");
+    const cached = this.bodies.get(revision.doc);
+    if (cached?.revision === revision.id) return cached.document;
     const key = this.keyFor(revision.epoch);
     try {
       return this.validate(
@@ -437,22 +508,230 @@ export class Vault {
       if (key !== this.secret) key.fill(0);
     }
   }
+  private checkRevision(revision: Revision, id = revision.doc) {
+    const grant = this.grants.get(revision.device);
+    if (
+      revision.schema !== "knovv-revision.v1" ||
+      revision.doc !== id ||
+      ![revision.id, revision.doc, revision.object, revision.device].every(
+        (v) => /^[0-9a-f]{64}$/.test(v),
+      ) ||
+      !(revision.parent === null || /^[0-9a-f]{64}$/.test(revision.parent)) ||
+      !grant ||
+      !verify(revision, grant.signing_public)
+    )
+      throw new Error("invalid-revision-binding");
+  }
+  private record(entry: JournalEntry) {
+    this.checkRevision(entry.envelope);
+    if (!Number.isSafeInteger(entry.seq) || entry.seq < 0)
+      throw new Error("invalid-revision-sequence");
+    const prior = this.known.get(entry.envelope.id);
+    if (
+      prior &&
+      (canonical(prior.envelope) !== canonical(entry.envelope) ||
+        (prior.seq > 0 && entry.seq > 0 && prior.seq !== entry.seq))
+    )
+      throw new Error("revision-sequence-replay");
+    if (
+      entry.seq > 0 &&
+      this.sequences.has(entry.seq) &&
+      this.sequences.get(entry.seq) !== entry.envelope.id
+    )
+      throw new Error("revision-sequence-replay");
+    if (!prior || entry.seq > 0) this.known.set(entry.envelope.id, entry);
+    if (entry.seq > 0) this.sequences.set(entry.seq, entry.envelope.id);
+  }
+  private ancestor(ancestor: string, head: Revision) {
+    const seen = new Set<string>();
+    let current: Revision | undefined = head;
+    while (current && !seen.has(current.id)) {
+      if (current.id === ancestor) return true;
+      seen.add(current.id);
+      if (current.parent === ancestor) return true;
+      current = current.parent
+        ? this.known.get(current.parent)?.envelope
+        : undefined;
+    }
+    return false;
+  }
+  async historyPage(
+    id: string,
+    before = 0,
+  ): Promise<{ revisions: JournalEntry[]; nextBefore: number | null }> {
+    const ticket = this.session;
+    this.require();
+    const reply = await this.wait(
+      this.json("/api/documents/" + id + (before ? "?before=" + before : "")),
+      ticket,
+    );
+    if (!Array.isArray(reply.revisions) || reply.revisions.length > 50)
+      throw new Error("invalid-revision-history");
+    let previous = before || Number.MAX_SAFE_INTEGER;
+    for (const entry of reply.revisions as JournalEntry[]) {
+      this.checkRevision(entry.envelope, id);
+      if (
+        !Number.isSafeInteger(entry.seq) ||
+        entry.seq < 1 ||
+        entry.seq >= previous
+      )
+        throw new Error("invalid-revision-history");
+      this.record(entry);
+      previous = entry.seq;
+    }
+    const next = reply.next_before ?? null;
+    if (
+      next !== null &&
+      (!Number.isSafeInteger(next) || next !== previous || next < 1)
+    )
+      throw new Error("invalid-revision-history");
+    return { revisions: reply.revisions, nextBefore: next };
+  }
+  private async ensureAdvance(revision: Revision, id: string) {
+    this.checkRevision(revision, id);
+    const current = this.overlays.get(id);
+    if (!current || current.id === revision.id) return;
+    const requested = new Set<number>();
+    for (;;) {
+      let node = revision;
+      const seen = new Set<string>();
+      for (;;) {
+        if (node.id === current.id) return;
+        if (seen.has(node.id) || node.parent === null)
+          throw new Error("revision-rollback-or-fork");
+        seen.add(node.id);
+        if (node.parent === current.id) return;
+        const parent = this.known.get(node.parent);
+        if (parent) {
+          node = parent.envelope;
+          continue;
+        }
+        const before = this.known.get(node.id)?.seq ?? 0;
+        if (!before || requested.has(before))
+          throw new Error("revision-history-gap");
+        requested.add(before);
+        const page = await this.historyPage(id, before);
+        if (!page.revisions.length) throw new Error("revision-history-gap");
+        break;
+      }
+    }
+  }
+  private async remember(document: Document, revision: Revision) {
+    const ticket = this.session,
+      { body: _, ...fields } = document;
+    const meta: DocumentMeta = {
+      ...fields,
+      ordinal: -1,
+      object: revision.object,
+    };
+    const compressed = await this.wait(
+        compress(encoder.encode(canonical(meta))),
+        ticket,
+      ),
+      epoch = this.publication!.epoch;
+    const cipher = encrypt(
+      this.secret!,
+      compressed,
+      `knovv-head-meta:${this.publication!.vault}:${document.id}:${revision.id}:${epoch}`,
+    );
+    await this.wait(
+      this.storage.set(`headmeta:${this.publication!.vault}:${document.id}`, {
+        epoch,
+        revision: revision.id,
+        cipher,
+      }),
+      ticket,
+    );
+    this.overlayDocs.set(document.id, meta);
+    this.bodies.set(document.id, { revision: revision.id, document });
+  }
+  private async retainedMeta(revision: Revision) {
+    const ticket = this.session,
+      item = await this.wait(
+        this.storage.get<{
+          epoch: number;
+          revision: string;
+          cipher: Uint8Array;
+        }>(`headmeta:${this.publication!.vault}:${revision.doc}`),
+        ticket,
+      );
+    if (!item || item.revision !== revision.id) return null;
+    const key = this.keyFor(item.epoch);
+    try {
+      const raw = await this.wait(
+        inflate(
+          decrypt(
+            key,
+            item.cipher,
+            `knovv-head-meta:${this.publication!.vault}:${revision.doc}:${revision.id}:${item.epoch}`,
+          ),
+        ),
+        ticket,
+      );
+      try {
+        const meta = JSON.parse(decoder.decode(raw)) as DocumentMeta;
+        if (meta.id !== revision.doc || meta.object !== revision.object)
+          throw new Error("invalid-head-metadata");
+        this.overlayDocs.set(meta.id, meta);
+        return meta;
+      } finally {
+        raw.fill(0);
+      }
+    } finally {
+      if (key !== this.secret) key.fill(0);
+    }
+  }
+  private async adopt(
+    revision: Revision,
+    id = revision.doc,
+  ): Promise<Document> {
+    const ticket = this.session,
+      previous = this.adoptions.get(id) ?? Promise.resolve();
+    const action = previous
+      .catch(() => undefined)
+      .then(async () => {
+        if (ticket !== this.session) throw new Error("vault-locked");
+        await this.wait(this.ensureAdvance(revision, id), ticket);
+        const document = await this.wait(this.revisionDoc(revision), ticket);
+        await this.wait(this.remember(document, revision), ticket);
+        this.overlays.delete(id);
+        this.overlays.set(id, revision);
+        await this.wait(this.persistHeads(), ticket);
+        return document;
+      });
+    this.adoptions.set(id, action);
+    try {
+      return await this.wait(action, ticket);
+    } finally {
+      if (this.adoptions.get(id) === action) this.adoptions.delete(id);
+    }
+  }
   async open(id: string): Promise<OpenDocument> {
     const ticket = this.session;
     this.require();
     let revision = this.overlays.get(id) ?? null;
     try {
       const remote = await this.wait(this.json("/api/documents/" + id), ticket);
-      if (remote.head) revision = remote.head;
+      if (remote.head) {
+        this.checkRevision(remote.head, id);
+        for (const entry of remote.revisions ?? []) {
+          this.checkRevision(entry.envelope, id);
+          this.record(entry);
+        }
+        if (
+          !(remote.revisions ?? []).some(
+            (e: JournalEntry) => e.envelope.id === remote.head.id,
+          )
+        )
+          throw new Error("revision-head-mismatch");
+        revision = remote.head;
+      } else if (revision) throw new Error("revision-head-rollback");
     } catch (error) {
-      if (error instanceof ApiError) throw error;
+      if (!(error instanceof TypeError)) throw error;
       this.offline = true;
     }
     if (revision) {
-      const document = await this.wait(this.revisionDoc(revision), ticket);
-      this.overlays.set(id, revision);
-      this.overlayDocs.set(id, document);
-      await this.wait(this.persistHeads(), ticket);
+      const document = await this.wait(this.adopt(revision, id), ticket);
       return { document, revision };
     }
     const meta = await this.wait(this.metaForId(id), ticket);
@@ -465,34 +744,80 @@ export class Vault {
       revision: null,
     };
   }
+
   async refreshGrants() {
     const ticket = this.session;
-    try {
-      const data = await this.wait(this.json("/api/devices"), ticket);
-      await this.wait(
-        this.storage.set("grants:" + this.publication!.vault, data.devices),
-        ticket,
-      );
-      this.offline = false;
-    } catch (error) {
-      if (error instanceof ApiError) throw error;
-      this.offline = true;
-    }
-    const grants =
-      (await this.wait(
-        this.storage.get<DeviceGrant[]>("grants:" + this.publication!.vault),
-        ticket,
-      )) ?? [];
-    this.grants.clear();
-    for (const grant of grants) {
-      if (!verify(grant, this.pack!.trust.owner))
-        throw new Error("invalid-device-enrollment");
-      this.grants.set(grant.id, grant);
-    }
-    const own = this.grants.get(this.device!.id);
-    if (!own || own.revoked) throw new Error("device-not-enrolled");
+    const action = this.enrollmentUpdates
+      .catch(() => undefined)
+      .then(async () => {
+        if (ticket !== this.session) throw new Error("vault-locked");
+        const key = "grants:" + this.publication!.vault;
+        const cached =
+          (await this.wait(this.storage.get<DeviceGrant[]>(key), ticket)) ?? [];
+        let incoming: DeviceGrant[];
+        try {
+          incoming = (await this.wait(this.json("/api/devices"), ticket))
+            .devices;
+          this.offline = false;
+        } catch (error) {
+          if (!(error instanceof TypeError)) throw error;
+          incoming = cached;
+          this.offline = true;
+        }
+        if (!Array.isArray(incoming))
+          throw new Error("invalid-device-enrollment");
+        const merged = new Map<string, DeviceGrant>();
+        for (const grant of [...cached, ...this.grants.values()]) {
+          if (!verify(grant, this.pack!.trust.owner))
+            throw new Error("invalid-device-enrollment");
+          const prior = merged.get(grant.id);
+          if (!prior || prior.generation < grant.generation)
+            merged.set(grant.id, grant);
+        }
+        const seen = new Set<string>();
+        for (const grant of incoming) {
+          if (
+            !verify(grant, this.pack!.trust.owner) ||
+            grant.schema !== "knovv-device.v1" ||
+            !Number.isSafeInteger(grant.generation) ||
+            grant.generation < 1 ||
+            typeof grant.revoked !== "boolean" ||
+            sha256(encoder.encode(grant.signing_public)) !== grant.id ||
+            seen.has(grant.id)
+          )
+            throw new Error("invalid-device-enrollment");
+          seen.add(grant.id);
+          const prior = merged.get(grant.id);
+          if (
+            prior &&
+            (prior.generation > grant.generation ||
+              (prior.generation === grant.generation &&
+                canonical(prior) !== canonical(grant)))
+          )
+            throw new Error("enrollment-rollback");
+          merged.set(grant.id, grant);
+        }
+        await this.wait(this.storage.set(key, [...merged.values()]), ticket);
+        this.grants = merged;
+        const own = this.grants.get(this.device!.id);
+        if (!own || own.revoked) throw new Error("device-not-enrolled");
+      });
+    this.enrollmentUpdates = action;
+    await this.wait(action, ticket);
   }
-  private async refreshPublication(): Promise<void> {
+  private async refreshPublication() {
+    const ticket = this.session;
+    const action = this.publicationUpdates
+      .catch(() => undefined)
+      .then(async () => {
+        if (ticket !== this.session) throw new Error("vault-locked");
+        await this.readPublication();
+      });
+    this.publicationUpdates = action;
+    await this.wait(action, ticket);
+  }
+
+  private async readPublication(): Promise<void> {
     const ticket = this.session;
     this.require();
     const pub = (await this.wait(
@@ -559,6 +884,7 @@ export class Vault {
       );
       this.metadata.clear();
       this.locators.clear();
+      await this.wait(this.raw(pub.manifest), ticket);
       await this.wait(
         this.storage.set("checkpoint:" + pub.vault, {
           ...this.pack!.trust,
@@ -575,6 +901,7 @@ export class Vault {
       if (!adopted) secret.fill(0);
     }
   }
+
   async sync(): Promise<void> {
     const ticket = this.session;
     this.require();
@@ -587,38 +914,74 @@ export class Vault {
           this.json("/api/sync?after=" + this.cursor),
           ticket,
         );
-        if (!Array.isArray(reply.revisions) || reply.cursor < this.cursor)
+        if (
+          !Array.isArray(reply.revisions) ||
+          !Number.isSafeInteger(reply.cursor) ||
+          reply.cursor < this.cursor
+        )
           throw new Error("invalid-sync-cursor");
+        let previous = this.cursor;
         for (const entry of reply.revisions as JournalEntry[]) {
-          if (!Number.isSafeInteger(entry.seq) || entry.seq <= this.cursor)
+          if (!Number.isSafeInteger(entry.seq) || entry.seq <= previous)
             throw new Error("invalid-sync-sequence");
-          const doc = await this.wait(this.revisionDoc(entry.envelope), ticket);
-          this.overlays.set(doc.id, entry.envelope);
-          this.overlayDocs.set(doc.id, doc);
+          this.record(entry);
+          const current = this.overlays.get(entry.envelope.doc);
+          if (!current || !this.ancestor(entry.envelope.id, current))
+            await this.wait(this.adopt(entry.envelope), ticket);
+          previous = entry.seq;
         }
-        if (reply.has_more && reply.cursor === this.cursor)
-          throw new Error("stalled-sync-cursor");
+        if (
+          reply.cursor !== previous ||
+          (reply.has_more && previous === this.cursor)
+        )
+          throw new Error("invalid-sync-cursor");
         this.cursor = reply.cursor;
         more = reply.has_more;
+        await this.wait(this.persistHeads(), ticket);
       }
       this.offline = false;
-      await this.wait(this.persistHeads(), ticket);
     } catch (error) {
-      if (error instanceof ApiError || !(error instanceof TypeError))
-        throw error;
+      if (!(error instanceof TypeError)) throw error;
       this.offline = true;
     }
   }
   private async persistHeads() {
     const ticket = this.session;
-    await this.wait(
-      this.storage.set("journal:" + this.publication!.vault, {
-        cursor: this.cursor,
-        heads: [...this.overlays.values()],
-      }),
-      ticket,
-    );
+    const action = this.checkpoints
+      .catch(() => undefined)
+      .then(async () => {
+        if (ticket !== this.session) throw new Error("vault-locked");
+        const heads = new Set([...this.overlays.values()].map((r) => r.id));
+        const ordered = [...this.known.values()].sort((a, b) => a.seq - b.seq),
+          recent = new Set(ordered.slice(-10000).map((e) => e.envelope.id));
+        const kept = ordered.filter(
+          (e) =>
+            e.seq > this.cursor ||
+            heads.has(e.envelope.id) ||
+            recent.has(e.envelope.id),
+        );
+        await this.wait(
+          this.storage.set("journal:" + this.publication!.vault, {
+            cursor: this.cursor,
+            heads: [...this.overlays.values()],
+            known: kept,
+          }),
+          ticket,
+        );
+        for (const entry of ordered)
+          if (
+            !heads.has(entry.envelope.id) &&
+            !recent.has(entry.envelope.id) &&
+            entry.seq <= this.cursor
+          ) {
+            this.known.delete(entry.envelope.id);
+            if (entry.seq) this.sequences.delete(entry.seq);
+          }
+      });
+    this.checkpoints = action;
+    await this.wait(action, ticket);
   }
+
   newDocument(kind: Document["kind"] = "capture"): Document {
     this.require();
     const logical_id = "knovv:" + hex(random()),
@@ -869,7 +1232,7 @@ export class Vault {
         const value = (await this.wait(uploaded.json(), ticket)) as any;
         throw new ApiError(value.error ?? "upload-failed", uploaded.status);
       }
-      await this.wait(
+      const acknowledged = await this.wait(
         this.json("/api/revisions", {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -888,9 +1251,11 @@ export class Vault {
         ),
         ticket,
       );
-      const doc = await this.wait(this.revisionDoc(revision), ticket);
-      this.overlays.set(doc.id, revision);
-      this.overlayDocs.set(doc.id, doc);
+      this.record({
+        seq: Number.isSafeInteger(acknowledged.seq) ? acknowledged.seq : 0,
+        envelope: revision,
+      });
+      await this.wait(this.adopt(revision), ticket);
       for (const ref of document.attachments ?? [])
         await this.wait(
           this.storage.remove(
@@ -938,19 +1303,55 @@ export class Vault {
   async baseSearch(query: string) {
     const ticket = this.session;
     const { searchIndex } = await this.wait(import("./search"), ticket);
-    return searchIndex(query, async (bucket) => {
-      const oid = this.manifest!.search[bucket];
-      return oid ? this.object<Record<string, number[]>>(oid) : {};
-    });
-  }
-  async overlaySearch(query: string) {
-    const ticket = this.session;
-    const { terms } = await this.wait(import("./search"), ticket);
-    const tokens = terms(query);
-    return this.recent.filter((d) =>
-      tokens.every((t) => (d.title + " " + d.body).toLowerCase().includes(t)),
+    return searchIndex(
+      query,
+      async (bucket) => {
+        const oid = this.manifest!.search[bucket];
+        return oid ? this.object<Record<string, number[]>>(oid) : {};
+      },
+      this.manifest!.search_prefix ?? 2,
     );
   }
+
+  async overlaySearch(query: string) {
+    const ticket = this.session,
+      { terms } = await this.wait(import("./search"), ticket),
+      tokens = terms(query),
+      result: DocumentMeta[] = [];
+    for (const revision of this.overlays.values()) {
+      let meta =
+        this.overlayDocs.get(revision.doc) ??
+        (await this.wait(this.retainedMeta(revision), ticket));
+      if (
+        meta &&
+        tokens.every((t) =>
+          (meta!.title + " " + meta!.summary).toLowerCase().includes(t),
+        )
+      ) {
+        result.push(meta);
+        continue;
+      }
+      try {
+        const doc = await this.wait(this.revisionDoc(revision), ticket);
+        this.bodies.set(doc.id, { revision: revision.id, document: doc });
+        if (!meta) {
+          const { body: _, ...fields } = doc;
+          meta = { ...fields, ordinal: -1, object: revision.object };
+          this.overlayDocs.set(doc.id, meta);
+        }
+        if (
+          tokens.every((t) =>
+            (doc.title + " " + doc.body).toLowerCase().includes(t),
+          )
+        )
+          result.push(meta);
+      } catch (error) {
+        if (!(this.offline && error instanceof TypeError)) throw error;
+      }
+    }
+    return result;
+  }
+
   searchWorkerState() {
     this.require();
     return {

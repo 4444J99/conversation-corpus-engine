@@ -215,6 +215,9 @@ def seed(config: Config, bundle: Path, grants: list[dict], transport, *, schema:
                 canonical(grant).decode(),
             ],
         )
+        stored = transport.query("SELECT envelope FROM devices WHERE id=?", [grant["id"]])
+        if len(stored) != 1 or json.loads(stored[0]["envelope"]) != grant:
+            raise ValueError("device-grant-conflict")
     # CAS publishes only the checked parent, and cannot reset another writer's head.
     if not previous:
         transport.query(
@@ -238,64 +241,114 @@ def seed(config: Config, bundle: Path, grants: list[dict], transport, *, schema:
     return {"publication": checksum, "objects": len(objects), "cipher_bytes": size}
 
 
-def snapshot(config: Config, destination: Path, transport):
-    # One SQL statement establishes a consistent journal/object observation.
+def snapshot(config: Config, destination: Path, transport, *, page_entries: int = 256):
+    if not 1 <= page_entries <= 1000:
+        raise ValueError("invalid-page-bound")
+    # One statement fixes the publication, grants and journal high-water mark.
     rows = transport.query(
-        "SELECT 'publication' kind,envelope value,0 seq FROM publications UNION ALL SELECT 'device',envelope,0 FROM devices UNION ALL SELECT 'revision',envelope,seq FROM revisions UNION ALL SELECT 'object',json_object('id',id,'size',size),0 FROM objects WHERE uploaded=1 LIMIT 100001"
+        "SELECT 'publication' kind,envelope value FROM publications UNION ALL SELECT 'device',envelope FROM devices UNION ALL SELECT 'cutoff',CAST(COALESCE(MAX(seq),0) AS TEXT) FROM revisions"
     )
-    if len(rows) > 100000:
-        raise ValueError("snapshot-row-bound")
     heads = [json.loads(r["value"]) for r in rows if r["kind"] == "publication"]
     if len(heads) != 1:
         raise ValueError("snapshot-publication-unavailable")
     head = heads[0]
     authenticate(head, config.owner_public)
-    objects = [json.loads(r["value"]) for r in rows if r["kind"] == "object"]
-    if (
-        any(
-            not HEX.fullmatch(x.get("id", ""))
-            or type(x.get("size")) is not int
-            or not 0 <= x["size"] <= 48 * 1024 * 1024
-            for x in objects
-        )
-        or sum(x["size"] for x in objects) > config.max_cipher_bytes
-    ):
-        raise ValueError("snapshot-storage-bound")
+    cutoff = int(next(r["value"] for r in rows if r["kind"] == "cutoff"))
+    grants = [json.loads(r["value"]) for r in rows if r["kind"] == "device"]
+    for grant in grants:
+        authenticate(grant, config.owner_public)
     destination = safe_path(destination)
     destination.mkdir(mode=0o700, parents=True, exist_ok=False)
     (destination / "objects").mkdir(mode=0o700)
-    for item in objects:
-        path = destination / "objects" / item["id"]
-        transport.get(item["id"], path)
-        if path.stat().st_size != item["size"] or digest(path.read_bytes()) != item["id"]:
-            raise ValueError("snapshot-ciphertext-mismatch")
-    journal = {
-        "schema": "knovv-journal.v1",
-        "vault": head["vault"],
-        "epoch": head["epoch"],
-        "grants": [json.loads(r["value"]) for r in rows if r["kind"] == "device"],
-        "revisions": sorted(
-            [
-                {"seq": r["seq"], "envelope": json.loads(r["value"])}
-                for r in rows
-                if r["kind"] == "revision"
-            ],
-            key=lambda r: r["seq"],
-        ),
-    }
+    (destination / "journal-pages").mkdir(mode=0o700)
+    size = count = 0
+    after = ""
+    while True:
+        objects = transport.query(
+            "SELECT id,size FROM objects WHERE uploaded=1 AND id>? ORDER BY id LIMIT ?",
+            [after, page_entries],
+        )
+        if not objects:
+            break
+        for item in objects:
+            if (
+                not HEX.fullmatch(item.get("id", ""))
+                or item["id"] <= after
+                or type(item.get("size")) is not int
+                or not 0 <= item["size"] <= 48 * 1024 * 1024
+            ):
+                raise ValueError("snapshot-storage-bound")
+            size += item["size"]
+            if size > config.max_cipher_bytes:
+                raise ValueError("snapshot-storage-bound")
+            path = destination / "objects" / item["id"]
+            transport.get(item["id"], path)
+            if path.stat().st_size != item["size"] or digest(path.read_bytes()) != item["id"]:
+                raise ValueError("snapshot-ciphertext-mismatch")
+            after = item["id"]
+            count += 1
     from .knovv_cli import _write  # noqa: PLC0415
 
+    pages = []
+    cursor = revisions = 0
+    while cursor < cutoff:
+        entries = transport.query(
+            "SELECT seq,envelope FROM revisions WHERE seq>? AND seq<=? ORDER BY seq LIMIT ?",
+            [cursor, cutoff, page_entries],
+        )
+        if not entries:
+            raise ValueError("snapshot-journal-gap")
+        values = []
+        for entry in entries:
+            if type(entry["seq"]) is not int or not cursor < entry["seq"] <= cutoff:
+                raise ValueError("snapshot-journal-order")
+            values.append(
+                canonical({"seq": entry["seq"], "envelope": json.loads(entry["envelope"])}) + b"\n"
+            )
+            cursor = entry["seq"]
+        raw = b"".join(values)
+        if len(raw) > 8 * 1024 * 1024:
+            raise ValueError("snapshot-page-bound")
+        name = f"journal-pages/{len(pages):08}.jsonl"
+        path = destination / name
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        pages.append(
+            {
+                "file": name,
+                "sha256": digest(raw),
+                "bytes": len(raw),
+                "entries": len(entries),
+                "first": entries[0]["seq"],
+                "last": cursor,
+            }
+        )
+        revisions += len(entries)
+    journal = {
+        "schema": "knovv-journal.v2",
+        "vault": head["vault"],
+        "epoch": head["epoch"],
+        "grants": grants,
+        "cutoff": cutoff,
+        "pages": pages,
+    }
     _write(destination / "journal.json", journal)
-    _write(destination / "HEAD.knovv", head)
     receipt = {
-        "schema": "knovv-ciphertext-snapshot.v1",
+        "schema": "knovv-ciphertext-snapshot.v2",
         "publication": digest(canonical(head)),
-        "objects": len(objects),
-        "revisions": len(journal["revisions"]),
+        "objects": count,
+        "cipher_bytes": size,
+        "revisions": revisions,
+        "cutoff": cutoff,
         "verified_ciphertext": True,
         "content_restore": "requires-enrolled-device",
     }
     _write(destination / "receipt.json", receipt)
+    # HEAD is the completion marker and appears only after every readback succeeds.
+    _write(destination / "HEAD.knovv", head)
     return receipt
 
 

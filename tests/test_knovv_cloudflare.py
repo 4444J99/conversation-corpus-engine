@@ -91,3 +91,47 @@ def test_seed_refuses_unrelated_database_and_corrupt_objects_before_remote_write
         seed(config, bundle, [grant], transport)
     assert not transport.objects
     assert not transport.query("SELECT name FROM sqlite_master WHERE type='table'")
+
+
+def test_stale_revocation_cannot_be_reported_as_applied(tmp_path):
+    config, bundle, grant, owner = setup(tmp_path)
+    transport = Transport()
+    seed(config, bundle, [grant], transport)
+    active = sign(
+        {key: value for key, value in {**grant, "generation": 3}.items() if key != "signature"},
+        owner,
+    )
+    seed(config, bundle, [active], transport)
+    revoked = sign(
+        {
+            key: value
+            for key, value in {**grant, "generation": 2, "revoked": True}.items()
+            if key != "signature"
+        },
+        owner,
+    )
+    with pytest.raises(ValueError, match="device-grant-conflict"):
+        seed(config, bundle, [revoked], transport)
+
+
+def test_snapshot_pages_a_stable_cutoff_without_a_lifetime_limit(tmp_path):
+    config, bundle, grant, _ = setup(tmp_path)
+    transport = Transport()
+    seed(config, bundle, [grant], transport)
+    for n in range(5):
+        transport.query(
+            "INSERT INTO revisions(id,doc,parent,object,device,envelope) VALUES (?,?,?,?,?,?)",
+            [f"{n:064x}", "d" * 64, None, "f" * 64, grant["id"], json.dumps({"id": f"{n:064x}"})],
+        )
+    target = tmp_path / "paged"
+    receipt = snapshot(config, target, transport, page_entries=2)
+    manifest = json.loads((target / "journal.json").read_bytes())
+    assert manifest["schema"] == "knovv-journal.v2"
+    assert manifest["cutoff"] == 5 and receipt["revisions"] == 5
+    assert [page["entries"] for page in manifest["pages"]] == [2, 2, 1]
+    sequences = []
+    for page in manifest["pages"]:
+        raw = (target / page["file"]).read_bytes()
+        assert digest(raw) == page["sha256"] and len(raw) == page["bytes"]
+        sequences.extend(json.loads(line)["seq"] for line in raw.splitlines())
+    assert sequences == [1, 2, 3, 4, 5]

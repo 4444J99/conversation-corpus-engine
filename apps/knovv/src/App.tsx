@@ -77,10 +77,10 @@ export function App() {
     [query, setQuery] = useState(""),
     [hits, setHits] = useState<DocumentMeta[]>([]),
     [searchInfo, setSearchInfo] = useState("");
-  const [opened, setOpened] = useState<OpenDocument | null>(null),
+  const [opened, setOpenedState] = useState<OpenDocument | null>(null),
     [editing, setEditing] = useState(false),
-    [edited, setEdited] = useState<Document | null>(null),
-    [dirty, setDirty] = useState(false);
+    [edited, setEditedState] = useState<Document | null>(null),
+    [dirty, setDirtyState] = useState(false);
   const [drafts, setDrafts] = useState<OpenDocument[]>([]),
     [history, setHistory] = useState<JournalEntry[]>([]),
     [showHistory, setShowHistory] = useState(false),
@@ -88,6 +88,7 @@ export function App() {
   const [version, setVersion] = useState(0),
     [backlinks, setBacklinks] = useState<DocumentMeta[]>([]);
   const [toc, setToc] = useState<{ id: string; text: string }[]>([]);
+  const [historyBefore, setHistoryBefore] = useState<number | null>(null);
   const worker = useRef<Worker | null>(null),
     requestId = useRef(0),
     suspend = useRef(false);
@@ -97,6 +98,36 @@ export function App() {
     dirty: boolean;
   }>({ edited: null, opened: null, dirty: false });
   current.current = { edited, opened, dirty };
+  const editorVersion = useRef(0),
+    navigationVersion = useRef(0),
+    workerPublication = useRef("");
+  function setEdited(value: Document | null) {
+    editorVersion.current++;
+    current.current.edited = value;
+    setEditedState(value);
+  }
+  function setOpened(value: OpenDocument | null) {
+    current.current.opened = value;
+    setOpenedState(value);
+  }
+  function setDirty(value: boolean) {
+    current.current.dirty = value;
+    setDirtyState(value);
+  }
+  function adoptPublicationWorker() {
+    if (!vault.unlocked) return;
+    const pub = vault.publication!,
+      stamp = `${pub.vault}:${pub.generation}:${pub.manifest}`;
+    if (worker.current && workerPublication.current === stamp) return;
+    worker.current?.terminate();
+    requestId.current++;
+    const next = new Worker(new URL("./search.worker.ts", import.meta.url), {
+      type: "module",
+    });
+    next.postMessage({ type: "init", ...vault.searchWorkerState() });
+    worker.current = next;
+    workerPublication.current = stamp;
+  }
   useEffect(() => {
     if (!unlocked || editing) {
       setToc([]);
@@ -120,7 +151,7 @@ export function App() {
       vault.lock();
     };
   }, [storage, vault]);
-  async function guarded(work: () => Promise<void>) {
+  async function guarded(work: () => Promise<unknown>) {
     setError("");
     setBusy(true);
     try {
@@ -145,42 +176,46 @@ export function App() {
       setEditing(false);
       setDirty(false);
       setPackText("");
-      const w = new Worker(new URL("./search.worker.ts", import.meta.url), {
-        type: "module",
-      });
-      w.postMessage({ type: "init", ...vault.searchWorkerState() });
-      worker.current = w;
+      navigationVersion.current++;
+      adoptPublicationWorker();
       setUnlocked(true);
       setDrafts(await vault.drafts());
       setVersion((v) => v + 1);
     });
   }
   async function lock() {
+    navigationVersion.current++;
     await guarded(async () => {
       const state = current.current;
-      if (state.dirty && state.edited)
-        await vault.stage(state.edited, parentOf(state.opened));
-      worker.current?.terminate();
-      worker.current = null;
-      requestId.current++;
-      vault.lock();
-      setUnlocked(false);
-      setOpened(null);
-      setEdited(null);
-      setEditing(false);
-      setDirty(false);
-      setHits([]);
-      setHistory([]);
-      setDrafts([]);
-      setConflict(null);
-      setBacklinks([]);
-      setQuery("");
-      setNotice("");
-      setError("");
-      setHasPack(true);
+      try {
+        if (state.dirty && state.edited)
+          await vault.stage(state.edited, parentOf(state.opened));
+      } finally {
+        worker.current?.terminate();
+        worker.current = null;
+        requestId.current++;
+        vault.lock();
+        setUnlocked(false);
+        setOpened(null);
+        setEdited(null);
+        setEditing(false);
+        setDirty(false);
+        setHits([]);
+        setHistory([]);
+        setDrafts([]);
+        setConflict(null);
+        setBacklinks([]);
+        setQuery("");
+        setNotice("");
+        setError("");
+        setHasPack(true);
+        workerPublication.current = "";
+      }
     });
   }
   async function open(id: string) {
+    const navigation = ++navigationVersion.current,
+      editor = editorVersion.current;
     requestId.current++;
     setQuery("");
     await guarded(async () => {
@@ -188,6 +223,12 @@ export function App() {
       if (state.dirty && state.edited)
         await vault.stage(state.edited, parentOf(state.opened));
       const value = await vault.open(id);
+      if (
+        navigation !== navigationVersion.current ||
+        editor !== editorVersion.current ||
+        !vault.unlocked
+      )
+        return;
       setOpened(value);
       setEdited(null);
       setEditing(false);
@@ -201,7 +242,15 @@ export function App() {
     });
   }
   async function navigate(next: string) {
+    const navigation = ++navigationVersion.current,
+      editor = editorVersion.current;
     if (dirty && edited) await vault.stage(edited, parentOf(opened));
+    if (
+      navigation !== navigationVersion.current ||
+      editor !== editorVersion.current ||
+      !vault.unlocked
+    )
+      return false;
     setDirty(false);
     setScreen(next);
     setOpened(null);
@@ -210,7 +259,11 @@ export function App() {
     setQuery("");
     setHits([]);
     location.hash = "/" + next;
-    if (next === "drafts") setDrafts(await vault.drafts());
+    if (next === "drafts") {
+      const nextDrafts = await vault.drafts();
+      if (navigation === navigationVersion.current) setDrafts(nextDrafts);
+    }
+    return true;
   }
   useEffect(() => {
     if (!unlocked) return;
@@ -230,15 +283,11 @@ export function App() {
       if (window.document.visibilityState !== "visible" || suspend.current)
         return;
       suspend.current = true;
-      const generation = vault.publication!.generation;
       vault
         .sync()
         .then(() => {
-          if (vault.publication?.generation !== generation)
-            worker.current?.postMessage({
-              type: "init",
-              ...vault.searchWorkerState(),
-            });
+          if (!vault.unlocked) return;
+          adoptPublicationWorker();
           setVersion((v) => v + 1);
         })
         .catch((e) => setError(explain(e)))
@@ -286,7 +335,7 @@ export function App() {
         }) => {
           if (id !== requestId.current) return;
           try {
-            const changed = new Set(vault.recent.map((d) => d.id)),
+            const changed = vault.changedIds,
               loaded: DocumentMeta[] = [];
             for (const ordinal of result.ordinals) {
               const meta = await vault.meta(ordinal);
@@ -349,13 +398,15 @@ export function App() {
     setConflict(null);
   }
   async function create(kind: Document["kind"] = "capture") {
-    await navigate("document");
+    if (!(await navigate("document"))) return;
     const d = vault.newDocument(kind);
     setOpened({ document: d, revision: null });
     edit(d);
   }
   async function save() {
     if (!edited) return;
+    const navigation = navigationVersion.current,
+      editor = editorVersion.current;
     await guarded(async () => {
       const doc = {
         ...edited,
@@ -365,25 +416,54 @@ export function App() {
       };
       try {
         const result = await vault.save(doc, parentOf(opened));
-        setDirty(false);
-        setEdited(doc);
+        if (navigation !== navigationVersion.current || !vault.unlocked) return;
+        const unchanged = editor === editorVersion.current;
+        if (unchanged) {
+          setDirty(false);
+          setEdited(doc);
+        } else setDirty(true);
         setOpened({
           document: doc,
           revision: result.revision,
           local: result.state === "local",
         });
         setNotice(
-          result.state === "remote"
-            ? "Saved and synced. Archive snapshot pending."
-            : "Saved as an encrypted local draft. Remote sync is pending.",
+          !unchanged
+            ? "Earlier changes synced. Your newer edits remain in the editor."
+            : result.state === "remote"
+              ? "Saved and synced. Archive snapshot pending."
+              : "Saved as an encrypted local draft. Remote sync is pending.",
         );
         setVersion((v) => v + 1);
-        setDrafts(await vault.drafts());
+        const pending = await vault.drafts();
+        if (navigation === navigationVersion.current) setDrafts(pending);
       } catch (e) {
-        if (e instanceof ApiError && e.status === 409)
-          setConflict(await vault.open(doc.id));
+        if (
+          navigation === navigationVersion.current &&
+          e instanceof ApiError &&
+          e.status === 409
+        ) {
+          const value = await vault.open(doc.id);
+          if (navigation === navigationVersion.current) setConflict(value);
+        }
         throw e;
       }
+    });
+  }
+  async function loadHistory(id: string, before = 0) {
+    const navigation = navigationVersion.current;
+    await guarded(async () => {
+      const page = await vault.historyPage(id, before);
+      if (
+        navigation !== navigationVersion.current ||
+        current.current.opened?.document.id !== id
+      )
+        return;
+      setHistory((previous) =>
+        before ? [...previous, ...page.revisions].slice(-500) : page.revisions,
+      );
+      setHistoryBefore(page.nextBefore);
+      setShowHistory(true);
     });
   }
   async function fileCapture(file: File) {
@@ -611,6 +691,7 @@ export function App() {
               onClick={() =>
                 void guarded(async () => {
                   await vault.sync();
+                  adoptPublicationWorker();
                   setVersion((v) => v + 1);
                   setNotice(
                     vault.offline ? "Using cached knowledge." : "Up to date.",
@@ -856,10 +937,9 @@ export function App() {
                   )}
                   <button
                     onClick={() =>
-                      void guarded(async () => {
-                        setHistory(await vault.history(content.id));
-                        setShowHistory(!showHistory);
-                      })
+                      showHistory
+                        ? setShowHistory(false)
+                        : void loadHistory(content.id)
                     }
                   >
                     ↻ History
@@ -965,8 +1045,9 @@ export function App() {
                   <EvidencePicker
                     vault={vault}
                     value={edited}
-                    onChange={(value) => {
-                      setEdited(value);
+                    onChange={(update) => {
+                      if (current.current.edited?.id !== edited.id) return;
+                      setEdited(update(current.current.edited));
                       setDirty(true);
                     }}
                   />
@@ -1076,6 +1157,19 @@ export function App() {
               {showHistory && (
                 <section className="history">
                   <h2>Saved revisions</h2>
+                  <button onClick={() => void loadHistory(content.id)}>
+                    Show latest revisions
+                  </button>
+                  {historyBefore !== null && (
+                    <button
+                      disabled={busy}
+                      onClick={() =>
+                        void loadHistory(content.id, historyBefore)
+                      }
+                    >
+                      Load earlier revisions
+                    </button>
+                  )}
                   {content.source_history?.map((item) => (
                     <button
                       key={item.version}

@@ -42,6 +42,7 @@ from .library_note_text import inert as _inert
 from .library_note_text import inert_lines as _inert_lines
 from .library_note_text import plain as _plain
 from .library_note_text import safe_uid as _uid
+from .library_paths import _absolute, _no_symlinks
 from .library_store import Library, canonical_json
 from .library_vault import PROFILE_CARDS, PROFILE_FULL, PROFILE_NONE, VAULT_PROFILES, plan_vault
 from .library_vault_gate import VaultCaps, hard_cap_problems, measure_vault
@@ -95,17 +96,6 @@ def _safe_relative(value: str) -> Path:
     ):
         raise ValueError(f"unsafe export path: {value!r}")
     return path
-
-
-def _no_symlinks(path: Path) -> None:
-    for component in (path, *path.parents):
-        if component.is_symlink():
-            raise ValueError(f"export path contains a symlink: {component}")
-
-
-def _absolute(path: Path) -> Path:
-    """Normalize lexically; resolving would follow the symlinks we must reject."""
-    return Path(os.path.abspath(path))  # noqa: PTH100 - no filesystem walks or symlink following
 
 
 class _CheckedBinary:

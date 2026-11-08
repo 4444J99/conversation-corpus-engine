@@ -1,3 +1,4 @@
+import { ByteCache } from "./byte-cache";
 import { sha256 } from "./crypto";
 import { inflate, readStream } from "./vault";
 import { searchIndex, type Postings } from "./search";
@@ -27,7 +28,7 @@ async function loadCipher(oid: string) {
 let secret: Uint8Array | null = null, // allow-secret: runtime-only
   publication: Publication | null = null,
   manifest: Manifest | null = null;
-const buckets = new Map<string, Postings>();
+const buckets = new ByteCache<string, Postings>(8 * 1024 * 1024);
 self.onmessage = async (event: MessageEvent) => {
   const { type, id, query } = event.data;
   if (type === "init") {
@@ -58,15 +59,18 @@ self.onmessage = async (event: MessageEvent) => {
   }
   if (type !== "search" || !secret || !publication || !manifest) return;
   try {
-    const result = await searchIndex(query, async (bucket) => {
-      if (buckets.has(bucket)) return buckets.get(bucket)!;
-      const oid = manifest!.search[bucket];
-      if (!oid) return {};
-      const index = await reader!.value<Postings>(oid);
-      if (buckets.size >= 16) buckets.delete(buckets.keys().next().value!);
-      buckets.set(bucket, index);
-      return index;
-    });
+    const result = await searchIndex(
+      query,
+      async (bucket) => {
+        if (buckets.has(bucket)) return buckets.get(bucket)!;
+        const oid = manifest!.search[bucket];
+        if (!oid) return {};
+        const index = await reader!.value<Postings>(oid);
+        buckets.set(bucket, index);
+        return index;
+      },
+      manifest!.search_prefix ?? 2,
+    );
     self.postMessage({ id, result });
   } catch {
     self.postMessage({

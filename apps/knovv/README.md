@@ -145,7 +145,8 @@ cce-knovv import-journal --bundle "$SNAPSHOT" --owner-public "$OWNER_PUBLIC" \
   --authoring-home "$AUTHORING_HOME"
 ```
 
-The snapshot reads one consistent D1 observation, downloads uploaded ciphertext,
+The snapshot fixes its publication, grants and journal cutoff in one D1 observation,
+pages immutable objects and revisions, downloads uploaded ciphertext,
 checks every object digest and writes its head only after readback completes.
 Its receipt distinguishes verified ciphertext from decrypted content restoration.
 Preserve the complete snapshot in the existing private recovery repository and
@@ -171,9 +172,42 @@ existing source adapters and are not marked complete by publication.
 
 The ciphertext cache is bounded to 32 MiB; cold reads and uncached offline reads
 are different cases. Search decodes postings in a worker and reports bounded result
-counts. Reader data slabs are bounded to 32 MiB uncompressed. Journal import is
-bounded to 10,000 entries and 64 MiB decoded content per batch. Cloud control
+counts. Reader data slabs are bounded to 32 MiB uncompressed. Decoded body, metadata, locator
+and search caches have separate byte budgets; two encrypted bootstrap catalogs are pinned for reopening.
+New search catalogs shard token hashes across four hex digits; two-digit catalogs remain readable. Journal import resumes in
+batches of at most 256 new entries and 64 MiB decoded content, with no lifetime entry ceiling.
+Version 2 snapshots use integrity-checked JSONL pages of at most 8 MiB; legacy snapshots remain readable. Cloud control
 operations have a one-hour wall and per-command timeouts. Publication has a default
 one-hour deadline and a shared 15-minute attribution budget; unmeasured authorship
 is shown explicitly when that budget expires. These bounds fail visibly; they do
 not turn an incomplete publication into a verified head.
+
+
+## Enrolled local-agent authoring
+
+Enroll each agent as a separate device and package its credential using the commands
+above. Build the Node client with `npm run build`; the Python entrypoint dispatches
+to that exact checkout build. Use existing `cf access login` authentication for the
+application; the client never retrieves or prints a raw Access token. The same
+signed revision, revocation and conflict checks apply as in the browser.
+
+```sh
+cce-knovv agent new --package "$AGENT_PACKAGE" --passphrase-file "$AGENT_UNLOCK" \
+  --state-dir "$AGENT_PRIVATE_STATE" --origin "$APP_ORIGIN" --agent codex \
+  --input "$PRIVATE_INPUT_JSON" --output "$NEW_PRIVATE_RESULT"
+
+cce-knovv agent save --package "$AGENT_PACKAGE" --passphrase-file "$AGENT_UNLOCK" \
+  --state-dir "$AGENT_PRIVATE_STATE" --origin "$APP_ORIGIN" --agent codex \
+  --id "$DOCUMENT_ID" --parent "$REVISION_ID" \
+  --input "$PRIVATE_INPUT_JSON" --output "$NEW_PRIVATE_RESULT"
+```
+
+Input JSON contains `title`/`body` and optional sources, links, relationships, tags,
+summary or status. Agent-created and edited content declares `author=agent` and
+`last_editor=agent:<name>`. `read --id` and `drafts` use the same options without
+`--input`; output is a new mode-0600 file. The private state directory must be
+owned, mode 0700 and free of symlinks. An exclusive process lock prevents competing
+writers; its contents contain ciphertext, the protected credential and opaque trust
+checkpoints. A conflict preserves the encrypted draft for inspection/recovery.
+An interrupted process may leave its lock: verify that its recorded PID is gone
+before removing only that lock and retrying. No source-host service is required.

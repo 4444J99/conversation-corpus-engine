@@ -5,6 +5,7 @@ export const terms = (query: string) =>
 export async function searchIndex(
   query: string,
   load: (bucket: string) => Promise<Postings>,
+  prefix = 2,
 ): Promise<{
   ordinals: number[];
   total: number;
@@ -17,7 +18,7 @@ export async function searchIndex(
   const cache = new Map<string, Promise<Postings>>();
   const lists = await Promise.all(
     tokens.map(async (token) => {
-      const bucket = sha256(encoder.encode(token)).slice(0, 2);
+      const bucket = sha256(encoder.encode(token)).slice(0, prefix);
       if (!cache.has(bucket)) cache.set(bucket, load(bucket));
       const index = await cache.get(bucket)!;
       if (!Object.hasOwn(index, token)) return [];

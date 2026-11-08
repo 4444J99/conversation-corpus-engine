@@ -47,6 +47,8 @@ def test_private_projection_is_source_bound_searchable_and_exactly_restorable(tm
     )  # allow-secret: runtime-only
     assert manifest["count"] == 3
     assert manifest["search"]
+    assert manifest["search_prefix"] == 4
+    assert all(len(bucket) == 4 for bucket in manifest["search"])
     restored = restore_bundle(target, tmp_path / "restored", owner, owner.signing_public())
     docs = [json.loads(p.read_text()) for p in (tmp_path / "restored").glob("*.json")]
     source = next(d for d in docs if d["kind"] == "source")
