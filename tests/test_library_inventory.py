@@ -855,11 +855,8 @@ def test_sources_are_never_written_and_leave_no_sidecars(tmp_path):
         opencode_databases=[root / "opencode.db"],
         antigravity_sources=[wal],
     )
-    after = snapshot(root)
-    assert {k: v for k, v in after.items() if not k.endswith(("-shm", "-wal"))} == {
-        k: v for k, v in before.items() if not k.endswith(("-shm", "-wal"))
-    }
-    assert set(after) - set(before) <= {"wal.db-shm", "wal.db-wal"} - set(before)
+    # Not a byte of any source file, the WAL database's sidecars included, may change.
+    assert snapshot(root) == before
     assert set(kinds(tmp_path, "antigravity")) == {"w"}
 
 
@@ -1318,3 +1315,284 @@ def test_command_has_no_default_source_locations():
         "copilot_state_dir", "copilot_database", "opencode_database",
     ):  # fmt: skip
         assert getattr(args, name) == []
+
+
+# ---------------------------------------------------------------------------------------------
+# Review findings: OpenCode identity merge, WAL sources that must stay byte-identical, Copilot
+# directories that fold only when every transcript the reader can open is the same
+# ---------------------------------------------------------------------------------------------
+
+OPENCODE_WITH_PARENT = (
+    "CREATE TABLE session (id TEXT, title TEXT, time_created INT, time_updated INT,"
+    " directory TEXT, parent_id TEXT);"
+)
+OPENCODE_WITHOUT_PARENT = (
+    "CREATE TABLE session (id TEXT, title TEXT, time_created INT, time_updated INT,"
+    " directory TEXT);"
+)
+
+
+def opencode_copy(path: Path, title: str, parent: str | None | bool = False) -> Path:
+    """An OpenCode database holding session ``child``; ``parent=False`` omits the column."""
+    if parent is False:
+        return database(
+            path,
+            OPENCODE_WITHOUT_PARENT,
+            ("INSERT INTO session VALUES ('child',?,1,1,'/d')", (title,)),
+        )
+    return database(
+        path,
+        OPENCODE_WITH_PARENT,
+        ("INSERT INTO session VALUES ('child',?,1,1,'/d',?)", (title, parent)),
+    )
+
+
+def test_opencode_copy_without_parent_evidence_cannot_erase_a_proven_subagent(tmp_path):
+    proven = opencode_copy(tmp_path / "a" / "o.db", "proven", "p1")
+    bare = opencode_copy(tmp_path / "b" / "o.db", "bare")
+    run_inventory(tmp_path, opencode_databases=[proven, bare])
+    assert kinds(tmp_path, "opencode") == {"child": ("subagent", "p1")}
+    assert findings(tmp_path, "opencode") == set()
+
+
+def test_opencode_session_v2_without_parent_does_not_erase_the_session_table_parent(tmp_path):
+    source = database(
+        tmp_path / "o.db",
+        OPENCODE_WITH_PARENT + "CREATE TABLE session_v2 (id TEXT, title TEXT, time_created INT,"
+        " time_updated INT, directory TEXT);",
+        ("INSERT INTO session VALUES ('child','T',1,1,'/d','p1')", ()),
+        ("INSERT INTO session_v2 VALUES ('child','T2',2,2,'/d')", ()),
+    )
+    run_inventory(tmp_path, opencode_databases=[source])
+    assert kinds(tmp_path, "opencode") == {"child": ("subagent", "p1")}
+
+
+def test_opencode_later_copy_with_parent_evidence_upgrades_an_unknown_kind(tmp_path):
+    bare = opencode_copy(tmp_path / "a" / "o.db", "bare")
+    proven = opencode_copy(tmp_path / "b" / "o.db", "proven", "p1")
+    run_inventory(tmp_path, opencode_databases=[bare, proven])
+    assert kinds(tmp_path, "opencode") == {"child": ("subagent", "p1")}
+
+
+@pytest.mark.parametrize("second", ["p2", None])
+def test_opencode_contradictory_parent_claims_are_a_finding_not_an_overwrite(tmp_path, second):
+    first = opencode_copy(tmp_path / "a" / "o.db", "first", "p1")
+    other = opencode_copy(tmp_path / "b" / "o.db", "second", second)
+    run_inventory(tmp_path, opencode_databases=[first, other])
+    assert kinds(tmp_path, "opencode") == {"child": ("unknown", None)}
+    assert "conflicting_parent_identity" in findings(tmp_path, "opencode")
+    assert finding_paths(tmp_path, "opencode", "conflicting_parent_identity") == {
+        str(other.resolve())
+    }
+
+
+def test_opencode_agreeing_copies_keep_the_relationship_without_a_finding(tmp_path):
+    first = opencode_copy(tmp_path / "a" / "o.db", "first", "p1")
+    second = opencode_copy(tmp_path / "b" / "o.db", "second", "p1")
+    run_inventory(tmp_path, opencode_databases=[first, second])
+    assert kinds(tmp_path, "opencode") == {"child": ("subagent", "p1")}
+    assert findings(tmp_path, "opencode") == set()
+    assert rows(tmp_path)[("opencode", "child")]["prompt_title"] == "second"
+
+
+WAL_SESSION = (
+    "CREATE TABLE session (id TEXT, title TEXT, time_created INT, time_updated INT,"
+    " directory TEXT);"
+)
+
+
+def live_wal_copy(tmp_path: Path) -> Path:
+    """A copied WAL-mode database with writable -wal and -shm; one row lives only in the log."""
+    live = tmp_path / "live" / "o.db"
+    live.parent.mkdir()
+    holder = sqlite3.connect(live)
+    try:
+        holder.execute("PRAGMA journal_mode=WAL")
+        holder.execute("PRAGMA wal_autocheckpoint=0")
+        holder.execute(WAL_SESSION.rstrip(";"))
+        holder.execute("INSERT INTO session VALUES ('base','T',1,1,'/d')")
+        holder.commit()
+        holder.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        holder.execute("INSERT INTO session VALUES ('pending','T',1,1,'/d')")
+        holder.commit()
+        target = tmp_path / "backup" / "o.db"
+        target.parent.mkdir()
+        for suffix in ("", "-wal", "-shm"):
+            shutil.copyfile(str(live) + suffix, str(target) + suffix)
+    finally:
+        holder.close()
+    for suffix in ("-wal", "-shm"):
+        assert Path(str(target) + suffix).stat().st_size > 0
+    return target
+
+
+def test_wal_source_with_both_sidecars_is_read_without_changing_any_byte(tmp_path):
+    source = live_wal_copy(tmp_path)
+    before = snapshot(source.parent)
+    assert set(before) == {"o.db", "o.db-wal", "o.db-shm"}
+    receipt = run_inventory(tmp_path, opencode_databases=[source])
+    assert snapshot(source.parent) == before
+    # The pending row exists only in the log, so the log must have been read.
+    assert set(kinds(tmp_path, "opencode")) == {"base", "pending"}
+    assert findings(tmp_path, "opencode") == set()
+    assert receipt["status"] == "complete"
+
+
+def test_wal_snapshot_lives_in_a_private_directory_that_is_removed_afterwards(
+    tmp_path, monkeypatch
+):
+    source = live_wal_copy(tmp_path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(library_inventory.tempfile, "tempdir", str(scratch))
+    opened: list[str] = []
+    original = library_inventory._connect_readonly
+
+    def recording(run, uri):
+        opened.append(uri)
+        return original(run, uri)
+
+    monkeypatch.setattr(library_inventory, "_connect_readonly", recording)
+    run_inventory(tmp_path, opencode_databases=[source])
+    assert set(kinds(tmp_path, "opencode")) == {"base", "pending"}
+    assert len(opened) == 1
+    assert opened[0].startswith(scratch.as_uri())
+    assert source.parent.as_uri() not in opened[0]
+    assert list(scratch.iterdir()) == []
+
+
+def test_wal_snapshot_is_never_placed_inside_a_declared_source(tmp_path, monkeypatch):
+    source = live_wal_copy(tmp_path)
+    monkeypatch.setattr(library_inventory.tempfile, "tempdir", str(source.parent))
+    before = snapshot(source.parent)
+    run_inventory(tmp_path, opencode_databases=[source])
+    assert snapshot(source.parent) == before
+    assert rows(tmp_path) == {}
+    assert findings(tmp_path, "opencode") == {"snapshot_location_unsafe"}
+
+
+def test_a_wal_source_too_large_to_snapshot_is_a_finding_not_an_unbounded_copy(
+    tmp_path, monkeypatch
+):
+    source = live_wal_copy(tmp_path)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(library_inventory.tempfile, "tempdir", str(scratch))
+    monkeypatch.setattr(library_inventory, "SNAPSHOT_MAX_BYTES", 1024)
+    before = snapshot(source.parent)
+    receipt = run_inventory(tmp_path, opencode_databases=[source])
+    assert snapshot(source.parent) == before
+    assert list(scratch.iterdir()) == []
+    assert rows(tmp_path) == {}
+    assert findings(tmp_path, "opencode") == {"database_too_large_to_snapshot"}
+    assert receipt["status"] == "complete"
+
+
+def test_a_wal_source_that_keeps_changing_while_copied_is_a_finding(tmp_path, monkeypatch):
+    source = live_wal_copy(tmp_path)
+    original = library_inventory._copy_hashed
+
+    def racing(run, origin, destination):
+        digest = original(run, origin, destination)
+        if str(origin).endswith("-wal"):
+            with origin.open("ab") as handle:
+                handle.write(b"\0")
+        return digest
+
+    monkeypatch.setattr(library_inventory, "_copy_hashed", racing)
+    run_inventory(tmp_path, opencode_databases=[source])
+    assert rows(tmp_path) == {}
+    assert findings(tmp_path, "opencode") == {"database_changed_during_snapshot"}
+
+
+def test_a_wal_source_that_settles_after_one_attempt_is_read(tmp_path, monkeypatch):
+    source = live_wal_copy(tmp_path)
+    original = library_inventory._copy_hashed
+    attempts = {"count": 0}
+
+    def racing_once(run, origin, destination):
+        digest = original(run, origin, destination)
+        if str(origin).endswith("-wal"):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                os.utime(origin, ns=(1, 1))
+        return digest
+
+    monkeypatch.setattr(library_inventory, "_copy_hashed", racing_once)
+    run_inventory(tmp_path, opencode_databases=[source])
+    assert attempts["count"] == 2
+    assert set(kinds(tmp_path, "opencode")) == {"base", "pending"}
+    assert findings(tmp_path, "opencode") == set()
+
+
+def copilot_copy(root: Path, name: str, **files: str) -> Path:
+    """A Copilot session-state directory whose transcript files hold the given text."""
+    directory = root / name
+    directory.mkdir(parents=True)
+    for file_name, text in files.items():
+        (directory / file_name.replace("__", ".")).write_text(text, encoding="utf-8")
+    return directory
+
+
+START = json.dumps({"type": "session.start", "data": {"sessionId": "c1"}}) + "\n"
+
+
+def test_copilot_directories_with_one_event_log_but_different_messages_do_not_fold(tmp_path):
+    copilot_copy(tmp_path / "a", "c1", events__jsonl=START, messages__jsonl="first body\n")
+    copilot_copy(tmp_path / "b", "c1", events__jsonl=START, messages__jsonl="second body\n")
+    receipt = run_inventory(tmp_path, copilot_state_dirs=[tmp_path / "a", tmp_path / "b"])
+    assert receipt["families"]["copilot"]["folded_duplicates"] == 0
+    assert {o[0] for o in observed(tmp_path, "copilot")} == {
+        str((tmp_path / "a" / "c1").resolve()),
+        str((tmp_path / "b" / "c1").resolve()),
+    }
+
+
+@pytest.mark.parametrize(
+    "name", ["session.jsonl", "messages.jsonl", "conversation.json", "messages.json"]
+)
+def test_every_reader_supported_transcript_name_takes_part_in_the_fingerprint(tmp_path, name):
+    key = name.replace(".", "__")
+    copilot_copy(tmp_path / "a", "c1", events__jsonl=START, **{key: "one\n"})
+    copilot_copy(tmp_path / "b", "c1", events__jsonl=START, **{key: "two\n"})
+    receipt = run_inventory(tmp_path, copilot_state_dirs=[tmp_path / "a", tmp_path / "b"])
+    assert receipt["families"]["copilot"]["folded_duplicates"] == 0
+    assert len(observed(tmp_path, "copilot")) == 2
+
+
+def test_copilot_directories_that_hold_the_same_text_under_different_names_do_not_fold(tmp_path):
+    copilot_copy(tmp_path / "a", "c1", events__jsonl=START, messages__jsonl="body\n")
+    copilot_copy(tmp_path / "b", "c1", events__jsonl=START, messages__json="body\n")
+    receipt = run_inventory(tmp_path, copilot_state_dirs=[tmp_path / "a", tmp_path / "b"])
+    assert receipt["families"]["copilot"]["folded_duplicates"] == 0
+    assert len(observed(tmp_path, "copilot")) == 2
+
+
+def test_copilot_directory_with_an_extra_empty_transcript_is_not_the_same_directory(tmp_path):
+    copilot_copy(tmp_path / "a", "c1", events__jsonl=START)
+    copilot_copy(tmp_path / "b", "c1", events__jsonl=START, messages__jsonl="")
+    receipt = run_inventory(tmp_path, copilot_state_dirs=[tmp_path / "a", tmp_path / "b"])
+    assert receipt["families"]["copilot"]["folded_duplicates"] == 0
+    assert len(observed(tmp_path, "copilot")) == 2
+
+
+def test_copilot_directories_fold_when_every_transcript_file_matches(tmp_path):
+    files = {"events__jsonl": START, "messages__jsonl": "body\n", "conversation__json": "{}\n"}
+    kept = copilot_copy(tmp_path / "a", "c1", **files)
+    copilot_copy(tmp_path / "b", "c1", **files)
+    receipt = run_inventory(tmp_path, copilot_state_dirs=[tmp_path / "a", tmp_path / "b"])
+    assert receipt["families"]["copilot"]["folded_duplicates"] == 1
+    assert [o[0] for o in observed(tmp_path, "copilot")] == [str(kept.resolve())]
+
+
+def test_copilot_directory_with_an_escaping_transcript_symlink_is_never_folded(tmp_path):
+    outside = tmp_path / "outside" / "messages.jsonl"
+    outside.parent.mkdir()
+    outside.write_text("secret\n")
+    for side in ("a", "b"):
+        directory = copilot_copy(tmp_path / side, "c1", events__jsonl=START)
+        (directory / "messages.jsonl").symlink_to(outside)
+    receipt = run_inventory(tmp_path, copilot_state_dirs=[tmp_path / "a", tmp_path / "b"])
+    assert receipt["families"]["copilot"]["folded_duplicates"] == 0
+    assert len(observed(tmp_path, "copilot")) == 2
+    assert "symlink_escape" in findings(tmp_path, "copilot")

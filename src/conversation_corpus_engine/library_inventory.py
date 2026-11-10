@@ -3,8 +3,8 @@
 The knowledge library ingests native sessions through an "estate database": a SQLite inventory
 named in the source manifest under ``estate_databases``. This module is the producer for that
 inventory. Every source root is declared by the caller; nothing is discovered from a home
-directory, and sources are never written (SQLite sources are opened read-only, symlinks that
-leave their declared root are not followed).
+directory, and sources are never written: no byte of a source or of a SQLite sidecar changes
+(see ``_native_database``), and symlinks that leave their declared root are not followed.
 
 Identity is the contract. One native session is one ``sessions`` row, whichever roots hold a
 copy of it, and the identity rules are the ones the earlier estate corpus builder used, so an
@@ -39,6 +39,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 from collections import Counter, defaultdict
@@ -61,6 +62,16 @@ CODEX_STATE_DATABASE = "state_5.sqlite"
 CODEX_HEAD_LINES = 64
 DATABASE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
 CHUNK = 1 << 20
+SNAPSHOT_MAX_BYTES = 2 << 30
+SNAPSHOT_ATTEMPTS = 3
+# Every transcript file the reader opens in a session-state directory (library_native).
+COPILOT_TRANSCRIPTS = (
+    "events.jsonl",
+    "session.jsonl",
+    "messages.jsonl",
+    "conversation.json",
+    "messages.json",
+)
 UUID_PATTERN = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
@@ -109,8 +120,12 @@ class _Problem(Exception):
 
 
 class _Run:
-    def __init__(self, conn: sqlite3.Connection, max_seconds: float):
+    def __init__(
+        self, conn: sqlite3.Connection, max_seconds: float, protected: Iterable[Path] = ()
+    ):
         self.conn = conn
+        # Declared source roots: no private copy may be created inside one.
+        self.protected = tuple(Path(root).resolve() for root in protected)
         self.deadline = time.monotonic() + max_seconds
         self.folded: Counter[str] = Counter()
         self.savepoints = 0
@@ -230,23 +245,15 @@ def _unresolved(
     )
 
 
-def _upsert(
-    conn: sqlite3.Connection,
-    family: str,
-    sid: Any,
-    source: Path,
-    *,
-    kind: str = "unknown",
-    parent: str | None = None,
-    started: str | None = None,
-    project: str | None = None,
-    title: str | None = None,
-    branch: str | None = None,
-    head: str | None = None,
-    snippet: str = "",
-) -> None:
-    if not isinstance(sid, str) or not sid:
-        raise _Problem("native_identity_missing")
+def _merge_identity(
+    conn: sqlite3.Connection, family: str, sid: str, source: Path, kind: str, parent: str | None
+) -> tuple[str, str | None]:
+    """Merge one copy's kind and parent claim into what the session already has.
+
+    A copy that lacks parent evidence (``unknown``) never erases an established relationship, and
+    contradictory claims become an ``unknown`` session with a ``conflicting_parent_identity``
+    finding instead of the later copy silently winning. Every family goes through this merge.
+    """
     existing = conn.execute(
         "SELECT session_kind,parent_session_id FROM sessions WHERE agent_family=? AND session_id=?",
         (family, sid),
@@ -267,6 +274,27 @@ def _upsert(
             kind, parent = old_kind, old_parent
     if parent_conflicted:
         kind, parent = "unknown", None
+    return kind, parent
+
+
+def _upsert(
+    conn: sqlite3.Connection,
+    family: str,
+    sid: Any,
+    source: Path,
+    *,
+    kind: str = "unknown",
+    parent: str | None = None,
+    started: str | None = None,
+    project: str | None = None,
+    title: str | None = None,
+    branch: str | None = None,
+    head: str | None = None,
+    snippet: str = "",
+) -> None:
+    if not isinstance(sid, str) or not sid:
+        raise _Problem("native_identity_missing")
+    kind, parent = _merge_identity(conn, family, sid, source, kind, parent)
     conn.execute(
         """
         INSERT INTO sessions(session_id,agent_family,session_kind,parent_session_id,
@@ -450,13 +478,32 @@ def _fingerprint(run: _Run, path: Path) -> str:
     return digest.hexdigest()
 
 
+def _file_size(target: Any) -> int | None:
+    return target.stat().st_size
+
+
+def _bundle_size(target: Sequence[tuple[str, Path]]) -> int | None:
+    return sum(path.stat().st_size for _, path in target)
+
+
+def _bundle_fingerprint(run: _Run, target: Sequence[tuple[str, Path]]) -> str:
+    """Hash which transcript names are present together with every file's size and bytes."""
+    digest = hashlib.sha256()
+    for name, path in sorted(target):
+        digest.update(f"{name}\0{path.stat().st_size}\0".encode())
+        _file_sha256(run, path, digest)
+    return digest.hexdigest()
+
+
 def _fold(
     run: _Run,
     family: str,
     items: Sequence[Any],
-    probe: Callable[[Any], Path | None] = lambda item: item,
+    probe: Callable[[Any], Any] = lambda item: item,
     scope: Callable[[Any], Any] = lambda item: None,
     twins: dict[Any, Any] | None = None,
+    measure: Callable[[Any], int | None] = _file_size,
+    identify: Callable[[_Run, Any], str] = _fingerprint,
 ) -> list[Any]:
     """Keep the first of each set of byte-identical copies; count the others as folded.
 
@@ -465,13 +512,15 @@ def _fold(
     always kept: empty files carry no identity and are accounted for one by one. Copies are
     identical only within one ``scope`` (for a Copilot session-state directory its name, because
     the name is the identity). A folded item is mapped to the kept copy in ``twins`` when given.
+    ``measure`` and ``identify`` size and fingerprint what ``probe`` returns; the defaults are a
+    single file, and a Copilot directory supplies the bundle of every transcript the reader opens.
     """
     sizes: dict[tuple[Any, int], int] = Counter()
     measured: dict[int, int | None] = {}
     for index, item in enumerate(items):
         target = probe(item)
         try:
-            size = target.stat().st_size if target is not None else None
+            size = measure(target) if target is not None else None
         except OSError:
             size = None
         measured[index] = size
@@ -486,7 +535,7 @@ def _fold(
             kept.append(item)
             continue
         try:
-            identity = (scope(item), size, _fingerprint(run, target))
+            identity = (scope(item), size, identify(run, target))
         except OSError:
             kept.append(item)
             continue
@@ -582,31 +631,97 @@ def _connect_readonly(run: _Run, uri: str) -> sqlite3.Connection:
     return connection
 
 
-def _lacks_wal_sidecars(path: Path) -> bool:
-    """True for a WAL-mode database file missing its write-ahead log or its shared memory.
-
-    SQLite creates the missing one even for a read-only connection, which would write into the
-    source's directory. Only a database with both beside it is opened in place.
-    """
+def _is_wal_mode(path: Path) -> bool:
+    """True when the database header says the file is in WAL mode."""
     with path.open("rb") as handle:
         header = handle.read(20)
-    wal_mode = len(header) == 20 and header[18] == 2 and header[19] == 2
-    return wal_mode and not all(Path(str(path) + s).exists() for s in ("-wal", "-shm"))
+    return len(header) == 20 and header[18] == 2 and header[19] == 2
+
+
+def _stamp(path: Path) -> tuple[int, int, int]:
+    status = path.stat()
+    return status.st_size, status.st_mtime_ns, status.st_ino
+
+
+def _copy_hashed(run: _Run, origin: Path, destination: Path) -> str:
+    """Copy ``origin`` to a new private file and return the SHA-256 of the bytes copied."""
+    digest = hashlib.sha256()
+    descriptor = os.open(destination, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+    with origin.open("rb") as source, os.fdopen(descriptor, "wb") as target:
+        while chunk := source.read(CHUNK):
+            run.check()
+            digest.update(chunk)
+            target.write(chunk)
+    return digest.hexdigest()
+
+
+@contextlib.contextmanager
+def _private_snapshot(run: _Run, path: Path) -> Iterator[Path]:
+    """Yield a private copy of a WAL-mode database and its write-ahead log; remove it afterwards.
+
+    Even a ``mode=ro`` connection may rewrite an existing ``-shm`` file, so a WAL-mode source
+    whose sidecars are both present is never opened in place. The database and its non-empty log
+    are copied into a fresh 0700 directory under the system temporary directory (never inside the
+    source's directory or a declared source) and the copy is opened instead; the ``-shm`` file is
+    not touched at all. The copy counts only when the source's size, modification time and inode
+    are unchanged and its bytes hash the same before and after the copy, retried a few times for
+    a source that is being written. A source larger than ``SNAPSHOT_MAX_BYTES`` (or than the free
+    space of the temporary directory) is a finding, never an unbounded copy.
+    """
+    log = Path(str(path) + "-wal")
+    base = Path(tempfile.gettempdir())
+    resolved = base.resolve()
+    if any(resolved.is_relative_to(root) for root in (path.parent.resolve(), *run.protected)):
+        raise _Problem("snapshot_location_unsafe")
+    scratch = Path(tempfile.mkdtemp(prefix="cce-inventory-snapshot-", dir=base))
+    try:
+        copy = scratch / "snapshot.sqlite"
+        copied_log = Path(str(copy) + "-wal")
+        for _ in range(SNAPSHOT_ATTEMPTS):
+            before = (_stamp(path), _stamp(log))
+            members = [(path, copy)] + ([(log, copied_log)] if before[1][0] else [])
+            size = sum(stamp[0] for stamp in before)
+            if size > SNAPSHOT_MAX_BYTES or size > shutil.disk_usage(scratch).free // 2:
+                raise _Problem("database_too_large_to_snapshot")
+            for target in (copy, copied_log):
+                target.unlink(missing_ok=True)
+            copied = [_copy_hashed(run, origin, target) for origin, target in members]
+            if (_stamp(path), _stamp(log)) == before and copied == [
+                _file_sha256(run, origin).hexdigest() for origin, _ in members
+            ]:
+                break
+        else:
+            raise _Problem("database_changed_during_snapshot")
+        yield copy
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 @contextlib.contextmanager
 def _native_database(run: _Run, family: str, path: Path) -> Iterator[sqlite3.Connection]:
-    """Open a native SQLite source read-only; it is never written and never checkpointed.
+    """Open a native SQLite source so that no byte of it, or of a sidecar, changes.
 
-    A WAL-mode base file without both sidecars (an archived copy) cannot be opened read-only
-    without SQLite creating the missing one. A stable, double-hashed base-file snapshot is read instead, for
-    metadata only, and only with no nonempty WAL or rollback journal; its historical WAL custody
-    stays a recorded finding.
+    * WAL mode with both ``-wal`` and ``-shm`` present: a validated private snapshot of the
+      database and its log is read (``_private_snapshot``), so pending log content is seen.
+    * WAL mode missing either sidecar (an archived copy): opening it, even read-only, would make
+      SQLite create the missing one. A stable, double-hashed base-file snapshot is read instead,
+      for metadata only, and only with no nonempty WAL or rollback journal; its historical WAL
+      custody stays a recorded finding.
+    * Otherwise the file is opened in place with ``mode=ro``, which writes nothing.
     """
     uri = path.as_uri()
+    wal_mode = _is_wal_mode(path)
+    if wal_mode and all(Path(str(path) + s).exists() for s in ("-wal", "-shm")):
+        with _private_snapshot(run, path) as copy:
+            copied = _connect_readonly(run, copy.as_uri())
+            try:
+                yield copied
+            finally:
+                copied.close()
+        return
     snapshot = None
     connection = None
-    if not _lacks_wal_sidecars(path):
+    if not wal_mode:
         try:
             connection = _connect_readonly(run, uri + "?mode=ro")
         except sqlite3.OperationalError as error:
@@ -1193,6 +1308,7 @@ def _copilot(run: _Run, state_dirs: Sequence[Path], databases: Sequence[Path]) -
 
     directories: list[Path] = []
     events: dict[Path, Path | None] = {}
+    transcripts: dict[Path, list[tuple[str, Path]] | None] = {}
     for root in _roots(run, family, state_dirs):
         try:
             children = sorted(root.iterdir())
@@ -1205,18 +1321,33 @@ def _copilot(run: _Run, state_dirs: Sequence[Path], databases: Sequence[Path]) -
             if resolved in events:
                 continue
             directories.append(resolved)
-            # The event log is read through the same containment rule as the directory.
-            log = resolved / "events.jsonl"
-            contained = _contained(run, family, root, log) if os.path.lexists(log) else None
-            events[resolved] = contained if contained is not None and contained.is_file() else None
+            # Every transcript file the reader opens is read through the same containment rule
+            # as the directory. A name that is present but cannot be trusted (it escapes the
+            # root, or is not a regular file) leaves the directory unfoldable.
+            found: list[tuple[str, Path]] = []
+            trusted = True
+            for name in COPILOT_TRANSCRIPTS:
+                candidate = resolved / name
+                if not os.path.lexists(candidate):
+                    continue
+                contained = _contained(run, family, root, candidate)
+                if contained is not None and contained.is_file():
+                    found.append((name, contained))
+                else:
+                    trusted = False
+            events[resolved] = next((path for name, path in found if name == "events.jsonl"), None)
+            transcripts[resolved] = found if trusted and found else None
 
-    # A session-state directory's name is its identity, so only same-named copies can be copies.
+    # A session-state directory's name is its identity, so only same-named copies can be copies,
+    # and then only when every transcript file the reader can open is byte-identical.
     kept = _fold(
         run,
         family,
         directories,
-        probe=lambda directory: events[directory],
+        probe=lambda directory: transcripts[directory],
         scope=lambda directory: directory.name,
+        measure=_bundle_size,
+        identify=_bundle_fingerprint,
     )
     for directory in kept:
         run.check()
@@ -1328,6 +1459,16 @@ def _opencode_database(run: _Run, source: Path) -> None:
                 )
                 continue
             parent = _text(raw_parent)
+            # A copy without parent evidence cannot erase a proven relationship, and copies that
+            # disagree become a finding; the other columns keep this family's last-copy-wins.
+            kind, parent = _merge_identity(
+                conn,
+                "opencode",
+                sid,
+                source,
+                "subagent" if parent else ("root" if has_parent else "unknown"),
+                parent,
+            )
             conn.execute(
                 """
                 INSERT INTO sessions(session_id,agent_family,session_kind,parent_session_id,
@@ -1342,7 +1483,7 @@ def _opencode_database(run: _Run, source: Path) -> None:
                 """,
                 (
                     sid,
-                    "subagent" if parent else ("root" if has_parent else "unknown"),
+                    kind,
                     parent,
                     _epoch_iso(created, 1000),
                     _text(directory),
@@ -1490,7 +1631,11 @@ def build_inventory(
         conn.execute("PRAGMA journal_mode = DELETE")
         conn.execute("PRAGMA synchronous = OFF")
         conn.executescript(SCHEMA)
-        run = _Run(conn, max_seconds)
+        run = _Run(
+            conn,
+            max_seconds,
+            [Path(root) for roots in sources.declared().values() for root in roots],
+        )
         conn.execute("BEGIN")
         try:
             _gemini(run, sources.gemini_sources)
