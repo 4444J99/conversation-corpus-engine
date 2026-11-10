@@ -23,6 +23,7 @@ from .library_build import (
 )
 from .library_cards import export_cards, is_card_folder, verify_cards
 from .library_export import EXPORT_PROFILES, LEGACY_PROFILE, export_library, verify_export
+from .library_inventory import DEFAULT_MAX_SECONDS, InventorySources, build_inventory
 from .library_passages import PASSAGE_LIMIT
 from .library_read_metadata import MAX_ATTACHMENTS, message_metadata, sequence_attachment_count
 from .library_store import (
@@ -671,6 +672,55 @@ def add_library_parser(subparsers: Any) -> Any:
         help="Reading vault written into the generation: none (default, no vault), cards "
         "(one capped card per record) or full (whole records in capped linked parts)",
     )
+    inventory = sub.add_parser(
+        "inventory",
+        help="Inventory native coding-agent sessions into the database a manifest names under "
+        "estate_databases",
+        description=(
+            "Read explicitly declared native session roots (never written) and write a new "
+            "session-corpus.db plus inventory-receipt.json. Every source flag may repeat, so one "
+            "run can list a live root and archived copies of the same family; byte-identical "
+            "copies are observed once. Exits 0 when complete, 3 when --max-seconds ran out."
+        ),
+    )
+    inventory.add_argument("--json", action="store_true", help="JSON is the default output")
+    inventory.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="New private directory (it must not exist, and must be outside every Git work tree "
+        "or ignored by it); receives session-corpus.db and inventory-receipt.json",
+    )
+    for flag, help_text in (
+        ("--claude-projects", "Claude Code projects directory (holds <project>/<session>.jsonl)"),
+        (
+            "--codex-root",
+            "Codex home holding sessions/, archived_sessions/ and optionally state_5.sqlite",
+        ),
+        ("--codex-census", "Optional Codex census JSON (sessions[].relative_path)"),
+        ("--gemini-source", "Gemini census JSON (sessions[] with session_id)"),
+        (
+            "--antigravity-source",
+            "Antigravity CLI directory, native .db file or census JSON",
+        ),
+        ("--copilot-state-dir", "Copilot session-state directory (one folder per session)"),
+        ("--copilot-database", "Copilot session-store SQLite database"),
+        ("--opencode-database", "OpenCode SQLite database"),
+    ):
+        inventory.add_argument(
+            flag,
+            action="append",
+            type=Path,
+            default=[],
+            metavar="PATH",
+            help=f"{help_text}; repeatable, in precedence order",
+        )
+    inventory.add_argument(
+        "--max-seconds",
+        type=float,
+        default=DEFAULT_MAX_SECONDS,
+        help="Wall-clock budget; a run that exceeds it writes an incomplete receipt and exits 3",
+    )
     publish = sub.add_parser("publish", help="Verify and atomically publish an existing candidate")
     common(publish)
     publish.add_argument("generation", type=Path)
@@ -1032,8 +1082,32 @@ def _verify_export_command(args: argparse.Namespace) -> int:
     return 1 if problems else 0
 
 
+def _inventory_command(args: argparse.Namespace) -> int:
+    # The inventory holds session titles, snippets and project paths: authorise where it lands
+    # before any source is read.
+    require_git_private(args.out)
+    receipt = build_inventory(
+        InventorySources(
+            claude_projects=args.claude_projects,
+            codex_roots=args.codex_root,
+            codex_censuses=args.codex_census,
+            gemini_sources=args.gemini_source,
+            antigravity_sources=args.antigravity_source,
+            copilot_state_dirs=args.copilot_state_dir,
+            copilot_databases=args.copilot_database,
+            opencode_databases=args.opencode_database,
+        ),
+        args.out,
+        max_seconds=args.max_seconds,
+    )
+    print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if receipt["status"] == "complete" else 3
+
+
 def handle_library(args: argparse.Namespace) -> int:
     try:
+        if args.action == "inventory":
+            return _inventory_command(args)
         if args.action == "verify-export":
             return _verify_export_command(args)
         if args.action in {"export", "export-cards"}:

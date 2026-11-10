@@ -107,6 +107,46 @@ The manifest is private: it contains local source locations. Native readers reta
 
 To reuse a failed generation whose source ingestion finished, set `resume_generation` to its absolute generation directory and list only supplemental sources in the new manifest. The builder verifies the failed state, source counts, manifest, publication base, database integrity and every normalized object digest. It hash-binds and compacts a new copy, leaving the seed untouched; baseline observations count against the new record budget. The report retains the seed receipt and all coverage findings. Older candidates without a phase marker are explicitly labeled as weaker legacy ingestion evidence. Set measured `limits` in the manifest for the next invocation; a resume never changes global limits or hides the failed attempt.
 
+## Native inventory
+
+`estate_databases` names SQLite inventories of native coding-agent sessions. `cce library inventory` produces one from source roots you declare; nothing is discovered from a home directory and every flag has no default.
+
+```bash
+cce library inventory \
+  --claude-projects /private/live/claude/projects \
+  --claude-projects /private/archive-2025/claude/projects \
+  --codex-root /private/live/codex \
+  --codex-root /private/archive-2025/codex \
+  --opencode-database /private/live/opencode/opencode.db \
+  --out /private/inventories/native-2026-01
+```
+
+`--out` must be a new directory outside every Git work tree (or ignored by it), because the inventory holds session titles, snippets and project paths. It is created mode 0700 and receives `session-corpus.db` (mode 0600) and `inventory-receipt.json`. Name the database in the next build:
+
+```json
+{ "estate_databases": ["/private/inventories/native-2026-01/session-corpus.db"] }
+```
+
+Source flags, each repeatable and read in the order given (a path declared twice counts once, at its last position):
+
+| Flag | Source |
+| --- | --- |
+| `--claude-projects DIR` | Claude Code projects directory; every `*.jsonl` below it, including subagent transcripts |
+| `--codex-root DIR` | Codex home holding `sessions/`, `archived_sessions/` (`.jsonl` and `.jsonl.zst`) and optionally `state_5.sqlite` |
+| `--codex-census FILE` | Optional Codex census (`sessions[].relative_path`); rollouts are found without one |
+| `--gemini-source FILE` | Gemini census JSON (`sessions[]` with `session_id`) |
+| `--antigravity-source PATH` | Antigravity CLI directory, native `.db` file or census JSON |
+| `--copilot-state-dir DIR` | Copilot `session-state` directory, one folder per session |
+| `--copilot-database FILE` | Copilot session-store database |
+| `--opencode-database FILE` | OpenCode database |
+| `--max-seconds N` | Wall-clock budget (default 7200) |
+
+Identity follows the native record, so the same transcript gets the same session id whichever root holds it: a Claude subagent is `<sessionId>/agent/<agentId>` with the session as its parent, a Codex session is the `id` in its `session_meta` header rather than its file name, and conflicting parent claims become an `unknown` kind with a recorded finding. One session is one `sessions` row; each distinct source file adds one `source_observations` row. Copies with the same size and SHA-256 within a family are folded: only the first, in declaration order and then sorted path, is observed, and the rest are counted as `folded_duplicates`. Copies that differ are all observed. Codex reads every state database before any rollout, so parent edges from one root apply to rollouts from another.
+
+Sources are never written. SQLite sources open read-only; a symlink that leaves its declared root is not followed; an unreadable or malformed source is recorded as a finding (`unresolved_source_observations`) for that source and the run continues. The receipt holds counts and paths only: the schema and implementation versions, the declared roots, per-family session counts by kind, observations, folded duplicates, findings by code, artifacts by classification, the database SHA-256 and the start and end times. The command prints it as JSON and exits 0; it exits 2 when `--out` exists or no source is declared, and 3 when `--max-seconds` ran out (the receipt then says `incomplete` and the database is not a usable inventory).
+
+A build reads each body through the native readers described above. A session whose transcript is not under a declared root stays a metadata-only record, so list the archived copies you want searched.
+
 ## Web captures
 
 A capture tool that fetches saved web pages writes *shards*: JSONL files with one row per page attempt. `cce library build` reads them through the `web_captures` key of the source manifest, the same intake as the other sources, so a saved page is searchable like a chat and is bounded, receipted and published the same way. The key lists absolute paths: a shard file, or a folder whose `*.jsonl` files (at any depth, symlinks never followed) are read in name order. Both `capture-shard.v1` pages and `wikipedia-article.v1` articles are supported. Select body shards explicitly; clip ledgers, receipt files, fetch logs and manifests are operational state, not page text. Intake does not fetch URLs.
