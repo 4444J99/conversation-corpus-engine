@@ -28,6 +28,12 @@ JSONRPC_INTERNAL_ERROR = -32603
 
 ARCHIVE_ROOT_ENV = "CCE_ARCHIVE_ROOT"
 ARCHIVE_TOOL = "cce_archive_search"
+
+
+class NoSearchableCorpusError(ValueError):
+    """No registered or direct federation corpus could be resolved for cce_search."""
+
+
 ARCHIVE_LIMIT_MAX = 25
 
 
@@ -321,7 +327,7 @@ class CceMcpServer:
         if validation["valid"]:
             return project_root
         missing = ", ".join(validation["missing_files"]) or "registry entries"
-        raise ValueError(
+        raise NoSearchableCorpusError(
             "No searchable corpus found. Provide corpus_root or register a corpus; "
             f"missing {missing}."
         )
@@ -332,7 +338,19 @@ class CceMcpServer:
         if mode not in {None, "action", "unresolved", "timeline", "family_brief"}:
             raise ValueError("mode must be one of action, unresolved, timeline, or family_brief")
         limit = optional_limit(arguments)
-        corpus_root = self.corpus_root_from_args(arguments)
+        try:
+            corpus_root = self.corpus_root_from_args(arguments)
+        except NoSearchableCorpusError:
+            explicit = any(
+                optional_string(arguments, key)
+                for key in ("corpus_root", "corpus_id", "project_root")
+            )
+            # The default configuration of this server is an archive (and optionally a
+            # library), not a federation registry. Without an explicit federation target,
+            # answer from the configured archive instead of failing.
+            if explicit or self.archive_root is None or mode is not None:
+                raise
+            return self.archive_search({"query": query, "limit": limit})
         validation = validate_corpus_root(corpus_root)
         if not validation["valid"]:
             missing = ", ".join(validation["missing_files"])
