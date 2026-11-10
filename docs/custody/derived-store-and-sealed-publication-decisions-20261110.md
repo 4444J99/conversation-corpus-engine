@@ -34,10 +34,12 @@ Status observed 2026-11-10 (not a claim of acceptance):
 - Enrollment decision: production enrollment uses the identities generated for that lane
   (one publisher, desktop and phone recipients, plus an offline recovery recipient required by
   `docs/encrypted-publication.md`). Their key files and unlock material stay outside Git and outside
-  any agent-readable shared path; moving them into the owner's password manager is the custody
-  step, and no agent copies them into chat, CI secrets or a repository.
+  any agent-readable shared path. Custody is split: each key file and its passphrase live in
+  separate locations with independent access controls (for example the key file on an encrypted
+  offline volume and the passphrase in the password manager), so compromise of one location does
+  not decrypt the corpus. No agent copies either into chat, CI secrets or a repository.
 - Key decision: new identities require a passphrase of at least 12 bytes, generated at random and
-  held in a single password-manager item. Losing all enrolled keys loses only the offsite copy, never
+  held apart from its key file. Losing all enrolled keys loses only the offsite copy, never
   the originals.
 - Remote selection: the offsite remote for the library database is the existing encrypted Drive
   overlay (shared rclone client, retiring this year, so it is not used for new bulk copies). For
