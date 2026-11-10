@@ -713,7 +713,7 @@ def add_library_parser(subparsers: Any) -> Any:
             type=Path,
             default=[],
             metavar="PATH",
-            help=f"{help_text}; repeatable, in precedence order",
+            help=f"{help_text}; repeatable, visited in the order given",
         )
     inventory.add_argument(
         "--max-seconds",

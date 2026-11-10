@@ -33,6 +33,7 @@ import datetime
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -129,6 +130,11 @@ def _key(path: Path | str) -> str:
     return str(Path(path).resolve())
 
 
+def _literal(path: Path | str) -> Path:
+    """The absolute path as written, without following a symlink in its last component."""
+    return Path(path).absolute()
+
+
 def _text(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
@@ -208,10 +214,19 @@ def _artifact(conn: sqlite3.Connection, family: str, path: Path, object_key: str
     )
 
 
-def _unresolved(conn: sqlite3.Connection, family: str, path: Path, object_key: str, reason: str):
+def _unresolved(
+    conn: sqlite3.Connection,
+    family: str,
+    path: Path,
+    object_key: str,
+    reason: str,
+    *,
+    literal: bool = False,
+):
+    """Record a finding. ``literal`` keeps a symlink's own path instead of its target's."""
     conn.execute(
         "INSERT OR IGNORE INTO unresolved_source_observations VALUES (?,?,?,?)",
-        (family, _key(path), str(object_key), reason),
+        (family, str(_literal(path)) if literal else _key(path), str(object_key), reason),
     )
 
 
@@ -364,7 +379,12 @@ def _walk_files(
         for name in dirnames:
             if (here / name).is_symlink():
                 _unresolved(
-                    run.conn, family, here / name, "directory", "directory_symlink_not_followed"
+                    run.conn,
+                    family,
+                    here / name,
+                    "directory",
+                    "directory_symlink_not_followed",
+                    literal=True,
                 )
         for name in filenames:
             if not name.endswith(suffixes):
@@ -374,10 +394,12 @@ def _walk_files(
                 try:
                     target = candidate.resolve(strict=True)
                 except (OSError, RuntimeError):
-                    _unresolved(run.conn, family, candidate, "file", "symlink_unresolvable")
+                    _unresolved(
+                        run.conn, family, candidate, "file", "symlink_unresolvable", literal=True
+                    )
                     continue
                 if not target.is_relative_to(base):
-                    _unresolved(run.conn, family, candidate, "file", "symlink_escape")
+                    _unresolved(run.conn, family, candidate, "file", "symlink_escape", literal=True)
                     continue
                 if target.is_file():
                     found.add(target)
@@ -391,10 +413,10 @@ def _contained(run: _Run, family: str, base: Path, path: Path) -> Path | None:
     try:
         resolved = path.resolve()
     except (OSError, RuntimeError):
-        _unresolved(run.conn, family, path, "file", "symlink_unresolvable")
+        _unresolved(run.conn, family, path, "file", "symlink_unresolvable", literal=True)
         return None
     if not resolved.is_relative_to(base):
-        _unresolved(run.conn, family, path, "file", "symlink_escape")
+        _unresolved(run.conn, family, path, "file", "symlink_escape", literal=True)
         return None
     return resolved
 
@@ -406,6 +428,14 @@ def _file_sha256(run: _Run, path: Path, digest: Any = None) -> Any:
             run.check()
             digest.update(chunk)
     return digest
+
+
+def _plain_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(CHUNK):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _fingerprint(run: _Run, path: Path) -> str:
@@ -425,13 +455,18 @@ def _fold(
     family: str,
     items: Sequence[Any],
     probe: Callable[[Any], Path | None] = lambda item: item,
+    scope: Callable[[Any], Any] = lambda item: None,
+    twins: dict[Any, Any] | None = None,
 ) -> list[Any]:
     """Keep the first of each set of byte-identical copies; count the others as folded.
 
     ``items`` arrive in precedence order (declaration order, then sorted path). Only items whose
-    size matches another's are hashed. An item with nothing to fingerprint is always kept.
+    size matches another's are hashed. An item with nothing to fingerprint, or with no bytes, is
+    always kept: empty files carry no identity and are accounted for one by one. Copies are
+    identical only within one ``scope`` (for a Copilot session-state directory its name, because
+    the name is the identity). A folded item is mapped to the kept copy in ``twins`` when given.
     """
-    sizes: dict[int, int] = Counter()
+    sizes: dict[tuple[Any, int], int] = Counter()
     measured: dict[int, int | None] = {}
     for index, item in enumerate(items):
         target = probe(item)
@@ -440,25 +475,27 @@ def _fold(
         except OSError:
             size = None
         measured[index] = size
-        if size is not None:
-            sizes[size] += 1
+        if size:
+            sizes[(scope(item), size)] += 1
     kept: list[Any] = []
-    seen: set[tuple[int, str]] = set()
+    seen: dict[tuple[Any, int, str], Any] = {}
     for index, item in enumerate(items):
         size = measured[index]
         target = probe(item)
-        if size is None or target is None or sizes[size] < 2:
+        if not size or target is None or sizes[(scope(item), size)] < 2:
             kept.append(item)
             continue
         try:
-            identity = (size, _fingerprint(run, target))
+            identity = (scope(item), size, _fingerprint(run, target))
         except OSError:
             kept.append(item)
             continue
         if identity in seen:
             run.folded[family] += 1
+            if twins is not None:
+                twins[item] = seen[identity]
             continue
-        seen.add(identity)
+        seen[identity] = item
         kept.append(item)
     return kept
 
@@ -470,7 +507,11 @@ def _fold(
 
 @contextlib.contextmanager
 def _text_stream(run: _Run, path: Path) -> Iterator[Any]:
-    """Read a (possibly zstd-compressed) text file without extracting it to disk."""
+    """Read a (possibly zstd-compressed) text file without extracting it to disk.
+
+    The caller reads to the end or leaves by raising (closing the generator does). A stream that
+    ends cleanly is accepted only when ``zstd`` itself then exits with status 0.
+    """
     if not path.name.endswith(".zst"):
         with path.open(encoding="utf-8", errors="replace") as stream:
             yield stream
@@ -481,7 +522,8 @@ def _text_stream(run: _Run, path: Path) -> Iterator[Any]:
     process = subprocess.Popen(
         [executable, "-dc", "--", str(path)], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
     )
-    timer = threading.Timer(max(run.remaining(), 0.1), process.kill)
+    budget = min(max(run.remaining(), 0.1), threading.TIMEOUT_MAX)
+    timer = threading.Timer(budget, process.kill)
     timer.start()
     failed = False
     try:
@@ -492,13 +534,20 @@ def _text_stream(run: _Run, path: Path) -> Iterator[Any]:
         raise
     finally:
         timer.cancel()
-        finished = process.poll() is not None
-        if not finished:
+        if failed and process.poll() is None:
             process.kill()
-        process.wait()
+        try:
+            # After a clean end of stream zstd is about to exit; wait for its real status.
+            process.wait(timeout=None if failed else budget)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            exited = False
+        else:
+            exited = True
         if process.stdout is not None:
             process.stdout.close()
-    if finished and process.returncode and not failed:
+    if not failed and not (exited and process.returncode == 0):
         raise _Problem("source_decode_failed")
 
 
@@ -533,31 +582,31 @@ def _connect_readonly(run: _Run, uri: str) -> sqlite3.Connection:
     return connection
 
 
-def _bare_wal_database(path: Path) -> bool:
-    """True for a WAL-mode database file with no write-ahead log or shared memory beside it.
+def _lacks_wal_sidecars(path: Path) -> bool:
+    """True for a WAL-mode database file missing its write-ahead log or its shared memory.
 
-    SQLite would create those sidecars even for a read-only connection, which would write into
-    the source's directory.
+    SQLite creates the missing one even for a read-only connection, which would write into the
+    source's directory. Only a database with both beside it is opened in place.
     """
     with path.open("rb") as handle:
         header = handle.read(20)
     wal_mode = len(header) == 20 and header[18] == 2 and header[19] == 2
-    return wal_mode and not any(Path(str(path) + s).exists() for s in ("-wal", "-shm"))
+    return wal_mode and not all(Path(str(path) + s).exists() for s in ("-wal", "-shm"))
 
 
 @contextlib.contextmanager
 def _native_database(run: _Run, family: str, path: Path) -> Iterator[sqlite3.Connection]:
     """Open a native SQLite source read-only; it is never written and never checkpointed.
 
-    A WAL-mode base file with no sidecars (an archived copy) cannot be opened read-only without
-    SQLite creating them. A stable, double-hashed base-file snapshot is read instead, for
+    A WAL-mode base file without both sidecars (an archived copy) cannot be opened read-only
+    without SQLite creating the missing one. A stable, double-hashed base-file snapshot is read instead, for
     metadata only, and only with no nonempty WAL or rollback journal; its historical WAL custody
     stays a recorded finding.
     """
     uri = path.as_uri()
     snapshot = None
     connection = None
-    if not _bare_wal_database(path):
+    if not _lacks_wal_sidecars(path):
         try:
             connection = _connect_readonly(run, uri + "?mode=ro")
         except sqlite3.OperationalError as error:
@@ -748,14 +797,23 @@ def _codex(run: _Run, roots: Sequence[Path], censuses: Sequence[Path]) -> None:
             if located not in ordered:
                 ordered.append(located)
 
-    for path in _fold(run, family, list(dict.fromkeys(ordered))):
+    twins: dict[Path, Path] = {}
+    identified: dict[Path, str] = {}
+    for path in _fold(run, family, list(dict.fromkeys(ordered)), twins=twins):
         run.check()
         sid = None
         with _source(run, family, path, "file"):
             sid = _codex_rollout(run, path, edges)
         if sid:
+            identified[path] = sid
             for census, index, recovered, relative, census_root in references.get(path, []):
                 _codex_census_row(run, census, index, recovered, relative, census_root, path, sid)
+    # A census row that names a folded copy still reaches a byte-identical rollout, so it is
+    # accounted for against the identity its kept twin proved.
+    for copy, kept in twins.items():
+        if sid := identified.get(kept):
+            for census, index, recovered, relative, census_root in references.get(copy, []):
+                _codex_census_row(run, census, index, recovered, relative, census_root, copy, sid)
 
 
 def _codex_state(run: _Run, database: Path) -> dict[str, set[str]]:
@@ -1134,6 +1192,7 @@ def _copilot(run: _Run, state_dirs: Sequence[Path], databases: Sequence[Path]) -
             _copilot_database(run, path)
 
     directories: list[Path] = []
+    events: dict[Path, Path | None] = {}
     for root in _roots(run, family, state_dirs):
         try:
             children = sorted(root.iterdir())
@@ -1141,17 +1200,28 @@ def _copilot(run: _Run, state_dirs: Sequence[Path], databases: Sequence[Path]) -
             _unresolved(run.conn, family, root, "source", "source_unreadable")
             continue
         for directory in children:
-            if directory.is_dir() and (resolved := _contained(run, family, root, directory)):
-                directories.append(resolved)
+            if not directory.is_dir() or not (resolved := _contained(run, family, root, directory)):
+                continue
+            if resolved in events:
+                continue
+            directories.append(resolved)
+            # The event log is read through the same containment rule as the directory.
+            log = resolved / "events.jsonl"
+            contained = _contained(run, family, root, log) if os.path.lexists(log) else None
+            events[resolved] = contained if contained is not None and contained.is_file() else None
 
-    def events_of(directory: Path) -> Path | None:
-        events = directory / "events.jsonl"
-        return events if events.is_file() else None
-
-    for directory in _fold(run, family, list(dict.fromkeys(directories)), probe=events_of):
+    # A session-state directory's name is its identity, so only same-named copies can be copies.
+    kept = _fold(
+        run,
+        family,
+        directories,
+        probe=lambda directory: events[directory],
+        scope=lambda directory: directory.name,
+    )
+    for directory in kept:
         run.check()
         with _source(run, family, directory, "session-state"):
-            _copilot_directory(run, directory, events_of(directory))
+            _copilot_directory(run, directory, events[directory])
 
 
 def _copilot_database(run: _Run, path: Path) -> None:
@@ -1405,8 +1475,8 @@ def build_inventory(
     Returns the receipt. ``status`` is ``incomplete`` when the time budget ran out; the files are
     still written so the partial work is inspectable, but it is not a usable inventory.
     """
-    if max_seconds <= 0:
-        raise ValueError("max_seconds must be positive")
+    if not math.isfinite(max_seconds) or max_seconds <= 0:
+        raise ValueError("max_seconds must be a positive, finite number")
     if sources.empty():
         raise ValueError("declare at least one source")
     destination = _prepare_output(Path(out), sources)
@@ -1436,7 +1506,7 @@ def build_inventory(
         receipt = _receipt(conn, run, sources, complete=complete, started=started, finished=_now())
     finally:
         conn.close()
-    digest = hashlib.sha256(database.read_bytes()).hexdigest()
+    digest = _plain_sha256(database)
     receipt["database"] = {
         "file": DATABASE_NAME,
         "sha256": digest,

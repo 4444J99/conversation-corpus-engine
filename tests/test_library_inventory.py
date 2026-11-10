@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -1019,6 +1020,247 @@ def test_time_budget_stops_the_run_and_marks_the_receipt_incomplete(tmp_path):
     )
     assert receipt["status"] == "incomplete"
     assert (tmp_path / "out" / "inventory-receipt.json").is_file()
+
+
+# ---------------------------------------------------------------------------------------------
+# Review round 1: folding scope, containment, sidecars, decoding, budgets
+# ---------------------------------------------------------------------------------------------
+
+
+def artifacts(tmp_path: Path, family: str, name: str = "out") -> dict[str, int]:
+    with sqlite3.connect(tmp_path / name / "session-corpus.db") as connection:
+        return dict(
+            connection.execute(
+                "SELECT classification,count(*) FROM source_artifact_observations "
+                "WHERE agent_family=? GROUP BY classification",
+                (family,),
+            )
+        )
+
+
+def finding_paths(tmp_path: Path, family: str, reason: str, name: str = "out") -> set[str]:
+    with sqlite3.connect(tmp_path / name / "session-corpus.db") as connection:
+        return {
+            r[0]
+            for r in connection.execute(
+                "SELECT source_path FROM unresolved_source_observations "
+                "WHERE agent_family=? AND reason=?",
+                (family, reason),
+            )
+        }
+
+
+def test_the_last_differing_copy_visited_is_the_custody_copy(tmp_path):
+    base = [claude_event("s", isSidechain=False)]
+    jsonl(tmp_path / "first" / "p" / "s.jsonl", base)
+    second = jsonl(
+        tmp_path / "second" / "p" / "s.jsonl", base + [claude_event("s", "more", isSidechain=False)]
+    )
+    run_inventory(tmp_path, claude_projects=[tmp_path / "first", tmp_path / "second"])
+    row = rows(tmp_path)[("claude", "s")]
+    assert row["custody_path"] == str(second.resolve())
+    assert row["started_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_symlink_findings_name_the_symlink_not_its_target(tmp_path):
+    target = tmp_path / "shared" / "memory"
+    target.mkdir(parents=True)
+    projects = tmp_path / "claude"
+    (projects / "a").mkdir(parents=True)
+    (projects / "b").mkdir(parents=True)
+    (projects / "a" / "memory").symlink_to(target)
+    (projects / "b" / "memory").symlink_to(target)
+    outside = jsonl(tmp_path / "outside" / "s.jsonl", [claude_event("x", isSidechain=False)])
+    (projects / "a" / "one.jsonl").symlink_to(outside)
+    (projects / "b" / "two.jsonl").symlink_to(outside)
+    receipt = run_inventory(tmp_path, claude_projects=[projects])
+    assert receipt["families"]["claude"]["findings_by_code"] == {
+        "directory_symlink_not_followed": 2,
+        "symlink_escape": 2,
+    }
+    assert finding_paths(tmp_path, "claude", "directory_symlink_not_followed") == {
+        str(projects.resolve() / "a" / "memory"),
+        str(projects.resolve() / "b" / "memory"),
+    }
+
+
+def test_copilot_directories_with_different_names_never_fold(tmp_path):
+    for name in ("alpha", "beta"):
+        jsonl(tmp_path / "state" / name / "events.jsonl", [{"type": "user.message", "data": {}}])
+    for name in ("empty-a", "empty-b"):
+        (tmp_path / "state" / name).mkdir()
+        (tmp_path / "state" / name / "events.jsonl").write_text("")
+    receipt = run_inventory(tmp_path, copilot_state_dirs=[tmp_path / "state"])
+    assert set(kinds(tmp_path, "copilot")) == {"alpha", "beta", "empty-a", "empty-b"}
+    assert receipt["families"]["copilot"]["folded_duplicates"] == 0
+
+
+def test_copilot_event_log_symlink_leaving_the_root_is_not_followed(tmp_path):
+    outside = jsonl(
+        tmp_path / "outside" / "events.jsonl",
+        [
+            {
+                "type": "session.start",
+                "data": {"sessionId": "linked", "context": {"cwd": "/must/not/be/read"}},
+            }
+        ],
+    )
+    (tmp_path / "state" / "linked").mkdir(parents=True)
+    (tmp_path / "state" / "linked" / "events.jsonl").symlink_to(outside)
+    run_inventory(tmp_path, copilot_state_dirs=[tmp_path / "state"])
+    assert "symlink_escape" in findings(tmp_path, "copilot")
+    assert set(kinds(tmp_path, "copilot")) == {"linked"}
+    assert rows(tmp_path)[("copilot", "linked")]["project_root"] is None
+
+
+def test_empty_claude_transcripts_are_each_accounted_for(tmp_path):
+    for name in ("a.jsonl", "b.jsonl", "c.jsonl"):
+        (tmp_path / "claude" / "p").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "claude" / "p" / name).write_text("")
+    receipt = run_inventory(tmp_path, claude_projects=[tmp_path / "claude"])
+    assert artifacts(tmp_path, "claude") == {"empty_transcript": 3}
+    assert receipt["families"]["claude"]["folded_duplicates"] == 0
+
+
+def test_census_row_naming_a_folded_copy_is_still_accounted_for(tmp_path):
+    rollout = [codex_meta(THREAD), codex_message("m", "same")]
+    jsonl(tmp_path / "live" / "sessions" / "r.jsonl", rollout)
+    jsonl(tmp_path / "old" / "sessions" / "nested" / "r.jsonl", rollout)
+    census = tmp_path / "old" / "census.json"
+    census.write_text(json.dumps({"sessions": [{"relative_path": "sessions/nested/r.jsonl"}]}))
+    receipt = run_inventory(
+        tmp_path, codex_roots=[tmp_path / "live", tmp_path / "old"], codex_censuses=[census]
+    )
+    assert receipt["families"]["codex"]["folded_duplicates"] == 1
+    assert (str(census.resolve()), "sessions/0", THREAD) in observed(tmp_path, "codex")
+    assert artifacts(tmp_path, "codex") == {}
+
+
+def wal_pair(directory: Path, keep: str) -> Path:
+    """A WAL-mode database copied beside only one of its sidecars, as a backup might leave it."""
+    directory.mkdir(parents=True)
+    live = directory.parent / f"{directory.name}-live" / "conversation_summaries.db"
+    live.parent.mkdir()
+    connection = sqlite3.connect(live)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("CREATE TABLE conversation_summaries (conversation_id TEXT)")
+        connection.execute("INSERT INTO conversation_summaries VALUES ('w1')")
+        connection.commit()
+        if keep == "shm":
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        target = directory / live.name
+        shutil.copyfile(live, target)
+        shutil.copyfile(str(live) + "-" + keep, str(target) + "-" + keep)
+    finally:
+        connection.close()
+    return target
+
+
+@pytest.mark.parametrize("keep", ["wal", "shm"])
+def test_a_wal_database_with_one_sidecar_never_gains_the_other(tmp_path, keep):
+    source = wal_pair(tmp_path / "backup", keep)
+    before = sorted(p.name for p in source.parent.iterdir())
+    assert len(before) == 2
+    run_inventory(tmp_path, antigravity_sources=[source])
+    assert sorted(p.name for p in source.parent.iterdir()) == before
+    if keep == "wal":
+        # The log holds the only copy of the data; reading the base alone would be wrong.
+        assert findings(tmp_path, "antigravity") == {"database_requires_its_journal"}
+        assert rows(tmp_path) == {}
+    else:
+        assert set(kinds(tmp_path, "antigravity")) == {"w1"}
+
+
+@pytest.mark.skipif(ZSTD is None, reason="zstd is not installed")
+def test_a_truncated_zstd_stream_is_a_decode_failure(tmp_path):
+    lines = [codex_meta(THREAD)] + [codex_message(f"m{i}", "x" * 4000) for i in range(300)]
+    path = zst(tmp_path / "rollout.jsonl.zst", lines)
+    run = library_inventory._Run(sqlite3.connect(":memory:"), 60)
+    with library_inventory._text_stream(run, path) as stream:
+        assert len(stream.read().splitlines()) == len(lines)
+    data = path.read_bytes()
+    path.write_bytes(data[: len(data) * 3 // 4])
+    for _ in range(5):  # the race the check closes is timing-dependent, so repeat it
+        with (
+            pytest.raises(library_inventory._Problem) as raised,
+            library_inventory._text_stream(run, path) as stream,
+        ):
+            stream.read()
+        assert raised.value.code == "source_decode_failed"
+    # Abandoning the stream early, as the Codex header probe does, is not a failure.
+    events = library_inventory._jsonl_events(run, "codex", path)
+    assert next(events)[0] == 1
+    events.close()
+
+
+def test_unreadable_files_and_folders_are_findings(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root reads everything")
+    projects = tmp_path / "claude"
+    jsonl(projects / "p" / "ok.jsonl", [claude_event("ok", isSidechain=False)])
+    locked_file = jsonl(projects / "p" / "locked.jsonl", [claude_event("locked")])
+    locked_dir = projects / "closed"
+    jsonl(locked_dir / "s.jsonl", [claude_event("hidden")])
+    locked_file.chmod(0)
+    locked_dir.chmod(0)
+    try:
+        receipt = run_inventory(tmp_path, claude_projects=[projects])
+    finally:
+        locked_file.chmod(0o600)
+        locked_dir.chmod(0o700)
+    assert set(kinds(tmp_path, "claude")) == {"ok"}
+    assert findings(tmp_path, "claude") == {"source_unreadable"}
+    assert finding_paths(tmp_path, "claude", "source_unreadable") == {
+        str(locked_file.resolve()),
+        str(locked_dir.resolve()),
+    }
+    assert receipt["status"] == "complete"
+
+
+def test_a_database_held_under_an_exclusive_lock_is_a_finding(tmp_path):
+    locked = database(
+        tmp_path / "locked.db",
+        "CREATE TABLE session (id TEXT, title TEXT, time_created INT, time_updated INT,"
+        " directory TEXT);",
+        ("INSERT INTO session VALUES ('o1','T',1,1,'/d')", ()),
+    )
+    free = database(
+        tmp_path / "free.db",
+        "CREATE TABLE session (id TEXT, title TEXT, time_created INT, time_updated INT,"
+        " directory TEXT);",
+        ("INSERT INTO session VALUES ('o2','T',1,1,'/d')", ()),
+    )
+    holder = sqlite3.connect(locked, isolation_level=None)
+    try:
+        holder.execute("BEGIN EXCLUSIVE")
+        receipt = run_inventory(tmp_path, opencode_databases=[locked, free])
+    finally:
+        holder.close()
+    assert set(kinds(tmp_path, "opencode")) == {"o2"}
+    assert findings(tmp_path, "opencode") == {"source_database_error"}
+    assert receipt["status"] == "complete"
+
+
+@pytest.mark.parametrize("budget", [float("nan"), float("inf"), -1.0, 0.0])
+def test_the_time_budget_must_be_a_positive_finite_number(tmp_path, budget):
+    projects = tmp_path / "claude"
+    jsonl(projects / "p" / "s.jsonl", [claude_event("s", isSidechain=False)])
+    with pytest.raises(ValueError, match="positive"):
+        build_inventory(
+            InventorySources(claude_projects=[projects]), tmp_path / "x", max_seconds=budget
+        )
+
+
+@pytest.mark.skipif(ZSTD is None, reason="zstd is not installed")
+def test_a_very_large_time_budget_still_decodes(tmp_path):
+    home = tmp_path / "codex"
+    zst(home / "sessions" / f"rollout-{THREAD}.jsonl.zst", [codex_meta(THREAD)])
+    receipt = build_inventory(
+        InventorySources(codex_roots=[home]), tmp_path / "out", max_seconds=1e12
+    )
+    assert receipt["status"] == "complete"
+    assert kinds(tmp_path, "codex") == {THREAD: ("root", None)}
 
 
 # ---------------------------------------------------------------------------------------------
