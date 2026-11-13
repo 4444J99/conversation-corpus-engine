@@ -1089,7 +1089,11 @@ def _codex_census_row(
     candidate = Path(relative).expanduser()
     reachable = candidate if candidate.is_absolute() else base / candidate
     key = f"sessions/{index}"
-    if not recovered and reachable.resolve() == rollout:
+    try:
+        reaches = not recovered and reachable.resolve() == rollout
+    except (ValueError, OSError, RuntimeError):
+        reaches = False  # malformed root_path metadata is not reader-resolvable
+    if reaches:
         _observe(conn, "codex", census, key, sid)
     else:
         # The reader resolves census paths against root_path, else the census directory.
@@ -1375,7 +1379,12 @@ def _copilot(run: _Run, state_dirs: Sequence[Path], databases: Sequence[Path]) -
                 if not os.path.lexists(candidate):
                     continue
                 contained = _contained(run, family, root, candidate)
-                if contained is not None and contained.is_file():
+                # The reader also rejects a file that leaves its own session directory.
+                if (
+                    contained is not None
+                    and contained.is_file()
+                    and contained.is_relative_to(resolved)
+                ):
                     found.append((name, contained))
                 else:
                     trusted = False

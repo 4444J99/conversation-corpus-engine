@@ -1848,3 +1848,26 @@ def test_a_census_with_a_malformed_root_path_does_not_abort_the_run(tmp_path):
     receipt = run_inventory(tmp_path, gemini_sources=[bad, good])
     assert receipt["status"] == "complete"
     assert "g" in kinds(tmp_path, "gemini")
+
+
+def test_a_codex_census_with_a_malformed_root_path_is_not_reader_resolvable(tmp_path):
+    home = tmp_path / "codex"
+    rollout = jsonl(home / "sessions" / "a.jsonl", [codex_meta()])
+    census = tmp_path / "census.json"
+    census.write_text(
+        json.dumps({"root_path": "\u0000bad", "sessions": [{"relative_path": "sessions/a.jsonl"}]})
+    )
+    receipt = run_inventory(tmp_path, codex_roots=[home], codex_censuses=[census])
+    assert receipt["status"] == "complete"
+    assert THREAD in kinds(tmp_path, "codex")
+    assert rollout.exists()
+
+
+def test_copilot_symlink_leaving_its_session_directory_blocks_folding(tmp_path):
+    shared = tmp_path / "shared-events.jsonl"
+    shared.write_text(START)
+    first = copilot_copy(tmp_path / "a", "c1")
+    (first / "events.jsonl").symlink_to(shared)
+    copilot_copy(tmp_path / "b", "c1", events__jsonl=START)
+    receipt = run_inventory(tmp_path, copilot_state_dirs=[tmp_path / "a", tmp_path / "b"])
+    assert receipt["families"]["copilot"]["folded_duplicates"] == 0
