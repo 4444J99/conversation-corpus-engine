@@ -220,3 +220,67 @@ def test_unpublished_store_is_a_503(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def test_search_pagination_keeps_the_kind_filter(wiki):
+    status, body, _ = wiki("/search?q=*&wing=ai&kind=chat&limit=1")
+    assert status == 200 and "kind=chat" in body
+
+
+def test_browse_applies_the_kind_filter(wiki):
+    payload = json.loads(wiki("/api/search?q=*&wing=ai&kind=nothing-of-the-kind")[1])
+    assert payload["total"] == 0 and payload["hits"] == []
+    assert json.loads(wiki("/api/search?q=*&wing=ai&kind=chat")[1])["total"] == 4
+
+
+def test_navigation_survives_a_search_jump(wiki):
+    uid = quote(wiki.records["d"], safe="")
+    _, body, _ = wiki(f"/record/{uid}?q=late")
+    assert "<mark>" in body and "Earlier messages" in body
+    _, middle, _ = wiki(f"/record/{uid}?q=needle")
+    assert "Later messages" in middle
+
+
+def test_continue_link_resumes_the_message_the_cursor_names(tmp_path, monkeypatch):
+    path = tmp_path / "library.sqlite"
+    long = Conversation(
+        provider="chatgpt",
+        source_id="long",
+        title="Long body",
+        messages=[Message(role="user", text="short"), Message(role="assistant", text="x" * 30000)],
+    )
+    with Library.create(path) as library:
+        library.put(long)
+    monkeypatch.setattr(library_serve, "open_library", lambda root: (tmp_path, Library(path)))
+    server, thread = library_serve.start_in_thread(tmp_path)
+    port = server.server_address[1]
+    try:
+
+        def fetch(target):
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
+            connection.request("GET", target, headers={"Host": f"127.0.0.1:{port}"})
+            response = connection.getresponse()
+            return response.status, response.read().decode()
+
+        status, body = fetch(f"/record/{quote(long.uid, safe='')}")
+        assert status == 200
+        assert "message=1&amp;offset=" in body and "Continue this message" in body
+        offset = body.split("message=1&amp;offset=")[1].split("&")[0]
+        status, rest = fetch(f"/record/{quote(long.uid, safe='')}?message=1&offset={offset}")
+        assert status == 200 and "Continue this message" not in rest
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_ipv6_loopback_binds(tmp_path):
+    try:
+        server = library_serve.LibraryServer(("::1", 0), tmp_path)
+    except OSError as error:  # a host without IPv6 loopback cannot run this check
+        pytest.skip(str(error))
+    try:
+        assert server.server_address[1] > 0
+        assert f"[::1]:{server.server_address[1]}" in server.allowed_hosts()
+    finally:
+        server.server_close()

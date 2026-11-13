@@ -21,6 +21,7 @@ from __future__ import annotations
 import html
 import json
 import re
+import socket
 import sqlite3
 import threading
 from http import HTTPStatus
@@ -198,6 +199,8 @@ class LibraryServer(ThreadingHTTPServer):
                 f"The library server only binds loopback addresses, not {address[0]!r}"
             )
         self.store_root = store_root
+        # "::1" needs an IPv6 socket; the family must be set before the base class binds.
+        self.address_family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
         super().__init__(address, LibraryHandler)
 
     def allowed_hosts(self) -> set[str]:
@@ -377,6 +380,10 @@ class LibraryHandler(BaseHTTPRequestHandler):
             marks = ",".join("?" * len(arguments["providers"]))
             where.append(f"provider IN ({marks})")
             values.extend(arguments["providers"])
+        if arguments["kinds"]:
+            marks = ",".join("?" * len(arguments["kinds"]))
+            where.append(f"kind IN ({marks})")
+            values.extend(arguments["kinds"])
         clause = (" WHERE " + " AND ".join(where)) if where else ""
         connection = library.connection
         total = connection.execute(f"SELECT COUNT(*) FROM records{clause}", values).fetchone()[0]
@@ -412,6 +419,7 @@ class LibraryHandler(BaseHTTPRequestHandler):
             pairs: list[tuple[str, str]] = [("q", text), ("offset", str(offset))]
             pairs += [(key, value) for key, value in persist.items() if value]
             pairs += [("provider", value) for value in providers]
+            pairs += [("kind", value) for value in query.get("kind") or []]
             return "/search?" + urlencode(pairs)
 
         head = (
@@ -590,30 +598,31 @@ class LibraryHandler(BaseHTTPRequestHandler):
                 f"</div><pre class=text>{rendered}</pre>{continued}</div>"
             )
         pager = []
-        following_message, following_offset = data.get("next_message"), data.get("next_offset")
+        resume_message, resume_offset = data.get("next_message"), data.get("next_offset")
         first = shown[0].get("message", 0) if shown else 0
-        if first > 0 and not data.get("match"):
-            previous = max(0, first - MESSAGES_PER_PAGE)
+        last = shown[-1].get("message", 0) if shown else 0
+        total = (
+            data.get("message_count") if sequence == "main" else data.get("alternate_message_count")
+        )
+        if first > 0:
+            previous = max(0, first - MESSAGES_PER_PAGE) if len(shown) > 1 else first - 1
             pager.append(
                 f"<a href='{_e(_link(here, message=previous, sequence=sequence))}'>&larr; Earlier messages</a>"
             )
         else:
             pager.append("<span></span>")
-        if following_offset is not None:
+        if resume_offset:
+            # The read stopped inside a message: resume at the message the cursor names (the one
+            # being read when a single message was asked for), at the offset it names.
+            target = resume_message if resume_message is not None else last
             pager.append(
-                f"<a href='{_e(_link(here, message=data.get('message', 0), offset=following_offset, sequence=sequence))}'>Continue this message &rarr;</a>"
+                f"<a href='{_e(_link(here, message=target, offset=resume_offset, sequence=sequence))}'>Continue this message &rarr;</a>"
             )
-        elif not data.get("match"):
-            last = shown[-1].get("message", 0) if shown else 0
-            total = (
-                data.get("message_count")
-                if sequence == "main"
-                else data.get("alternate_message_count")
-            )
-            following_message = following_message if following_message is not None else last + 1
-            if isinstance(total, int) and following_message < total:
+        else:
+            following = resume_message if resume_message is not None else last + 1
+            if isinstance(total, int) and following < total:
                 pager.append(
-                    f"<a href='{_e(_link(here, message=following_message, sequence=sequence))}'>Later messages &rarr;</a>"
+                    f"<a href='{_e(_link(here, message=following, sequence=sequence))}'>Later messages &rarr;</a>"
                 )
         body += f"<nav class=pager>{''.join(pager)}</nav>"
         if related:
