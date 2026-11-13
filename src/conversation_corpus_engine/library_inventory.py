@@ -478,6 +478,9 @@ def _fingerprint(run: _Run, path: Path) -> str:
             if sidecar.is_file() and sidecar.stat().st_size:
                 digest.update(suffix.encode())
                 _file_sha256(run, sidecar, digest)
+        # Whether the shared-memory sidecar exists decides how the copy can be read, so copies
+        # that differ only in that availability are not interchangeable.
+        digest.update(b"shm" if Path(str(path) + "-shm").exists() else b"noshm")
     return digest.hexdigest()
 
 

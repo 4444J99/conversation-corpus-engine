@@ -1871,3 +1871,20 @@ def test_copilot_symlink_leaving_its_session_directory_blocks_folding(tmp_path):
     copilot_copy(tmp_path / "b", "c1", events__jsonl=START)
     receipt = run_inventory(tmp_path, copilot_state_dirs=[tmp_path / "a", tmp_path / "b"])
     assert receipt["families"]["copilot"]["folded_duplicates"] == 0
+
+
+def test_wal_copies_differing_only_in_shm_availability_are_not_folded(tmp_path):
+    first = database(
+        tmp_path / "a" / "o.db",
+        "CREATE TABLE session (id TEXT, title TEXT, time_created INT, time_updated INT,"
+        " directory TEXT);",
+        ("INSERT INTO session VALUES ('o1','T',1,1,'/d')", ()),
+    )
+    second = tmp_path / "b" / "o.db"
+    second.parent.mkdir()
+    shutil.copyfile(first, second)
+    for copy in (first, second):
+        Path(str(copy) + "-wal").write_bytes(b"pending-journal")
+    Path(str(second) + "-shm").write_bytes(b"shared-memory")
+    receipt = run_inventory(tmp_path, opencode_databases=[first, second])
+    assert receipt["families"]["opencode"]["folded_duplicates"] == 0
