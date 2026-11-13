@@ -258,6 +258,7 @@ def read_record(
     limit: int = 12000,
     around_query: str | None = None,
     message_end: int | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read one message span; with `around_query` centre it on the first match; with
     `message_end` read the messages [message, message_end) within a total character budget."""
@@ -273,7 +274,8 @@ def read_record(
         isinstance(message_end, bool) or not isinstance(message_end, int) or message_end <= message
     ):
         raise ValueError("message_end must be an integer greater than message")
-    payload = library.record(uid, version=version, digest=digest)
+    if payload is None:
+        payload = library.record(uid, version=version, digest=digest)
     main, alternates = _sequences(payload, uid)
     messages = main if sequence == "main" else alternates
     result = _record_header(
@@ -588,6 +590,7 @@ def record_toc(
     mode: str = "auto",
     toc_offset: int = 0,
     toc_limit: int = 50,
+    payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Table of contents of one record: markdown headings (with message and character offsets)
     or, without headings, a per-message index. Entries are paged and the total is exact."""
@@ -602,7 +605,8 @@ def record_toc(
         or not 1 <= toc_limit <= MAX_TOC_ENTRIES
     ):
         raise ValueError(f"toc_limit must be an integer from 1 to {MAX_TOC_ENTRIES}")
-    payload = library.record(uid, version=version, digest=digest)
+    if payload is None:
+        payload = library.record(uid, version=version, digest=digest)
     main, alternates = _sequences(payload, uid)
     messages = main if sequence == "main" else alternates
     result = _record_header(
@@ -1000,7 +1004,12 @@ def read_cursor(arguments: dict[str, Any]) -> tuple[int, int]:
 
 
 def read_arguments(
-    library: Library, arguments: dict[str, Any], offset: int, limit: int
+    library: Library,
+    arguments: dict[str, Any],
+    offset: int,
+    limit: int,
+    *,
+    payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The read the MCP tool and `cce library read` share: a passage, a message range
     (`message_end`) or a table of contents (`toc`), from the arguments the caller gave.
@@ -1030,6 +1039,7 @@ def read_arguments(
             mode=arguments.get("toc_mode", "auto"),
             toc_offset=integer_argument(arguments, "toc_offset", 0, 1000000000),
             toc_limit=integer_argument(arguments, "toc_limit", 50, MAX_TOC_ENTRIES),
+            payload=payload,
         )
     return read_record(
         library,
@@ -1046,6 +1056,7 @@ def read_arguments(
             if "message_end" in arguments
             else None
         ),
+        payload=payload,
     )
 
 

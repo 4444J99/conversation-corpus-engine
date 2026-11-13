@@ -24,6 +24,7 @@ import re
 import socket
 import sqlite3
 import threading
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -47,7 +48,16 @@ SEARCH_PAGE = 20
 MESSAGES_PER_PAGE = 20
 PAGE_CHARACTERS = 24000
 RELATED_LIMIT = 20
+# A record page waits this long for its related records before it links to the page that waits
+# longer; a record page shows its contents inline only for a record this short, because reading
+# the headings of a long record means decoding and scanning every message of it.
+RELATED_INLINE_SECONDS = 1.0
+RELATED_PAGE_SECONDS = 20.0
+RELATED_PROGRESS_INSTRUCTIONS = 10000
+CONTENTS_INLINE_MESSAGES = 300
+CONTENTS_PAGE = 100
 UI_SEARCH_SECONDS = 8.0
+SUBPAGES = ("history", "contents", "related")
 UID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,200}$")
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -153,20 +163,52 @@ def _seconds(query: dict[str, list[str]]) -> float:
     return value
 
 
-def related_records(library: Library, uid: str, limit: int = RELATED_LIMIT) -> list[dict[str, Any]]:
-    """Records that repeat passages of ``uid``, most shared first (``[]`` before blocks exist).
+class _RelatedExpired(Exception):
+    pass
+
+
+def related_records_bounded(
+    library: Library,
+    uid: str,
+    limit: int = RELATED_LIMIT,
+    *,
+    max_seconds: float | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Records that repeat passages of ``uid``, most shared first, and whether the list is
+    complete (``[]`` before blocks exist).
 
     The relation is the library's own deterministic repeated-passage index; two records are
     related because they contain the same eligible prose block, not because of any inference.
+    With ``max_seconds`` the query is interrupted when the time is up and the answer is
+    ``([], False)``: a partial group count would rank records wrongly, so nothing is returned
+    rather than a misleading list.
     """
-    rows = library.connection.execute(
-        "SELECT r.uid, r.title, r.provider, r.lane, COUNT(DISTINCT o2.digest) AS shared "
-        "FROM occurrences o1 JOIN occurrences o2 ON o2.digest=o1.digest AND o2.uid<>o1.uid "
-        "JOIN records r ON r.uid=o2.uid WHERE o1.uid=? GROUP BY r.uid "
-        "ORDER BY shared DESC, r.uid LIMIT ?",
-        (uid, limit),
-    ).fetchall()
-    return [dict(row) for row in rows]
+    deadline = None if max_seconds is None else time.monotonic() + max_seconds
+
+    def check() -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _RelatedExpired
+
+    try:
+        with library.sql_progress(
+            check if deadline is not None else None,
+            instructions=RELATED_PROGRESS_INSTRUCTIONS,
+        ):
+            rows = library.connection.execute(
+                "SELECT r.uid, r.title, r.provider, r.lane, COUNT(DISTINCT o2.digest) AS shared "
+                "FROM occurrences o1 JOIN occurrences o2 ON o2.digest=o1.digest "
+                "AND o2.uid<>o1.uid JOIN records r ON r.uid=o2.uid WHERE o1.uid=? "
+                "GROUP BY r.uid ORDER BY shared DESC, r.uid LIMIT ?",
+                (uid, limit),
+            ).fetchall()
+    except _RelatedExpired:
+        return [], False
+    return [dict(row) for row in rows], True
+
+
+def related_records(library: Library, uid: str, limit: int = RELATED_LIMIT) -> list[dict[str, Any]]:
+    """Records that repeat passages of ``uid`` (see ``related_records_bounded``), unbounded."""
+    return related_records_bounded(library, uid, limit)[0]
 
 
 def library_summary(library: Library) -> dict[str, Any]:
@@ -199,6 +241,8 @@ class LibraryServer(ThreadingHTTPServer):
                 f"The library server only binds loopback addresses, not {address[0]!r}"
             )
         self.store_root = store_root
+        # A generation is immutable, so its home-page counts are read once per generation.
+        self.summaries: dict[str, dict[str, Any]] = {}
         # "::1" needs an IPv6 socket; the family must be set before the base class binds.
         self.address_family = socket.AF_INET6 if ":" in address[0] else socket.AF_INET
         super().__init__(address, LibraryHandler)
@@ -280,7 +324,7 @@ class LibraryHandler(BaseHTTPRequestHandler):
             return
         with library:
             if path == "/":
-                self._home(library)
+                self._home(library, generation)
             elif path == "/search":
                 self._search(library, generation, query, html_view=True)
             elif path == "/api/search":
@@ -291,7 +335,10 @@ class LibraryHandler(BaseHTTPRequestHandler):
                 self._api_read(library, path[len("/api/read/") :], query)
             elif path.startswith("/api/related/"):
                 uid = self._uid(path[len("/api/related/") :])
-                self._json(HTTPStatus.OK, {"uid": uid, "related": related_records(library, uid)})
+                related, complete = related_records_bounded(
+                    library, uid, max_seconds=RELATED_PAGE_SECONDS
+                )
+                self._json(HTTPStatus.OK, {"uid": uid, "related": related, "complete": complete})
             else:
                 raise _Missing("unknown page")
 
@@ -304,8 +351,13 @@ class LibraryHandler(BaseHTTPRequestHandler):
 
     # -- pages -----------------------------------------------------------------------------
 
-    def _home(self, library: Library) -> None:
-        summary = library_summary(library)
+    def _home(self, library: Library, generation: Path) -> None:
+        key = str(generation)
+        summary = self.server.summaries.get(key)
+        if summary is None:
+            summary = library_summary(library)
+            self.server.summaries.clear()
+            self.server.summaries[key] = summary
 
         def table(title: str, counts: dict[str, int], key: str) -> str:
             rows = "".join(
@@ -484,19 +536,24 @@ class LibraryHandler(BaseHTTPRequestHandler):
     def _record(self, library: Library, raw: str, query: dict[str, list[str]]) -> None:
         parts = raw.split("/")
         uid = self._uid(parts[0])
-        if len(parts) > 2 or (len(parts) == 2 and parts[1] != "history"):
+        if len(parts) > 2 or (len(parts) == 2 and parts[1] not in SUBPAGES):
             raise _Missing("unknown page")
         if (
             library.connection.execute("SELECT 1 FROM records WHERE uid=?", (uid,)).fetchone()
             is None
         ):
             raise _Missing("no such record")
-        if len(parts) == 2:
-            self._history(library, uid)
-            return
         sequence = _first(query, "sequence", "main")
         if sequence not in ("main", "alternate"):
             raise ValueError("sequence must be main or alternate")
+        if len(parts) == 2:
+            if parts[1] == "history":
+                self._history(library, uid)
+            elif parts[1] == "contents":
+                self._contents(library, uid, query, sequence)
+            else:
+                self._related(library, uid)
+            return
         around = _first(query, "q").strip()
         message = _int(query, "message", 0, 0, 10000000)
         offset = _int(query, "offset", 0, 0, 1000000000)
@@ -510,15 +567,32 @@ class LibraryHandler(BaseHTTPRequestHandler):
             if offset:
                 base["offset"] = offset
                 del base["message_end"]
-        data = read_arguments(library, base, *read_cursor(base))
-        toc_arguments = {"uid": uid, "toc": True, "toc_limit": 60, "sequence": sequence}
-        contents = read_arguments(library, toc_arguments, *read_cursor(toc_arguments))
-        related = related_records(library, uid)
+        # One decode serves the read and the contents: decoding a record is the cost of the
+        # page, and a long record is tens of megabytes of JSON.
+        payload = library.record(uid)
+        data = read_arguments(library, base, *read_cursor(base), payload=payload)
+        contents: dict[str, Any] | None = None
+        if (data.get("message_count") or 0) <= CONTENTS_INLINE_MESSAGES:
+            toc_arguments = {"uid": uid, "toc": True, "toc_limit": 60, "sequence": sequence}
+            contents = read_arguments(
+                library, toc_arguments, *read_cursor(toc_arguments), payload=payload
+            )
+        related, related_complete = related_records_bounded(
+            library, uid, max_seconds=RELATED_INLINE_SECONDS
+        )
         self._send(
             HTTPStatus.OK,
             _page(
                 data.get("title") or uid,
-                self._record_html(uid, data, contents, related, around, sequence),
+                self._record_html(
+                    uid,
+                    data,
+                    contents,
+                    related,
+                    related_complete=related_complete,
+                    around=around,
+                    sequence=sequence,
+                ),
                 query=around,
             ),
             "text/html; charset=utf-8",
@@ -528,8 +602,10 @@ class LibraryHandler(BaseHTTPRequestHandler):
         self,
         uid: str,
         data: dict[str, Any],
-        contents: dict[str, Any],
+        contents: dict[str, Any] | None,
         related: list[dict[str, Any]],
+        *,
+        related_complete: bool,
         around: str,
         sequence: str,
     ) -> str:
@@ -556,7 +632,13 @@ class LibraryHandler(BaseHTTPRequestHandler):
                 f"({_e(data.get('alternate_message_count' if other == 'alternate' else 'main_message_count'))}"
                 " messages)</a></p>"
             )
-        headings = contents.get("toc") or []
+        headings = (contents or {}).get("toc") or []
+        if contents is None:
+            body += (
+                f"<p class=mute><a href='{_e(_link(here + '/contents', sequence=sequence))}'>"
+                f"Contents of this {_e(data.get('message_count'))}-message record</a> "
+                "(opens on demand: it reads every message)</p>"
+            )
         if headings:
             entries = "".join(
                 f"<li style='margin-left:{max(0, int(h.get('level', 1)) - 1)}rem'>"
@@ -564,8 +646,8 @@ class LibraryHandler(BaseHTTPRequestHandler):
                 f"{_e(h.get('heading') or h.get('preview') or 'message ' + str(h['message']))}</a></li>"
                 for h in headings
             )
-            kind = "Contents" if contents.get("toc_kind") == "headings" else "Messages"
-            body += f"<details><summary>{kind} ({len(headings)}{'+' if contents.get('toc_next_offset') is not None else ''})</summary><ul>{entries}</ul></details>"
+            kind = "Contents" if (contents or {}).get("toc_kind") == "headings" else "Messages"
+            body += f"<details><summary>{kind} ({len(headings)}{'+' if (contents or {}).get('toc_next_offset') is not None else ''})</summary><ul>{entries}</ul></details>"
         if data.get("match") is None and around:
             body += "<div class=notice>No match for the search words in this record.</div>"
         shown = data.get("messages") or [data]
@@ -625,7 +707,14 @@ class LibraryHandler(BaseHTTPRequestHandler):
                     f"<a href='{_e(_link(here, message=following, sequence=sequence))}'>Later messages &rarr;</a>"
                 )
         body += f"<nav class=pager>{''.join(pager)}</nav>"
-        if related:
+        if not related_complete:
+            body += (
+                f"<h2>Related records</h2><p class=mute>The list is not ready within "
+                f"{RELATED_INLINE_SECONDS:g} s for this record. "
+                f"<a href='{_e(here + '/related')}'>Compute it (up to "
+                f"{RELATED_PAGE_SECONDS:g} s)</a>.</p>"
+            )
+        elif related:
             items = "".join(
                 f"<li><a href='{_e(record_path(r['uid']))}'>{_e(r['title'] or r['uid'])}</a> "
                 f"<span class=mute>{_e(r['provider'])} &middot; {int(r['shared'])} shared passages</span></li>"
@@ -633,6 +722,82 @@ class LibraryHandler(BaseHTTPRequestHandler):
             )
             body += f"<h2>Related records</h2><p class=mute>Records that repeat passages found here.</p><ul>{items}</ul>"
         return body
+
+    def _contents(
+        self, library: Library, uid: str, query: dict[str, list[str]], sequence: str
+    ) -> None:
+        """The headings (or a per-message index) of one record, a page at a time. It reads every
+        message, so it is its own page and a long record's body does not wait for it."""
+        start = _int(query, "toc_offset", 0, 0, 1000000000)
+        arguments: dict[str, Any] = {
+            "uid": uid,
+            "toc": True,
+            "toc_offset": start,
+            "toc_limit": CONTENTS_PAGE,
+            "sequence": sequence,
+        }
+        data = read_arguments(library, arguments, *read_cursor(arguments))
+        here = record_path(uid)
+        entries = "".join(
+            f"<li><a href='{_e(_link(here, message=e['message'], sequence=sequence))}"
+            f"#message-{int(e['message'])}'>{int(e['message'])}. "
+            f"{_e(e.get('heading') or e.get('preview') or 'message ' + str(e['message']))}"
+            f"</a></li>"
+            for e in data.get("toc") or []
+        )
+        kind = "Contents" if data.get("toc_kind") == "headings" else "Messages"
+        links = []
+        if start:
+            before = max(0, start - CONTENTS_PAGE)
+            links.append(
+                f"<a href='{_e(_link(here + '/contents', toc_offset=before or None, sequence=sequence))}'>"
+                "&larr; Previous</a>"
+            )
+        else:
+            links.append("<span></span>")
+        following = data.get("toc_next_offset")
+        if following is not None:
+            links.append(
+                f"<a href='{_e(_link(here + '/contents', toc_offset=following, sequence=sequence))}'>"
+                "Next &rarr;</a>"
+            )
+        body = (
+            f"<h1>{kind}</h1><p><a href='{_e(_link(here, sequence=sequence))}'>&larr; "
+            f"{_e(data.get('title') or uid)}</a></p>"
+            f"<p class=mute>{int(data.get('toc_total', 0)):,} entries</p>"
+            f"<ol style='list-style:none;padding:0'>{entries}</ol>"
+            f"<nav class=pager>{''.join(links)}</nav>"
+        )
+        self._send(
+            HTTPStatus.OK,
+            _page(f"{kind} of {data.get('title') or uid}", body),
+            "text/html; charset=utf-8",
+        )
+
+    def _related(self, library: Library, uid: str) -> None:
+        related, complete = related_records_bounded(library, uid, max_seconds=RELATED_PAGE_SECONDS)
+        if not complete:
+            body_text = (
+                f"<div class=notice>The list was not ready within {RELATED_PAGE_SECONDS:g} s, "
+                "so none is shown: a partial count would rank records wrongly.</div>"
+            )
+        elif related:
+            body_text = (
+                "<ul>"
+                + "".join(
+                    f"<li><a href='{_e(record_path(r['uid']))}'>{_e(r['title'] or r['uid'])}</a> "
+                    f"<span class=mute>{_e(r['provider'])} &middot; {int(r['shared'])} shared passages</span></li>"
+                    for r in related
+                )
+                + "</ul>"
+            )
+        else:
+            body_text = "<p>No other record repeats a passage found here.</p>"
+        body = (
+            f"<h1>Related records</h1><p><a href='{_e(record_path(uid))}'>&larr; {_e(uid)}</a></p>"
+            f"<p class=mute>Records that repeat eligible passages of this one.</p>{body_text}"
+        )
+        self._send(HTTPStatus.OK, _page("Related records", body), "text/html; charset=utf-8")
 
     def _history(self, library: Library, uid: str) -> None:
         revisions = library.history(uid)
@@ -675,6 +840,7 @@ __all__ = [
     "DEFAULT_SEARCH_SECONDS",
     "LibraryServer",
     "related_records",
+    "related_records_bounded",
     "library_summary",
     "serve",
     "start_in_thread",

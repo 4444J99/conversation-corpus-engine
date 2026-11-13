@@ -284,3 +284,107 @@ def test_ipv6_loopback_binds(tmp_path):
         assert f"[::1]:{server.server_address[1]}" in server.allowed_hosts()
     finally:
         server.server_close()
+
+
+def test_record_page_decodes_the_record_once(wiki, monkeypatch):
+    calls = []
+    original = Library.record
+
+    def counted(self, uid, **kwargs):
+        calls.append(uid)
+        return original(self, uid, **kwargs)
+
+    monkeypatch.setattr(Library, "record", counted)
+    status, _, _ = wiki(f"/record/{quote(wiki.records['a'], safe='')}")
+    assert status == 200
+    assert calls == [wiki.records["a"]]
+
+
+def test_long_record_page_links_its_contents_instead_of_reading_them(wiki, monkeypatch):
+    monkeypatch.setattr(library_serve, "CONTENTS_INLINE_MESSAGES", 10)
+    uid = quote(wiki.records["d"], safe="")
+    status, body, _ = wiki(f"/record/{uid}")
+    assert status == 200
+    assert f"/record/{uid}/contents" in body
+    assert "<summary>Messages" not in body and "<summary>Contents" not in body
+    status, page, _ = wiki(f"/record/{uid}/contents")
+    assert status == 200
+    assert "47 entries" in page
+    assert "#message-5'" in page
+    assert "Next" not in page  # 47 entries fit on one page of 100
+
+
+def test_contents_page_pages_its_entries(wiki, monkeypatch):
+    monkeypatch.setattr(library_serve, "CONTENTS_PAGE", 20)
+    uid = quote(wiki.records["d"], safe="")
+    _, first, _ = wiki(f"/record/{uid}/contents")
+    assert "toc_offset=20" in first and "Previous" not in first
+    _, last, _ = wiki(f"/record/{uid}/contents?toc_offset=40")
+    assert "Next" not in last and "Previous" in last
+    assert "#message-46'" in last
+
+
+def test_contents_page_validates_its_offset(wiki):
+    uid = quote(wiki.records["a"], safe="")
+    status, _, _ = wiki(f"/record/{uid}/contents?toc_offset=-1")
+    assert status == 400
+    status, _, _ = wiki(f"/record/{uid}/contents?sequence=sideways")
+    assert status == 400
+
+
+def test_related_page_lists_records(wiki):
+    status, body, _ = wiki(f"/record/{quote(wiki.records['a'], safe='')}/related")
+    assert status == 200
+    assert "Second record" in body
+
+
+def test_slow_related_records_link_to_their_own_page(wiki, monkeypatch):
+    real = library_serve.related_records_bounded
+
+    def bounded(library, uid, limit=library_serve.RELATED_LIMIT, *, max_seconds=None):
+        if max_seconds == library_serve.RELATED_INLINE_SECONDS:
+            return [], False
+        return real(library, uid, limit, max_seconds=max_seconds)
+
+    monkeypatch.setattr(library_serve, "related_records_bounded", bounded)
+    uid = quote(wiki.records["a"], safe="")
+    _, body, _ = wiki(f"/record/{uid}")
+    assert f"/record/{uid}/related" in body
+    assert "Second record" not in body
+    _, page, _ = wiki(f"/record/{uid}/related")
+    assert "Second record" in page
+
+
+def test_related_query_stops_at_its_deadline(tmp_path, monkeypatch):
+    monkeypatch.setattr(library_serve, "RELATED_PROGRESS_INSTRUCTIONS", 1)
+    path = tmp_path / "library.sqlite"
+    with Library.create(path) as library:
+        for source in ("a", "b"):
+            library.put(_record(source, source, [SHARED + source]))
+        library.index_blocks()
+        uid = _record("a", "a", []).uid
+        related, complete = library_serve.related_records_bounded(library, uid, max_seconds=60)
+        assert complete and len(related) == 1
+        ticks = iter(range(10**6))
+        original = library_serve.time.monotonic
+        try:
+            library_serve.time.monotonic = lambda: next(ticks)
+            related, complete = library_serve.related_records_bounded(library, uid, max_seconds=0.5)
+        finally:
+            library_serve.time.monotonic = original
+        assert (related, complete) == ([], False)
+
+
+def test_home_counts_are_read_once_per_generation(wiki, monkeypatch):
+    calls = []
+    original = library_serve.library_summary
+
+    def counted(library):
+        calls.append(1)
+        return original(library)
+
+    monkeypatch.setattr(library_serve, "library_summary", counted)
+    for _ in range(3):
+        status, _, _ = wiki("/")
+        assert status == 200
+    assert len(calls) == 1
