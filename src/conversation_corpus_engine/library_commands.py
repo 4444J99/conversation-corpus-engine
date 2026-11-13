@@ -12,6 +12,9 @@ from typing import Any
 
 from .archive_database import PHRASE_RE, WORD_RE
 from .attributed_knowledge import ZETTEL_SCHEMA, export_zettels, zettel_atoms
+from .browser_links import DEFAULT_KINDS as DEFAULT_LINK_KINDS
+from .browser_links import KINDS as LINK_KINDS
+from .browser_links import export_browser_links
 from .corpus_store import CorpusStoreError, require_git_private
 from .library_analysis import AnalysisLimits, export_analysis
 from .library_build import (
@@ -676,6 +679,41 @@ def add_library_parser(subparsers: Any) -> Any:
         help="Reading vault written into the generation: none (default, no vault), cards "
         "(one capped card per record) or full (whole records in capped linked parts)",
     )
+    links = sub.add_parser(
+        "browser-links",
+        help="Export the browser-state canonical links as one note per URL for a documents root",
+        description=(
+            "Read the browser-state canonical set (bookmarks, reading list, tabs, Wikipedia "
+            "visits, optionally history) and write one note per normalized URL under a private "
+            "directory, plus a receipt holding the `documents` manifest entry that reads it. "
+            "Nothing is fetched and nothing already exported is deleted."
+        ),
+    )
+    links.add_argument("--json", action="store_true", help="JSON is the default output")
+    links.add_argument("--canonical", type=Path, required=True, help="browser-state canonical/")
+    links.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="Private directory, outside every Git work tree or ignored by it; new, or an "
+        "earlier browser-links export",
+    )
+    links.add_argument(
+        "--kind",
+        action="append",
+        choices=sorted(LINK_KINDS),
+        help="List to export (repeatable). Default: bookmarks, reading-list, tabs, wikipedia; "
+        "history is opt in",
+    )
+    links.add_argument(
+        "--min-visits", type=int, default=1, help="History rows below this visit count are skipped"
+    )
+    links.add_argument(
+        "--exclude-host",
+        action="append",
+        default=[],
+        help="Skip a host and its subdomains (repeatable)",
+    )
     inventory = sub.add_parser(
         "inventory",
         help="Inventory native coding-agent sessions into the database a manifest names under "
@@ -1105,6 +1143,18 @@ def _verify_export_command(args: argparse.Namespace) -> int:
     return 1 if problems else 0
 
 
+def _browser_links_command(args: argparse.Namespace) -> int:
+    receipt = export_browser_links(
+        args.canonical,
+        args.out,
+        kinds=args.kind or DEFAULT_LINK_KINDS,
+        min_visits=args.min_visits,
+        exclude_hosts=args.exclude_host,
+    )
+    print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 def _inventory_command(args: argparse.Namespace) -> int:
     # The inventory holds session titles, snippets and project paths: authorise where it lands
     # before any source is read.
@@ -1131,6 +1181,8 @@ def handle_library(args: argparse.Namespace) -> int:
     try:
         if args.action == "inventory":
             return _inventory_command(args)
+        if args.action == "browser-links":
+            return _browser_links_command(args)
         if args.action == "verify-export":
             return _verify_export_command(args)
         if args.action == "serve":
