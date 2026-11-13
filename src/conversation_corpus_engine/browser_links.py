@@ -26,6 +26,9 @@ exported (bookmarks, reading list, tabs and Wikipedia by default), `min_visits` 
 `exclude_hosts` narrow history, and the export directory must be outside every Git work tree
 or ignored by it.
 
+The manifest entry places the notes in the `ai` wing, `support` lane, so the authorship rules
+cannot give the owner credit for a page title.
+
 A refresh never deletes. A note whose link left the canonical set stays on disk and is counted
 as retained, because removing a record's source is a decision the owner makes, not a side effect.
 """
@@ -141,15 +144,24 @@ def _excluded(url: str, patterns: tuple[str, ...]) -> bool:
     return any(host == item or host.endswith("." + item) for item in patterns)
 
 
-def _open_rows(path: Path) -> Iterator[tuple[int, bytes]]:
+def _open_rows(path: Path) -> Iterator[tuple[int, bytes | None]]:
+    """(line number, line) of every line; an over-long line is drained in chunks, never held,
+    and comes back as None so the caller refuses it by number."""
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, "rb") as source:
         if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
             raise ValueError(f"{path.name} is not a regular file")
-        for number, line in enumerate(source, 1):
+        number = 0
+        while line := source.readline(MAX_ROW_BYTES + 1):
+            number += 1
             if number > MAX_ROWS_PER_FILE:
                 raise ValueError(f"{path.name} has more than {MAX_ROWS_PER_FILE} rows")
-            yield number, line
+            if len(line) > MAX_ROW_BYTES and not line.endswith(b"\n"):
+                while (rest := source.readline(MAX_ROW_BYTES)) and not rest.endswith(b"\n"):
+                    continue
+                yield number, None
+            else:
+                yield number, line
 
 
 def _file_digest(path: Path) -> str:
@@ -197,17 +209,25 @@ def collect_links(
         entry["status"] = "read"
         read = accepted = 0
         for number, raw in _open_rows(path):
-            if not raw.strip():
+            if raw is not None and not raw.strip():
                 continue
             read += 1
             try:
-                if len(raw) > MAX_ROW_BYTES:
+                if raw is None or len(raw) > MAX_ROW_BYTES:
                     raise LinkRefused("row is longer than the size bound")
                 try:
                     row = json.loads(raw)
                 except ValueError:
                     raise LinkRefused("row is not valid JSON") from None
                 url, key = check_row(row)
+                title = _clean(row.get("title"), MAX_TITLE_CHARS)
+                folders = _strings(row.get("folders"), MAX_FOLDER_CHARS, MAX_FOLDERS)
+                browsers = _strings(row.get("sources"), 32, 12)
+                try:
+                    for text in (url, key, title, *folders, *browsers):
+                        text.encode("utf-8")
+                except UnicodeEncodeError:
+                    raise LinkRefused("row holds text that is not valid UTF-8") from None
                 visits = row.get("visit_count", 0)
                 visits = visits if isinstance(visits, int) and not isinstance(visits, bool) else 0
                 if kind == "history" and visits < min_visits:
@@ -226,11 +246,11 @@ def collect_links(
             accepted += 1
             link = links.setdefault(key, _Link(key=key, url=url))
             link.kinds.add(kind)
-            link.title = link.title or _clean(row.get("title"), MAX_TITLE_CHARS)
+            link.title = link.title or title
             if len(url) < len(link.url):
                 link.url = url
-            link.folders.update(_strings(row.get("folders"), MAX_FOLDER_CHARS, MAX_FOLDERS))
-            link.browsers.update(_strings(row.get("sources"), 32, 12))
+            link.folders.update(folders)
+            link.browsers.update(browsers)
             added, first = _timestamp(row.get("added")), _timestamp(row.get("first_seen"))
             if added and (not link.added or added < link.added):
                 link.added = added
@@ -313,8 +333,10 @@ def manifest_entry(destination: Path) -> dict[str, Any]:
         "id": "browser-links",
         "root": str(destination),
         "include": [f"{NOTES_FOLDER}/**/*.md"],
-        "wing": "authored",
-        "lane": "research",
+        # Not an authored family: a note of a link is another party's title and a generated
+        # layout, so it must never receive owner credit from the document rules.
+        "wing": "ai",
+        "lane": "support",
         "kind": "document",
     }
 
@@ -359,6 +381,7 @@ def export_browser_links(
     for key in sorted(links):
         link = links[key]
         path = _note_path(destination, link)
+        _no_symlinks(path.parent)
         data = render_note(link).encode("utf-8")
         current.add(str(path.relative_to(destination)))
         if _existing(path) == data:
@@ -368,6 +391,7 @@ def export_browser_links(
         written += 1
     retained = 0
     folder = destination / NOTES_FOLDER
+    _no_symlinks(folder)
     if folder.is_dir():
         retained = sum(
             1 for note in folder.rglob("*.md") if str(note.relative_to(destination)) not in current

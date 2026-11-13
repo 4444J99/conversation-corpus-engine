@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from conversation_corpus_engine import browser_links
+from conversation_corpus_engine.attribution_rules import attribute_message, record_info
 from conversation_corpus_engine.library_documents import iter_documents
 from conversation_corpus_engine.web_capture import normalized_url_key, page_id
 
@@ -150,3 +151,69 @@ def test_the_export_is_readable_as_a_documents_root(canonical, tmp_path):
     assert len(records) == 1
     assert "Tide tables" in json.dumps(records[0].to_dict())
     assert report["counts"]["ingested"] == 1
+
+
+def test_a_symlinked_notes_folder_is_refused_before_anything_is_written(canonical, tmp_path):
+    out = tmp_path / "out"
+    browser_links.export_browser_links(canonical, out)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (out / "links").rename(tmp_path / "moved")
+    (out / "links").symlink_to(elsewhere)
+    with pytest.raises(ValueError, match="symlink"):
+        browser_links.export_browser_links(canonical, out)
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_a_symlinked_prefix_folder_is_refused(canonical, tmp_path):
+    out = tmp_path / "out"
+    browser_links.export_browser_links(canonical, out)
+    prefix = next(p for p in (out / "links").iterdir())
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    prefix.rename(tmp_path / "moved")
+    prefix.symlink_to(elsewhere)
+    _write(canonical, "reading-list", [{"url": "https://example.com/tides", "title": "Changed"}])
+    with pytest.raises(ValueError, match="symlink"):
+        browser_links.export_browser_links(canonical, out)
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_text_that_is_not_utf8_is_a_refusal_not_an_abort(tmp_path):
+    root = tmp_path / "canonical"
+    _write(
+        root,
+        "bookmarks",
+        [
+            r'{"url": "https://ok.example.com/", "title": "Fine"}',
+            r'{"url": "https://bad.example.com/", "title": "lone \ud800 surrogate"}',
+        ],
+    )
+    receipt = browser_links.export_browser_links(root, tmp_path / "out")
+    assert receipt["counts"]["links"] == 1 and receipt["counts"]["refused"] == 1
+    assert receipt["findings"][0]["reason"] == "row holds text that is not valid UTF-8"
+
+
+def test_an_oversized_line_is_drained_and_refused_by_number(tmp_path, monkeypatch):
+    monkeypatch.setattr(browser_links, "MAX_ROW_BYTES", 1024)
+    root = tmp_path / "canonical"
+    root.mkdir()
+    big = '{"url": "https://big.example.com/", "title": "' + "x" * 5000 + '"}'
+    (root / "bookmarks.jsonl").write_text(
+        '{"url": "https://a.example.com/", "title": "A"}\n'
+        + big
+        + '\n{"url": "https://b.example.com/", "title": "B"}\n'
+    )
+    receipt = browser_links.export_browser_links(root, tmp_path / "out", kinds=("bookmarks",))
+    assert receipt["counts"]["links"] == 2
+    assert [f["line"] for f in receipt["findings"]] == [2]
+
+
+def test_notes_are_not_credited_to_the_owner(canonical, tmp_path):
+    receipt = browser_links.export_browser_links(canonical, tmp_path / "out")
+    record = next(iter_documents([receipt["manifest_entry"]], report={}))
+    payload = record.to_dict()
+    info = record_info(payload)
+    for message in record.messages:
+        spans = attribute_message(message.text, role=message.role, record=info)
+        assert spans and all(span.author != "owner" for span in spans)
