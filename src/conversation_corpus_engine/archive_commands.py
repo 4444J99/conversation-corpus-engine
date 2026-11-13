@@ -304,6 +304,7 @@ def run_stages(
     limits: Limits | None = None,
     merge: bool = False,
     allow_input_loss: bool = False,
+    drop_providers: bool = False,
     rebuild_lineage: bool = False,
 ) -> dict[str, Any]:
     paths, authorization = context.paths, context.write_authorization()
@@ -336,6 +337,7 @@ def run_stages(
                 library_root=context.library_root,
                 merge=merge,
                 allow_input_loss=allow_input_loss,
+                drop_providers=drop_providers,
                 rebuild_lineage=rebuild_lineage,
             )
             result[stage] = {
@@ -427,6 +429,12 @@ def add_archive_parser(subparsers: Any) -> None:
             "--allow-input-loss",
             action="store_true",
             help="explicitly allow --merge to omit a previous library or live-capture input",
+        )
+        parser.add_argument(
+            "--drop-providers",
+            action="store_true",
+            help="without --merge, allow the manifest to stop listing providers this call does "
+            "not read (their shards stay in the store)",
         )
         parser.add_argument(
             "--rebuild-lineage",
@@ -673,6 +681,7 @@ def handle_archive(args: argparse.Namespace) -> int:
                 limits=limits,
                 merge=args.merge,
                 allow_input_loss=args.allow_input_loss,
+                drop_providers=args.drop_providers,
                 rebuild_lineage=args.rebuild_lineage,
             )
         except MergeInputLoss as exc:
