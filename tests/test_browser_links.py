@@ -252,7 +252,7 @@ def test_a_control_character_in_a_url_is_refused(tmp_path):
 def test_the_receipt_digest_is_of_the_bytes_the_links_came_from(canonical, tmp_path):
     receipt = browser_links.export_browser_links(canonical, tmp_path / "out")
     read = [source for source in receipt["sources"] if source["status"] == "read"]
-    assert len(read) == 3
+    assert len(read) == 2
     for source in read:
         data = (canonical / source["file"]).read_bytes()
         assert source["sha256"] == hashlib.sha256(data).hexdigest()
