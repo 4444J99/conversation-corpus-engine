@@ -78,6 +78,21 @@ lookup report an unavailable-store error. An accessible store with no published
 pointer still reports that no generation has been published. Read paths never
 create a missing store.
 
+## Browse as a wiki
+
+`cce library serve` reads the current published generation and serves it as linked pages on a loopback address (default `127.0.0.1:8766`), so the library can be browsed like a wiki without exporting a second copy of private text:
+
+```sh
+cce library serve --store-root /private/store --port 8766
+```
+
+- `/` shows record counts by wing, lane and provider; each is a link to a newest-first listing.
+- `/search?q=...` is the same planned, time-bounded search as `cce library search` (`plan`, `max_seconds`, `wing`, `lane`, `provider`, `offset` query parameters). A result is one line (title, provider, lane, body status); its excerpt opens on demand. A partial page says so.
+- `/record/UID` shows metadata, a table of contents, 20 messages at a time with earlier and later links and `#message-N` anchors, an alternate-sequence switch, and **Related records**: other records that repeat the same eligible passages (the deterministic block index, not an inference). `?q=words` jumps to and marks the first match.
+- `/record/UID/history` lists revisions; `/api/search`, `/api/read/UID` and `/api/related/UID` return the same bounded JSON as the CLI and MCP tools.
+
+The server accepts only loopback binds and loopback `Host` headers, answers GET and HEAD only, runs no script, and shows source text escaped as plain preformatted text, never as HTML or Markdown.
+
 ## Source manifest
 
 ```json
