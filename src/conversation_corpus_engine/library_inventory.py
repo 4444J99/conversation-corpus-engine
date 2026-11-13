@@ -1393,6 +1393,7 @@ def _copilot_database(run: _Run, path: Path) -> None:
         ]
         rows = list(native.execute("SELECT id," + ",".join(fields) + " FROM sessions"))
     for index, (sid, cwd, branch, created, summary) in enumerate(rows):
+        run.check()
         if not isinstance(sid, str) or not sid:
             _unresolved(conn, "copilot", path, f"sessions/row-{index}", "native_identity_missing")
             continue

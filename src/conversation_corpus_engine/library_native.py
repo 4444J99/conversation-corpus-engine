@@ -446,6 +446,8 @@ def _claude(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) 
             },
         )
     for line, record in records:
+        if not composite and record.get("agentId"):
+            continue  # a subagent record belongs to its own identity, not to the root body
         mismatch = (
             (
                 not proven
@@ -894,6 +896,12 @@ def _read_source(
     path: Path, family: str, body: _Body, object_key: str = "", depth: int = 0
 ) -> None:
     identity = str(path)
+    # Each census row is resolved on its own, so distinct rows of one census stay distinct reads.
+    read_key = (
+        f"{identity}\0{object_key}"
+        if path.suffix == ".json" and "sessions/" in object_key
+        else identity
+    )
     observation: dict[str, Any] = {
         "source_path": identity,
         "object_key": object_key,
@@ -901,7 +909,7 @@ def _read_source(
     }
     if observation in body.observations:
         return
-    if identity in body.read_paths:
+    if read_key in body.read_paths:
         previous = next((item for item in body.observations if item["source_path"] == identity), {})
         body.observations.append({**previous, **observation})
         return
@@ -909,7 +917,7 @@ def _read_source(
     if depth > 3:
         body.finding("source_reference_depth_limit", path)
         return
-    body.read_paths.add(identity)
+    body.read_paths.add(read_key)
     try:
         if path.is_dir():
             files = [

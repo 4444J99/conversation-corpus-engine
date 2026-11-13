@@ -1733,3 +1733,61 @@ def test_claude_session_id_alias_is_identity_filtered_by_the_reader(tmp_path):
         for r in iter_estate(tmp_path / "out" / "session-corpus.db")
     }
     assert texts == {"s1": ["one"], "s2": ["two"]}
+
+
+def test_claude_root_body_excludes_subagent_records_of_the_same_transcript(tmp_path):
+    projects = tmp_path / "claude"
+    jsonl(
+        projects / "p" / "t.jsonl",
+        [
+            {"type": "user", "sessionId": "s", "message": {"role": "user", "content": "root"}},
+            {
+                "type": "user",
+                "sessionId": "s",
+                "agentId": "a",
+                "message": {"role": "user", "content": "child"},
+            },
+        ],
+    )
+    run_inventory(tmp_path, claude_projects=[projects])
+    texts = {
+        r.source_id: [m.text for m in r.messages]
+        for r in iter_estate(tmp_path / "out" / "session-corpus.db")
+    }
+    assert texts["s"] == ["root"]
+    assert texts["s/agent/a"] == ["child"]
+
+
+def test_copilot_database_rows_stop_at_the_deadline(tmp_path):
+    source = database(
+        tmp_path / "copilot.db",
+        "CREATE TABLE sessions (id TEXT, cwd TEXT, branch TEXT, created_at TEXT, summary TEXT);",
+    )
+    with sqlite3.connect(source) as connection:
+        connection.executemany(
+            "INSERT INTO sessions VALUES (?,NULL,NULL,NULL,NULL)",
+            [(f"c{i}",) for i in range(20000)],
+        )
+    receipt = build_inventory(
+        InventorySources(copilot_databases=[source]), tmp_path / "out", max_seconds=0.01
+    )
+    assert receipt["status"] == "incomplete"
+
+
+def test_every_census_reference_of_a_repeated_identity_is_read(tmp_path):
+    directory = tmp_path / "agy"
+    directory.mkdir()
+    (directory / "one.json").write_text(json.dumps({"role": "user", "content": "first"}))
+    (directory / "two.json").write_text(json.dumps({"role": "user", "content": "second"}))
+    census = directory / "census.json"
+    census.write_text(
+        json.dumps(
+            {
+                "sessions": [{"uuid": "s", "path": "one.json"}],
+                "tm_cli": {"sessions": [{"uuid": "s", "path": "two.json"}]},
+            }
+        )
+    )
+    run_inventory(tmp_path, antigravity_sources=[census])
+    (record,) = list(iter_estate(tmp_path / "out" / "session-corpus.db"))
+    assert sorted(m.text for m in record.messages) == ["first", "second"]
