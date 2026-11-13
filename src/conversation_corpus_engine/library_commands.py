@@ -809,6 +809,18 @@ def add_library_parser(subparsers: Any) -> Any:
     )
     for name in ("status", "verify"):
         common(sub.add_parser(name))
+    serve = sub.add_parser(
+        "serve",
+        help="Browse the library as a local read-only wiki (loopback only)",
+        description=(
+            "Serve the current published generation as linked pages on a loopback address: "
+            "home, ranked search, one page per record with contents, paged messages, related "
+            "records and revision history. Nothing is exported or written."
+        ),
+    )
+    common(serve)
+    serve.add_argument("--host", default="127.0.0.1", help="loopback address only")
+    serve.add_argument("--port", type=int, default=8766)
     search = sub.add_parser(
         "search",
         help="Paged full-text retrieval; the match count is exact up to 1000",
@@ -1110,6 +1122,12 @@ def handle_library(args: argparse.Namespace) -> int:
             return _inventory_command(args)
         if args.action == "verify-export":
             return _verify_export_command(args)
+        if args.action == "serve":
+            # library_serve imports this module, so the import waits until the command runs.
+            from .library_serve import serve as serve_library  # noqa: PLC0415
+
+            serve_library(configured_store(args.store_root), host=args.host, port=args.port)
+            return 0
         if args.action in {"export", "export-cards"}:
             # The export is the library's text as plaintext (all of it, or a card per record):
             # authorise where it lands before the library or the reviewed envelope is read.
