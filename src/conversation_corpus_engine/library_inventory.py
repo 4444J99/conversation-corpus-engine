@@ -1187,7 +1187,13 @@ def _antigravity(run: _Run, sources: Sequence[Path]) -> None:
             units.append(("database" if path.suffix in DATABASE_SUFFIXES else "census", path))
         else:
             _unresolved(run.conn, family, path, "source", "source_missing")
-    for kind, path in _fold(run, family, units, probe=lambda unit: unit[1]):
+    for kind, path in _fold(
+        run,
+        family,
+        units,
+        probe=lambda unit: unit[1],
+        scope=lambda unit: _census_base(unit[1]) if unit[0] == "census" else None,
+    ):
         run.check()
         with _source(run, family, path):
             if kind == "database":

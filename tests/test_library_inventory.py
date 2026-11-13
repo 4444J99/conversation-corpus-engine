@@ -1650,3 +1650,42 @@ def test_a_large_census_stops_at_the_deadline_and_reports_incomplete(tmp_path):
     )
     assert receipt["status"] == "incomplete"
     assert len(kinds(tmp_path, "gemini")) < 20000
+
+
+def agy_census(directory: Path, record_container: dict[str, Any], body: bool) -> Path:
+    directory.mkdir(parents=True)
+    if body:
+        (directory / "body.json").write_text(json.dumps({"role": "user", "content": "agy body"}))
+    census = directory / "census.json"
+    census.write_text(json.dumps(record_container))
+    return census
+
+
+def test_nested_antigravity_census_references_are_reader_resolvable(tmp_path):
+    record = {"uuid": "s", "path": "body.json"}
+    top = agy_census(tmp_path / "top", {"sessions": [record]}, body=True)
+    nested = agy_census(tmp_path / "nested", {"tm_cli": {"sessions": [record]}}, body=True)
+    run_inventory(tmp_path, "top-out", antigravity_sources=[top])
+    run_inventory(tmp_path, "nested-out", antigravity_sources=[nested])
+    expected = [
+        m.text for r in iter_estate(tmp_path / "top-out" / "session-corpus.db") for m in r.messages
+    ]
+    got = [
+        m.text
+        for r in iter_estate(tmp_path / "nested-out" / "session-corpus.db")
+        for m in r.messages
+    ]
+    assert expected
+    assert got == expected
+
+
+def test_identical_antigravity_censuses_with_different_bases_are_not_folded(tmp_path):
+    record = {"sessions": [{"uuid": "s", "path": "body.json"}]}
+    first = agy_census(tmp_path / "a", record, body=False)
+    second = agy_census(tmp_path / "b", record, body=True)
+    receipt = run_inventory(tmp_path, antigravity_sources=[first, second])
+    assert receipt["families"]["antigravity"]["folded_duplicates"] == 0
+    messages = [
+        m.text for r in iter_estate(tmp_path / "out" / "session-corpus.db") for m in r.messages
+    ]
+    assert messages == ["agy body"]

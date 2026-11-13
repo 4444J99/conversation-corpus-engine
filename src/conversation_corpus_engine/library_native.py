@@ -959,7 +959,9 @@ def _read_source(
         elif base_suffix == ".json":
             payload = json.loads(text)
             if isinstance(payload, dict) and (
-                "sessions" in payload or object_key.startswith("sessions/")
+                "sessions" in payload
+                or object_key.startswith("sessions/")
+                or "/sessions/" in object_key
             ):
                 resolved = _census_path(payload, body.native_id, object_key, path)
                 if resolved:
