@@ -895,23 +895,31 @@ def _codex(run: _Run, roots: Sequence[Path], censuses: Sequence[Path]) -> None:
             if not isinstance(relative, str) or not relative:
                 _unresolved(conn, family, census, f"sessions/{index}", "native_path_missing")
                 continue
-            located, recovered = None, False
-            for root in codex_roots:
-                candidate = (root / relative).resolve()
-                if not candidate.is_relative_to(root):
-                    _unresolved(conn, family, census, f"sessions/{index}", "census_path_escape")
-                elif candidate.is_file():
-                    located = candidate
-                    break
-            if located is None:
-                matches = discovered.get(Path(relative).name.removesuffix(".zst"), [])
-                if len(matches) == 1:
-                    located, recovered = matches[0], True
-                else:
-                    reason = "native_source_missing" if not matches else "native_source_ambiguous"
-                    _unresolved(conn, family, census, f"sessions/{index}", reason)
-                    continue
-            references[located].append((census, index, recovered, relative, data.get("root_path")))
+            try:
+                located, recovered = None, False
+                for root in codex_roots:
+                    candidate = (root / relative).resolve()
+                    if not candidate.is_relative_to(root):
+                        _unresolved(conn, family, census, f"sessions/{index}", "census_path_escape")
+                    elif candidate.is_file():
+                        located = candidate
+                        break
+                if located is None:
+                    matches = discovered.get(Path(relative).name.removesuffix(".zst"), [])
+                    if len(matches) == 1:
+                        located, recovered = matches[0], True
+                    else:
+                        reason = (
+                            "native_source_missing" if not matches else "native_source_ambiguous"
+                        )
+                        _unresolved(conn, family, census, f"sessions/{index}", reason)
+                        continue
+                references[located].append(
+                    (census, index, recovered, relative, data.get("root_path"))
+                )
+            except (ValueError, OSError, RuntimeError):
+                _unresolved(conn, family, census, f"sessions/{index}", "native_path_invalid")
+                continue
             if located not in ordered:
                 ordered.append(located)
 
@@ -955,6 +963,7 @@ def _codex_state(run: _Run, database: Path) -> dict[str, set[str]]:
             fields = [f'"{name}"' if name in columns else "NULL" for name in names]
             rows = list(native.execute("SELECT id," + ",".join(fields) + " FROM threads"))
     for index, (sid, raw_source, cwd, title, branch, head, created) in enumerate(rows):
+        run.check()
         if not isinstance(sid, str) or not sid:
             _unresolved(conn, "codex", database, f"threads/row-{index}", "native_identity_missing")
             continue
@@ -1213,9 +1222,14 @@ def _antigravity_database(run: _Run, path: Path) -> None:
                 for row in native.execute("SELECT * FROM conversation_summaries")
             ]
         elif "trajectory_meta" in tables:
+            columns = _columns(native, "trajectory_meta")
+            identity = next((n for n in ("cascade_id", "trajectory_id") if n in columns), None)
+            if identity is None:
+                raise _Problem("unsupported_antigravity_database")
+            # The reader accepts trajectory_id when there is no cascade_id; normalize it here.
             records = [
-                ("trajectory_meta", dict(row))
-                for row in native.execute("SELECT cascade_id FROM trajectory_meta")
+                ("trajectory_meta", {"cascade_id": row[0]})
+                for row in native.execute(f'SELECT "{identity}" FROM trajectory_meta')
             ]
         else:
             raise _Problem("unsupported_antigravity_database")

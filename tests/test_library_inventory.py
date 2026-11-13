@@ -1791,3 +1791,38 @@ def test_every_census_reference_of_a_repeated_identity_is_read(tmp_path):
     run_inventory(tmp_path, antigravity_sources=[census])
     (record,) = list(iter_estate(tmp_path / "out" / "session-corpus.db"))
     assert sorted(m.text for m in record.messages) == ["first", "second"]
+
+
+def test_codex_state_rows_stop_at_the_deadline(tmp_path):
+    home = tmp_path / "codex"
+    state_database(home, [], [])
+    with sqlite3.connect(home / "state_5.sqlite") as connection:
+        connection.executemany(
+            "INSERT INTO threads VALUES (?,NULL,'cli','/d','T',NULL,NULL,1)",
+            [(f"t{i}",) for i in range(20000)],
+        )
+    receipt = build_inventory(
+        InventorySources(codex_roots=[home]), tmp_path / "out", max_seconds=0.01
+    )
+    assert receipt["status"] == "incomplete"
+
+
+def test_a_codex_census_path_with_a_nul_is_a_finding_not_a_crash(tmp_path):
+    home = tmp_path / "codex"
+    home.mkdir()
+    census = tmp_path / "census.json"
+    census.write_text(json.dumps({"sessions": [{"relative_path": "\u0000bad.jsonl"}]}))
+    receipt = run_inventory(tmp_path, codex_roots=[home], codex_censuses=[census])
+    assert receipt["status"] == "complete"
+    assert "native_path_invalid" in findings(tmp_path, "codex")
+
+
+def test_antigravity_trajectory_id_is_accepted_like_the_reader(tmp_path):
+    source = database(
+        tmp_path / "agy" / "conversations" / "t.db",
+        "CREATE TABLE trajectory_meta (trajectory_id TEXT);",
+        ("INSERT INTO trajectory_meta VALUES (?)", ("t1",)),
+    )
+    run_inventory(tmp_path, antigravity_sources=[source.parent.parent])
+    assert "t1" in kinds(tmp_path, "antigravity")
+    assert "source_database_error" not in findings(tmp_path, "antigravity")
