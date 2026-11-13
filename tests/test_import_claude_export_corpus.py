@@ -475,6 +475,33 @@ class ImportMultiPartCorpusTests(unittest.TestCase):
             )
             self.assertFalse((output / "source" / "export").exists())
 
+    def test_empty_export_yields_valid_zero_thread_corpus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = Path(tmpdir) / "export"
+            output = Path(tmpdir) / "out"
+            _write_claude_bundle(bundle, [])
+
+            result = import_claude_export_corpus(bundle, output, corpus_id="claude-empty-test")
+
+            self.assertEqual(result["thread_count"], 0)
+            contract = json.loads((output / "corpus" / "contract.json").read_text(encoding="utf-8"))
+            self.assertEqual(contract["counts"]["threads"], 0)
+            self.assertEqual(contract["counts"]["excluded_conversations"], 0)
+
+    def test_all_excluded_export_records_excluded_count_in_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = Path(tmpdir) / "export"
+            output = Path(tmpdir) / "out"
+            conv = _claude_conv("conv-E", "Textless", "")
+            conv["chat_messages"] = []
+            _write_claude_bundle(bundle, [conv])
+
+            result = import_claude_export_corpus(bundle, output, corpus_id="claude-excl-test")
+
+            self.assertEqual(result["thread_count"], 0)
+            contract = json.loads((output / "corpus" / "contract.json").read_text(encoding="utf-8"))
+            self.assertEqual(contract["counts"]["excluded_conversations"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -131,7 +131,9 @@ def merge_bundle_roots(bundle_roots: list[Path], provider: str, workdir: Path) -
     return merged, duplicates
 
 
-def _empty_corpus(corpus_dir: Path, provider: str, manifest: dict[str, Any]) -> dict[str, Any]:
+def _empty_corpus(
+    corpus_dir: Path, provider: str, manifest: dict[str, Any], *, excluded: int = 0
+) -> dict[str, Any]:
     """Write the projector-shaped surface for a provider with no eligible rows."""
     corpus_dir.mkdir(parents=True, exist_ok=True)
     for filename in ALL_COLLECTIONS:
@@ -159,7 +161,7 @@ def _empty_corpus(corpus_dir: Path, provider: str, manifest: dict[str, Any]) -> 
             "threads": 0,
             "families": 0,
             "pairs": 0,
-            "excluded_conversations": 0,
+            "excluded_conversations": excluded,
             "actions": 0,
             "unresolved": 0,
             "entities": 0,
@@ -246,15 +248,30 @@ def project_export_bundle(
             raise CorpusProjectionError(
                 f"the {provider} export did not ingest: {info.get('error') or info.get('status')}"
             )
-        projected_out = work / "projected"
-        summary = project_corpus(paths.root, projected_out, providers=[provider])
-        provider_summary = summary[provider]
         corpus_dir = output_root / "corpus"
+        if not info.get("conversations"):
+            # A bundle with no conversations has no activity stamp for the archive
+            # projector to require; it is a valid zero-thread corpus.
+            provider_summary = {
+                "corpus_id": corpus_dirname(provider),
+                "status": "empty",
+                "conversations_seen": 0,
+                "excluded": {},
+            }
+        else:
+            projected_out = work / "projected"
+            provider_summary = project_corpus(paths.root, projected_out, providers=[provider])[
+                provider
+            ]
         if provider_summary.get("status") == "empty":
             shutil.rmtree(corpus_dir, ignore_errors=True)
-            contract = _empty_corpus(corpus_dir, provider, manifest)
+            contract = _empty_corpus(
+                corpus_dir,
+                provider,
+                manifest,
+                excluded=sum(provider_summary.get("excluded", {}).values()),
+            )
             counts = dict(contract["counts"])
-            counts["excluded_conversations"] = sum(provider_summary.get("excluded", {}).values())
         else:
             projected_corpus = Path(provider_summary["root"]) / "corpus"
             shutil.rmtree(corpus_dir, ignore_errors=True)
