@@ -256,3 +256,24 @@ def test_the_receipt_digest_is_of_the_bytes_the_links_came_from(canonical, tmp_p
     for source in read:
         data = (canonical / source["file"]).read_bytes()
         assert source["sha256"] == hashlib.sha256(data).hexdigest()
+
+
+def test_deeply_nested_json_is_a_refusal_not_an_abort(tmp_path):
+    root = tmp_path / "canonical"
+    root.mkdir()
+    (root / "bookmarks.jsonl").write_text(
+        "[" * 100000 + "]" * 100000 + '\n{"url": "https://ok.example.com/", "title": "ok"}\n'
+    )
+    receipt = browser_links.export_browser_links(root, tmp_path / "out", kinds=("bookmarks",))
+    assert receipt["counts"]["links"] == 1 and receipt["counts"]["refused"] == 1
+
+
+def test_a_one_shot_host_iterable_reaches_the_receipt(canonical, tmp_path):
+    receipt = browser_links.export_browser_links(
+        canonical,
+        tmp_path / "out",
+        kinds=("history",),
+        exclude_hosts=(host for host in ["private.test"]),
+    )
+    assert receipt["counts"]["excluded_host"] == 1
+    assert receipt["exclude_hosts"] == ["private.test"]

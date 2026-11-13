@@ -214,7 +214,7 @@ def collect_links(
                     raise LinkRefused("row is longer than the size bound")
                 try:
                     row = json.loads(raw)
-                except ValueError:
+                except (ValueError, RecursionError):
                     raise LinkRefused("row is not valid JSON") from None
                 url, key = check_row(row)
                 title = _clean(row.get("title"), MAX_TITLE_CHARS)
@@ -352,6 +352,7 @@ def export_browser_links(
     in its path, and is either new or the result of an earlier export. Notes are written
     atomically and only when their bytes change; nothing already there is deleted.
     """
+    hosts = tuple(exclude_hosts)  # a one-shot iterable is read once, then reused for the receipt
     canonical = _absolute(canonical)
     destination = _absolute(destination)
     if not canonical.is_dir():
@@ -370,7 +371,7 @@ def export_browser_links(
         canonical,
         kinds=chosen,
         min_visits=min_visits,
-        exclude_hosts=exclude_hosts,
+        exclude_hosts=hosts,
         report=report,
     )
     written = unchanged = 0
@@ -403,7 +404,7 @@ def export_browser_links(
         "schema": SCHEMA,
         "kinds": list(chosen),
         "min_visits": min_visits,
-        "exclude_hosts": sorted({_clean(item, 253).lower() for item in exclude_hosts} - {""}),
+        "exclude_hosts": sorted({_clean(item, 253).lower() for item in hosts} - {""}),
         "sources": report["sources"],
         "counts": {
             **report["counts"],
