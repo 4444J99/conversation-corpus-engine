@@ -1596,3 +1596,57 @@ def test_copilot_directory_with_an_escaping_transcript_symlink_is_never_folded(t
     assert receipt["families"]["copilot"]["folded_duplicates"] == 0
     assert len(observed(tmp_path, "copilot")) == 2
     assert "symlink_escape" in findings(tmp_path, "copilot")
+
+
+# ---------------------------------------------------------------------------------------------
+# Review round 3: parentless same-kind copies, census bases, census deadlines
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_parentless_copy_of_the_same_kind_keeps_the_established_parent(tmp_path):
+    first = tmp_path / "a" / "census.json"
+    second = tmp_path / "b" / "census.json"
+    for path, record in (
+        (first, {"session_id": "s", "parent_session_id": "p"}),
+        (second, {"session_id": "s", "kind": "subagent"}),
+    ):
+        path.parent.mkdir()
+        path.write_text(json.dumps({"sessions": [record]}))
+    run_inventory(tmp_path, gemini_sources=[first, second])
+    assert kinds(tmp_path, "gemini")["s"] == ("subagent", "p")
+    assert "conflicting_parent_identity" not in findings(tmp_path, "gemini")
+
+
+def test_identical_censuses_with_different_relative_bases_are_not_folded(tmp_path):
+    body = json.dumps({"sessions": [{"session_id": "s", "path": "body.json"}]})
+    for side in ("a", "b"):
+        (tmp_path / side).mkdir()
+        (tmp_path / side / "census.json").write_text(body)
+    receipt = run_inventory(
+        tmp_path, gemini_sources=[tmp_path / "a" / "census.json", tmp_path / "b" / "census.json"]
+    )
+    assert receipt["families"]["gemini"]["folded_duplicates"] == 0
+    assert len(observed(tmp_path, "gemini")) == 2
+
+
+def test_identical_censuses_sharing_a_base_still_fold(tmp_path):
+    body = json.dumps(
+        {"root_path": str(tmp_path / "base"), "sessions": [{"session_id": "s", "path": "x"}]}
+    )
+    for side in ("a", "b"):
+        (tmp_path / side).mkdir()
+        (tmp_path / side / "census.json").write_text(body)
+    receipt = run_inventory(
+        tmp_path, gemini_sources=[tmp_path / "a" / "census.json", tmp_path / "b" / "census.json"]
+    )
+    assert receipt["families"]["gemini"]["folded_duplicates"] == 1
+
+
+def test_a_large_census_stops_at_the_deadline_and_reports_incomplete(tmp_path):
+    census = tmp_path / "census.json"
+    census.write_text(json.dumps({"sessions": [{"session_id": f"s{i}"} for i in range(20000)]}))
+    receipt = build_inventory(
+        InventorySources(gemini_sources=[census]), tmp_path / "out", max_seconds=0.01
+    )
+    assert receipt["status"] == "incomplete"
+    assert len(kinds(tmp_path, "gemini")) < 20000

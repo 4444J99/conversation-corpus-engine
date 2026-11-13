@@ -272,6 +272,9 @@ def _merge_identity(
             kind, parent = "unknown", None
         elif kind == "unknown":
             kind, parent = old_kind, old_parent
+        elif parent is None and kind == old_kind:
+            # Same kind but no parent evidence: keep the relationship already established.
+            parent = old_parent
     if parent_conflicted:
         kind, parent = "unknown", None
     return kind, parent
@@ -1091,6 +1094,21 @@ def _json_file(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _census_base(path: Path) -> str:
+    """The base a census resolves its relative transcript paths against (the reader's rule).
+
+    Byte-identical censuses are equivalent only when they share this base.
+    """
+    try:
+        data = _json_file(path)
+        root = data.get("root_path") if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        root = None
+    if isinstance(root, str) and root:
+        return str(Path(root).expanduser().resolve())
+    return str(path.parent.resolve())
+
+
 def _gemini(run: _Run, sources: Sequence[Path]) -> None:
     files = []
     for path in _declared(sources):
@@ -1098,7 +1116,7 @@ def _gemini(run: _Run, sources: Sequence[Path]) -> None:
             files.append(path)
         else:
             _unresolved(run.conn, "gemini", path, "source", "source_missing")
-    for path in _fold(run, "gemini", files):
+    for path in _fold(run, "gemini", files, scope=_census_base):
         run.check()
         with _source(run, "gemini", path):
             _gemini_census(run, path)
@@ -1110,6 +1128,7 @@ def _gemini_census(run: _Run, path: Path) -> None:
     if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
         raise _Problem("unsupported_census")
     for index, record in enumerate(data["sessions"]):
+        run.check()
         key = f"sessions/{index}"
         if not isinstance(record, dict):
             _unresolved(conn, "gemini", path, key, "invalid_record")
@@ -1235,6 +1254,7 @@ def _antigravity_census(run: _Run, path: Path) -> None:
 def _antigravity_record(
     run: _Run, path: Path, key: str, record: Any, claimed_id: str | None = None
 ) -> None:
+    run.check()
     conn = run.conn
     if not isinstance(record, dict):
         _unresolved(conn, "antigravity", path, key, "invalid_record")
