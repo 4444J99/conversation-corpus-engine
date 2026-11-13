@@ -120,6 +120,8 @@ def check_row(row: Any) -> tuple[str, str]:
         raise LinkRefused("url must be an http or https address without whitespace")
     if len(url) > MAX_URL_CHARS:
         raise LinkRefused(f"url is longer than {MAX_URL_CHARS} characters")
+    if _CONTROL.search(url):
+        raise LinkRefused("url holds a control character")
     try:
         parts = urlsplit(url)
         valid = (
@@ -144,33 +146,28 @@ def _excluded(url: str, patterns: tuple[str, ...]) -> bool:
     return any(host == item or host.endswith("." + item) for item in patterns)
 
 
-def _open_rows(path: Path) -> Iterator[tuple[int, bytes | None]]:
-    """(line number, line) of every line; an over-long line is drained in chunks, never held,
-    and comes back as None so the caller refuses it by number."""
+def _open_rows(path: Path, digest: Any) -> Iterator[tuple[int, bytes | None]]:
+    """(line number, line) of every line, hashing every byte read into ``digest`` so the receipt
+    names exactly the bytes the links came from. An over-long line is drained in chunks, never
+    held, and comes back as None so the caller refuses it by number."""
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, "rb") as source:
         if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
             raise ValueError(f"{path.name} is not a regular file")
         number = 0
         while line := source.readline(MAX_ROW_BYTES + 1):
+            digest.update(line)
             number += 1
             if number > MAX_ROWS_PER_FILE:
                 raise ValueError(f"{path.name} has more than {MAX_ROWS_PER_FILE} rows")
             if len(line) > MAX_ROW_BYTES and not line.endswith(b"\n"):
-                while (rest := source.readline(MAX_ROW_BYTES)) and not rest.endswith(b"\n"):
-                    continue
+                while rest := source.readline(MAX_ROW_BYTES):
+                    digest.update(rest)
+                    if rest.endswith(b"\n"):
+                        break
                 yield number, None
             else:
                 yield number, line
-
-
-def _file_digest(path: Path) -> str:
-    digest = hashlib.sha256()
-    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(descriptor, "rb") as source:
-        while block := source.read(1024 * 1024):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def collect_links(
@@ -205,10 +202,10 @@ def collect_links(
             entry["status"] = "missing"
             findings.append({"file": path.name, "line": 0, "code": "list_missing"})
             continue
-        entry["sha256"] = _file_digest(path)
         entry["status"] = "read"
         read = accepted = 0
-        for number, raw in _open_rows(path):
+        source_digest = hashlib.sha256()
+        for number, raw in _open_rows(path, source_digest):
             if raw is not None and not raw.strip():
                 continue
             read += 1
@@ -257,7 +254,7 @@ def collect_links(
             if first and (not link.first_seen or first < link.first_seen):
                 link.first_seen = first
             link.visits = max(link.visits, visits)
-        entry.update(rows=read, accepted=accepted)
+        entry.update(rows=read, accepted=accepted, sha256=source_digest.hexdigest())
     report["counts"] = {
         "links": len(links),
         "refused": counts["refused"],
@@ -378,10 +375,16 @@ def export_browser_links(
     )
     written = unchanged = 0
     current: set[str] = set()
+    checked: set[Path] = set()
     for key in sorted(links):
         link = links[key]
         path = _note_path(destination, link)
-        _no_symlinks(path.parent)
+        if path.parent not in checked:
+            # Each folder is checked where the note lands: a nested Git work tree or a symlink
+            # below the export root would otherwise make a private note Git-visible.
+            _no_symlinks(path.parent)
+            require_git_private(path.parent)
+            checked.add(path.parent)
         data = render_note(link).encode("utf-8")
         current.add(str(path.relative_to(destination)))
         if _existing(path) == data:

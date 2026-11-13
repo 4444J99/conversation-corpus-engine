@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -217,3 +218,41 @@ def test_notes_are_not_credited_to_the_owner(canonical, tmp_path):
     for message in record.messages:
         spans = attribute_message(message.text, role=message.role, record=info)
         assert spans and all(span.author != "owner" for span in spans)
+
+
+def test_a_nested_git_work_tree_below_the_export_is_refused(canonical, tmp_path):
+    out = tmp_path / "out"
+    browser_links.export_browser_links(canonical, out)
+    moved = tmp_path / "moved"
+    (out / "links").rename(moved)
+    (out / "links").mkdir()
+    subprocess.run(["git", "init", "-q", str(out / "links")], check=True)
+    _write(canonical, "reading-list", [{"url": "https://example.com/tides", "title": "Changed"}])
+    with pytest.raises(Exception, match="(?i)private|git"):
+        browser_links.export_browser_links(canonical, out)
+
+
+def test_a_control_character_in_a_url_is_refused(tmp_path):
+    root = tmp_path / "canonical"
+    _write(
+        root,
+        "bookmarks",
+        [
+            {"url": "https://example.com/a\x00b", "title": "nul"},
+            {"url": "https://example.com/ok", "title": "ok"},
+        ],
+    )
+    receipt = browser_links.export_browser_links(root, tmp_path / "out", kinds=("bookmarks",))
+    assert receipt["counts"]["links"] == 1
+    assert receipt["findings"][0]["reason"] == "url holds a control character"
+    for note in (tmp_path / "out" / "links").rglob("*.md"):
+        assert "\x00" not in note.read_text()
+
+
+def test_the_receipt_digest_is_of_the_bytes_the_links_came_from(canonical, tmp_path):
+    receipt = browser_links.export_browser_links(canonical, tmp_path / "out")
+    read = [source for source in receipt["sources"] if source["status"] == "read"]
+    assert len(read) == 3
+    for source in read:
+        data = (canonical / source["file"]).read_bytes()
+        assert source["sha256"] == hashlib.sha256(data).hexdigest()
