@@ -448,6 +448,9 @@ def _claude(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) 
     for line, record in records:
         if not composite and record.get("agentId"):
             continue  # a subagent record belongs to its own identity, not to the root body
+        if not composite and record.get("isSidechain") is True:
+            # Read as before (tagged as a sidechain), but never silently attributed to the parent.
+            body.finding("sidechain_without_agent_identity", path, str(line))
         mismatch = (
             (
                 not proven

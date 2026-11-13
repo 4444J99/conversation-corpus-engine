@@ -1914,3 +1914,23 @@ def test_a_codex_census_with_an_unknown_home_user_is_not_reader_resolvable(tmp_p
     assert receipt["status"] == "complete"
     assert THREAD in kinds(tmp_path, "codex")
     assert rollout.exists()
+
+
+def test_claude_root_body_flags_unidentified_sidechain_records(tmp_path):
+    projects = tmp_path / "claude"
+    jsonl(
+        projects / "p" / "t.jsonl",
+        [
+            {"type": "user", "sessionId": "s", "message": {"role": "user", "content": "root"}},
+            {
+                "type": "user",
+                "sessionId": "s",
+                "isSidechain": True,
+                "message": {"role": "user", "content": "side"},
+            },
+        ],
+    )
+    run_inventory(tmp_path, claude_projects=[projects])
+    (record,) = list(iter_estate(tmp_path / "out" / "session-corpus.db"))
+    assert record.extra["body_status"] == "partial"
+    assert any(f.startswith("sidechain_without_agent_identity") for f in record.extra["findings"])
