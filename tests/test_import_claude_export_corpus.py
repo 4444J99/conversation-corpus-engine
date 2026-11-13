@@ -8,9 +8,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from conversation_corpus_engine.corpus_text import detect_near_duplicates  # noqa: E402
 from conversation_corpus_engine.import_claude_export_corpus import (  # noqa: E402
     build_thread_audit,
-    detect_near_duplicates,
     extract_message_text,
     import_claude_export_corpus,
 )
@@ -103,16 +103,23 @@ class ImportClaudeExportCorpusTests(unittest.TestCase):
             contract = json.loads(
                 (output_root / "corpus" / "contract.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(contract["adapter_type"], "claude-export")
+            self.assertEqual(contract["adapter_type"], "archive-normalized")
+            self.assertEqual(contract["corpus_id"], "corpus-claude-archive")
             self.assertEqual(contract["counts"]["threads"], 1)
-            self.assertTrue((output_root / "corpus" / "source-snapshot.json").exists())
+            self.assertFalse((output_root / "corpus" / "source-snapshot.json").exists())
             threads = load_corpus_collection(output_root / "corpus" / "threads-index.json")
             self.assertEqual(threads[0]["title_normalized"], "Claude Test Thread")
-            self.assertIn("claude-export", threads[0]["tags"])
+            self.assertIn("claude-archive", threads[0]["tags"])
             readme = (output_root / "README.md").read_text(encoding="utf-8")
             self.assertIn("Imported conversations: 1", readme)
 
-    def test_import_claude_export_writes_audit_and_near_duplicates(self) -> None:
+    def test_import_claude_export_writes_projector_surface_without_legacy_audit_files(
+        self,
+    ) -> None:
+        # The rewire (#78) retired the importers' hand-built audit and
+        # near-duplicate files with the hand-built shaping; the same bundle now
+        # yields the projector's collections, and the repeated ask is no longer
+        # screened here.
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             output_root = root / "claude-history-memory"
@@ -144,18 +151,15 @@ class ImportClaudeExportCorpusTests(unittest.TestCase):
                                 "sender": "assistant",
                                 "created_at": "2026-03-14T10:01:00Z",
                                 "updated_at": "2026-03-14T10:01:00Z",
-                                "text": "",
+                                "text": "I will keep parity with the richer adapter path.",
                                 "content": [
-                                    {"type": "code", "language": "python", "text": "print(1)"},
                                     {
-                                        "type": "tool_result",
-                                        "name": "python",
-                                        "content": [{"type": "text", "text": "42"}],
-                                    },
-                                    {"type": "image", "width": 800, "height": 600},
+                                        "type": "text",
+                                        "text": "I will keep parity with the richer adapter path.",
+                                    }
                                 ],
-                                "attachments": [{"file_name": "spec.pdf"}],
-                                "files": [{"name": "notes.txt"}],
+                                "attachments": [],
+                                "files": [],
                             },
                         ],
                     },
@@ -206,18 +210,14 @@ class ImportClaudeExportCorpusTests(unittest.TestCase):
             contract = json.loads(
                 (output_root / "corpus" / "contract.json").read_text(encoding="utf-8")
             )
-            audits = load_corpus_collection(output_root / "corpus" / "import-audit.json")
-            duplicates = load_corpus_collection(output_root / "corpus" / "near-duplicates.json")
-
-            self.assertEqual(result["near_duplicate_count"], 1)
-            self.assertEqual(contract["counts"]["near_duplicates"], 1)
-            self.assertIn("flagged_threads", contract["counts"])
-            self.assertEqual(len(audits), 2)
-            self.assertEqual(len(duplicates), 1)
-            self.assertEqual(
-                duplicates[0]["titles"],
-                ["Claude Audit Thread A", "Claude Audit Thread B"],
-            )
+            self.assertEqual(result["thread_count"], 2)
+            self.assertEqual(contract["adapter_type"], "archive-normalized")
+            self.assertEqual(contract["corpus_id"], "corpus-claude-archive")
+            self.assertEqual(result["near_duplicate_count"], 0)
+            self.assertFalse((output_root / "corpus" / "import-audit.json").exists())
+            self.assertFalse((output_root / "corpus" / "near-duplicates.json").exists())
+            manifest = load_corpus_collection(output_root / "import-manifest.json")
+            self.assertEqual(len(manifest), 2)
 
 
 class ExtractMessageTextTests(unittest.TestCase):
