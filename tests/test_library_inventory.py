@@ -1826,3 +1826,25 @@ def test_antigravity_trajectory_id_is_accepted_like_the_reader(tmp_path):
     run_inventory(tmp_path, antigravity_sources=[source.parent.parent])
     assert "t1" in kinds(tmp_path, "antigravity")
     assert "source_database_error" not in findings(tmp_path, "antigravity")
+
+
+def test_a_codex_census_of_unresolved_rows_stops_at_the_deadline(tmp_path):
+    census = tmp_path / "census.json"
+    census.write_text(
+        json.dumps({"sessions": [{"relative_path": f"missing-{i}.jsonl"} for i in range(20000)]})
+    )
+    receipt = build_inventory(
+        InventorySources(codex_censuses=[census]), tmp_path / "out", max_seconds=0.01
+    )
+    assert receipt["status"] == "incomplete"
+
+
+def test_a_census_with_a_malformed_root_path_does_not_abort_the_run(tmp_path):
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"root_path": "\u0000bad", "sessions": [{"session_id": "b"}]}))
+    good = tmp_path / "good" / "census.json"
+    good.parent.mkdir()
+    good.write_text(json.dumps({"sessions": [{"session_id": "g"}]}))
+    receipt = run_inventory(tmp_path, gemini_sources=[bad, good])
+    assert receipt["status"] == "complete"
+    assert "g" in kinds(tmp_path, "gemini")

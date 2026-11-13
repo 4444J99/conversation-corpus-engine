@@ -832,6 +832,7 @@ def _claude_transcript(run: _Run, path: Path) -> None:
         else:
             _unresolved(conn, "claude", path, "file", "native_identity_missing")
     for sid, metadata in identities.items():
+        run.check()
         _upsert(
             conn,
             "claude",
@@ -891,6 +892,7 @@ def _codex(run: _Run, roots: Sequence[Path], censuses: Sequence[Path]) -> None:
         if not isinstance(data, dict) or not isinstance(data.get("sessions"), list):
             continue
         for index, record in enumerate(data["sessions"]):
+            run.check()
             relative = record.get("relative_path") if isinstance(record, dict) else None
             if not isinstance(relative, str) or not relative:
                 _unresolved(conn, family, census, f"sessions/{index}", "native_path_missing")
@@ -1106,15 +1108,16 @@ def _json_file(path: Path) -> Any:
 def _census_base(path: Path) -> str:
     """The base a census resolves its relative transcript paths against (the reader's rule).
 
-    Byte-identical censuses are equivalent only when they share this base.
+    Byte-identical censuses are equivalent only when they share this base. Any failure while
+    probing falls back to the census directory; the per-source handling accounts for the file.
     """
     try:
         data = _json_file(path)
         root = data.get("root_path") if isinstance(data, dict) else None
-    except (OSError, ValueError, RecursionError):
-        root = None
-    if isinstance(root, str) and root:
-        return str(Path(root).expanduser().resolve())
+        if isinstance(root, str) and root:
+            return str(Path(root).expanduser().resolve())
+    except (OSError, ValueError, RuntimeError, RecursionError):
+        pass
     return str(path.parent.resolve())
 
 
@@ -1356,6 +1359,7 @@ def _copilot(run: _Run, state_dirs: Sequence[Path], databases: Sequence[Path]) -
             _unresolved(run.conn, family, root, "source", "source_unreadable")
             continue
         for directory in children:
+            run.check()
             if not directory.is_dir() or not (resolved := _contained(run, family, root, directory)):
                 continue
             if resolved in events:
