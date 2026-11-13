@@ -1888,3 +1888,29 @@ def test_wal_copies_differing_only_in_shm_availability_are_not_folded(tmp_path):
     Path(str(second) + "-shm").write_bytes(b"shared-memory")
     receipt = run_inventory(tmp_path, opencode_databases=[first, second])
     assert receipt["families"]["opencode"]["folded_duplicates"] == 0
+
+
+def test_a_claude_symlink_to_an_extensionless_target_is_a_finding(tmp_path):
+    projects = tmp_path / "claude"
+    (projects / "p").mkdir(parents=True)
+    blob = projects / "p" / "blob"
+    blob.write_text(json.dumps(claude_event("s", isSidechain=False)) + "\n")
+    (projects / "p" / "session.jsonl").symlink_to(blob)
+    run_inventory(tmp_path, claude_projects=[projects])
+    assert "symlink_target_format_unsupported" in findings(tmp_path, "claude")
+    assert ("claude", "s") not in rows(tmp_path)
+
+
+def test_a_codex_census_with_an_unknown_home_user_is_not_reader_resolvable(tmp_path):
+    home = tmp_path / "codex"
+    rollout = jsonl(home / "sessions" / f"rollout-{THREAD}.jsonl", [codex_meta()])
+    census = tmp_path / "census.json"
+    census.write_text(
+        json.dumps(
+            {"sessions": [{"relative_path": f"~cce_nonexistent_user/rollout-{THREAD}.jsonl"}]}
+        )
+    )
+    receipt = run_inventory(tmp_path, codex_roots=[home], codex_censuses=[census])
+    assert receipt["status"] == "complete"
+    assert THREAD in kinds(tmp_path, "codex")
+    assert rollout.exists()

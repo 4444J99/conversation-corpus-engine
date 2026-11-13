@@ -432,7 +432,18 @@ def _walk_files(
                 if not target.is_relative_to(base):
                     _unresolved(run.conn, family, candidate, "file", "symlink_escape", literal=True)
                     continue
-                if target.is_file():
+                if target.is_file() and not target.name.endswith(suffixes):
+                    # The reader dispatches on the file name; a target without a supported
+                    # suffix would be inventoried but unreadable, so account for it instead.
+                    _unresolved(
+                        run.conn,
+                        family,
+                        candidate,
+                        "file",
+                        "symlink_target_format_unsupported",
+                        literal=True,
+                    )
+                elif target.is_file():
                     found.add(target)
             else:
                 found.add(candidate)
@@ -1088,11 +1099,11 @@ def _codex_census_row(
         if expected != sid:
             _unresolved(conn, "codex", rollout, "metadata", "relocated_native_identity_mismatch")
             return
-    base = Path(census_root if isinstance(census_root, str) and census_root else census.parent)
-    candidate = Path(relative).expanduser()
-    reachable = candidate if candidate.is_absolute() else base / candidate
     key = f"sessions/{index}"
     try:
+        base = Path(census_root if isinstance(census_root, str) and census_root else census.parent)
+        candidate = Path(relative).expanduser()
+        reachable = candidate if candidate.is_absolute() else base / candidate
         reaches = not recovered and reachable.resolve() == rollout
     except (ValueError, OSError, RuntimeError):
         reaches = False  # malformed root_path metadata is not reader-resolvable
