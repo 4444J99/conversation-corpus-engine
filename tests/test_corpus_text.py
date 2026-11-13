@@ -1,8 +1,10 @@
 """The shared text heuristics were moved out of the two export importers without changing them.
 
-The golden values below were produced by the importers' own code before the move (the digests by
-running both importers over the fixtures, the literals by running the old `split_sentences` and
-friends from the previous commit). Every string here is invented.
+The golden values below were produced by the importers' own code before the move (the literals by
+running the old `split_sentences` and friends from the previous commit). The digests were
+recomputed after conversation-corpus-engine#78 rewired the importers onto the archive corpus
+projector, so they pin the projected collections, not the retired hand-built ones. Every string
+here is invented.
 """
 
 from __future__ import annotations
@@ -23,8 +25,10 @@ from conversation_corpus_engine.sharded_collection import load_corpus_collection
 
 CHATGPT_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "chatgpt-export"
 # Digests of every collection the importers write, over the fixtures, from the code before the move.
-GOLDEN_CHATGPT_DIGEST = "4bd42f737190f699044a753aff6eef29e63533f36ed5d7c6b6ca5727a42f9d4e"
-GOLDEN_CLAUDE_DIGEST = "a4276bfdc5900ff93c2911c6fbc49880ed81d0a2d9df9a73d1f3deb1a210b621"
+GOLDEN_CHATGPT_DIGEST = "85a0e10c2df9126514bc01ad316cb613d6e7bf045e88422dbb23dda69624f73f"
+GOLDEN_CLAUDE_DIGEST = "10ca6dec4ff79ba2dfa37a4c8e28f65ab36d5d0a0ecb3cbe9ce3053441454d37"
+# The projected collections only: the rewire retired the importers' extra
+# files (entity-aliases, import-audit, near-duplicates) with the hand-built shaping.
 DIGESTED = (
     "threads-index.json",
     "semantic-v3-index.json",
@@ -35,9 +39,6 @@ DIGESTED = (
     "action-ledger.json",
     "unresolved-ledger.json",
     "canonical-entities.json",
-    "entity-aliases.json",
-    "import-audit.json",
-    "near-duplicates.json",
 )
 MOVED = (
     "STOP_WORDS",
@@ -148,7 +149,9 @@ def test_the_importers_use_the_one_shared_definition(module) -> None:
     for name in MOVED:
         if hasattr(module, name):
             assert getattr(module, name) is getattr(corpus_text, name), name
-    assert module.detect_near_duplicates is corpus_text.detect_near_duplicates
+    # The importers no longer re-export detect_near_duplicates: the rewire
+    # retired near-duplicate screening with the hand-built shaping. The screen
+    # itself still lives in corpus_text and is covered by its own tests.
     for name in MOVED:
         owner = getattr(corpus_text, name)
         if callable(owner):
@@ -202,14 +205,14 @@ def test_the_heuristics_give_the_output_the_importers_gave_before_the_move() -> 
     assert corpus_text.dedupe_preserve(["A  b", "a b", "C", ""]) == ["A b", "C"]
 
 
-def test_the_chatgpt_importer_writes_the_same_collections_as_before(tmp_path: Path) -> None:
+def test_the_chatgpt_importer_writes_the_projector_collections(tmp_path: Path) -> None:
     import_chatgpt_export_corpus.import_chatgpt_export_corpus(
         CHATGPT_FIXTURE, tmp_path / "out", corpus_id="golden-chatgpt"
     )
     assert _digest(tmp_path / "out") == GOLDEN_CHATGPT_DIGEST
 
 
-def test_the_claude_importer_writes_the_same_collections_as_before(tmp_path: Path) -> None:
+def test_the_claude_importer_writes_the_projector_collections(tmp_path: Path) -> None:
     import_claude_export_corpus.import_claude_export_corpus(
         _claude_bundle(tmp_path), tmp_path / "out", corpus_id="golden-claude"
     )
@@ -217,7 +220,7 @@ def test_the_claude_importer_writes_the_same_collections_as_before(tmp_path: Pat
     duplicates = load_corpus_collection(
         tmp_path / "out" / "corpus" / "near-duplicates.json", default=[]
     )
-    assert len(duplicates) == 1  # the repeated ask is still found by the moved screen
+    assert duplicates == []  # near-duplicate screening left the importer path with the rewire
 
 
 def test_the_pair_builder_numbers_pairs_and_leads_with_the_assistant_when_it_must() -> None:
