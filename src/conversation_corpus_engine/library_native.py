@@ -422,11 +422,16 @@ def _codex(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) -
                 body.add(event, payload["message"], "system", locator, kind="compaction")
 
 
+def _claude_session(record: dict[str, Any]) -> Any:
+    """The session identity of a Claude record, accepting both spellings the producer accepts."""
+    return record.get("sessionId") or record.get("session_id")
+
+
 def _claude(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) -> None:
     parent, separator, agent = body.native_id.partition("/agent/")
     composite = bool(separator and parent and agent and "/" not in agent)
     proven = composite and any(
-        record.get("sessionId") == parent and record.get("agentId") == agent
+        _claude_session(record) == parent and record.get("agentId") == agent
         for _, record in records
     )
     if proven:
@@ -445,12 +450,12 @@ def _claude(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) 
             (
                 not proven
                 or (
-                    bool(record.get("sessionId") or record.get("agentId"))
-                    and (record.get("sessionId") != parent or record.get("agentId") != agent)
+                    bool(_claude_session(record) or record.get("agentId"))
+                    and (_claude_session(record) != parent or record.get("agentId") != agent)
                 )
             )
             if composite
-            else bool(record.get("sessionId") and record["sessionId"] != body.native_id)
+            else bool(_claude_session(record) and _claude_session(record) != body.native_id)
         )
         if mismatch:
             body.finding("identity_mismatch", path, str(line))

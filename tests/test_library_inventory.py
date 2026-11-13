@@ -1689,3 +1689,47 @@ def test_identical_antigravity_censuses_with_different_bases_are_not_folded(tmp_
         m.text for r in iter_estate(tmp_path / "out" / "session-corpus.db") for m in r.messages
     ]
     assert messages == ["agy body"]
+
+
+def test_opencode_row_processing_stops_at_the_deadline(tmp_path):
+    source = database(
+        tmp_path / "opencode.db",
+        "CREATE TABLE session (id TEXT, title TEXT, time_created INT, time_updated INT,"
+        " directory TEXT);",
+    )
+    with sqlite3.connect(source) as connection:
+        connection.executemany(
+            "INSERT INTO session VALUES (?,?,1,1,'/d')", [(f"o{i}", "T") for i in range(20000)]
+        )
+    receipt = build_inventory(
+        InventorySources(opencode_databases=[source]), tmp_path / "out", max_seconds=0.01
+    )
+    assert receipt["status"] == "incomplete"
+    assert len(kinds(tmp_path, "opencode")) < 20000
+
+
+def test_a_deeply_nested_census_is_a_finding_and_later_sources_still_run(tmp_path):
+    deep = tmp_path / "deep.json"
+    deep.write_text("[" * 200000 + "]" * 200000)
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({"sessions": [{"session_id": "g"}]}))
+    receipt = run_inventory(tmp_path, gemini_sources=[deep, good])
+    assert receipt["status"] == "complete"
+    assert "g" in kinds(tmp_path, "gemini")
+
+
+def test_claude_session_id_alias_is_identity_filtered_by_the_reader(tmp_path):
+    projects = tmp_path / "claude"
+    jsonl(
+        projects / "p" / "t.jsonl",
+        [
+            {"type": "user", "session_id": "s1", "message": {"role": "user", "content": "one"}},
+            {"type": "user", "session_id": "s2", "message": {"role": "user", "content": "two"}},
+        ],
+    )
+    run_inventory(tmp_path, claude_projects=[projects])
+    texts = {
+        r.source_id: [m.text for m in r.messages]
+        for r in iter_estate(tmp_path / "out" / "session-corpus.db")
+    }
+    assert texts == {"s1": ["one"], "s2": ["two"]}

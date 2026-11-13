@@ -1102,7 +1102,7 @@ def _census_base(path: Path) -> str:
     try:
         data = _json_file(path)
         root = data.get("root_path") if isinstance(data, dict) else None
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         root = None
     if isinstance(root, str) and root:
         return str(Path(root).expanduser().resolve())
@@ -1479,6 +1479,7 @@ def _opencode_database(run: _Run, source: Path) -> None:
             gathered.append((table, "parent_id" in columns, rows))
     for table, has_parent, rows in gathered:
         for index, (sid, title, created, updated, directory, raw_parent) in enumerate(rows):
+            run.check()
             if not isinstance(sid, str) or not sid:
                 _unresolved(
                     conn, "opencode", source, f"{table}/row-{index}", "native_identity_missing"
