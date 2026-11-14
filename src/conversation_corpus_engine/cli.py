@@ -4,6 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
+from .app_cache_commands import add_app_cache_parser, handle_app_cache
 from .archive_commands import add_archive_parser, handle_archive
 from .archive_sealed_commands import add_sealed_parser
 from .archive_sealed_commands import run as run_sealed
@@ -747,6 +748,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_archive_parser(subparsers)
     add_attribute_parser(add_library_parser(subparsers))
     add_sealed_parser(subparsers)
+    add_app_cache_parser(subparsers)
 
     return parser
 
@@ -757,6 +759,9 @@ def main() -> None:
 
     if args.group == "sealed":
         raise SystemExit(run_sealed(args))
+
+    if args.group == "app-cache":
+        raise SystemExit(handle_app_cache(args))
 
     if args.group == "archive":
         raise SystemExit(handle_archive(args))
