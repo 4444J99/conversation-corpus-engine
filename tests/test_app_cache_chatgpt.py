@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -161,3 +162,47 @@ def test_cli_stages_and_reports(cache: Path, tmp_path: Path, capsys: pytest.Capt
     assert app_cache_commands.handle_app_cache(args) == 0
     assert json.loads(capsys.readouterr().out)["conversations_with_full_body"] == 1
     assert app_cache_commands.handle_app_cache(args) == 2
+
+
+def test_existing_empty_directory_is_made_owner_only(cache: Path, tmp_path: Path) -> None:
+    out = tmp_path / "open"
+    out.mkdir(mode=0o755)
+    out.chmod(0o755)
+    write_staging(scan([cache], brotli=None), out)
+    assert (out.stat().st_mode & 0o777) == 0o700
+    assert all((p.stat().st_mode & 0o077) == 0 for p in out.iterdir())
+
+
+def test_messages_only_conversation_is_indexed_and_missing_roots_are_counted(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Cache_Data"
+    root.mkdir()
+    write_entry(
+        root, "0000000000000001_0", f"{HOST}/conversations/{OTHER}/messages", b'{"messages":[]}'
+    )
+    result = scan([root, tmp_path / "absent"], brotli=None)
+    assert result.index[OTHER].sources == {"messages"}
+    assert result.roots_missing == 1
+    report = write_staging(result, tmp_path / "o")
+    assert report["conversations_known_total"] == 1 and report["roots_missing"] == 1
+
+
+def test_cli_refuses_missing_roots_and_a_git_visible_out(
+    tmp_path: Path, cache: Path, capsys
+) -> None:
+    parser = argparse.ArgumentParser()
+    app_cache_commands.add_app_cache_parser(parser.add_subparsers(dest="group"))
+    missing = parser.parse_args(
+        ["app-cache", "chatgpt", "--root", str(tmp_path / "nope"), "--out", str(tmp_path / "m")]
+    )
+    assert app_cache_commands.handle_app_cache(missing) == 2
+    assert not (tmp_path / "m").exists()
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    visible = parser.parse_args(
+        ["app-cache", "chatgpt", "--root", str(cache), "--out", str(repo / "stage")]
+    )
+    assert app_cache_commands.handle_app_cache(visible) == 2
+    assert not (repo / "stage").exists()

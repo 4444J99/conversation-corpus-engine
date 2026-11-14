@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gzip
+import subprocess
 import sys
 from pathlib import Path
 
@@ -11,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app_cache_support import write_entry  # noqa: E402
 
+from conversation_corpus_engine import app_cache_chromium as chromium  # noqa: E402
 from conversation_corpus_engine.app_cache_chromium import (  # noqa: E402
     BodyUnavailable,
     CacheEntry,
@@ -80,3 +82,39 @@ def test_decode_failure_names_the_layer() -> None:
 
 def test_strip_query_drops_userinfo_and_fragment() -> None:
     assert strip_query("https://u:p@h.test:8443/p?q=1#f") == "https://h.test:8443/p"
+
+
+def test_invalid_port_does_not_abort_a_scan(tmp_path: Path) -> None:
+    assert strip_query("https://h.test:bad/p") == ""
+    write_entry(tmp_path, "00000000000000b1_0", "https://h.test:bad/p", b"ok")
+    (entry,) = list(iter_entries(tmp_path))
+    assert isinstance(entry, CacheEntry)
+
+
+def test_brotli_decoder_failures_become_body_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Module:
+        @staticmethod
+        def decompress(data: bytes) -> bytes:
+            raise ValueError("corrupt")
+
+    monkeypatch.setattr(chromium.importlib, "import_module", lambda name: Module)
+    decoder = chromium.brotli_decoder()
+    assert decoder is not None
+    with pytest.raises(BodyUnavailable, match="brotli-decode-failed"):
+        decoder(b"x")
+
+
+def test_brotli_command_timeout_becomes_body_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(name: str) -> None:
+        raise ImportError(name)
+
+    def slow(*args: object, **kwargs: object) -> None:
+        raise subprocess.TimeoutExpired("brotli", 1)
+
+    monkeypatch.setattr(chromium.importlib, "import_module", refuse)
+    monkeypatch.setattr(chromium.shutil, "which", lambda name: "/bin/brotli")
+    monkeypatch.setattr(chromium.subprocess, "run", slow)
+    decoder = chromium.brotli_decoder()
+    assert decoder is not None
+    with pytest.raises(BodyUnavailable, match="brotli-decode-failed"):
+        decoder(b"x")

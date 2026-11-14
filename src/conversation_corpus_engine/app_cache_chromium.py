@@ -84,10 +84,10 @@ def strip_query(url: str) -> str:
     """Drop userinfo, query and fragment: cached URLs can carry signed, credential-like parameters."""
     try:
         parts = urlsplit(url)
-    except ValueError:
+        host = parts.hostname or ""
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:  # an invalid port is only detected when it is read
         return ""
-    host = parts.hostname or ""
-    port = f":{parts.port}" if parts.port else ""
     return f"{parts.scheme}://{host}{port}{parts.path}"
 
 
@@ -208,17 +208,28 @@ def brotli_decoder() -> Callable[[bytes], bytes] | None:
     """A brotli decoder when this machine has one (module first, then the command), else None."""
     try:
         module = importlib.import_module("brotli")
-        return lambda data: bytes(module.decompress(data))
     except ImportError:
-        pass
+        module = None
+    if module is not None:
+
+        def decode(data: bytes) -> bytes:
+            try:
+                return bytes(module.decompress(data))
+            except Exception as error:  # the module's own error type is not importable portably
+                raise BodyUnavailable("brotli-decode-failed") from error
+
+        return decode
     command = shutil.which("brotli")
     if not command:
         return None
 
     def run(data: bytes) -> bytes:
-        done = subprocess.run(
-            [command, "-d", "-c"], input=data, capture_output=True, check=False, timeout=120
-        )
+        try:
+            done = subprocess.run(
+                [command, "-d", "-c"], input=data, capture_output=True, check=False, timeout=120
+            )
+        except (subprocess.TimeoutExpired, OSError) as error:
+            raise BodyUnavailable("brotli-decode-failed") from error
         if done.returncode != 0:
             raise BodyUnavailable("brotli-decode-failed")
         return done.stdout

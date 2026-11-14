@@ -35,6 +35,7 @@ from .app_cache_chromium import (
     iter_entries,
     read_body,
 )
+from .app_cache_output import prepare_directory, write_private
 
 SCHEMA = "cce-chatgpt-app-cache/v1"
 SHARD_NAME = "conversations-000.json"
@@ -82,6 +83,7 @@ class IndexRow:
 @dataclass
 class ScanResult:
     roots: list[str] = field(default_factory=list)
+    roots_missing: int = 0
     conversations: dict[str, dict[str, Any]] = field(default_factory=dict)
     index: dict[str, IndexRow] = field(default_factory=dict)
     message_page_conversations: set[str] = field(default_factory=set)
@@ -137,7 +139,10 @@ def scan(roots: Iterable[Path], brotli: Callable[[bytes], bytes] | None | Any = 
     decoder = brotli_decoder() if brotli is AUTO else brotli
     result = ScanResult()
     for root in roots:
-        result.roots.append(root.name if not root.is_dir() else str(root))
+        if not root.is_dir():
+            result.roots_missing += 1
+            continue
+        result.roots.append(str(root))
         for entry in iter_entries(root):
             result.entries_seen += 1
             if isinstance(entry, Skipped):
@@ -161,6 +166,9 @@ def _collect(
     if messages:
         result.message_pages += 1
         result.message_page_conversations.add(messages.group(1))
+        result.index.setdefault(messages.group(1), IndexRow(messages.group(1))).sources.add(
+            "messages"
+        )
         return
     try:
         body = _json(entry, brotli)
@@ -218,6 +226,7 @@ def coverage(result: ScanResult, today: datetime | None = None) -> dict[str, Any
         "schema": SCHEMA,
         "generated_at": (today or datetime.now(UTC)).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "roots_read": len(result.roots),
+        "roots_missing": result.roots_missing,
         "cache_entries_seen": result.entries_seen,
         "cache_entries_skipped": dict(sorted(result.entries_skipped.items())),
         "conversation_entries_relevant": result.relevant_entries,
@@ -236,19 +245,16 @@ def coverage(result: ScanResult, today: datetime | None = None) -> dict[str, Any
 
 def write_staging(result: ScanResult, out: Path) -> dict[str, Any]:
     """Write the staging root. ``out`` must be new or empty; nothing existing is overwritten."""
-    out = out.expanduser().absolute()
-    if out.exists() and (not out.is_dir() or any(out.iterdir())):
-        raise FileExistsError(f"staging root already exists and is not empty: {out}")
-    out.mkdir(mode=0o700, parents=True, exist_ok=True)
+    out = prepare_directory(out)
     ordered = sorted(
         result.conversations.values(), key=lambda c: (_stamp(c.get("update_time")), c["id"])
     )
-    (out / SHARD_NAME).write_text(json.dumps(ordered, ensure_ascii=False), encoding="utf-8")
+    write_private(out / SHARD_NAME, json.dumps(ordered, ensure_ascii=False))
     index = [row.as_dict() for _, row in sorted(result.index.items())]
-    (out / INDEX_NAME).write_text(
+    write_private(
+        out / INDEX_NAME,
         json.dumps({"schema": SCHEMA, "conversations": index}, ensure_ascii=False, indent=1),
-        encoding="utf-8",
     )
     report = coverage(result)
-    (out / COVERAGE_NAME).write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
+    write_private(out / COVERAGE_NAME, json.dumps(report, indent=1) + "\n")
     return report

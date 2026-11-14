@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 
 from .app_cache_chatgpt import default_roots, scan, write_staging
+from .corpus_store import CorpusStoreError, require_git_private
 
 
 def add_app_cache_parser(subparsers: argparse._SubParsersAction) -> argparse.ArgumentParser:
@@ -36,9 +37,14 @@ def add_app_cache_parser(subparsers: argparse._SubParsersAction) -> argparse.Arg
 def handle_app_cache(args: argparse.Namespace) -> int:
     if args.action == "chatgpt":
         roots = args.root or default_roots(Path.home())
+        missing = [str(r) for r in roots if not r.is_dir()]
+        if (args.root and missing) or len(missing) == len(roots):
+            print(f"error: cache root does not exist: {', '.join(missing)}")
+            return 2
         try:
+            require_git_private(args.out)
             report = write_staging(scan(roots), args.out)
-        except FileExistsError as error:
+        except (FileExistsError, CorpusStoreError) as error:
             print(f"error: {error}")
             return 2
         print(json.dumps(report, indent=2) if args.json else _summary(report))
