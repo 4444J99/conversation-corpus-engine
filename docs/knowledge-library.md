@@ -94,6 +94,16 @@ cce library serve --store-root /private/store --port 8766
 
 The server accepts only loopback binds and loopback `Host` headers, answers GET and HEAD only, runs no script, and shows source text escaped as plain preformatted text, never as HTML or Markdown.
 
+### Atoms
+
+An atom is one deduplicated eligible prose block of the library's block index (a passage of at least 120 characters, stored once however many records repeat it). Its address is the SHA-256 digest of its canonical text, so it is a stable, citable unit, and every occurrence names its record, message and character span, so an atom always leads back to its sources. The wiki shows them as small linked pages:
+
+- `/record/UID/atoms` lists the record's atoms in reading order, 25 a page, each with a bounded preview, how many other records hold it (counted to 50, then "50+") and links to the atom and to its message.
+- `/atom/DIGEST` shows the passage (clipped at 24,000 characters, with a notice), every place it occurs (50 a page, with a link to each record message), and, for a chosen occurrence (`?uid=&message=&block=`, the first occurrence by default), the previous and next atom in that record, so a reader walks a record atom by atom.
+- `/api/atom/DIGEST` returns the same data as JSON. Passages are escaped plain text.
+
+The pages need the block index (built with the library; `Library.index_blocks`). A record with no atoms says so. `library_atoms.py` holds the reads; nothing is written.
+
 ## Browser links
 
 `cce library browser-links --canonical DIR --out DIR` turns the browser-state canonical set (`bookmarks`, `reading-list`, `tabs`, `wikipedia` and, only when named with `--kind history`, `history`) into one plain-text note per normalized URL under `OUT/links/<xx>/pg_<24 hex>.md`, and writes `browser-links-receipt.json` with the `documents` entry that reads it (wing `ai`, lane `support`, kind `document`: not an authored family, so the authorship rules never give the owner credit for a page title). The file name is the same page id a web capture row of that URL carries, so a link note and its captured page text meet on one id. A URL held by several lists or browsers is one note that names them all. Notes carry no export time and no local path, so a refresh rewrites only changed notes and never deletes: a note whose link left the set stays and is counted as `retained_not_in_source`. Rows of the wrong shape, non-http(s) addresses, embedded credentials and a missing list are findings by file and line, never by address. `--min-visits` and `--exclude-host` narrow history. The output directory must be outside every Git work tree or ignored by it, and new or an earlier export. Nothing is fetched and no browser store is read. Declared under `documents`, the notes build, search and publish like any other document.

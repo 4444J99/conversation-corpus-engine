@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
+from .library_atoms import atom as read_atom
+from .library_atoms import record_atoms, valid_digest
 from .library_commands import (
     open_library,
     read_arguments,
@@ -57,7 +59,9 @@ RELATED_PROGRESS_INSTRUCTIONS = 10000
 CONTENTS_INLINE_MESSAGES = 300
 CONTENTS_PAGE = 100
 UI_SEARCH_SECONDS = 8.0
-SUBPAGES = ("history", "contents", "related")
+ATOMS_SHARED_SECONDS = 2.0
+ATOMS_PER_PAGE = 25
+SUBPAGES = ("history", "contents", "related", "atoms")
 UID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,200}$")
 SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
@@ -329,6 +333,10 @@ class LibraryHandler(BaseHTTPRequestHandler):
                 self._search(library, generation, query, html_view=True)
             elif path == "/api/search":
                 self._search(library, generation, query, html_view=False)
+            elif path.startswith("/atom/"):
+                self._atom(library, path[len("/atom/") :], query, as_json=False)
+            elif path.startswith("/api/atom/"):
+                self._atom(library, path[len("/api/atom/") :], query, as_json=True)
             elif path.startswith("/record/"):
                 self._record(library, path[len("/record/") :], query)
             elif path.startswith("/api/read/"):
@@ -551,6 +559,8 @@ class LibraryHandler(BaseHTTPRequestHandler):
                 self._history(library, uid)
             elif parts[1] == "contents":
                 self._contents(library, uid, query, sequence)
+            elif parts[1] == "atoms":
+                self._atoms(library, uid, query)
             else:
                 self._related(library, uid)
             return
@@ -620,6 +630,7 @@ class LibraryHandler(BaseHTTPRequestHandler):
             f"<span class=pill>version {_e(data.get('version'))}</span>"
             f"<span class=pill>{_e(data.get('message_count'))} messages</span></div>"
             f"<p class=mute><a href='{_e(here)}/history'>Revision history</a> &middot; "
+            f"<a href='{_e(here)}/atoms'>Atoms</a> &middot; "
             f"<a href='{_e('/api/read/' + quote(uid, safe=''))}'>JSON</a>"
             f" &middot; <code>{_e(uid)}</code></p>"
             f"<div class=notice>{_e(data.get('source_notice'))}</div>"
@@ -798,6 +809,132 @@ class LibraryHandler(BaseHTTPRequestHandler):
             f"<p class=mute>Records that repeat eligible passages of this one.</p>{body_text}"
         )
         self._send(HTTPStatus.OK, _page("Related records", body), "text/html; charset=utf-8")
+
+    def _atoms(self, library: Library, uid: str, query: dict[str, list[str]]) -> None:
+        offset = _int(query, "offset", 0, 0, 1000000000)
+        data = record_atoms(library, uid, offset=offset, max_seconds=ATOMS_SHARED_SECONDS)
+        here = record_path(uid)
+        cards = "".join(
+            f"<div class=hit><div class=mute>#{a['position'] + 1} &middot; message "
+            f"{int(a['message'])} &middot; {int(a['chars']):,} characters"
+            + (
+                ""
+                if a["shared_records"] is None
+                else f" &middot; also in {a['shared_records']}{'' if a['shared_exact'] else '+'} "
+                "other records"
+            )
+            + f"</div><pre class=text>{_e(a['preview'])}{'...' if a['preview_truncated'] else ''}</pre>"
+            f"<a href='{_e(_link('/atom/' + a['digest'], uid=uid, message=a['message'], block=a['block']))}'>"
+            "Open this atom</a> &middot; "
+            f"<a href='{_e(_link(here, message=a['message']))}#message-{int(a['message'])}'>"
+            "in the record</a></div>"
+            for a in data["atoms"]
+        )
+        links = []
+        if offset:
+            links.append(
+                f"<a href='{_e(_link(here + '/atoms', offset=max(0, offset - ATOMS_PER_PAGE) or None))}'>"
+                "&larr; Previous</a>"
+            )
+        else:
+            links.append("<span></span>")
+        if data["next_offset"] is not None:
+            links.append(
+                f"<a href='{_e(_link(here + '/atoms', offset=data['next_offset']))}'>Next &rarr;</a>"
+            )
+        empty = (
+            "<p>This record has no atoms: its passages are shorter than 120 characters, or the "
+            "block index has not been built for this generation.</p>"
+            if not data["total"]
+            else ""
+        )
+        body = (
+            f"<h1>Atoms</h1><p><a href='{_e(here)}'>&larr; {_e(uid)}</a></p>"
+            f"<p class=mute>{int(data['total']):,} passages stored once each, in reading order. "
+            "An atom is addressed by the digest of its text.</p>"
+            f"{empty}{cards}<nav class=pager>{''.join(links)}</nav>"
+        )
+        self._send(HTTPStatus.OK, _page("Atoms", body), "text/html; charset=utf-8")
+
+    def _atom(
+        self, library: Library, raw: str, query: dict[str, list[str]], *, as_json: bool
+    ) -> None:
+        digest = raw.lower()
+        if not valid_digest(digest):
+            raise ValueError("an atom digest is 64 hexadecimal characters")
+        uid = _first(query, "uid") or None
+        message = _int(query, "message", -1, -1, 10000000) if "message" in query else None
+        block = _int(query, "block", -1, -1, 10000000) if "block" in query else None
+        if uid is not None:
+            uid = self._uid(uid)
+        offset = _int(query, "offset", 0, 0, 1000000000)
+        try:
+            data = read_atom(
+                library,
+                digest,
+                uid=uid,
+                message=message,
+                block=block,
+                occurrences_offset=offset,
+            )
+        except KeyError:
+            raise _Missing("no such atom") from None
+        if as_json:
+            self._json(HTTPStatus.OK, data)
+            return
+        here = "/atom/" + digest
+
+        def neighbour(label: str, item: dict[str, Any] | None, uid_: str) -> str:
+            if item is None:
+                return ""
+            href = _link(
+                "/atom/" + item["digest"], uid=uid_, message=item["message"], block=item["block"]
+            )
+            return (
+                f"<div class=hit><div class=mute>{label}</div><pre class=text>"
+                f"{_e(item['preview'])}{'...' if item['preview_truncated'] else ''}</pre>"
+                f"<a href='{_e(href)}'>Open</a></div>"
+            )
+
+        context = data["context"]
+        around = ""
+        if context:
+            around = (
+                f"<h2>Next to it in <a href='{_e(record_path(context['uid']))}'>"
+                f"{_e(context['uid'])}</a></h2>"
+                + neighbour("Before", context["previous"], context["uid"])
+                + neighbour("After", context["next"], context["uid"])
+            )
+        places = "".join(
+            f"<li><a href='{_e(_link(record_path(o['uid']), message=o['message']))}"
+            f"#message-{int(o['message'])}'>{_e(o['title'] or o['uid'])}</a> "
+            f"<span class=mute>{_e(o['provider'])} &middot; message {int(o['message'])} &middot; "
+            f"characters {int(o['start'])}-{int(o['end'])} &middot; "
+            f"<a href='{_e(_link(here, uid=o['uid'], message=o['message'], block=o['block']))}'>"
+            "neighbours</a></span></li>"
+            for o in data["occurrences"]
+        )
+        more = ""
+        if data["next_occurrences_offset"] is not None:
+            more = (
+                f"<nav class=pager><span></span><a href='"
+                f"{_e(_link(here, offset=data['next_occurrences_offset'], uid=uid, message=message, block=block))}"
+                "'>More places &rarr;</a></nav>"
+            )
+        cut = (
+            "<div class=notice>Only the first part of this long passage is shown.</div>"
+            if data["text_truncated"]
+            else ""
+        )
+        total = f"{data['occurrence_total']:,}{'' if data['occurrence_total_exact'] else '+'}"
+        body = (
+            f"<h1>Atom</h1><p class=mute><code>{_e(digest)}</code> &middot; "
+            f"{int(data['chars']):,} characters &middot; "
+            f"<a href='{_e('/api/atom/' + digest)}'>JSON</a></p>{cut}"
+            f"<pre class=text>{_e(data['text'])}</pre>{around}"
+            f"<h2>Where it occurs ({total})</h2><ul>{places}</ul>{more}"
+        )
+        self._send(HTTPStatus.OK, _page("Atom", body), "text/html; charset=utf-8")
 
     def _history(self, library: Library, uid: str) -> None:
         revisions = library.history(uid)
