@@ -69,9 +69,10 @@ def _perplexity(args: argparse.Namespace) -> int:
     bodies = args.body_dir or (database.parent / "fsCachedData")
     shared = Path.home().joinpath(*app_cache_perplexity.SHARED_CONTAINER)
     try:
+        require_git_private(args.out)
         result = app_cache_perplexity.scan(database, bodies)
         report = app_cache_perplexity.write_staging(result, args.out, shared)
-    except (FileExistsError, app_cache_perplexity.SnapshotError) as error:
+    except (FileExistsError, CorpusStoreError, app_cache_perplexity.SnapshotError) as error:
         print(f"error: {error}")
         return 2
     if args.json:

@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -171,3 +172,51 @@ def test_cli(cache: tuple[Path, Path], tmp_path: Path, capsys: pytest.CaptureFix
     assert app_cache_commands.handle_app_cache(args) == 0
     assert json.loads(capsys.readouterr().out)["space_notes"] == 1
     assert app_cache_commands.handle_app_cache(args) == 2
+
+
+def test_output_is_owner_only_and_the_cli_guards_git_visible_directories(
+    cache: tuple[Path, Path], tmp_path: Path
+) -> None:
+    out = tmp_path / "open"
+    out.mkdir()
+    out.chmod(0o755)
+    app_cache_perplexity.write_staging(app_cache_perplexity.scan(*cache), out)
+    assert (out.stat().st_mode & 0o777) == 0o700
+    assert all((p.stat().st_mode & 0o077) == 0 for p in out.iterdir())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    parser = argparse.ArgumentParser()
+    app_cache_commands.add_app_cache_parser(parser.add_subparsers(dest="group"))
+    db, bodies = cache
+    args = parser.parse_args(
+        [
+            "app-cache",
+            "perplexity",
+            "--cache-db",
+            str(db),
+            "--body-dir",
+            str(bodies),
+            "--out",
+            str(repo / "s"),
+        ]
+    )
+    assert app_cache_commands.handle_app_cache(args) == 2
+    assert not (repo / "s").exists()
+
+
+def test_missing_cache_db_is_an_error_exit(tmp_path: Path) -> None:
+    parser = argparse.ArgumentParser()
+    app_cache_commands.add_app_cache_parser(parser.add_subparsers(dest="group"))
+    args = parser.parse_args(
+        [
+            "app-cache",
+            "perplexity",
+            "--cache-db",
+            str(tmp_path / "x.db"),
+            "--out",
+            str(tmp_path / "o"),
+        ]
+    )
+    assert app_cache_commands.handle_app_cache(args) == 2
+    assert not (tmp_path / "o").exists()

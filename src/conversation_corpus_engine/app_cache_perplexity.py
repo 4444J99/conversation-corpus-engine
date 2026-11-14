@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .app_cache_output import prepare_directory, write_private
 from .app_cache_sqlite import SnapshotError, snapshot
 
 __all__ = ["SnapshotError"]
@@ -261,12 +262,9 @@ def coverage(result: ScanResult, shared_container: Path | None = None) -> dict[s
 
 
 def write_staging(result: ScanResult, out: Path, shared_container: Path | None = None) -> dict:
-    out = out.expanduser().absolute()
-    if out.exists() and (not out.is_dir() or any(out.iterdir())):
-        raise FileExistsError(f"staging root already exists and is not empty: {out}")
-    out.mkdir(mode=0o700, parents=True, exist_ok=True)
+    out = prepare_directory(out)
     payload = {"conversations": conversations(result)}
-    (out / SHARD_NAME).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    write_private(out / SHARD_NAME, json.dumps(payload, ensure_ascii=False))
     report = coverage(result, shared_container)
-    (out / COVERAGE_NAME).write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
+    write_private(out / COVERAGE_NAME, json.dumps(report, indent=1) + "\n")
     return report
