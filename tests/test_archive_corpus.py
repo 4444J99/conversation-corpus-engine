@@ -248,7 +248,7 @@ def test_upsert_and_build_federation_accept_both_corpora(fixture_archive) -> Non
         verdict = validate_json_file(
             "corpus-contract", out / f"corpus-{provider}-archive" / "corpus" / "contract.json"
         )
-        assert verdict["valid"], verdict["errors"]  # federation rewrites it; it still validates
+        assert verdict["valid"], verdict["errors"]
     federated = load_corpus_collection(
         federation_root / "federation" / "families-index.json", default=[]
     )
