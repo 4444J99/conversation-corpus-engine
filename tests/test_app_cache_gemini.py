@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -97,3 +98,28 @@ def test_cli(store: Path, tmp_path: Path, capsys: pytest.CaptureFixture) -> None
     assert app_cache_commands.handle_app_cache(args) == 0
     assert json.loads(capsys.readouterr().out)["chats"] == 2
     assert app_cache_commands.handle_app_cache(args) == 2
+
+
+def test_inventory_is_owner_only_and_the_cli_guards_git_visible_directories(
+    store: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "open"
+    out.mkdir()
+    out.chmod(0o755)
+    app_cache_gemini.write_report(app_cache_gemini.census(store), out)
+    assert (out.stat().st_mode & 0o777) == 0o700
+    assert all((p.stat().st_mode & 0o077) == 0 for p in out.iterdir())
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    parser = argparse.ArgumentParser()
+    app_cache_commands.add_app_cache_parser(parser.add_subparsers(dest="group"))
+    args = parser.parse_args(
+        ["app-cache", "gemini", "--store", str(store), "--out", str(repo / "g")]
+    )
+    assert app_cache_commands.handle_app_cache(args) == 2
+    assert not (repo / "g").exists()
+    missing = parser.parse_args(
+        ["app-cache", "gemini", "--store", str(tmp_path / "none"), "--out", str(tmp_path / "m")]
+    )
+    assert app_cache_commands.handle_app_cache(missing) == 2

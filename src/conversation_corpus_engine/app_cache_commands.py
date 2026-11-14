@@ -75,8 +75,9 @@ def handle_app_cache(args: argparse.Namespace) -> int:
 def _gemini(args: argparse.Namespace) -> int:
     store = args.store or app_cache_gemini.default_store(Path.home())
     try:
+        require_git_private(args.out)
         report = app_cache_gemini.write_report(app_cache_gemini.census(store), args.out)
-    except (FileExistsError, app_cache_gemini.SnapshotError) as error:
+    except (FileExistsError, CorpusStoreError, app_cache_gemini.SnapshotError) as error:
         print(f"error: {error}")
         return 2
     if args.json:

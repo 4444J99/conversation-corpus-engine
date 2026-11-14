@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from . import archive_read_gemini
+from .app_cache_output import prepare_directory, write_private
 from .app_cache_sqlite import SnapshotError, snapshot
 
 __all__ = ["SnapshotError"]
@@ -135,11 +136,8 @@ def census(store: Path) -> dict[str, Any]:
 
 def write_report(report: dict[str, Any], out: Path) -> dict[str, Any]:
     """Write the inventory (private, with ids) and a coverage file without ids."""
-    out = out.expanduser().absolute()
-    if out.exists() and (not out.is_dir() or any(out.iterdir())):
-        raise FileExistsError(f"output directory already exists and is not empty: {out}")
-    out.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (out / INVENTORY_NAME).write_text(json.dumps(report, indent=1), encoding="utf-8")
+    out = prepare_directory(out)
+    write_private(out / INVENTORY_NAME, json.dumps(report, indent=1))
     public = {k: v for k, v in report.items() if k != "inventory"}
-    (out / COVERAGE_NAME).write_text(json.dumps(public, indent=1) + "\n", encoding="utf-8")
+    write_private(out / COVERAGE_NAME, json.dumps(public, indent=1) + "\n")
     return public
