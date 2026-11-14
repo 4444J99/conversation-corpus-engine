@@ -90,7 +90,7 @@ def record_atoms(
         shared: int | None
         shared_exact = True
         if deadline is not None and time.monotonic() >= deadline:
-            shared = None
+            shared, shared_exact = None, False  # unknown, not an exact count
         else:
             shared, shared_exact = _shared_records(library, row["digest"], uid)
         atoms.append(

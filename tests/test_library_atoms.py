@@ -90,6 +90,7 @@ def test_sharing_counts_are_skipped_when_the_time_is_up(library_path):
     with Library(library_path) as library:
         page = library_atoms.record_atoms(library, uid, max_seconds=-1.0)
     assert [a["shared_records"] for a in page["atoms"]] == [None, None]
+    assert [a["shared_exact"] for a in page["atoms"]] == [False, False]
 
 
 def test_atom_reports_text_occurrences_and_neighbours(library_path):
