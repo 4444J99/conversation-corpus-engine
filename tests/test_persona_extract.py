@@ -206,6 +206,8 @@ class PersonaExtractTests(unittest.TestCase):
                 "rob",
                 "--source-corpus",
                 str(source),
+                "--mode",
+                "legacy-role",
                 "--project-root",
                 tmp,
                 "--json",
