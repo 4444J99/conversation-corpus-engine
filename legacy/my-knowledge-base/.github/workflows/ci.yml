@@ -1,0 +1,432 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches: [master, main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24"
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # ============================================
+  # Lint & Type Check
+  # ============================================
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Verify workflow action pins
+        run: npm run workflows:verify-pins
+
+      - name: Guard GitHub Pages core drift
+        run: npm run check:github-pages-core
+
+      - name: Dry-run GitHub Pages fallback/stale fixture tests
+        run: npm run test:github-pages-core
+
+      - name: Sync GitHub Pages index
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm run sync:github-pages
+
+      - name: Validate GitHub Pages data contract
+        run: npm run validate:github-pages -- --max-age-hours 72 --max-errored 8 --max-unreachable 5
+
+      - name: Emit GitHub Pages telemetry
+        run: npm run telemetry:github-pages
+
+      - name: Evaluate GitHub Pages alert rules
+        if: github.event_name != 'pull_request'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: npm run alerts:github-pages
+
+      - name: Upload GitHub Pages telemetry artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: github-pages-telemetry-${{ github.run_id }}
+          path: |
+            .test-tmp/github-pages-telemetry.json
+            .test-tmp/github-pages-alerts.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: TypeScript type check
+        run: npx tsc --noEmit
+
+  # ============================================
+  # Test with Coverage
+  # ============================================
+  test:
+    name: Test & Coverage
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      NODE_ENV: test
+      KB_EMBEDDINGS_PROVIDER: mock
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Cache TypeScript build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: dist
+          key: ${{ runner.os }}-tsc-${{ hashFiles('src/**/*.ts', 'tsconfig.json') }}
+          restore-keys: |
+            ${{ runner.os }}-tsc-
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build
+        run: npm run build
+
+      - name: Prepare database
+        run: npm run prepare-db
+
+      - name: Run deterministic test suites
+        run: npm run test:ci
+
+      - name: Generate coverage report (non-blocking)
+        run: npm run test:coverage -- --reporter=dot --coverage.reporter=json-summary --coverage.reporter=lcov
+        continue-on-error: true
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        with:
+          files: ./coverage/lcov.info
+          flags: unittests
+          name: knowledge-base-coverage
+          fail_ci_if_error: false
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-report
+          path: coverage/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ============================================
+  # Search Endpoint Parity Smoke
+  # ============================================
+  search-parity-smoke:
+    name: Search Parity Smoke
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs: [lint, test]
+    env:
+      NODE_ENV: test
+      KB_EMBEDDINGS_PROVIDER: mock
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Prepare database
+        run: npm run prepare-db
+
+      - name: Run parity smoke suite
+        run: npm run test:parity
+
+  # ============================================
+  # Universe Contracts & Ingest Safety
+  # ============================================
+  universe-contracts:
+    name: Universe Contracts
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs: [lint, test]
+    env:
+      NODE_ENV: test
+      KB_EMBEDDINGS_PROVIDER: mock
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Prepare database
+        run: npm run prepare-db
+
+      - name: Run universe suites
+        run: npm run test:universe
+
+      - name: Run native parity suite
+        run: npm run test:native
+
+  # ============================================
+  # Local Runtime Probe Parity Gate
+  # ============================================
+  runtime-probe-parity-local:
+    name: Runtime Probe Parity (local)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs: [lint, test]
+    env:
+      NODE_ENV: test
+      KB_EMBEDDINGS_PROVIDER: mock
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Prepare database
+        run: npm run prepare-db
+
+      - name: Run local parity runtime probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p docs/evidence/runtime-probes
+
+          npx tsx src/web-server.ts > local-runtime-probe-server.log 2>&1 &
+          SERVER_PID=$!
+
+          cleanup() {
+            kill "$SERVER_PID" > /dev/null 2>&1 || true
+            wait "$SERVER_PID" > /dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          for _ in {1..45}; do
+            if curl -fsS "http://127.0.0.1:3000/api/health" > /dev/null; then
+              echo "Local API is ready."
+              break
+            fi
+            sleep 2
+          done
+
+          curl -fsS "http://127.0.0.1:3000/api/health" > /dev/null
+          npm run probe:runtime -- --env local --mode parity --base-url "http://127.0.0.1:3000" --out "docs/evidence/runtime-probes/local-ci-parity-${GITHUB_RUN_ID}.json"
+
+      - name: Upload local runtime probe artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: local-runtime-probe-parity-${{ github.run_id }}
+          path: |
+            docs/evidence/runtime-probes/local-ci-parity-*.json
+            local-runtime-probe-server.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ============================================
+  # Flaky Test Watch (Non-Blocking)
+  # ============================================
+  stability-watch:
+    name: Flaky Watch (non-blocking)
+    if: github.event_name == 'pull_request'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+      KB_EMBEDDINGS_PROVIDER: mock
+      STABILITY_RUNS: "3"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Prepare database
+        run: npm run prepare-db
+
+      - name: Repeat flaky-prone suites
+        run: npm run test:stability
+
+  # ============================================
+  # Secret Scanning
+  # ============================================
+  secrets:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install TruffleHog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
+
+      - name: Run TruffleHog
+        run: |
+          trufflehog git file://. --only-verified --fail
+        continue-on-error: true
+
+  # ============================================
+  # Security Scanning
+  # ============================================
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: npm audit
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@5595ccaf912efad79be6eef63a5619ff05969be3 # v3
+        with:
+          languages: typescript
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@5595ccaf912efad79be6eef63a5619ff05969be3 # v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@5595ccaf912efad79be6eef63a5619ff05969be3 # v3
+        with:
+          category: "/language:typescript"
+
+  # ============================================
+  # Docker Build & Push
+  # ============================================
+  docker:
+    name: Docker Build
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    needs: [lint, test]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64
+
+      - name: Run Trivy vulnerability scanner
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@5595ccaf912efad79be6eef63a5619ff05969be3 # v3
+        with:
+          sarif_file: "trivy-results.sarif"

@@ -1,9 +1,45 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+from archive_support import build_export
+
+from conversation_corpus_engine.archive_ingest import (
+    DEFAULT_ARCHIVE_DIRNAME,
+    ArchivePaths,
+    authorize_archive,
+)
+from conversation_corpus_engine.corpus_store import register_corpus_store
+
+# Every CCE_* variable the engine reads (corpus_store, library_commands, mcp_server, paths and
+# provider_catalog). Named here so the intent is reviewable; the fixture below also sweeps any
+# other CCE_* key, so a variable added later cannot leak in from a developer shell.
+CCE_ENVIRONMENT_VARIABLES = (
+    "CCE_CORPUS_STORE_ROOT",
+    "CCE_LIBRARY_STORE_ROOT",
+    "CCE_ARCHIVE_ROOT",
+    "CCE_WORKSPACE_ROOT",
+    "CCE_PROJECT_ROOT",
+    "CCE_SOURCE_DROP_ROOT",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolate_cce_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with no CCE_* variable exported by the developer's shell.
+
+    A shell that exports CCE_CORPUS_STORE_ROOT (a symlinked legacy store) made tests that assert
+    the unconfigured path see the configured one instead (issue #81). Clearing happens before the
+    test body, so tests that deliberately set a variable with monkeypatch.setenv or
+    patch.dict("os.environ", ...) still do. monkeypatch restores the original values afterwards.
+    """
+    ambient = sorted(name for name in os.environ if name.startswith("CCE_"))
+    for name in (*CCE_ENVIRONMENT_VARIABLES, *ambient):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture
@@ -24,6 +60,30 @@ def project_root(workspace: Path) -> Path:
 @pytest.fixture
 def source_drop_root(workspace: Path) -> Path:
     return workspace / "source-drop"
+
+
+@pytest.fixture
+def archive_env(tmp_path: Path):
+    """Synthetic export plus a registered private store and an authorized archive root."""
+    export = build_export(tmp_path / "export")
+    project = tmp_path / "project"
+    store = tmp_path / "store"
+    project.mkdir(exist_ok=True)
+    store.mkdir()
+    register_corpus_store(project, store)
+    authorization = authorize_archive(
+        project_root=project,
+        archive_root=store / DEFAULT_ARCHIVE_DIRNAME,
+        corpus_store_root=store,
+        source_roots=(export,),
+    )
+    return SimpleNamespace(
+        export=export,
+        project=project,
+        store=store,
+        auth=authorization,
+        paths=ArchivePaths(authorization.destination),
+    )
 
 
 def seed_minimal_corpus(

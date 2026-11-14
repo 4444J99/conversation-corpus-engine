@@ -1,6 +1,6 @@
 # Conversation Corpus Engine
 
-[![CI](https://github.com/organvm-i-theoria/conversation-corpus-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/organvm-i-theoria/conversation-corpus-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/4444J99/conversation-corpus-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/4444J99/conversation-corpus-engine/actions/workflows/ci.yml)
 
 `conversation-corpus-engine` is the canonical Organ I implementation of the AI conversation corpus system extracted from the staging workspace at `Workspace/intake/ai-exports`.
 
@@ -97,8 +97,55 @@ cce evaluation run --root /path/to/corpus --project-root /path/to/project --corp
 cce review queue --project-root /path/to/project
 cce review resolve federated-family-merge-... --decision accepted --note "same family"
 cce source freshness /path/to/corpus
-cce-mcp --project-root /path/to/project
+cce archive build --export-root /path/to/ai-exports --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
+cce archive verify --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
+cce archive search "kubernetes ingress" --provider claude --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
+cce archive serve --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
+cce-mcp --project-root /path/to/project --archive-root /path/to/private-corpus-store/archive-all
 ```
+
+`cce archive` turns raw provider exports (ChatGPT, Claude, Gemini Takeout + NotebookLM, Grok,
+Perplexity, Copilot) into an Obsidian vault/wiki, a static archive site, a SQLite FTS5 search
+database and a graph, all inside the private corpus store. See
+[docs/archive-surfaces.md](docs/archive-surfaces.md).
+
+The unified private knowledge library extends this with versioned records from web archives,
+native coding sessions, and selected authored documents. It provides bounded CLI/MCP search,
+revision history, graph/index contracts, Obsidian-compatible Markdown, and a verified Notion
+import ZIP. Library builds now emit a stable progress event at the start of every phase
+(including previously silent fingerprint, verify, and artifact stages) with elapsed_seconds,
+and byte-limit failures include measured numbers for sizing retries. See [docs/knowledge-library.md](docs/knowledge-library.md).
+
+`cce library attribute` labels who wrote each span of each message (owner, agent, third party or unknown) with deterministic rules, and nothing is profile-eligible until the owner has reviewed a sample and the precision gate is met; see [docs/attributed-knowledge.md](docs/attributed-knowledge.md).
+
+Documents that came out of software repositories can only be told apart by their git history.
+`scripts/git_origin_hints.py` (stdlib only) reads history-only clones (bare or blobless, one
+`git log` pass per repository) and writes one `cce.origin-hints.v1` row per file: `agent` when every
+commit touching it is agent-signed (a `Co-Authored-By: Claude`-style trailer, a bot or agent author,
+the agent footer), `human` when none is, `mixed` otherwise.
+
+```bash
+python scripts/git_origin_hints.py --repos-dir /path/to/clones --wanted wanted.jsonl --out hints.jsonl
+cce library attribute --report --origin-hints hints.jsonl --library /path/to/library
+```
+
+Git cannot see renames (not followed), a human squash that holds agent text, a human committing agent
+output, text from before git, or rewritten history; a `human` hint never grants owner credit and a
+`mixed` hint withholds it. See [docs/attributed-knowledge.md](docs/attributed-knowledge.md#git-history-hints).
+
+Example:
+
+```bash
+cce library status --store-root /path/to/private-corpus-store
+cce library search "lattice" --store-root /path/to/private-corpus-store --limit 10
+```
+
+The Copilot reader takes SingleFile captures of Copilot web research pages from a `copilot/` folder,
+or from any folder with `--source copilot=/path/to/copilot-captures`. Each recognized page becomes
+one search-kind conversation. It reads the `.html`/`.htm` pages that carry a Copilot SingleFile
+header; HTML that is not a Copilot page is skipped and counted, and every other file is counted by
+extension and never opened. The capture date is the only timestamp. The pages hold no user turn,
+and none is invented.
 
 Corpus-destination writers fail closed unless a store has first been registered and the
 configured root exactly matches that active registration. The
@@ -129,6 +176,12 @@ currently exposes:
   answer, citations, and structured top-hit metadata.
 - `cce_list_corpora`: list registered project corpora.
 - `cce_surface_context`: build the MCP-facing project context payload.
+- `cce_archive_search`: full-text search the private AI archive search database. Only advertised
+  when the server is started with `--archive-root` (or `CCE_ARCHIVE_ROOT`); the root is server
+  configuration and is never a tool argument. Results are private conversation text.
+
+When started with `--library-store-root` (or `CCE_LIBRARY_STORE_ROOT`), it also exposes read-only
+`cce_library_search`, `cce_library_read`, and `cce_library_history`.
 
 ## Layout
 
@@ -144,6 +197,7 @@ currently exposes:
 - `src/conversation_corpus_engine/import_claude_export_corpus.py` — Claude bundle import
 - `src/conversation_corpus_engine/import_claude_local_session_corpus.py` — Claude local-session import
 - `src/conversation_corpus_engine/import_chatgpt_export_corpus.py` — ChatGPT conversations.json export import
+- `src/conversation_corpus_engine/export_projector.py` — shared rewire of legacy export importers through the archive corpus projector (see #78)
 - `src/conversation_corpus_engine/provider_discovery.py` — source-drop inbox discovery
 - `src/conversation_corpus_engine/provider_import.py` — provider import/onboarding orchestration
 - `src/conversation_corpus_engine/provider_refresh.py` — provider refresh orchestration over import, evaluation, and corpus promotion
@@ -159,7 +213,14 @@ currently exposes:
 - `src/conversation_corpus_engine/governance_candidates.py` — candidate stage/review/apply/rollback workflow
 - `src/conversation_corpus_engine/corpus_diff.py` — live-vs-candidate structural and retrieval diffing
 - `src/conversation_corpus_engine/corpus_candidates.py` — corpus candidate stage/review/promote/rollback workflow
-- `tests/` — extraction-safe regression tests
+- `src/conversation_corpus_engine/archive_model.py` — provider-neutral conversation schema, ids, time, atomic JSONL
+- `src/conversation_corpus_engine/archive_read_*.py` — streaming readers (chatgpt, claude, gemini, notebooklm, grok, perplexity, copilot)
+- `src/conversation_corpus_engine/archive_ingest.py` — normalized store, manifest denominators, custody gate
+- `src/conversation_corpus_engine/archive_topics.py` — TF-IDF topic hubs and cross-provider neighbours
+- `src/conversation_corpus_engine/archive_vault.py` / `archive_database.py` / `archive_graph.py` / `archive_site.py` / `archive_serve.py` — vault, search database, graph, site and loopback server
+- `src/conversation_corpus_engine/archive_layout.py` — every archive file, folder and note name, and the one wikilink function, minted through `derive_name`
+- `src/conversation_corpus_engine/archive_commands.py` — `cce archive` command group and cross-surface verification
+- `tests/` — extraction-safe regression tests (archive tests use only synthetic fixtures)
 
 ## Runtime Outputs
 
@@ -167,4 +228,4 @@ Runtime state is written to `state/`, `federation/`, and `reports/`. Those direc
 
 ## Status
 
-This repo now serves as the canonical Organ I home of the conversation corpus system. The adjacent Meta consumer path is also live: `schema-definitions` canonizes the outward contracts, `organvm-engine` discovers and validates emitted surface bundles, and `organvm-mcp-server` exposes them to agent sessions. Operational hardening is underway: CI gates all pushes, ChatGPT is a first-class provider alongside Claude/Gemini/Grok/Perplexity/Copilot, and sanitized test fixtures document the expected export formats. The next frontier is downstream dashboard consumption and additional provider adapters.
+This repo now serves as the canonical Organ I home of the conversation corpus system. The adjacent Meta consumer path is also live: `schema-definitions` canonizes the outward contracts, `organvm-engine` discovers and validates emitted surface bundles, and `organvm-mcp-server` exposes them to agent sessions. Operational hardening is underway: CI gates all pushes, ChatGPT is a first-class provider alongside Claude/Gemini/Grok/Perplexity/Copilot, and sanitized test fixtures document the expected export formats. Archive provider readers (including Copilot SingleFile research pages) are complete and CI-green on main. The unified private knowledge library (PR #86) adds versioned records, bounded retrieval, and portable exports over the existing archive and selected documents; see docs/knowledge-library.md. Library builds emit per-phase progress events with elapsed times and numbered byte-limit diagnostics. The next frontier is downstream dashboard consumption and additional provider adapters.

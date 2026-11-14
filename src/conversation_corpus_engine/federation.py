@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
+import json
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import archive_layout
 from .answering import (
     STOP_WORDS,
     build_answer,
@@ -270,7 +273,40 @@ def load_corpus_surface(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_federation(project_root: Path) -> dict[str, Any]:
+class ArchiveManifestChanged(RuntimeError):
+    """A federation build changed the archive manifest, which it must only ever read around."""
+
+
+def archive_manifest_fingerprint(archive_root: Path) -> dict[str, str | None]:
+    """The archive manifest's recorded source fingerprint and the sha256 of the whole file."""
+    path = archive_root / archive_layout.MANIFEST_FILENAME
+    if not path.is_file():
+        raise FileNotFoundError(f"No archive manifest at {path}")
+    raw = path.read_bytes()
+    recorded = json.loads(raw.decode("utf-8")).get("source_fingerprint")
+    return {"source_fingerprint": recorded, "file_sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def build_federation(project_root: Path, *, archive_root: Path | None = None) -> dict[str, Any]:
+    """Materialize the federation.
+
+    With `archive_root`, the archive manifest fingerprint is recorded before and after the build
+    and the build fails if it moved: federation reads the projected corpora and must never touch
+    the archive they came from.
+    """
+    before = archive_manifest_fingerprint(archive_root) if archive_root is not None else None
+    result = _build_federation(project_root)
+    if archive_root is not None:
+        after = archive_manifest_fingerprint(archive_root)
+        if after != before:
+            raise ArchiveManifestChanged(
+                f"the archive manifest changed during the federation build ({before} -> {after})"
+            )
+        result["archive_manifest_fingerprint"] = after
+    return result
+
+
+def _build_federation(project_root: Path) -> dict[str, Any]:
     registry = load_registry(project_root)
     active_entries = [
         entry for entry in registry.get("corpora", []) if entry.get("status", "active") == "active"

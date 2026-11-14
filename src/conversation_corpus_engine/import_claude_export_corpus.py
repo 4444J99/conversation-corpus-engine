@@ -4,25 +4,31 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
-import time
+import sys
 from collections import Counter
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .answering import slugify, tokenize, write_json, write_markdown
+from .answering import slugify, write_markdown
+from .corpus_store import git_visible_refusal
+from .corpus_text import (
+    PROMPT,
+    RESPONSE,
+    build_pairs_from_turns,
+    dedupe_preserve,
+    normalize_whitespace,
+    shorten,
+)
+from .export_projector import project_export_bundle, projected_rows
 from .sharded_collection import (
     collection_exists,
     collection_storage_path,
     content_hash_key,
     load_collection,
-    merge_entity_records,
-    merge_ledger_records,
     write_collection,
     write_corpus_collection,
 )
-from .source_lifecycle import build_source_snapshot
 
 if TYPE_CHECKING:
     from .corpus_store import CorpusWriteAuthorization
@@ -31,90 +37,6 @@ DEFAULT_OUTPUT_ROOT = Path.cwd() / "claude-history-memory"
 CONTRACT_NAME = "conversation-corpus-engine.v2"
 CONTRACT_VERSION = 2
 REQUIRED_BUNDLE_FILES = ("conversations.json", "users.json")
-STOP_WORDS = {
-    "a",
-    "about",
-    "all",
-    "also",
-    "an",
-    "and",
-    "any",
-    "are",
-    "as",
-    "at",
-    "be",
-    "been",
-    "being",
-    "but",
-    "by",
-    "can",
-    "could",
-    "do",
-    "for",
-    "from",
-    "get",
-    "going",
-    "have",
-    "if",
-    "in",
-    "into",
-    "is",
-    "it",
-    "just",
-    "like",
-    "make",
-    "maybe",
-    "more",
-    "need",
-    "not",
-    "of",
-    "on",
-    "or",
-    "our",
-    "out",
-    "say",
-    "should",
-    "so",
-    "that",
-    "the",
-    "their",
-    "them",
-    "then",
-    "there",
-    "they",
-    "this",
-    "to",
-    "want",
-    "we",
-    "what",
-    "where",
-    "will",
-    "with",
-    "you",
-    "your",
-}
-ACTION_MARKERS = (
-    "need to",
-    "needs to",
-    "should",
-    "will",
-    "want to",
-    "implement",
-    "add",
-    "build",
-    "develop",
-    "next step",
-    "recommend",
-)
-UNRESOLVED_MARKERS = (
-    "maybe",
-    "perhaps",
-    "unclear",
-    "unknown",
-    "whether",
-    "what if",
-    "which option",
-)
 
 
 def now_iso() -> str:
@@ -195,88 +117,6 @@ def discover_bundle_roots(input_path: Path) -> list[Path]:
         f"Claude export bundle at {input_path} is missing required files: "
         f"{', '.join(missing)} (no multi-part subdirectories with valid bundles found either)"
     )
-
-
-def normalize_whitespace(text: str) -> str:
-    return " ".join(text.split()).strip()
-
-
-def shorten(text: str, limit: int = 320) -> str:
-    cleaned = normalize_whitespace(text)
-    if len(cleaned) <= limit:
-        return cleaned
-    return cleaned[: max(0, limit - 3)].rstrip() + "..."
-
-
-def split_sentences(text: str) -> list[str]:
-    rough = []
-    for line in text.splitlines():
-        stripped_line = line.strip()
-        if not stripped_line:
-            continue
-        rough.extend(
-            part.strip()
-            for part in stripped_line.replace("?", "?\n")
-            .replace("!", "!\n")
-            .replace(".", ".\n")
-            .splitlines()
-        )
-    return [normalize_whitespace(item) for item in rough if normalize_whitespace(item)]
-
-
-def top_keywords(text: str, *, limit: int = 12) -> list[str]:
-    counts = Counter(
-        token for token in tokenize(text) if token not in STOP_WORDS and len(token) > 2
-    )
-    return [token for token, _ in counts.most_common(limit)]
-
-
-def vector_terms(text: str, *, limit: int = 18) -> dict[str, float]:
-    counts = Counter(
-        token for token in tokenize(text) if token not in STOP_WORDS and len(token) > 2
-    )
-    if not counts:
-        return {}
-    highest = max(counts.values())
-    return {
-        token: round(count / highest, 4)  # allow-secret
-        for token, count in counts.most_common(limit)
-    }
-
-
-def dedupe_preserve(values: list[str]) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for value in values:
-        cleaned = normalize_whitespace(value)
-        lowered = cleaned.lower()
-        if not cleaned or lowered in seen:
-            continue
-        seen.add(lowered)
-        ordered.append(cleaned)
-    return ordered
-
-
-def extract_actions(sentences: list[str]) -> list[str]:
-    candidates = []
-    for sentence in sentences:
-        lowered = sentence.lower()
-        if len(sentence) < 24 or len(sentence) > 220:
-            continue
-        if any(marker in lowered for marker in ACTION_MARKERS):
-            candidates.append(shorten(sentence, 180))
-    return dedupe_preserve(candidates)[:6]
-
-
-def extract_unresolved(sentences: list[str]) -> list[str]:
-    candidates = []
-    for sentence in sentences:
-        lowered = sentence.lower()
-        if len(sentence) < 24 or len(sentence) > 220:
-            continue
-        if sentence.endswith("?") or any(marker in lowered for marker in UNRESOLVED_MARKERS):
-            candidates.append(shorten(sentence, 180))
-    return dedupe_preserve(candidates)[:5]
 
 
 def infer_title(conversation: dict[str, Any], fallback_index: int) -> str:
@@ -422,84 +262,20 @@ def sorted_messages(conversation: dict[str, Any]) -> list[dict[str, Any]]:
 def build_pairs(
     messages: list[dict[str, Any]], thread_uid: str, family_id: str
 ) -> list[dict[str, Any]]:
-    pairs: list[dict[str, Any]] = []
-    current_prompt = ""
-    current_response_parts: list[str] = []
-    current_title = ""
-    pair_index = 0
-
+    turns: list[tuple[str, str, str]] = []
     for message in messages:
         sender = (message.get("sender") or "").lower()
         text = extract_message_text(message)
         if not text:
             continue
-        if sender == "human":
-            if current_prompt or current_response_parts:
-                pair_index += 1
-                response_text = normalize_whitespace(" ".join(current_response_parts))
-                summary = shorten(f"User: {current_prompt} Assistant: {response_text}", 240)
-                pair_id = f"{thread_uid}-pair-{pair_index:03d}"
-                pairs.append(
-                    {
-                        "pair_id": pair_id,
-                        "thread_uid": thread_uid,
-                        "title": current_title
-                        or shorten(current_prompt, 80)
-                        or f"Claude Pair {pair_index:03d}",
-                        "summary": summary,
-                        "search_text": f"{pair_id} {current_prompt} {response_text}",
-                        "themes": top_keywords(f"{current_prompt} {response_text}", limit=8),
-                        "entities": [],
-                        "family_ids": [family_id],
-                        "vector_terms": vector_terms(f"{current_prompt} {response_text}"),
-                    },
-                )
-            current_prompt = text
-            current_title = shorten(text, 80)
-            current_response_parts = []
-        else:
-            if not current_prompt:
-                current_prompt = "[assistant-led]"
-                current_title = "Assistant-Led Turn"
-            current_response_parts.append(text)
-
-    if current_prompt or current_response_parts:
-        pair_index += 1
-        response_text = normalize_whitespace(" ".join(current_response_parts))
-        summary = shorten(f"User: {current_prompt} Assistant: {response_text}", 240)
-        pair_id = f"{thread_uid}-pair-{pair_index:03d}"
-        pairs.append(
-            {
-                "pair_id": pair_id,
-                "thread_uid": thread_uid,
-                "title": current_title or f"Claude Pair {pair_index:03d}",
-                "summary": summary,
-                "search_text": f"{pair_id} {current_prompt} {response_text}",
-                "themes": top_keywords(f"{current_prompt} {response_text}", limit=8),
-                "entities": [],
-                "family_ids": [family_id],
-                "vector_terms": vector_terms(f"{current_prompt} {response_text}"),
-            },
-        )
-    return pairs
-
-
-def build_entities(title: str, keywords: list[str]) -> list[dict[str, str]]:
-    entities = [{"canonical_label": title, "entity_type": "conversation"}]
-    for keyword in keywords[:3]:
-        entities.append(
-            {"canonical_label": keyword.replace("-", " ").title(), "entity_type": "concept"}
-        )
-    seen: set[str] = set()
-    result: list[dict[str, str]] = []
-    for entity in entities:
-        label = normalize_whitespace(entity["canonical_label"])
-        lowered = label.lower()
-        if not label or lowered in seen:
-            continue
-        seen.add(lowered)
-        result.append({"canonical_label": label, "entity_type": entity["entity_type"]})
-    return result
+        turns.append((PROMPT if sender == "human" else RESPONSE, text, ""))
+    return build_pairs_from_turns(
+        turns,
+        thread_uid,
+        family_id,
+        label="Claude",
+        make_pair_id=lambda index, _key: f"{thread_uid}-pair-{index:03d}",
+    )
 
 
 def build_thread_audit(
@@ -555,72 +331,6 @@ def build_thread_audit(
     }
 
 
-def _trigram_fingerprint(text: str) -> frozenset[str]:
-    """Build character trigram set from tokenized text for fast similarity screening."""
-    tokens = [t for t in tokenize(text.lower()) if t not in STOP_WORDS and len(t) > 2]
-    trigrams: set[str] = set()
-    for token in tokens:
-        for k in range(len(token) - 2):
-            trigrams.add(token[k : k + 3])
-    return frozenset(trigrams)
-
-
-def detect_near_duplicates(
-    threads: list[dict[str, Any]],
-    first_prompts: dict[str, str],
-    *,
-    threshold: float = 0.92,
-    throttle: float = 0.0,
-) -> list[dict[str, Any]]:
-    """Detect near-duplicate threads by comparing first user prompts.
-
-    Uses a trigram Jaccard pre-filter to avoid expensive SequenceMatcher calls
-    on clearly dissimilar pairs. The Jaccard threshold (0.35) is conservative —
-    any pair with SequenceMatcher ratio >= 0.92 will pass the pre-filter.
-    """
-    candidates: list[dict[str, Any]] = []
-    uid_to_index = {t["thread_uid"]: idx for idx, t in enumerate(threads)}
-    uids = [thread["thread_uid"] for thread in threads]
-
-    # Pre-compute fingerprints for eligible prompts
-    fingerprints: dict[str, frozenset[str]] = {}
-    for uid in uids:
-        prompt = first_prompts.get(uid, "")
-        if len(prompt) >= 20:
-            fingerprints[uid] = _trigram_fingerprint(prompt[:500])
-
-    eligible = [uid for uid in uids if uid in fingerprints]
-
-    for i in range(len(eligible)):
-        fp_a = fingerprints[eligible[i]]
-        prompt_a = first_prompts[eligible[i]][:500]
-        if throttle > 0 and i % 50 == 0:
-            time.sleep(throttle)
-        for j in range(i + 1, len(eligible)):
-            fp_b = fingerprints[eligible[j]]
-            # Fast Jaccard pre-filter (frozenset ops, microseconds per pair)
-            union_size = len(fp_a | fp_b)
-            if union_size == 0:
-                continue
-            if len(fp_a & fp_b) / union_size < 0.35:
-                continue
-            # Expensive comparison only for plausible candidates
-            prompt_b = first_prompts[eligible[j]][:500]
-            ratio = SequenceMatcher(None, prompt_a, prompt_b).ratio()
-            if ratio >= threshold:
-                candidates.append(
-                    {
-                        "thread_uids": [eligible[i], eligible[j]],
-                        "similarity": round(ratio, 4),
-                        "titles": [
-                            threads[uid_to_index[eligible[i]]].get("title_normalized", ""),
-                            threads[uid_to_index[eligible[j]]].get("title_normalized", ""),
-                        ],
-                    }
-                )
-    return candidates
-
-
 def copy_bundle_files(
     bundle_root: Path,
     output_root: Path,
@@ -669,30 +379,8 @@ def import_claude_export_corpus(
     authorization: CorpusWriteAuthorization | None = None,
 ) -> dict[str, Any]:
     bundle_roots = discover_bundle_roots(input_path)
-    bundle_root = bundle_roots[0]  # primary — used for source_snapshot, manifest, briefs
+    bundle_root = bundle_roots[0]  # primary — used for the README source input
     is_multi_part = len(bundle_roots) > 1
-
-    conversations: list[dict[str, Any]] = []
-    seen_conversation_uuids: set[str] = set()
-    duplicate_skipped_count = 0
-    for part_root in bundle_roots:
-        part_conversations = load_collection(
-            part_root / "conversations.json",
-            default=[],
-        )
-        for conv in part_conversations:
-            uid = conv.get("uuid")
-            if uid and uid in seen_conversation_uuids:
-                duplicate_skipped_count += 1
-                continue
-            if uid:
-                seen_conversation_uuids.add(uid)
-            conversations.append(conv)
-    # projects, memories, users only loaded from the primary bundle — these are
-    # account-scoped, not export-scoped, so they're identical across parts.
-    projects = load_json_file(bundle_root / "projects.json", default=[])
-    memories = load_json_file(bundle_root / "memories.json", default=[])
-    users = load_json_file(bundle_root / "users.json", default=[])
 
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "corpus").mkdir(parents=True, exist_ok=True)
@@ -709,302 +397,43 @@ def import_claude_export_corpus(
             )
         )
 
-    threads: list[dict[str, Any]] = []
-    semantic_threads: list[dict[str, Any]] = []
-    pairs: list[dict[str, Any]] = []
-    doctrine_briefs: list[dict[str, Any]] = []
-    family_dossiers: list[dict[str, Any]] = []
-    canonical_families: list[dict[str, Any]] = []
-    actions: list[dict[str, Any]] = []
-    unresolved: list[dict[str, Any]] = []
-    import_manifest: list[dict[str, Any]] = []
-    entity_map: dict[str, dict[str, Any]] = {}
-    thread_audits: list[dict[str, Any]] = []
-    first_prompts: dict[str, str] = {}
-
-    imported_conversation_count = 0
-    empty_conversation_count = 0
-    for index, conversation in enumerate(conversations, start=1):
-        messages = sorted_messages(conversation)
-        extracted_messages = [extract_message_text(message) for message in messages]
-        extracted_messages = [text for text in extracted_messages if text]
-        if not extracted_messages:
-            empty_conversation_count += 1
-            continue
-
-        imported_conversation_count += 1
-        title = infer_title(conversation, index)
-        conversation_uuid = conversation.get("uuid") or f"claude-{index:04d}"
-        slug = slugify(f"{title}-{conversation_uuid[:8]}", limit=96)
-        family_id = f"family-{slug}"
-        thread_uid = f"thread-{slug}"
-        combined_text = "\n".join(extracted_messages)
-        sentences = split_sentences(combined_text)
-        keywords = top_keywords(combined_text)
-        vectors = vector_terms(combined_text)
-        action_items_text = extract_actions(sentences)
-        unresolved_items_text = extract_unresolved(sentences)
-        summary = shorten(" ".join(sentences[:3]) or combined_text or title, 320)
-        update_time = conversation.get("updated_at") or conversation.get("created_at") or now_iso()
-        key_entities = build_entities(title, keywords)
-        semantic_entities = [entity["canonical_label"] for entity in key_entities]
-        pair_items = build_pairs(messages, thread_uid, family_id)
-        for pair in pair_items:
-            pair["entities"] = semantic_entities
-        pairs.extend(pair_items)
-
-        audit = build_thread_audit(messages, extracted_messages, pair_items)
-        audit["thread_uid"] = thread_uid
-        thread_audits.append(audit)
-
-        first_human_prompt = ""
-        for message in messages:
-            if (message.get("sender") or "").lower() != "human":
-                continue
-            extracted_prompt = extract_message_text(message)
-            if extracted_prompt:
-                first_human_prompt = extracted_prompt
-                break
-        first_prompts[thread_uid] = first_human_prompt
-
-        action_items = [
-            {
-                "action_key": f"action-{slugify(action, limit=64)}",
-                "canonical_action": action,
-                "status": "open",
-                "family_ids": [family_id],
-                "thread_uids": [thread_uid],
-                "occurrence_count": 1,
-            }
-            for action in action_items_text
-        ]
-        unresolved_items = [
-            {
-                "question_key": f"question-{slugify(question, limit=64)}",
-                "canonical_question": question,
-                "why_unresolved": "Imported Claude export conversation still implies an open question or unresolved branch.",
-                "family_ids": [family_id],
-                "thread_uids": [thread_uid],
-                "occurrence_count": 1,
-            }
-            for question in unresolved_items_text
-        ]
-
-        tags = dedupe_preserve(["claude-export", "json-export", "calibration-import"])
-        threads.append(
-            {
-                "thread_uid": thread_uid,
-                "conversation_id": conversation_uuid,
-                "title_normalized": title,
-                "title_raw": title,
-                "answer_state": "imported_claude_export",
-                "tags": tags,
-                "semantic_tags": ["claude-thread"],
-                "keywords": keywords,
-                "semantic_themes": keywords[:6],
-                "semantic_v2_themes": keywords[:8],
-                "semantic_v3_themes": keywords[:8],
-                "semantic_v3_entities": semantic_entities,
-                "semantic_summary": summary,
-                "semantic_v2_summary": summary,
-                "semantic_v3_summary": f"{title} imported Claude conversation centered on {', '.join(keywords[:4])}.",
-                "action_count": len(action_items),
-                "unresolved_question_count": len(unresolved_items),
-                "audit_flags": audit.get("quality_flags", []),
-                "thread_path": str(output_root / "source" / "conversations.collection"),
-                "family_ids": [family_id],
-                "update_time_iso": update_time,
-            },
-        )
-        semantic_threads.append(
-            {
-                "thread_uid": thread_uid,
-                "title": title,
-                "summary": summary,
-                "search_text": f"{title} {combined_text}",
-                "family_ids": [family_id],
-                "vector_terms": vectors,
-            },
-        )
-        doctrine_briefs.append(
-            {
-                "family_id": family_id,
-                "canonical_title": title,
-                "canonical_thread_uid": thread_uid,
-                "member_count": 1,
-                "stable_themes": keywords[:8],
-                "brief_text": f"{title} currently centers on {', '.join(keywords[:4])}. Imported from Claude export {bundle_root.name}.",
-                "search_text": f"{title} {' '.join(keywords[:10])} {combined_text}",
-                "vector_terms": vectors,
-            },
-        )
-        family_dossiers.append(
-            {
-                "family_id": family_id,
-                "canonical_title": title,
-                "canonical_thread_uid": thread_uid,
-                "member_count": 1,
-                "stable_themes": keywords[:8],
-                "doctrine_summary": f"{title} imported Claude conversation summary: {summary}",
-                "search_text": f"{title} doctrine {' '.join(keywords[:10])} {combined_text}",
-                "actions": [
-                    {"action_key": item["action_key"], "canonical_action": item["canonical_action"]}
-                    for item in action_items
-                ],
-                "unresolved": [
-                    {
-                        "question_key": item["question_key"],
-                        "canonical_question": item["canonical_question"],
-                    }
-                    for item in unresolved_items
-                ],
-                "key_entities": key_entities,
-                "vector_terms": vectors,
-            },
-        )
-        canonical_families.append(
-            {
-                "canonical_family_id": family_id,
-                "canonical_title": title,
-                "canonical_thread_uid": thread_uid,
-                "thread_uids": [thread_uid],
-            },
-        )
-        actions.extend(action_items)
-        unresolved.extend(unresolved_items)
-        for entity in key_entities:
-            key = entity["canonical_label"].lower()
-            existing = entity_map.setdefault(
-                key,
-                {
-                    "canonical_entity_id": f"entity-{slugify(entity['canonical_label'], limit=64)}",
-                    "canonical_label": entity["canonical_label"],
-                    "entity_type": entity["entity_type"],
-                    "aliases": [],
-                },
-            )
-            existing["aliases"] = dedupe_preserve(existing.get("aliases", []) + [title])
-        import_manifest.append(
-            {
-                "conversation_uuid": conversation_uuid,
-                "thread_uid": thread_uid,
-                "family_id": family_id,
-                "pair_count": len(pair_items),
-                "title": title,
-            },
-        )
-
-    actions = merge_ledger_records(
-        actions,
-        key_field="action_key",
-        text_field="canonical_action",
+    # The corpus shaping lives in the archive projector now (#78): the bundle
+    # is ingested into a temporary normalized store and projected, so this
+    # importer and `cce archive project corpus` write identical contracts and
+    # member ids. The legacy hand-built shaping was removed, not kept beside
+    # the projector; only the importer's envelope (sources, manifest, README,
+    # result) remains here.
+    projected = project_export_bundle(
+        "claude", bundle_roots, output_root, authorization=authorization
     )
-    unresolved = merge_ledger_records(
-        unresolved,
-        key_field="question_key",
-        text_field="canonical_question",
+    rows = projected_rows(projected["corpus_dir"])
+    threads = rows["threads-index.json"]
+    pairs = rows["pairs-index.json"]
+    actions = rows["action-ledger.json"]
+    unresolved = rows["unresolved-ledger.json"]
+    pair_counts: Counter[str] = Counter(
+        pair.get("thread_uid") for pair in pairs if pair.get("thread_uid")
     )
-    entities = merge_entity_records(entity_map.values())
-    entity_aliases = [
-        {"canonical_label": entity["canonical_label"], "labels": entity.get("aliases", [])}
-        for entity in entities
-        if entity.get("aliases")
+    import_manifest = [
+        {
+            "conversation_uuid": thread["conversation_id"],
+            "thread_uid": thread["thread_uid"],
+            "family_id": thread["family_ids"][0] if thread.get("family_ids") else None,
+            "pair_count": pair_counts.get(thread["thread_uid"], 0),
+            "title": thread["title_normalized"],
+        }
+        for thread in threads
     ]
-    near_duplicates = detect_near_duplicates(threads, first_prompts, throttle=throttle)
-
-    corpus_dir = output_root / "corpus"
-    source_snapshot = build_source_snapshot(bundle_root, "claude-export", "bundle-json")
-    collections = {
-        "threads-index.json": threads,
-        "semantic-v3-index.json": semantic_threads,
-        "pairs-index.json": pairs,
-        "doctrine-briefs.json": doctrine_briefs,
-        "family-dossiers.json": family_dossiers,
-        "canonical-families.json": canonical_families,
-        "action-ledger.json": actions,
-        "unresolved-ledger.json": unresolved,
-        "canonical-entities.json": entities,
-        "entity-aliases.json": entity_aliases,
-        "doctrine-timeline.json": [],
-        "import-audit.json": thread_audits,
-    }
-    for filename, records in collections.items():
-        write_corpus_collection(
-            corpus_dir / filename,
-            records,
-            authorization=authorization,
-        )
-    if near_duplicates:
-        write_corpus_collection(
-            corpus_dir / "near-duplicates.json",
-            near_duplicates,
-            authorization=authorization,
-        )
-    write_json(corpus_dir / "source-snapshot.json", source_snapshot)
-    write_json(
-        corpus_dir / "contract.json",
-        {
-            "contract_name": CONTRACT_NAME,
-            "contract_version": CONTRACT_VERSION,
-            "adapter_type": "claude-export",
-            "corpus_id": slugify(corpus_id or output_root.name),
-            "name": name or output_root.name,
-            "generated_at": now_iso(),
-            "required_files": [
-                "corpus/threads-index.collection",
-                "corpus/semantic-v3-index.collection",
-                "corpus/pairs-index.collection",
-                "corpus/doctrine-briefs.collection",
-                "corpus/family-dossiers.collection",
-            ],
-            "counts": {
-                "threads": len(threads),
-                "families": len(canonical_families),
-                "pairs": len(pairs),
-                "actions": len(actions),
-                "unresolved": len(unresolved),
-                "entities": len(entities),
-                "projects": len(projects),
-                "memories": len(memories),
-                "users": len(users),
-                "empty_conversations": empty_conversation_count,
-                "near_duplicates": len(near_duplicates),
-                "flagged_threads": sum(1 for audit in thread_audits if audit.get("quality_flags")),
-            },
-            "source_input": str(bundle_root),
-            "collection_scope": "bundle-json",
-            "source_snapshot_path": "corpus/source-snapshot.json",
-            "source_signature_fingerprint": source_snapshot.get("signature_fingerprint"),
-            "source_content_fingerprint": source_snapshot.get("content_fingerprint"),
-            "source_file_count": source_snapshot.get("file_count"),
-            "source_total_bytes": source_snapshot.get("total_bytes"),
-            "source_latest_mtime_ns": source_snapshot.get("latest_mtime_ns"),
-        },
-    )
-    write_json(
-        corpus_dir / "evaluation-summary.json",
-        {
-            "generated_at": now_iso(),
-            "fixture_sources": {"manual": {"source": "unavailable", "count": 0}},
-            "regression_gates": {"overall_state": "warn", "source_reliability_state": "warn"},
-            "notes": ["Imported Claude export corpus has not been manually evaluated."],
-        },
-    )
-    write_json(
-        corpus_dir / "regression-gates.json",
-        {
-            "generated_at": now_iso(),
-            "overall_state": "warn",
-            "source_reliability_state": "warn",
-            "source_notes": ["Imported Claude export corpus has not been manually evaluated."],
-            "gates": [],
-        },
-    )
     write_corpus_collection(
         output_root / "import-manifest.json",
         import_manifest,
         authorization=authorization,
     )
+    # Projects, memories and users are account-scoped observations from the
+    # primary bundle; the projector counts them as excluded kinds instead.
+    projects = load_json_file(bundle_root / "projects.json", default=[])
+    memories = load_json_file(bundle_root / "memories.json", default=[])
+    users = load_json_file(bundle_root / "users.json", default=[])
     write_markdown(
         output_root / "README.md",
         "\n".join(
@@ -1016,9 +445,9 @@ def import_claude_export_corpus(
                 + (f" (+{len(bundle_roots) - 1} additional parts)" if is_multi_part else ""),
                 f"- Bundle parts: {len(bundle_roots)}"
                 + (f" ({', '.join(p.name for p in bundle_roots)})" if is_multi_part else ""),
-                f"- Duplicate conversations skipped across parts: {duplicate_skipped_count}",
-                f"- Imported conversations: {imported_conversation_count}",
-                f"- Empty conversations skipped: {empty_conversation_count}",
+                f"- Duplicate conversations skipped across parts: {projected['duplicate_conversations_skipped']}",
+                f"- Imported conversations: {projected['conversations_seen']}",
+                f"- Projected threads: {len(threads)}",
                 f"- Pair count: {len(pairs)}",
                 f"- Action count: {len(actions)}",
                 f"- Unresolved count: {len(unresolved)}",
@@ -1026,9 +455,13 @@ def import_claude_export_corpus(
                 f"- Memories observed: {len(memories)}",
                 f"- Users observed: {len(users)}",
                 f"- Copied source files: {len(copied_sources)}",
-                f"- Contract manifest: {corpus_dir / 'contract.json'}",
+                f"- Contract manifest: {output_root / 'corpus' / 'contract.json'}",
                 "",
-                "This corpus is federation-compatible but unevaluated. Its regression gate state is intentionally `warn` until manual fixtures are added.",
+                "Corpus shaped by the archive projector (corpus-claude-archive): "
+                "contracts and member ids match `cce archive project corpus` over "
+                "the same export. This corpus is federation-compatible but "
+                "unevaluated. Its regression gate state is intentionally `warn` "
+                "until manual fixtures are added.",
             ],
         ),
     )
@@ -1042,19 +475,28 @@ def import_claude_export_corpus(
         "pair_count": len(pairs),
         "action_count": len(actions),
         "unresolved_count": len(unresolved),
-        "empty_conversation_count": empty_conversation_count,
-        "near_duplicate_count": len(near_duplicates),
-        "flagged_thread_count": sum(1 for audit in thread_audits if audit.get("quality_flags")),
+        "empty_conversation_count": projected["excluded"].get("no-text", 0),
+        "near_duplicate_count": 0,
+        "flagged_thread_count": 0,
         "manifest_path": str(collection_storage_path(output_root / "import-manifest.json")),
         "readme_path": str(output_root / "README.md"),
         "bundle_part_count": len(bundle_roots),
         "bundle_part_names": [p.name for p in bundle_roots],
-        "duplicate_conversations_skipped": duplicate_skipped_count,
+        "duplicate_conversations_skipped": projected["duplicate_conversations_skipped"],
+        "projector_corpus_id": projected["contract"].get("corpus_id"),
+        "projector_adapter_type": projected["contract"].get("adapter_type"),
+        "projector_excluded": projected["excluded"],
+        "conversations_seen": projected["conversations_seen"],
     }
 
 
 def main() -> int:
     args = parse_args()
+    # The corpus is the export's text as plaintext, and --output-root defaults to the working
+    # directory: refuse a folder Git can see before the bundle is read.
+    if (refusal := git_visible_refusal(args.output_root)) is not None:
+        print(f"output refused: {refusal}", file=sys.stderr)
+        return 2
     result = import_claude_export_corpus(
         args.input_path,
         args.output_root,
