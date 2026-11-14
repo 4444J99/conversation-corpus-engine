@@ -1,0 +1,17 @@
+{
+  "tables": "SELECT name FROM sqlite_master WHERE type='table'",
+  "owner": "SELECT owner FROM knovv_identity WHERE id=1",
+  "owner-claim": "INSERT INTO knovv_identity(id,owner) VALUES (1,?)",
+  "publication": "SELECT digest,generation,vault,epoch FROM publications WHERE id=1",
+  "object-reserve": "INSERT OR IGNORE INTO objects(id,size) SELECT ?,? WHERE (SELECT bytes FROM usage WHERE id=1)+?<=?",
+  "object-state": "SELECT size,uploaded FROM objects WHERE id=?",
+  "object-verified": "UPDATE objects SET uploaded=1 WHERE id=?",
+  "device-upsert": "INSERT INTO devices(id,signing_public,generation,revoked,envelope) VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET generation=excluded.generation,revoked=excluded.revoked,envelope=excluded.envelope WHERE excluded.generation>devices.generation AND excluded.signing_public=devices.signing_public",
+  "device-read": "SELECT envelope FROM devices WHERE id=?",
+  "publication-first": "INSERT OR IGNORE INTO publications(id,generation,epoch,vault,digest,envelope) VALUES (1,?,?,?,?,?)",
+  "publication-cas": "UPDATE publications SET generation=?,epoch=?,digest=?,envelope=? WHERE id=1 AND digest=? AND vault=?",
+  "publication-digest": "SELECT digest FROM publications WHERE id=1",
+  "snapshot-cutoff": "SELECT 'publication' kind,envelope value FROM publications UNION ALL SELECT 'device',envelope FROM devices UNION ALL SELECT 'cutoff',CAST(COALESCE(MAX(seq),0) AS TEXT) FROM revisions",
+  "object-page": "SELECT id,size FROM objects WHERE uploaded=1 AND id>? ORDER BY id LIMIT ?",
+  "revision-page": "SELECT seq,envelope FROM revisions WHERE seq>? AND seq<=? ORDER BY seq LIMIT ?"
+}

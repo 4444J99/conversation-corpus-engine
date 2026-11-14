@@ -1,0 +1,41 @@
+{
+  "name": "knovv",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build && esbuild server/worker.ts --bundle --format=esm --platform=browser --target=es2022 --external:cloudflare:workers --loader:.sql=text --outfile=build/worker.mjs && esbuild agent/main.ts --bundle --format=esm --platform=node --target=node22 --outfile=build/agent.mjs && esbuild bench/publication.ts --bundle --format=esm --platform=node --target=node22 --outfile=build/benchmark.mjs",
+    "benchmark": "node build/benchmark.mjs",
+    "test": "vitest run",
+    "check": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.0.0",
+    "@noble/curves": "^2.0.0",
+    "@noble/hashes": "^2.0.0",
+    "fzstd": "^0.1.1",
+    "jose": "^6.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.0.0",
+    "remark-gfm": "^4.0.0"
+  },
+  "devDependencies": {
+    "@cloudflare/vite-plugin": "^2.0.0-beta.v.12",
+    "@cloudflare/workers-types": "5.20261107.1",
+    "@testing-library/react": "^16.3.3",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "cf": "^1.0.0-beta.28",
+    "esbuild": "^0.25.0",
+    "jsdom": "^31.0.0",
+    "miniflare": "^4.0.0",
+    "prettier": "^3.9.10",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0",
+    "vitest": "^3.2.0"
+  }
+}
