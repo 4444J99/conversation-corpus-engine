@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -15,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from conversation_corpus_engine import (
     app_cache_commands,
     app_cache_perplexity,
+    app_cache_sqlite,
     archive_read_perplexity,
 )  # noqa: E402
 from conversation_corpus_engine.app_cache_sqlite import SnapshotError, snapshot  # noqa: E402
@@ -220,3 +222,38 @@ def test_missing_cache_db_is_an_error_exit(tmp_path: Path) -> None:
     )
     assert app_cache_commands.handle_app_cache(args) == 2
     assert not (tmp_path / "o").exists()
+
+
+def test_snapshot_retries_when_the_wal_disappears_mid_copy(
+    cache: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = shutil.copyfile
+    calls = {"n": 0}
+
+    def flaky(src: str | Path, dst: str | Path, **kw: object) -> str | Path:
+        calls["n"] += 1
+        if calls["n"] == 2:  # the log copy of the first attempt
+            raise FileNotFoundError(src)
+        return real(src, dst, **kw)
+
+    monkeypatch.setattr(app_cache_sqlite.shutil, "copyfile", flaky)
+    result = app_cache_perplexity.scan(*cache)
+    assert list(result.spaces) == [SPACE] and calls["n"] >= 3
+
+
+def test_note_name_survives_and_a_complete_copy_beats_a_truncated_one_at_the_same_revision() -> (
+    None
+):
+    result = app_cache_perplexity.ScanResult()
+    short = json.loads(graphql("2026-11-09T20:01:00Z", "https://example.test/only-a-url"))
+    node = short["viewer"]["knowledgeContext"]["scopeBySpaceUUID"]["categories"][0]["items"][
+        "edges"
+    ][0]["node"]
+    node["content"]["truncated"] = True
+    full = json.loads(graphql("2026-11-09T20:01:00Z", "https://example.test/only-a-url full"))
+    app_cache_perplexity._spaces_from_graphql(full, result)
+    app_cache_perplexity._spaces_from_graphql(short, result)  # arrives later, same revision
+    (note,) = result.spaces[SPACE].values()
+    assert note["truncated"] is False and note["text"].endswith("full")
+    (conversation,) = app_cache_perplexity.conversations(result)
+    assert conversation["entries"][0]["answer"].startswith("# Synthetic Note\n\n")

@@ -42,17 +42,20 @@ def snapshot(path: Path) -> Iterator[sqlite3.Connection]:
     try:
         copy = scratch / "snapshot.sqlite"
         for _ in range(ATTEMPTS):
-            has_log = log.exists() and log.stat().st_size > 0
-            before = (_stamp(path), _stamp(log) if has_log else None)
-            total = before[0][0] + (before[1][0] if before[1] else 0)
-            if total > MAX_BYTES or total > shutil.disk_usage(scratch).free // 2:
-                raise SnapshotError("database too large to snapshot")
-            shutil.copyfile(path, copy)
-            copied_log = Path(str(copy) + "-wal")
-            copied_log.unlink(missing_ok=True)
-            if has_log:
-                shutil.copyfile(log, copied_log)
-            after = (_stamp(path), _stamp(log) if has_log else None)
+            try:
+                has_log = log.exists() and log.stat().st_size > 0
+                before = (_stamp(path), _stamp(log) if has_log else None)
+                total = before[0][0] + (before[1][0] if before[1] else 0)
+                if total > MAX_BYTES or total > shutil.disk_usage(scratch).free // 2:
+                    raise SnapshotError("database too large to snapshot")
+                shutil.copyfile(path, copy)
+                copied_log = Path(str(copy) + "-wal")
+                copied_log.unlink(missing_ok=True)
+                if has_log:
+                    shutil.copyfile(log, copied_log)
+                after = (_stamp(path), _stamp(log) if has_log else None)
+            except FileNotFoundError:
+                continue  # the app closed its last connection and checkpointed the log away
             if after == before:
                 break
         else:

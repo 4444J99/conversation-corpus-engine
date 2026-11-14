@@ -98,7 +98,16 @@ def _spaces_from_graphql(body: dict[str, Any], result: ScanResult) -> bool:
             key = str(ident.get("itemId") or node.get("name") or "")
             held = result.spaces.setdefault(match.group(1), {})
             old = held.get(key)
-            if old is None or str(node.get("updatedAt") or "") >= str(old.get("updatedAt") or ""):
+            stamp = str(node.get("updatedAt") or "")
+            truncated = bool((node.get("content") or {}).get("truncated"))
+            newer = old is None or stamp > str(old.get("updatedAt") or "")
+            same_revision_more_complete = (
+                old is not None
+                and stamp == str(old.get("updatedAt") or "")
+                and old["truncated"]
+                and not truncated
+            )
+            if newer or same_revision_more_complete:
                 held[key] = {
                     "name": str(node.get("name") or key),
                     "group": str(node.get("groupId") or ""),
@@ -182,6 +191,12 @@ def scan(cache_db: Path, body_dir: Path) -> ScanResult:
     return result
 
 
+def _titled(name: str, text: str) -> str:
+    """Keep the note's name findable: add it as a heading unless the body already leads with it."""
+    first = text.lstrip().splitlines()[0] if text.strip() else ""
+    return text if first.lstrip("# ").strip() == name else f"# {name}\n\n{text}"
+
+
 def conversations(result: ScanResult) -> list[dict[str, Any]]:
     """Export-shaped conversations: one per Space (notes) and one per thread (suggestions)."""
     out: list[dict[str, Any]] = []
@@ -192,7 +207,7 @@ def conversations(result: ScanResult) -> list[dict[str, Any]]:
                 "created_at": note["updatedAt"],
                 "query_status": "cached-note-truncated" if note["truncated"] else "cached-note",
                 "engine_mode": "SPACE_KNOWLEDGE_NOTE",
-                "answer": note["text"],
+                "answer": _titled(note["name"], note["text"]),
             }
             for note in ordered
         ]
