@@ -1,0 +1,18 @@
+llm:
+  provider: custom
+  model: anthropic/claude-3-haiku
+  baseUrl: https://openrouter.ai/api/v1
+  apiKeyEnv: OPENROUTER_API_KEY
+database:
+  path: ./db/knowledge.db
+embedding:
+  provider: "local"
+  model: "nomic-embed-text"
+  batchSize: 50
+  useCache: true
+  maxTokens: 1024
+search:
+  semanticPolicy: degrade
+  hybridPolicy: degrade
+  maxSearchWindow: 2000
+  enforceVectorSqlParity: true

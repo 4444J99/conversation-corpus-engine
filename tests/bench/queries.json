@@ -1,0 +1,162 @@
+{
+  "schema": "cce.bench-queries.v1",
+  "queries": [
+    {
+      "id": "q000",
+      "query": "ev0000q",
+      "expected_text": "Evidence token ev0000q",
+      "expected_message": 1,
+      "expected_uid": "chatgpt-bench-0000"
+    },
+    {
+      "id": "q001",
+      "query": "ma0009q ledger",
+      "expected_text": "Marker ma0009q",
+      "expected_message": 0,
+      "expected_uid": "chatgpt-bench-0009"
+    },
+    {
+      "id": "q002",
+      "query": "fu0018q",
+      "expected_uid": "chatgpt-bench-0018"
+    },
+    {
+      "id": "q003",
+      "query": "compass ma0027q",
+      "expected_text": "Marker ma0027q",
+      "expected_uid": "chatgpt-bench-0027"
+    },
+    {
+      "id": "q004",
+      "query": "ev0036q",
+      "expected_text": "Evidence token ev0036q",
+      "expected_message": 1,
+      "expected_uid": "chatgpt-bench-0036"
+    },
+    {
+      "id": "q005",
+      "query": "ma0045q quartz",
+      "expected_text": "Marker ma0045q",
+      "expected_message": 0,
+      "expected_uid": "chatgpt-bench-0045"
+    },
+    {
+      "id": "q006",
+      "query": "fu0054q",
+      "expected_uid": "chatgpt-bench-0054"
+    },
+    {
+      "id": "q007",
+      "query": "signal ma0063q",
+      "expected_text": "Marker ma0063q",
+      "expected_uid": "chatgpt-bench-0063"
+    },
+    {
+      "id": "q008",
+      "query": "ev0072q",
+      "expected_text": "Evidence token ev0072q",
+      "expected_message": 1,
+      "expected_uid": "chatgpt-bench-0072"
+    },
+    {
+      "id": "q009",
+      "query": "ma0081q ledger",
+      "expected_text": "Marker ma0081q",
+      "expected_message": 0,
+      "expected_uid": "chatgpt-bench-0081"
+    },
+    {
+      "id": "q010",
+      "query": "fu0090q",
+      "expected_uid": "chatgpt-bench-0090"
+    },
+    {
+      "id": "q011",
+      "query": "compass ma0099q",
+      "expected_text": "Marker ma0099q",
+      "expected_uid": "chatgpt-bench-0099"
+    },
+    {
+      "id": "q012",
+      "query": "ev0108q",
+      "expected_text": "Evidence token ev0108q",
+      "expected_message": 1,
+      "expected_uid": "chatgpt-bench-0108"
+    },
+    {
+      "id": "q013",
+      "query": "ma0117q quartz",
+      "expected_text": "Marker ma0117q",
+      "expected_message": 0,
+      "expected_uid": "chatgpt-bench-0117"
+    },
+    {
+      "id": "q014",
+      "query": "fu0126q",
+      "expected_uid": "chatgpt-bench-0126"
+    },
+    {
+      "id": "q015",
+      "query": "signal ma0135q",
+      "expected_text": "Marker ma0135q",
+      "expected_uid": "chatgpt-bench-0135"
+    },
+    {
+      "id": "q016",
+      "query": "ev0144q",
+      "expected_text": "Evidence token ev0144q",
+      "expected_message": 1,
+      "expected_uid": "chatgpt-bench-0144"
+    },
+    {
+      "id": "q017",
+      "query": "ma0153q ledger",
+      "expected_text": "Marker ma0153q",
+      "expected_message": 0,
+      "expected_uid": "chatgpt-bench-0153"
+    },
+    {
+      "id": "q018",
+      "query": "fu0162q",
+      "expected_uid": "chatgpt-bench-0162"
+    },
+    {
+      "id": "q019",
+      "query": "compass ma0171q",
+      "expected_text": "Marker ma0171q",
+      "expected_uid": "chatgpt-bench-0171"
+    },
+    {
+      "id": "q020",
+      "query": "ev0180q",
+      "expected_text": "Evidence token ev0180q",
+      "expected_message": 1,
+      "expected_uid": "chatgpt-bench-0180"
+    },
+    {
+      "id": "q021",
+      "query": "ma0189q quartz",
+      "expected_text": "Marker ma0189q",
+      "expected_message": 0,
+      "expected_uid": "chatgpt-bench-0189"
+    },
+    {
+      "id": "q022",
+      "query": "fu0198q",
+      "expected_uid": "chatgpt-bench-0198"
+    },
+    {
+      "id": "q023",
+      "query": "signal ma0207q",
+      "expected_text": "Marker ma0207q",
+      "expected_uid": "chatgpt-bench-0207"
+    },
+    {
+      "id": "q024",
+      "query": "ev0216q",
+      "expected_text": "Evidence token ev0216q",
+      "expected_message": 1,
+      "expected_uid": "chatgpt-bench-0216"
+    }
+  ]
+}

@@ -1,0 +1,351 @@
+{
+  "schema": "ai-exports-custody-receipt.v2",
+  "kind": "receipt",
+  "subject": "custody-ai-exports-second-copy",
+  "date": "20261030",
+  "observed_utc": {
+    "inventory_start": "2026-10-30T21:14:17Z",
+    "copy_start": "2026-10-30T21:24:11Z",
+    "copy_end": "2026-10-30T21:30:42Z"
+  },
+  "supersedes": {
+    "repo": "4444J99/limen",
+    "repo_state": "archived read-only; the old record is stale and frozen there",
+    "receipt": "docs/receipts/receipt-custody-ai-exports-second-copy-20261018.json",
+    "receipt_file_sha256": "3f83e679c169bd612cb95e7b6f19dac6ad65d2779a9401e4d82ec2bbddb90ed1",
+    "doc_section": "docs/architecture/ai-exports-archive.md, section Custody",
+    "claims_found_false_on_2026-10-30": [
+      "independent_physical_devices: true, destination /Volumes/T7Recovery: no volume with the recorded UUID 0287E02B-989A-419B-A7CA-B4BCE4ECA1FF is mounted; the only T7 attached (diskutil: Device / Media Name PSSD T7, 1.0 TB, disk6) now carries the volume TimeMachine (UUID 9E589481-02AB-473E-9289-E016C07279B6), and its former content sits in Archive4T/t7-absorbed-20261025",
+      "excluded.chatgpt: 'account export already replicated on two independent devices': the only remaining replica of the raw ChatGPT zip and the delta file is on Archive4T, the same physical disk as Scratch",
+      "doc: 'Only the T7Recovery copy is independent': it no longer exists as an independent copy"
+    ],
+    "old_receipt_numbers_still_true": {
+      "files_in_claude_gemini_grok_perplexity": 3547,
+      "observed_files_in_claude_gemini_grok_perplexity": 3547
+    }
+  },
+  "devices": {
+    "originals": {
+      "volumes": [
+        {
+          "name": "Scratch",
+          "device": "disk9s3",
+          "uuid": "6C5332ED-17E1-44A6-AC1F-1EA4B9C17894"
+        },
+        {
+          "name": "Archive4T",
+          "device": "disk9s1",
+          "uuid": "45C8AA30-307B-41E2-908D-5112E93B4AF5"
+        }
+      ],
+      "apfs_container": "disk9",
+      "apfs_physical_store": "disk8s2",
+      "physical_whole_disk": "disk8",
+      "protocol": "USB",
+      "filevault": false,
+      "note": "Ingress is a third volume of the same container; CleanUnique is a sparsebundle stored on Archive4T"
+    },
+    "second_copy": {
+      "volume": "Data (internal boot disk)",
+      "device": "disk3s5",
+      "uuid": "8F59B553-84C3-48C5-8B71-2684BE4C3FB1",
+      "apfs_container": "disk3",
+      "apfs_physical_store": "disk0s2",
+      "physical_whole_disk": "disk0",
+      "location": "internal",
+      "filevault": true
+    },
+    "time_machine_volume": {
+      "name": "TimeMachine",
+      "device": "disk7s1",
+      "uuid": "9E589481-02AB-473E-9289-E016C07279B6",
+      "apfs_physical_store": "disk6s2",
+      "physical_whole_disk": "disk6",
+      "protocol": "USB",
+      "filevault": true,
+      "capacity_bytes": 999995129856,
+      "used_bytes": 830685908992,
+      "free_bytes": 169101950976,
+      "role": "Time Machine only; not used for this copy"
+    },
+    "t7_recovery": {
+      "status": "absent",
+      "recorded_uuid": "0287E02B-989A-419B-A7CA-B4BCE4ECA1FF",
+      "successor": "volume TimeMachine on disk6 (diskutil: Device / Media Name PSSD T7, 1.0 TB, USB)",
+      "basis": "the volume name T7Recovery and the single attached T7; that the recorded volume was the one on this disk is inferred from the name and from Archive4T/t7-absorbed-20261025, not from a retained volume UUID"
+    },
+    "independent_physical_devices": true,
+    "independence_scope": "different physical disks only (disk0 internal, disk8 external). Both disks sit with the same Mac, so this is not an offsite or versioned copy"
+  },
+  "roots": {
+    "R1": {
+      "label": "R1",
+      "path": "/Volumes/Scratch/ai-exports",
+      "role": "raw exports of all five providers plus the ChatGPT extract",
+      "files": 17107,
+      "dirs": 3852,
+      "bytes": 8459455280,
+      "ds_store_files": 14,
+      "hashed_files": 17100,
+      "hashed_bytes": 5447841264,
+      "unhashed_files_over_90mb": 7,
+      "unhashed_bytes_over_90mb": 3011614016,
+      "hashed_manifest_sha256": "c3e0848a7bbbc1d4b6aeafeee1c79f28a6b63c3689abeffee36d674de9c7e4cf",
+      "per_provider": {
+        "(top-level files)": {
+          "bytes": 42406,
+          "files": 2
+        },
+        "chatgpt": {
+          "bytes": 4929529913,
+          "files": 13558
+        },
+        "claude": {
+          "bytes": 635293243,
+          "files": 1103
+        },
+        "gemini": {
+          "bytes": 2035465389,
+          "files": 1367
+        },
+        "grok": {
+          "bytes": 850506222,
+          "files": 1074
+        },
+        "perplexity": {
+          "bytes": 8618107,
+          "files": 3
+        }
+      }
+    },
+    "R2": {
+      "label": "R2",
+      "path": "/Volumes/Archive4T/09_Engineering/limen-private/chatgpt-account-export-20261017",
+      "role": "ChatGPT raw zip, delta file and working set (custody replica of 2026-10-17)",
+      "files": 1789,
+      "dirs": 9,
+      "bytes": 4139223379,
+      "ds_store_files": 0,
+      "hashed_files": 1787,
+      "hashed_bytes": 331617711,
+      "unhashed_files_over_90mb": 2,
+      "unhashed_bytes_over_90mb": 3807605668,
+      "hashed_manifest_sha256": "d1cef220b69b1cfdec05c86dabbf839859523dbbd7c2576be94b826efa85a4fe",
+      "per_provider": null
+    },
+    "R3": {
+      "label": "R3",
+      "path": "/Volumes/Archive4T/t7-absorbed-20261025/item-0035",
+      "role": "content copy of claude, gemini, grok and perplexity absorbed from the old T7 (same disk as R1)",
+      "files": 3538,
+      "dirs": 2271,
+      "bytes": 3529805101,
+      "ds_store_files": 1,
+      "hashed_files": 3534,
+      "hashed_bytes": 2002145181,
+      "unhashed_files_over_90mb": 4,
+      "unhashed_bytes_over_90mb": 1527659920,
+      "hashed_manifest_sha256": "211d5d2146e58fb7c12119165523d1421d23ba8603634000c764a144e8db41da",
+      "per_provider": null
+    },
+    "derived_not_raw": {
+      "path": "/Volumes/Scratch/cce-corpus-store",
+      "note": "derived normalized/vault/site outputs of 2026-10-17; regenerable from the raw exports, not copied"
+    }
+  },
+  "single_copy_findings": {
+    "scope": "across R1, R2, R3, all on one physical disk (disk8) before the new copy",
+    "chatgpt_raw_zip": {
+      "file": "chatgpt-export-2026-10-16.zip",
+      "bytes": 3716726167,
+      "sha256_from_receipt": "8bf473010993a38178a39e67cfd6440dfb52f16c9e6bbc320ba15cb3cffb46f0",
+      "copies_before": 1,
+      "where": "R2 only"
+    },
+    "chatgpt_delta_file": {
+      "file": "chatgpt-bodies-20261017-delta.json",
+      "bytes": 90879501,
+      "sha256_from_receipt": "cde13ffd2ea2b8317218863501e3bc2688c88150f60d161e3698e087ea18d43e",
+      "copies_before": 1,
+      "where": "R2 only (absent from R1 and R3, and not a member of the raw zip)"
+    },
+    "chatgpt_extract_on_scratch": {
+      "files": 13558,
+      "zip_members": 13554,
+      "members_present_with_same_name_and_size": 13554,
+      "files_not_in_zip": [
+        ".DS_Store",
+        "chatgpt-inventory-20261017 (1).json",
+        "pages/.DS_Store",
+        "spaces/.DS_Store"
+      ],
+      "meaning": "the Scratch ChatGPT extract is the raw zip unpacked; every zip member is present at the same size"
+    },
+    "r2_only_content_files": 1753,
+    "r2_only_by_top_level": {
+      ".": 15,
+      "_custody": 5,
+      "codex-verification-170334Z": 1,
+      "review": 1732
+    },
+    "text_file_only_in_r1": "knowledge-base-brainstorms-chatgpt.txt (26,018 bytes; absent from R2 and R3)",
+    "r1_vs_r3": {
+      "scope": "the four provider folders claude, gemini, grok, perplexity (not the ChatGPT folder or R1's top-level files)",
+      "identical_hashed": 3533,
+      "identical_size_unhashed": 4,
+      "differing": 0,
+      "only_in_r1": 10,
+      "only_in_r1_are": "10 .DS_Store files",
+      "only_in_r3": 0
+    },
+    "r2_custody_manifest_vs_fresh_hashes": {
+      "manifest_entries": 1784,
+      "fresh_hash_agree": 1782,
+      "disagree": 0,
+      "entries_not_freshly_hashed": 2,
+      "entries_not_freshly_hashed_are": "the raw zip and the delta file (over 90 MB); their recorded sha256 is relied on"
+    }
+  },
+  "coverage_by_service": {
+    "time_machine": {
+      "scratch": "excluded (tmutil isexcluded)",
+      "archive4t": "excluded (tmutil isexcluded)",
+      "scratch_ai_exports": "excluded (tmutil isexcluded)",
+      "internal_workspace": "included (tmutil isexcluded)",
+      "latest_backup_before_copy": "2026-10-30-170321 (local time)",
+      "second_copy_path": "included (tmutil isexcluded, checked after the copy); no backup has captured it yet"
+    },
+    "backblaze": "not installed: no app, no /Library/Backblaze.bzpkg, no launch daemon or agent, no process; Archive4T carries only a .bzvol volume marker whose newest ping log is 2026-07-23",
+    "dropbox": "not installed: no app and no sync folder; ~/.dropbox holds leftovers with unlink.db dated 2026-10-24",
+    "icloud_drive": "no export root found by name to depth 5 (one unrelated 2025 text file matched)",
+    "google_drive_for_desktop": "no export root found by name to depth 5 under My Drive",
+    "rclone_gdrive_limen_custody": "226 objects, 2.322 GiB, encrypted archives and receipts; none named as an AI export",
+    "onedrive": "empty apart from .Trash",
+    "internal_disk_before_the_copy": "no copy of the raw zip, the delta file, the Gemini takeout zip, the Grok zip or the Perplexity zip by name: a find over the home tree (same-volume only, started before the new copy existed; exit 1 for one OneDrive trash timeout) and Spotlight name queries both returned nothing, and the source path recorded in the 2026-10-17 ChatGPT receipt no longer exists",
+    "other_copies_on_the_originals_disk": "a name search over Archive4T, Scratch, Ingress and the CleanUnique image finds the raw zip and the delta file only in R2; only trash and temp folders were unreadable"
+  },
+  "second_copy": {
+    "path": "/Users/4jp/Workspace/titan/state/private/custody-ai-exports-second-copy-20261030",
+    "layout": [
+      "scratch-ai-exports",
+      "archive4t-chatgpt-replica",
+      "_run"
+    ],
+    "method": "openrsync -a (protocol 29), no --delete, each transfer under a 3600 s deadline, background IO class",
+    "files": 18896,
+    "bytes": 12598678659,
+    "free_bytes_before": 89223860224,
+    "verification": {
+      "r1": {
+        "shasum_exit": 0,
+        "ok": 17100,
+        "failed": 0,
+        "manifest_lines": 17100,
+        "structure": {
+          "copy_bytes": 8459455280,
+          "copy_files": 17107,
+          "mtime_mismatch_count": 0,
+          "only_in_copy_count": 0,
+          "only_in_source_count": 0,
+          "size_mismatch_count": 0,
+          "source_bytes": 8459455280,
+          "source_files": 17107
+        },
+        "unhashed_large": [
+          {
+            "bytes": 987541095,
+            "copy_size_matches": true,
+            "path": "chatgpt/sites/projects/project-0002/source/repositories/repository-0001.bundle"
+          },
+          {
+            "bytes": 880178618,
+            "copy_size_matches": true,
+            "path": "gemini/takeout-20261016T170618Z-1-001.zip",
+            "zip_crc_test": "ok"
+          },
+          {
+            "bytes": 348034676,
+            "copy_size_matches": true,
+            "path": "grok/0c7db3b5-1e6c-453b-8294-88767df85f3a.zip",
+            "zip_crc_test": "ok"
+          },
+          {
+            "bytes": 250315831,
+            "copy_size_matches": true,
+            "path": "chatgpt/chat.html"
+          },
+          {
+            "bytes": 246097170,
+            "copy_size_matches": true,
+            "path": "chatgpt/file-TMWHGwmKw8sD5txyuEmXGs.dat"
+          },
+          {
+            "bytes": 202151084,
+            "copy_size_matches": true,
+            "path": "gemini/NotebookLM/(one notebook folder)/Artifacts/(one audio file).wav"
+          },
+          {
+            "bytes": 97295542,
+            "copy_size_matches": true,
+            "path": "claude/conversations.json"
+          }
+        ],
+        "source_unchanged_since_inventory": true
+      },
+      "r2": {
+        "shasum_exit": 0,
+        "ok": 1787,
+        "failed": 0,
+        "manifest_lines": 1787,
+        "structure": {
+          "copy_bytes": 4139223379,
+          "copy_files": 1789,
+          "mtime_mismatch_count": 0,
+          "only_in_copy_count": 0,
+          "only_in_source_count": 0,
+          "size_mismatch_count": 0,
+          "source_bytes": 4139223379,
+          "source_files": 1789
+        },
+        "unhashed_large": [
+          {
+            "bytes": 3716726167,
+            "copy_size_matches": true,
+            "path": "chatgpt-export-2026-10-16.zip",
+            "zip_crc_test": "ok"
+          },
+          {
+            "bytes": 90879501,
+            "copy_size_matches": true,
+            "path": "chatgpt-bodies-20261017-delta.json"
+          }
+        ],
+        "source_unchanged_since_inventory": true
+      },
+      "replica_custody_manifest_recorded_2026_10_17": {
+        "manifest_sha256": "8718e8c7ca5c6cd9c09c224af70db6d02c239a8cdd7f4b64890fd0a95a725f06",
+        "shasum_exit": 0,
+        "ok": 1784,
+        "failed": 0,
+        "covers_raw_zip_and_delta": true,
+        "delta_line": "cde13ffd2ea2b8317218863501e3bc2688c88150f60d161e3698e087ea18d43e  chatgpt-bodies-20261017-delta.json"
+      },
+      "all_ok": true,
+      "files_over_90mb_in_r1": "not hashed (size limit): checked by size, modification time and, for zips, a CRC member test",
+      "zips_and_delta_in_r2": "checked against the sha256 recorded in the replica's own _custody/MANIFEST.sha256, not re-hashed at source"
+    },
+    "metadata_scope": "content, permission bits and modification time; extended attributes, ACLs and birth times are not carried"
+  },
+  "independent_physical_devices": true,
+  "copy_count_after": {
+    "chatgpt_raw_zip_and_delta": 2,
+    "claude_gemini_grok_perplexity": 3,
+    "chatgpt_extract_and_text_file": 2,
+    "independent_devices_holding_every_raw_root": 2
+  },
+  "open_items": [
+    "no offsite or versioned copy exists; a ~12.6 GB cloud upload is not made over the phone hotspot (bulk-to-cloud budget)",
+    "the new copy lives on the Mac's internal disk: it must be re-homed to another independent device before this Mac is retired",
+    "Time Machine had not captured the new copy at write time (latest backup 2026-10-30-170321 predates it)"
+  ]
+}

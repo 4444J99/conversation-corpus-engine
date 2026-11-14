@@ -84,7 +84,10 @@ class SchemaValidationTests(unittest.TestCase):
 
             self.assertTrue(result["valid"], result["errors"])
 
-    def test_validate_real_import_audit_and_near_duplicates_artifacts(self) -> None:
+    def test_validate_real_projector_contract_artifact(self) -> None:
+        # The rewire (#78) retired the importers' import-audit and
+        # near-duplicates files; the artifact a real import now validates is
+        # the projector's corpus contract.
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_root = Path(tmpdir)
             bundle_root = workspace_root / "claude-export"
@@ -168,17 +171,14 @@ class SchemaValidationTests(unittest.TestCase):
                 name="Claude History Memory",
             )
 
-            audit_result = validate_json_file(
-                "import-audit",
-                output_root / "corpus" / "import-audit.json",
-            )
-            near_duplicates_result = validate_json_file(
-                "near-duplicates",
-                output_root / "corpus" / "near-duplicates.json",
+            contract_result = validate_json_file(
+                "corpus-contract",
+                output_root / "corpus" / "contract.json",
             )
 
-            self.assertTrue(audit_result["valid"], audit_result["errors"])
-            self.assertTrue(near_duplicates_result["valid"], near_duplicates_result["errors"])
+            self.assertTrue(contract_result["valid"], contract_result["errors"])
+            self.assertFalse((output_root / "corpus" / "import-audit.json").exists())
+            self.assertFalse((output_root / "corpus" / "near-duplicates.json").exists())
 
     def test_validate_source_policy_and_promotion_policy_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
