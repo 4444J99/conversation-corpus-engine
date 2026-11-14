@@ -89,15 +89,11 @@ def census(store: Path) -> dict[str, Any]:
             "(SELECT count(*) FROM ZCHATMESSAGESTOREDMODEL)"
         ).fetchone()
     per_chat: dict[str, dict[str, Any]] = {}
-    for chat, _index, created, is_user, size, _tasks in messages:
-        row = per_chat.setdefault(
-            chat, {"messages": 0, "user_turns": 0, "bytes": 0, "first": None, "last": None}
-        )
+    for chat, _index, _created, is_user, size, _tasks in messages:
+        row = per_chat.setdefault(chat, {"messages": 0, "user_turns": 0, "bytes": 0})
         row["messages"] += 1
         row["user_turns"] += 1 if is_user else 0
         row["bytes"] += int(size or 0)
-        row["first"] = created if row["first"] is None else min(row["first"], created)
-        row["last"] = created if row["last"] is None else max(row["last"], created)
     inventory = [
         {
             "chat_uuid": chat,
@@ -126,7 +122,7 @@ def census(store: Path) -> dict[str, Any]:
         "chats_with_cached_messages": len(per_chat),
         "cached_messages_first": message_days[0] if message_days else None,
         "cached_messages_last": message_days[-1] if message_days else None,
-        "cached_messages_without_a_chat_row": sum(1 for chat in per_chat if chat not in known),
+        "cached_messages_without_a_chat_row": sum(1 for m in messages if m[0] not in known),
         "rows_with_encrypted_body": {"chats": encrypted_rows[0], "messages": encrypted_rows[1]},
         "bodies": "encrypted container (ZENCRYPTEDPROTOBYTES, prefix 2EBAFECA); not read, not opened",
         "owner_export": OWNER_EXPORT,

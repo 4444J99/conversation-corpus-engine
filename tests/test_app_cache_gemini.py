@@ -123,3 +123,23 @@ def test_inventory_is_owner_only_and_the_cli_guards_git_visible_directories(
         ["app-cache", "gemini", "--store", str(tmp_path / "none"), "--out", str(tmp_path / "m")]
     )
     assert app_cache_commands.handle_app_cache(missing) == 2
+
+
+def test_orphan_messages_are_counted_per_message_and_null_timestamps_are_tolerated(
+    store: Path,
+) -> None:
+    con = sqlite3.connect(store)
+    con.execute(
+        "INSERT INTO ZCHATMESSAGESTOREDMODEL VALUES (10, 5, 0, 1, 3, NULL, 'c_orphan', 'm10', ?)",
+        (SENTINEL,),
+    )
+    con.execute(
+        "INSERT INTO ZCHATMESSAGESTOREDMODEL VALUES (11, 5, 0, 0, 4, NULL, 'c_two', 'm11', ?)",
+        (SENTINEL,),
+    )
+    con.commit()
+    con.close()
+    report = app_cache_gemini.census(store)
+    assert report["cached_messages"] == 5
+    assert report["cached_messages_without_a_chat_row"] == 2
+    assert report["cached_messages_first"] == report["cached_messages_last"] == "2026-10-22"
