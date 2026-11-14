@@ -20,9 +20,19 @@ archive_layout.py mints every file, folder and note name (and every wikilink) wi
 
 ## Privacy model
 
+An opt-in [encrypted publication layer](encrypted-publication.md) can package explicitly selected
+private files as ciphertext in a separate dedicated Git worktree. It does not change any of the
+plaintext write rules below. Its keys, selections, manifests after decryption and restored files
+remain private; ordinary `archive` commands never write plaintext into that publication tree.
+
 - Raw exports are read, never written, moved or deduplicated. Output may not overlap a source root.
 - Every write goes through `authorize_corpus_write`: the destination must be a strict descendant of
   a registered, non-symlinked, non-Git corpus store (see `cce corpus-store register`).
+- Commands that only read an archive (`search`, `turns`, `serve`) attach through
+  `authorize_corpus_read`: the same registration, path, symlink-on-the-way and Git-privacy checks,
+  without the two whole-store walks (nested Git metadata, symlinks) that write custody adds and
+  that cost tens of seconds on a large store. It returns a `CorpusReadAuthorization`, which no write
+  path accepts. `verify` and every command that writes keep the full write custody.
 - **Attachment bytes are never ingested.** Attachments appear as file names (and sizes) only.
   Claude's `extracted_content` is dropped unless `--include-attachment-text` is passed.
 - Account identity, billing, login history and settings files are listed as *not read*, on purpose.
@@ -43,6 +53,9 @@ cce corpus-store register --root /path/to/cce-corpus-store --project-root /path/
 cce archive build --export-root /path/to/ai-exports \
   --project-root /path/to/cce-site --corpus-store-root /path/to/cce-corpus-store
 
+# the same, with the limits spelled out (these are the defaults)
+cce archive build ... --note-bytes 102400 --folder-entries 1800 --shard-bytes 50331648
+
 cce archive search "kubernetes ingress" --provider claude --project-root … --corpus-store-root …
 cce archive serve --project-root … --corpus-store-root …      # http://127.0.0.1:8765/
 ```
@@ -56,7 +69,10 @@ extension and never opened, so a folder of captures with other documents beside 
 place: `--source copilot=/path/to/copilot-captures`.
 
 `--export-root` expects one folder per provider: `chatgpt/`, `claude/`, `gemini/` (including
-`NotebookLM/`), `grok/`, `perplexity/`, `copilot/`. Override any with `--source provider=PATH`. A
+`NotebookLM/`), `grok/`, `perplexity/`, `copilot/` (the `copilotreports` provider reads the
+`.docx`/`.txt` files of the same folder) and `local-memory/` (the `localmemory` provider). The
+coding-CLI, notes, Drive, document and agent families come from `--library-root`. Override any with
+`--source provider=PATH`. A
 ChatGPT account export is a snapshot; pass the live delta with `--chatgpt-extra delta.json` (it wins
 over the same conversation in the export). Output defaults to `<store>/archive-all/`. Every name
 below is minted by `derive_name` (see *Naming contract*), so `cce archive verify-names` accepts a
@@ -64,15 +80,207 @@ whole build:
 
 | Path | What |
 |---|---|
-| `manifest-all.json` | per-provider counts, denominators (`derived_ids`, `unnameable_ids`, `duplicates_folded`, `duplicates_folded_identical`, `duplicates_folded_differing`), channels read / not read, source sha256, naming / schema / reader versions, source fingerprint |
-| `provider-<p>/collection-<p>-conversations.jsonl`, `provider-<p>/index-<p>-conversations.jsonl` | the provider-neutral store: full conversations, and one light summary row each |
+| `manifest-all.json` | per-provider counts, denominators (`derived_ids`, `unnameable_ids`, `duplicates_folded`, `duplicates_folded_identical`, `duplicates_folded_differing`), turns by author (`authors`), the shard list with sizes and sha256 (`layout`), channels read / not read, source sha256, naming / schema / reader versions, source fingerprint |
+| `provider-<p>/shard-<p>-<yyyymm>.jsonl`, `provider-<p>/index-<p>-<yyyymm>.jsonl` | the provider-neutral store, sliced by provider and month: full conversations, and one light summary row each. A month that outgrows `--shard-bytes` rolls to `-002`, `-003`; a conversation with no real month goes to `undated` |
 | `index-all-enrichment.jsonl`, `report-all-topics.json` | topics and nearest neighbours per conversation; the topic hub table |
-| `vault-all/` | open this folder in Obsidian |
+| `vault-all/` | open this folder in Obsidian; conversations sit in a folder per month (see *The bounded layout*) |
 | `manifest-all-vault.json` | the files the vault build generated, kept beside the manifest so the vault holds only notes and Obsidian's own settings; a rebuild prunes what it no longer writes, and removes the `.cce-vault-manifest.json` an earlier build left inside the vault |
-| `database-all-search.sqlite` | FTS5 search database |
+| `database-all-turns/` | the turn store: SQLite shards by author (`container-all-authored`, `container-all-machine`), provider and month, each with two FTS5 indexes (see *The two containers*) |
 | `graph-all/` | `index-all-nodes.jsonl`, `index-all-edges.jsonl`, `graph-all.graphml`, `report-all-graph.json` |
-| `site-all/` | open `home-all.html` directly, or use `cce archive serve` |
+| `index-all-lineage.jsonl`, `index-all-digests.jsonl` | the lineage of generations: what each ingest added, changed or removed against the one before (append-only), and the content digest of every conversation as of the latest one (see *The site is a wiki*) |
+| `site-all/` | open `home-all.html` directly, or use `cce archive serve`; conversation pages sit in the same month folders as the vault; `hubs/` holds one page per topic hub; `report-all-changes.html` is the recent-changes page (see *The site is a wiki*) |
 | `feed-<p>-prompts.jsonl`, `receipt-<p>-prompts-<16hex>-<yyyymmdd>.json` | the prompt feed and its receipt, written by `cce archive project feed` (see *The prompt feed*) |
+
+### The bounded layout (layout version 3)
+
+An archive that cannot be opened is as lost as one that cannot be read. Two failures ruled it out:
+a handful of files so large that no editor, browser or indexer survives them (a 42 MB page for
+one thread, a 334 MB search database, 164 MB of ChatGPT in one file), and folders with thousands of
+entries (a custody walk over a million files before a server may start). Every surface now keeps to
+limits, and `cce archive census` checks any tree against them.
+
+| Limit | Default | What happens past it |
+|---|---|---|
+| `--note-bytes` | 102,400 (ceiling 131,072) | a note, page or hub page is **split into numbered parts**; nothing is truncated |
+| `--folder-entries` | 1,800 (ceiling 2,000) | a month folder spills into one folder per day, a day into hash buckets |
+| `--shard-bytes` | 48 MiB (data ceiling 64 MiB) | a provider-month shard rolls to `-002`, `-003` |
+| SQLite files | exempt from the size ceiling | they are paged by their engine, never rendered, and sharded by provider and month anyway |
+| one oversize conversation | exempt, by name, from the data ceiling | a conversation is never cut, so a row larger than the shard target is its own shard and the manifest marks it `oversize_row`; the census lists that file under `violations.exempt` only if it also exceeds the data ceiling |
+
+- **Splitting is lossless.** A message that does not fit is cut at line boundaries; a fenced code
+  block cut this way is closed at the end of the piece and reopened at the start of the next, so
+  each piece renders alone; one line longer than the cap is cut on a character boundary. Parts are
+  `part-<provider>-p002-<hex>` (the hex hashes the name of the note they continue) in a folder named
+  like the conversation note, each linking to the previous part, the start and the next. The
+  conversation note stays the first part, so every existing `[[wikilink]]` still resolves.
+  `archive_split.rejoin` returns the original text byte for byte, which the tests assert.
+- **Hubs paginate too.** A provider, month, topic or collection hub that outgrows a note continues
+  on `part-all-p002-<hex>` pages; the hub keeps its own name for page one.
+- **Folders.** `vault-all/conversations/month-all-202506/conversation-<uid>.md` (and the same under
+  `site-all/conversations/`). The plan is a pure function of the conversations and their part
+  counts, so a rebuild places every file where it was. Undated conversations go to `undated`.
+- `cce archive verify` fails on any file or folder past its ceiling (except an oversize-row shard
+  the manifest names), on a vault or site whose conversation count differs from the manifest, on
+  author or shard counts that do not reconcile, and on a family whose counts differ from its
+  source's own (the library's record and message counts; local memory's file accounting and the
+  proof that every folded conversation is already in its owning provider). A first-generation
+  store (no `layout_version`) is not held to the limits.
+
+### The two containers
+
+The atom is the **turn**: one message. Every turn has exactly one author:
+
+- `human` — the person typed or wrote it: role `user`, channel `typed` (a prompt typed into a chat
+  or a coding CLI; the prompt feed's own rule, so the human count of a chat provider equals its feed
+  rows, less abandoned-branch asks, plus the typed turns the feed skipped for holding no text, plus
+  the `written` turns) or channel `written` (text the person authored or supplied outside a chat:
+  a note, a Drive document, a file they wrote, a project instruction, a notebook source);
+- `machine` — everything else: replies, reasoning, tool output, system text, memories and plans an
+  agent wrote, text a harness injected into a user turn, and every prompt a parent agent wrote
+  for a subagent.
+
+An author is claimed where the source proves it. Where it cannot, the reader classifies by
+provenance (who put the text into the system) and records the basis in the turn's
+`meta.author_basis`; the manifest counts the bases per provider (`author_basis`), so the doubt is
+visible and countable instead of silent.
+
+`author` is derived from the stored `role` and `channel`, so no conversation row changes. The turn
+store holds each turn once, in the container of its author:
+
+```
+database-all-turns/
+  manifest-all-turns.json
+  container-all-authored/provider-chatgpt/shard-chatgpt-202506.sqlite
+  container-all-machine/provider-chatgpt/shard-chatgpt-202506.sqlite
+```
+
+A shard holds its author's turns, their conversation rows, and FTS5 indexes over text and titles.
+`human + machine == messages` per provider and in total (checked by `verify`). Each turn carries
+the position of its conversation in the normalized shard (`cseq`), so `archive turns` without an
+author merges the two authors of a provider-month back into reading order: shard, conversation,
+turn. A conversation with no messages has no turn to hold, so its row goes to the machine
+container and it stays findable by title.
+
+```bash
+cce archive search "lantern wick" --author human          # what I typed
+cce archive search "lantern wick" --author machine --month 202506 --provider chatgpt
+cce archive turns --author human --provider chatgpt --month 202506 --limit 20
+cce archive census --root "$STORE/archive-all"              # sizes and fan-out, exit 1 on a violation
+cce archive fixture --out /tmp/fx --stress 120               # a 380 KB reply and 120 short conversations in one month
+```
+
+`/api/search` takes `author` and `month` as well as `provider` and `kind`; the MCP tool
+`cce_archive_search` takes `author` and `month`. A store built before the turn store answers from
+its single database and reports that it cannot filter by author or month.
+
+### Every family, one atom
+
+The store is two containers of one atom whatever the source: a chat turn, a coding-CLI turn, a
+note, a Drive document, a file and an agent memory are all a turn with an author, a provider (the
+source family), a source id, an ordinal and a timestamp, sharded and bounded the same way.
+
+| Provider (family) | Source | Human (container 1) | Machine (container 2) |
+|---|---|---|---|
+| `chatgpt` `claude` `gemini` `grok` `perplexity` `notebooklm` `copilot` | account exports, saved pages | typed prompts; project instructions and documents, notebook sources and notes, a Grok personality (`written`) | replies, reasoning, tool output, memories, notebook chat history and artifacts |
+| `claudecode` `codex` `opencode` `antigravity` `geminicli` `copilotcli` | library generation | what the person typed, a slash or shell command, pasted text | subagent prompts, harness-injected text, replies, reasoning, tool output |
+| `applenotes` `googledrive` | library generation | every turn (note body, table cells, document text) | — |
+| `documents` | library generation (authored files) | every turn (`written`) | — |
+| `agentmemory` `agentplans` | library generation (agent memory trees, plans, Codex outputs) | — | every turn |
+| `copilotreports` | the `.docx`/`.txt` reports saved beside Copilot pages | — | every turn |
+| `webcapture` | library generation (fetched web pages, see [knowledge library](knowledge-library.md#web-captures)) | — | every turn (the text of a page is another party's, never the person's) |
+| `localmemory` | the local-session memory folders | — | every record (conversation payloads are folded into their provider, account files excluded) |
+
+**The library bridge.** `cce library build` is the capture pipeline: it reads the coding CLIs'
+native stores, the notes and Drive captures and the document roots, merges what several captures
+say about one identity, and publishes a verified generation. `cce archive ingest --library-root
+<store|library-all|generation>` streams that generation's records into the archive providers
+above (`archive_read_library.py`), so nothing is re-read from an original and the archive's counts
+are held to the library's own: `verify` fails when a family's conversations plus folded
+duplicates differ from the library's record count, or the messages read differ from the library's
+message count. The library keeps every document under one provider; the bridge splits them by
+provenance into `documents`, `agentmemory` and `agentplans`. The ChatGPT pages the library holds
+beyond the account export join `chatgpt` (an id the export already has is folded, the export's
+version staying).
+
+**Who typed a CLI turn.** A coding CLI writes everything the model sees as a user turn
+(`archive_provenance.py`). A turn is human only in a root session and only when its text is not a
+harness wrapper: every user turn of a `subagent` session is a prompt the parent agent wrote, and
+a turn that opens with a known injected tag (`system-reminder`, `task-notification`,
+`environment_context`, `session_context`, …) or a known harness template (a compaction summary, a
+skill body, hook feedback) is machine. A slash command, a shell command and pasted text are the
+person's. A tag the rules do not know is machine and counted as `unclassified-tag:<name>`; a
+plain-text template the rules do not list stays human, so a CLI family's human count is an upper
+bound that the manifest's `author_basis` lets a reader audit. Antigravity's text is recovered from
+protobuf leaves with no role, so all of it is machine.
+
+```bash
+cce archive ingest --export-root "$EXPORTS" --library-root "$OLD_STORE" --provider claudecode --merge
+```
+
+`--merge` keeps the manifest entries of providers a call does not read, so a store this size is
+built one provider at a time and a failed one is read again alone; without it the manifest lists
+exactly the providers of the call. Before any selected provider is written, a merge checks its
+previous library and live-capture inputs. A library generation that lacks previously bridged
+source IDs refuses the merge. Live captures are checked by their normalized conversation IDs
+for every live-capture provider (the ChatGPT delta files, `copilot`, `copilotreports` and
+`localmemory`): omitting a capture file or refreshing a fixed filename with only newer records
+cannot remove earlier records, even when two input files share a basename. A complete account
+export may replace a ChatGPT delta if it contains all of those identities. A merge also refuses
+a selected provider whose source is absent (a missing or wrong folder) when the store already
+holds conversations for it, since the provider's receipt would become `absent` and its shards
+would be orphaned. Intentional removal requires
+`--allow-input-loss`, which is recorded in the
+manifest. Older manifests without the source-ID list use their existing library record count
+as the compatibility check; they cannot prove identity preservation within an equal-size
+replacement generation. Providers not selected keep their original input and build receipts.
+Captured identities remain protected across later merges after an account export absorbs them.
+A failed provider rebuild, with or without `--merge`, retains the previous shards and their
+input receipt, alongside a separate failed-attempt receipt (a provider that had no shards before
+has nothing to retain, and an unreadable previous manifest retains nothing); failure does not erase the protection for the next retry. The
+manifest totals keep counting those retained conversations, so the vault, site, search store,
+graph and turn store keep serving them too (the surfaces and the totals never disagree), and
+`cce archive verify` fails with `provider X failed: … (serving the N conversation(s) retained
+from the previous build)` until the provider is read again. The ingest summary marks such a
+provider `"retained": true`. The feed and corpus projections still skip any failed provider.
+Older live captures without recorded IDs cannot provide the same identity-level assurance;
+retain their original complete inputs for the first build that writes these receipts.
+
+The manifest records effective build options and the files actually read, with their SHA-256,
+byte size and declared origin (`account_export`, `live_capture`, or `library_generation`). The
+library database and its pointer are both hashed, and the generation's record/evidence/report
+fingerprints are carried with them. A hash cache reads a shared library database only once per
+ingest. Each input is keyed by its path relative to the provider's source root. A file outside
+the root (a delta, a library database) is keyed by its basename; when two inputs would share a
+key they are qualified as `external/<first 12 hex of the content SHA-256>/<name>`, so
+`source_files` and `inputs` never collapse them and no key holds an absolute host path. The
+`source_file` on each conversation row keeps the plain name and is paired with its
+`source_sha256`. Live captures are listed separately from account-export shards in the channel
+report: for ChatGPT, `channels.read` counts the export's shard files on one line and the delta
+files kept outside the export folder on the next, and together they equal the ChatGPT entries
+of `source_files` (a delta sits in `source_files` too, so a build with 29 shards and one delta
+lists 30 files and reports "29 conversation shard file(s)" plus "1 extra live capture
+file(s)"). This holds for a plain account export plus deltas; a library-bridged build also
+lists the library database and pointer in `source_files`, and its library line counts records,
+not files. A delta placed inside the export folder under a shard name (`conversations-NNN.json`)
+is counted on both lines and read twice (the second read folds as a duplicate); keep deltas
+outside the export folder.
+Origins describe the ingestion route; they are not a claim about who authored the text. An
+outer export ZIP that was unpacked before ingestion is not read by any reader, so it is recorded
+only when named: `--export-zip PROVIDER=PATH` (repeatable) hashes the ZIP and records its
+SHA-256, byte size and the origin `export_archive` in that provider's `inputs` (not in
+`source_files`, which lists what a reader opened) and its path in the build options. The
+provider must be part of the build and the file must exist, or the command exits 2. Naming a ZIP
+changes the source fingerprint, as any recorded input does. A ZIP that is not named is not
+recorded; preserve its original checksum in the capture receipt. Private source paths in build
+receipts belong in the private store, not in the code repository.
+
+A conversation larger than the shard target is never cut: its shard is that one row and
+the manifest marks it `oversize_row`. If that shard also exceeds the data ceiling, the
+census lists the file under `violations.exempt` with the reason. A shard larger than the
+target but within the ceiling needs no exemption in the census. A data file past the
+ceiling that the manifest does not name is still a violation.
+This exemption preserves the canonical record; it does not exempt an encrypted publication
+from its own unit, chunk, manifest or total-capacity limits.
 
 ### The normalized layer (version 2)
 
@@ -85,8 +293,9 @@ those two commands exit non-zero and ask for `cce archive build`.
 - Each **message** has an `id`: the vendor message id where the export has one (the ChatGPT node
   id, the Claude message uuid), otherwise `message-<provider>-<16hex>` over provider, conversation
   uid, role, timestamp and text, with an ordinal inside the hashed string for exact repeats. It
-  also has a `channel` (`typed`, `reply`, `thinking`, `tool`, `system`, `memory` or `project`) and
-  `typed_chars`, the characters the person typed before any appended attachment text.
+  also has a `channel` (`typed`, `reply`, `thinking`, `tool`, `system`, `memory`, `project` or
+  `written`) and `typed_chars`, the characters the person typed before any appended attachment
+  text.
 - A conversation with **no vendor id** (or one the naming contract cannot express) gets
   `derived-<16hex>` over provider, creation stamp and the first three messages' text. The manifest
   counts `derived_ids`, and `unnameable_ids` for the subset that had a vendor id the contract
@@ -107,16 +316,18 @@ those two commands exit non-zero and ask for `cce archive build`.
 |---|---|
 | `cce archive ingest` | read raw exports into the normalized store and write the manifest |
 | `cce archive analyze` | topic hubs and similarity |
-| `cce archive vault / database / graph / site` | one emitter each |
+| `cce archive vault / database / graph / site` | one emitter each (`database` builds the turn store) |
 | `cce archive build` | every stage, then `verify` |
 | `cce archive verify` | cross-check every surface against the manifest denominators |
-| `cce archive search QUERY` | FTS5 search (`--provider`, `--kind`, `--limit`, `--titles`, `--json`) |
+| `cce archive search QUERY` | FTS5 search (`--provider`, `--kind`, `--author`, `--month`, `--limit`, `--titles`, `--json`) |
+| `cce archive turns` | list the turns of a slice in reading order (`--author`, `--provider`, `--month`, `--uid`, `--limit`, `--offset`) |
+| `cce archive census --root DIR` | check a tree against the size and folder limits; exit 1 on a violation |
 | `cce archive serve` | site + `/api/search` on `127.0.0.1` (read-only) |
 | `cce archive names` | print the naming contract: kinds, scopes, version (`--json`) |
 | `cce archive verify-names --root DIR` | check every file and directory under `DIR` against the naming contract |
 | `cce archive project feed --root ARCHIVE --out DIR` | write each provider's prompt feed and receipt (`--provider` to pick) |
 | `cce archive project corpus --root ARCHIVE --out DIR` | write each provider's engine corpus folder for the federation (`--provider` to pick) |
-| `cce archive fixture --out DIR` | write deterministic synthetic ChatGPT and Claude exports that share one ask |
+| `cce archive fixture --out DIR [--stress N]` | write deterministic synthetic ChatGPT and Claude exports that share one ask; `--stress` adds one very long thread and N short conversations in one month |
 
 ## The prompt feed
 
@@ -137,9 +348,15 @@ text, so `--out` must be outside any Git work tree or ignored by it; otherwise t
   ordinal in the feed, `text_index` = 0, `text`, `timestamp`, `source_locator` =
   `<uid>#<event_ref>`, `body_kind` = `direct`, `provenance` = `unknown_user_input`. The writer has
   no provenance parameter: a vendor export can never claim to be operator-typed input.
-- **Determinism.** Rows are written in conversation order, then message order, with sorted keys,
-  so two runs give identical bytes. A repeated `event_ref` aborts the whole write and leaves no
-  file behind. A store that disagrees with its manifest is refused.
+- **Determinism.** Rows are written in the store's reading order (conversation shards oldest
+  month first, `undated` last, the reader's order inside a shard), then message order, with sorted
+  keys, so two runs over one store give identical bytes. A repeated `event_ref` aborts the whole
+  write and leaves no file behind. A store that disagrees with its manifest is refused.
+- **Order is not identity.** A first-generation store kept conversations in the reader's emission
+  order, so the feed of a rebuilt (sharded) store holds the same rows (same `session_ref`,
+  `event_ref`, `text`, `timestamp`, `source_locator`) at other positions: `event_index` and the
+  feed's sha256 change, nothing else does. A consumer keys a row on `(session_ref, event_ref)`
+  and treats `event_index` as the row's place in this one file.
 - **The receipt** holds counts and digests, never text: the feed's sha256, the row count, the
   alternate-branch count, the number of asks trimmed of attachment text, the excluded messages
   counted by reason (`kind-notebook`, `kind-memory`, `role-assistant`, `role-tool`, `empty-text`,
@@ -214,19 +431,22 @@ it. The conversation name is `conversation-` plus today's `stable_uid`, so exist
 reproduced byte for byte. One disclosed deviation from "`stable_uid` is frozen": a vendor id that
 is valid for `stable_uid` but that the contract cannot express as a name (an edge or doubled
 hyphen, or a name over 80 characters) is replaced by a derived id, with the original kept in
-`extra.vendor_id`, and the manifest counts it in `unnameable_ids`. `NAMING_VERSION` is recorded in every receipt; adding a kind or widening one bumps it (1: the first table; 2: the `manifest` kind accepts an optional subject), and names minted under an earlier version stay valid.
+`extra.vendor_id`, and the manifest counts it in `unnameable_ids`. `NAMING_VERSION` is recorded in every receipt; adding a kind or widening one bumps it (1: the first table; 2: the `manifest` kind accepts an optional subject; 3: the kinds `shard`, `part`, `day`, `bucket` and `container`, and the structural folder word `undated`; 4: the provider words of the families that are not web chat exports: `claudecode`, `codex`, `opencode`, `antigravity`, `geminicli`, `copilotcli`, `applenotes`, `googledrive`, `documents`, `agentmemory`, `agentplans`, `copilotreports`, `localmemory`; 5: the provider word `webcapture`), and names minted under an earlier version stay valid.
 `cce archive names --json` prints the full table and `cce archive verify-names` checks a tree. Only
-three plain folder words are outside the grammar (`conversations`, `hubs`, `meta`); everything
+four plain folder words are outside the grammar (`conversations`, `hubs`, `meta`, `undated`); everything
 else a build writes is a minted name, which `verify-names` confirms on a whole archive folder.
 
 `build` and `verify` exit non-zero if a provider failed to read, a vault wikilink dangles, the
-search database disagrees with the manifest, or the site has a different number of conversation
-pages than the manifest has conversations. A failing provider never stops the others.
+turn store disagrees with the manifest, the vault or the site has a different number of
+conversation notes or pages than the manifest has conversations, the author or shard counts do not
+reconcile, or a file or folder is past its ceiling. A failing provider never stops the others.
 
 ## The vault is the wiki
 
 The vault layout is lowercase throughout: `conversations/` (one `conversation-<uid>.md` per
-conversation), `hubs/`, `meta/`, and `home-all.md` at the top. `home-all.md` states the
+conversation, in a folder per month such as `month-all-202506/`, or in `undated/`; a thread too
+long for one note continues in `part-...` notes in a folder named like the note), `hubs/`, `meta/`,
+and `home-all.md` at the top. `home-all.md` states the
 denominators. `hubs/` holds one note per provider (`provider-chatgpt`), month
 (`month-all-202506`), topic (`topic-all-<term>`) and collection (`collection-<provider>-<subject>`;
 a project, notebook or GPT whose identifier is not a valid subject word is named by its 16 hex
@@ -243,6 +463,109 @@ of nearest neighbours and the transcript, with reasoning / tool / source message
 Message text is neutralised: `[[links]]`, `![[embeds]]`, `#tags` and leading `#` headings in a
 conversation cannot create vault structure. Rebuilds track the files they generated, prune the
 stale ones, and never touch notes you add yourself.
+
+## The site is a wiki
+
+The static site behaves like a wiki without a server and without a script on any conversation,
+hub or changes page (the CSP is the same one as before: no `script-src`). Every page stays under
+`--note-bytes`; each of the sections below is measured into the page budget, and none of them
+moves an existing conversation page URL.
+
+- **Message anchors.** Every message on a conversation page is a link target `#message-N` (N is
+  its 1-based place in the conversation, the fragment the library records use); a message split
+  across pieces keeps that id on its first piece and numbers the others `message-N-piece-K`. An
+  id is stable across rebuilds.
+- **Table of contents.** A page with three or more headings gets a contents list linking to
+  them (`message-N-hK`). The list is capped at 40 entries and each label at 60 characters, and is
+  shortened before a page may pass the cap; the headings themselves stay whole in the text.
+- **What links here.** The first page of every conversation lists the notes that link to it,
+  read from the vault's own wikilink graph (`archive_vault.incoming_links`): the hub notes
+  that list it (provider, month, topic, collection) and the conversations that link to it
+  (their *Related* lines), the first 25 by title with the count of the rest. A continuation
+  note counts as the note it continues. The section is always present.
+- **Topic pages.** Every topic hub has one static page, `site-all/hubs/topic-all-<term>.html`
+  (continued on `part-all-pNNN-<hex>` pages past the cap, spilled into bucket folders like the
+  vault's hubs). Topic chips and the topic entries under *What links here* link to them; a
+  term with no hub name keeps filtering the home page. Provider, month and collection hubs stay
+  vault-only.
+- **Author labels.** A message names its author after its role (`User · human`,
+  `Assistant · machine`) and carries `author-human` or `author-machine`: the two containers of
+  the turn store.
+- **Recent changes and history.** Each ingest records a *generation*: the source fingerprint of
+  its manifest, its parent's fingerprint, and the uids it added, changed (the content digest
+  differs; where a conversation was read from does not count) or removed against the generation
+  before, in `index-all-lineage.jsonl`, with the digests of the latest generation in
+  `index-all-digests.jsonl`. A generation is named by its fingerprint and the data's own latest
+  day, never a clock, and re-ingesting unchanged sources adds nothing. The first generation lists
+  everything as added; with `--merge`, a provider carried over from a store that predates the
+  lineage is digested from the shards it already holds, so it is part of that first generation
+  and not "added" by the next merge. `report-all-changes.html` lists exactly what the latest generation
+  added, changed and removed (continued on linked pages past the cap) above a table of the last
+  20 generations, and each conversation page ends with a *History* section: its newest 8
+  revisions, linking to their row on that page while the generation is still in the table.
+  Nothing is derived by diffing pages. The ledger and the digest file change together in
+  three steps, each safe to stop after: the new digests are written and synced to
+  `index-all-digests.jsonl.pending`; the ledger row is appended, carrying the sha256 of that
+  file in its `baseline` field; the pending file is renamed over the digest file. Every ingest
+  begins by settling an interrupted commit: a pending file the last row describes is renamed into
+  place, any other is discarded. What a crash leaves behind therefore does not depend on what the
+  next ingest reads: changed sources are diffed against the baseline the ledger describes, and no
+  generation is lost or recorded twice. `cce archive verify` reports a leftover pending file
+  and names the remedy (`cce archive ingest`). A digest file that is simply gone is rewritten by
+  an ingest of unchanged sources without adding a generation; if the sources changed meanwhile,
+  the next generation lists every conversation as added.
+
+  A crash only ever leaves a pending file the last row describes (finished by the next ingest)
+  or one it does not (discarded). What a crash cannot leave is a digest file that the last row's
+  `baseline` hash does not match with no pending file that does: the pending file was deleted or
+  edited after the row was written, or the digest file was replaced or restored from another
+  time. The next generation would be diffed against a stale baseline and the same generation
+  recorded twice, so an ingest refuses before it reads anything (exit 2, "lineage baseline
+  diverged from the ledger"; an edited pending file is left in place as evidence) and `verify`
+  fails with the same words (`lineage` status `baseline-diverged`). A ledger with an unreadable
+  line (a write cut short) is refused the same way and reported as `damaged`, naming the file
+  rather than a JSON error. A row without a `baseline` hash (written before rows carried it) has
+  nothing to compare. `verify` also lists any other `index-all-digests.jsonl.pending*` file as
+  stray: an ingest settles only its own pending file and never adopts another.
+
+  The remedy is explicit: `cce archive ingest|build --rebuild-lineage` digests the current
+  sources again (a provider this call did not read is digested from its stored shards),
+  replaces the baseline and appends exactly one row flagged `"rebuilt": true`. That row lists no
+  added, changed or removed uid, because the baseline that would say what changed is the one
+  that cannot be trusted. No ledger row is deleted: a damaged ledger keeps every readable row
+  and a copy of the damaged file is saved beside it as `index-all-lineage.jsonl.damaged`. A
+  ledger damaged in the middle (rows that still parse follow the unreadable line) is not
+  rebuilt, because the rebuild would drop those rows from the ledger: the ingest and `verify`
+  name the line, and the file has to be repaired by hand or restored from a copy. Not
+  detectable: a ledger and a digest file both rolled back together to an earlier consistent
+  state, and a ledger emptied of rows while a digest file remains (`verify` reports that one as
+  `empty`, an ingest does not refuse it).
+
+`cce archive verify` (and the verify that closes `build`) reports a `wiki` block (pages,
+messages and messages anchored, pages with a table of contents, backlink and history pages,
+turns by author, topic pages against topic hubs, generations, the `lineage` status and its note,
+recent-changes rows, links checked, dangling links) and fails when: a link, a fragment
+included, points at nothing (the home page's `#t=<term>` search fragment on a link to the home
+page is the one fragment that is not looked up as an anchor; any other fragment, one with an
+`=` included, must name an anchor of the page it points at); a message has no anchor or an id
+repeats; a page with three headings has no contents list; a page's *What links here* differs
+from the vault graph; a topic page is missing, has no hub, or lists other conversations than
+its hub; a message has no single author class or the labelled turns differ from the manifest's
+author counts; the lineage is broken (a ledger that holds no generation, digests with no
+ledger, a ledger with no digest file beside it, which is status `baseline-missing`, a ledger that
+does not chain or does not end at the manifest); the recent-changes page
+differs from the latest generation; or a page's history differs from the ledger.
+
+`verify` only reads. A store ingested before the lineage existed has neither lineage file, and
+that is not a failure: it passes with `lineage` status `absent` and a note in the wiki block,
+zero generations, an empty recent-changes page and no page history. It stays that way until
+`cce archive build` records its first generation (an ingest or merge does too, and
+`cce archive site` then shows it); that first generation lists everything as added, and the
+status becomes `recorded`. The pass depends on the site agreeing with the lineage: a site that
+lists changes or history while no ledger backs them still fails, as does any lineage that
+exists and is inconsistent. (A site built before the wiki features also lacks anchors, backlinks
+and history sections, and fails those checks until `cce archive site` rebuilds it; that is the
+site being stale, not the lineage.)
 
 ## Data-grounding rules the surfaces follow
 
@@ -264,9 +587,21 @@ tracker for provenance (`tracker.provenance(path)`) and for counters (`tracker.n
 Register it in `PROVIDER_SPECS` in `archive_ingest.py` and give it a synthetic fixture in
 `tests/archive_support.py` — never a real export.
 
+## Custody of the raw exports
+
+The raw provider exports this layer reads have their own custody record:
+[`custody/ai-exports-custody.md`](custody/ai-exports-custody.md) and its receipt. It replaces the Custody
+section of the archived `4444J99/limen` architecture page, which is stale and frozen. Read it before building
+a store from, or deleting anything derived from, the raw exports: it says where they live, which files exist
+only once, and which independent copy has been verified.
+
 ## Known limits
 
 - Topic hubs are lexical (TF-IDF); they are a navigation aid, not a semantic ontology.
+- The lineage ledger is append-only and carries every uid a generation touched; a first
+  generation of a very large archive is one long row. It is not rotated.
+- *What links here* shows 25 conversations and the recent-changes page lists the latest
+  generation only; the full history of one page is in its *History* section.
 - Attachment contents (images, PDFs, audio) are not searchable.
 - The bridge from this layer into engine corpora and federation (families, entities, review
   queue) is not built yet; the two layers share a store but not an index.

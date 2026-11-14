@@ -1,6 +1,6 @@
 # Conversation Corpus Engine
 
-[![CI](https://github.com/organvm-i-theoria/conversation-corpus-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/organvm-i-theoria/conversation-corpus-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/4444J99/conversation-corpus-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/4444J99/conversation-corpus-engine/actions/workflows/ci.yml)
 
 `conversation-corpus-engine` is the canonical Organ I implementation of the AI conversation corpus system extracted from the staging workspace at `Workspace/intake/ai-exports`.
 
@@ -112,7 +112,26 @@ database and a graph, all inside the private corpus store. See
 The unified private knowledge library extends this with versioned records from web archives,
 native coding sessions, and selected authored documents. It provides bounded CLI/MCP search,
 revision history, graph/index contracts, Obsidian-compatible Markdown, and a verified Notion
-import ZIP. See [docs/knowledge-library.md](docs/knowledge-library.md).
+import ZIP. Library builds now emit a stable progress event at the start of every phase
+(including previously silent fingerprint, verify, and artifact stages) with elapsed_seconds,
+and byte-limit failures include measured numbers for sizing retries. See [docs/knowledge-library.md](docs/knowledge-library.md).
+
+`cce library attribute` labels who wrote each span of each message (owner, agent, third party or unknown) with deterministic rules, and nothing is profile-eligible until the owner has reviewed a sample and the precision gate is met; see [docs/attributed-knowledge.md](docs/attributed-knowledge.md).
+
+Documents that came out of software repositories can only be told apart by their git history.
+`scripts/git_origin_hints.py` (stdlib only) reads history-only clones (bare or blobless, one
+`git log` pass per repository) and writes one `cce.origin-hints.v1` row per file: `agent` when every
+commit touching it is agent-signed (a `Co-Authored-By: Claude`-style trailer, a bot or agent author,
+the agent footer), `human` when none is, `mixed` otherwise.
+
+```bash
+python scripts/git_origin_hints.py --repos-dir /path/to/clones --wanted wanted.jsonl --out hints.jsonl
+cce library attribute --report --origin-hints hints.jsonl --library /path/to/library
+```
+
+Git cannot see renames (not followed), a human squash that holds agent text, a human committing agent
+output, text from before git, or rewritten history; a `human` hint never grants owner credit and a
+`mixed` hint withholds it. See [docs/attributed-knowledge.md](docs/attributed-knowledge.md#git-history-hints).
 
 Example:
 
@@ -178,6 +197,7 @@ When started with `--library-store-root` (or `CCE_LIBRARY_STORE_ROOT`), it also 
 - `src/conversation_corpus_engine/import_claude_export_corpus.py` — Claude bundle import
 - `src/conversation_corpus_engine/import_claude_local_session_corpus.py` — Claude local-session import
 - `src/conversation_corpus_engine/import_chatgpt_export_corpus.py` — ChatGPT conversations.json export import
+- `src/conversation_corpus_engine/export_projector.py` — shared rewire of legacy export importers through the archive corpus projector (see #78)
 - `src/conversation_corpus_engine/provider_discovery.py` — source-drop inbox discovery
 - `src/conversation_corpus_engine/provider_import.py` — provider import/onboarding orchestration
 - `src/conversation_corpus_engine/provider_refresh.py` — provider refresh orchestration over import, evaluation, and corpus promotion
@@ -208,4 +228,4 @@ Runtime state is written to `state/`, `federation/`, and `reports/`. Those direc
 
 ## Status
 
-This repo now serves as the canonical Organ I home of the conversation corpus system. The adjacent Meta consumer path is also live: `schema-definitions` canonizes the outward contracts, `organvm-engine` discovers and validates emitted surface bundles, and `organvm-mcp-server` exposes them to agent sessions. Operational hardening is underway: CI gates all pushes, ChatGPT is a first-class provider alongside Claude/Gemini/Grok/Perplexity/Copilot, and sanitized test fixtures document the expected export formats. Archive provider readers (including Copilot SingleFile research pages) are complete and CI-green on main. The unified private knowledge library (PR #86) adds versioned records, bounded retrieval, and portable exports over the existing archive and selected documents; see docs/knowledge-library.md. The next frontier is downstream dashboard consumption and additional provider adapters.
+This repo now serves as the canonical Organ I home of the conversation corpus system. The adjacent Meta consumer path is also live: `schema-definitions` canonizes the outward contracts, `organvm-engine` discovers and validates emitted surface bundles, and `organvm-mcp-server` exposes them to agent sessions. Operational hardening is underway: CI gates all pushes, ChatGPT is a first-class provider alongside Claude/Gemini/Grok/Perplexity/Copilot, and sanitized test fixtures document the expected export formats. Archive provider readers (including Copilot SingleFile research pages) are complete and CI-green on main. The unified private knowledge library (PR #86) adds versioned records, bounded retrieval, and portable exports over the existing archive and selected documents; see docs/knowledge-library.md. Library builds emit per-phase progress events with elapsed times and numbered byte-limit diagnostics. The next frontier is downstream dashboard consumption and additional provider adapters.

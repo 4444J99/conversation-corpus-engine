@@ -23,8 +23,18 @@ from .corpus_store import authorize_corpus_write
 from .library_documents import iter_documents
 from .library_native import iter_estate
 from .library_resume import DISK_FLOOR, copy_qualified_database, prepare_resume
-from .library_store import LIBRARY_SCHEMA, SCHEMA_SQL, Library, digest_json
+from .library_store import (
+    EVIDENCE_FINGERPRINT_SCHEMA,
+    LIBRARY_SCHEMA,
+    SCHEMA_SQL,
+    Library,
+    candidate_evidence_fingerprint,
+    digest_json,
+)
+from .library_vault import PROFILE_NONE, VAULT_PROFILES
+from .web_capture import DEFAULT_MAX_ROW_BYTES, iter_web_captures
 
+DEFAULT_VAULT_PROFILE = PROFILE_NONE
 SOURCES_SCHEMA = "cce.library-sources.v1"
 REPORT_SCHEMA = "cce.library-build.v1"
 DIRECTORY = "library-all"
@@ -57,9 +67,11 @@ def _pointer(store_root: Path) -> dict[str, Any] | None:
     path = store_root / DIRECTORY / POINTER
     if path.is_symlink():
         raise ValueError("library pointer cannot be a symlink")
-    if not path.exists():
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return None
-    value = json.loads(path.read_text(encoding="utf-8"))
+    value = json.loads(raw)
     if value.get("schema") != "cce.library-current.v1":
         raise ValueError("unknown library pointer schema")
     return value
@@ -95,12 +107,15 @@ def current_generation(store_root: Path) -> Path | None:
 def _validate_manifest(manifest: dict[str, Any]) -> dict[str, int]:
     if manifest.get("schema") != SOURCES_SCHEMA:
         raise ValueError(f"source manifest must use {SOURCES_SCHEMA}")
-    for key in ("archives", "snapshot_archives", "estate_databases"):
+    for key in ("archives", "snapshot_archives", "estate_databases", "web_captures"):
         values = manifest.get(key, [])
         if not isinstance(values, list) or any(
             not isinstance(value, str) or not Path(value).is_absolute() for value in values
         ):
             raise ValueError(f"{key} must list explicit absolute source paths")
+    row_limit = manifest.get("web_capture_max_row_bytes", DEFAULT_MAX_ROW_BYTES)
+    if isinstance(row_limit, bool) or not isinstance(row_limit, int) or row_limit <= 0:
+        raise ValueError("web_capture_max_row_bytes must be positive")
     if not isinstance(manifest.get("documents", []), list):
         raise ValueError("documents must be a list of explicit source declarations")
     resume_generation = manifest.get("resume_generation")
@@ -115,7 +130,13 @@ def _validate_manifest(manifest: dict[str, Any]) -> dict[str, int]:
         raise ValueError("indexed/export resume mode requires resume_generation")
     if resume_mode == "export" and any(
         manifest.get(key)
-        for key in ("archives", "snapshot_archives", "estate_databases", "documents")
+        for key in (
+            "archives",
+            "snapshot_archives",
+            "estate_databases",
+            "web_captures",
+            "documents",
+        )
     ):
         raise ValueError("export resume cannot include new source declarations")
     native_limit = manifest.get("native_max_source_bytes", 64 * 1024**2)
@@ -170,15 +191,35 @@ def build_library(
     project_root: Path,
     store_root: Path,
     progress: Any = None,
+    vault_profile: str = DEFAULT_VAULT_PROFILE,
 ) -> dict[str, Any]:
-    """Build a private immutable candidate; publication is a separate explicit operation."""
+    """Build a private immutable candidate; publication is a separate explicit operation.
+
+    ``vault_profile`` chooses the reading vault written beside the database: ``none`` (the
+    default) writes no vault at all, ``cards`` a small capped card vault and ``full`` whole
+    records split into capped linked parts. The index, graph, CSV and entry note are written
+    under every profile, and the profile is recorded in the report and the export manifest.
+    """
+    if vault_profile not in VAULT_PROFILES:
+        raise ValueError(
+            f"unknown vault profile {vault_profile!r}; choose one of {', '.join(VAULT_PROFILES)}"
+        )
     limits = _validate_manifest(manifest)
     resume_mode = manifest.get("resume_mode", "ingested")
     reuse_index = resume_mode in {"export", "indexed"}
     started = time.monotonic()
+
+    def emit(event: dict[str, Any]) -> None:
+        """Report a progress event; consumers get the original keys plus elapsed seconds."""
+        if progress:
+            progress({**event, "elapsed_seconds": round(time.monotonic() - started, 3)})
+
     working_budget = limits["max_output_bytes"] - FAILURE_RESERVE
     if working_budget <= 0:
-        raise ValueError("library output byte limit cannot reserve failure evidence")
+        raise ValueError(
+            "library output byte limit cannot reserve failure evidence: "
+            f"max_output_bytes={limits['max_output_bytes']} failure_reserve={FAILURE_RESERVE}"
+        )
     store_root = store_root.expanduser().absolute()
     previous_pointer = _pointer(store_root)
     previous = current_generation(store_root)
@@ -188,7 +229,7 @@ def build_library(
     destination = store_root / DIRECTORY / "generations" / name
     sources = [
         Path(path)
-        for key in ("archives", "snapshot_archives", "estate_databases")
+        for key in ("archives", "snapshot_archives", "estate_databases", "web_captures")
         for path in manifest.get(key, [])
     ]
     sources.extend(Path(row["root"]).expanduser() for row in manifest.get("documents", []))
@@ -204,20 +245,23 @@ def build_library(
         source_roots=sources,
         live_roots=[previous] if previous else [],
     )
-    if (
-        not reuse_index
-        and shutil.disk_usage(authorization.store_root).free
-        < limits["max_output_bytes"] + DISK_FLOOR
-    ):
-        raise ValueError(
-            "available storage does not cover declared library output budget plus 1 GiB"
-        )
-    if previous and (previous / "library.sqlite").stat().st_size > limits["max_output_bytes"]:
-        raise ValueError("previous library database exceeds declared output byte limit")
+    if not reuse_index:
+        free = shutil.disk_usage(authorization.store_root).free
+        if free < limits["max_output_bytes"] + DISK_FLOOR:
+            raise ValueError(
+                "available storage does not cover declared library output budget plus 1 GiB: "
+                f"free={free} max_output_bytes={limits['max_output_bytes']} floor={DISK_FLOOR}"
+            )
+    if previous:
+        previous_database_bytes = (previous / "library.sqlite").stat().st_size
+        if previous_database_bytes > limits["max_output_bytes"]:
+            raise ValueError(
+                "previous library database exceeds declared output byte limit: "
+                f"database={previous_database_bytes} max_output_bytes={limits['max_output_bytes']}"
+            )
     resume = None
     if resume_generation is not None:
-        if progress:
-            progress({"stage": "qualify_resume", "generation": str(resume_generation)})
+        emit({"stage": "qualify_resume", "generation": str(resume_generation)})
 
         def check_resume_deadline() -> None:
             if time.monotonic() - started > limits["max_seconds"]:
@@ -243,6 +287,7 @@ def build_library(
         "generation": str(destination),
         "source_manifest_hash": digest_json(manifest),
         "base_pointer": previous_pointer,
+        "vault_profile": vault_profile,
         "findings": [],
         "sources": [],
         "accepted_observations": 0,
@@ -288,8 +333,13 @@ def build_library(
         # old receipts retained during the atomic temporary-file replacement.
         current = sum(path.stat().st_size for path in destination.rglob("*") if path.is_file())
         ceiling = limits["max_output_bytes"] if failure else working_budget
-        if current + len(_json_bytes(value)) > ceiling:
-            raise ValueError("library output byte limit exceeded by receipt")
+        writing = len(_json_bytes(value))
+        if current + writing > ceiling:
+            raise ValueError(
+                "library output byte limit exceeded by receipt: "
+                f"current={current} writing={writing} ceiling={ceiling} "
+                f"max_output_bytes={limits['max_output_bytes']}"
+            )
         private_json(destination / filename, value)
         receipt_bytes = sum(
             path.stat().st_size
@@ -313,12 +363,20 @@ def build_library(
             measured_database_bytes = database.stat().st_size if database.exists() else 0
             next_size_check = now + 0.25
         if reuse_index and free_bytes - bytes_written < DISK_FLOOR:
-            raise ValueError("library build reached free-space floor")
+            raise ValueError(
+                "library build reached free-space floor: "
+                f"free={free_bytes} writing={bytes_written} floor={DISK_FLOOR}"
+            )
         if (
             measured_database_bytes + planned_output_bytes + bytes_written + receipt_bytes
             > working_budget
         ):
-            raise ValueError("library output byte limit exceeded")
+            raise ValueError(
+                "library output byte limit exceeded: "
+                f"database={measured_database_bytes} planned={planned_output_bytes} "
+                f"writing={bytes_written} receipts={receipt_bytes} "
+                f"budget={working_budget} max_output_bytes={limits['max_output_bytes']}"
+            )
         planned_output_bytes += bytes_written
 
     def hash_file(path: Path) -> str:
@@ -353,8 +411,8 @@ def build_library(
         write_receipt("sources.json", manifest)
         write_receipt("build-state.json", {"state": "building", "report": report})
         source_hashes_before_copy = assert_resume_unchanged()
-        if resume is not None and progress:
-            progress({"stage": "copy_resume", "generation": str(resume_generation)})
+        if resume is not None:
+            emit({"stage": "copy_resume", "generation": str(resume_generation)})
         database_source = (
             resume["database"]
             if resume is not None
@@ -375,7 +433,11 @@ def build_library(
                     * probe.execute("PRAGMA page_size").fetchone()[0]
                 )
         if initial_database_bytes + receipt_bytes > working_budget:
-            raise ValueError("library output byte limit exceeded by database copy or schema")
+            raise ValueError(
+                "library output byte limit exceeded by database copy or schema: "
+                f"database={initial_database_bytes} receipts={receipt_bytes} "
+                f"budget={working_budget} max_output_bytes={limits['max_output_bytes']}"
+            )
         if reuse_index:
             report["resume_copy"] = copy_qualified_database(
                 resume["database"],
@@ -393,6 +455,8 @@ def build_library(
                 destination / "library.sqlite",
                 previous=database_source,
                 compact_previous=resume is not None,
+                max_bytes=working_budget - receipt_bytes,
+                check_callback=check_bound,
             )
         with candidate as library, candidate.sql_progress(check_bound):
             source_hashes_after_copy = assert_resume_unchanged()
@@ -407,6 +471,9 @@ def build_library(
                 library.connection.execute(
                     f"PRAGMA max_page_count={max(1, (working_budget - receipt_bytes) // page_size)}"
                 )
+                if library.schema != LIBRARY_SCHEMA:
+                    # Indexed resume also copies its seed before any derived-schema migration.
+                    library.migrate_passages(check_callback=check_bound)
 
             if resume_mode == "export":
                 report["sources"] = [{"kind": "documents", "report": {"counts": {}}}]
@@ -422,8 +489,8 @@ def build_library(
                     report["changed_records"] += int(change["changed"])
                     if change["changed"]:
                         changed_uids.add(change["uid"])
-                    if progress and report["accepted_observations"] % 100 == 0:
-                        progress(
+                    if report["accepted_observations"] % 100 == 0:
+                        emit(
                             {
                                 "accepted": report["accepted_observations"],
                                 "changed": report["changed_records"],
@@ -501,6 +568,31 @@ def build_library(
                         }
                         for code, count in native_report.get("findings", {}).items()
                     )
+                if manifest.get("web_captures"):
+                    capture_report: dict[str, Any] = {}
+                    for item in iter_web_captures(
+                        manifest["web_captures"],
+                        report=capture_report,
+                        max_row_bytes=manifest.get(
+                            "web_capture_max_row_bytes", DEFAULT_MAX_ROW_BYTES
+                        ),
+                        max_records=max(0, limits["max_records"] - report["accepted_observations"]),
+                        check_callback=check_bound,
+                    ):
+                        accept(item)
+                    report["sources"].append({"kind": "web_captures", "report": capture_report})
+                    report["findings"].extend(capture_report["findings"])
+                    if capture_report.get("findings_omitted"):
+                        report["findings"].append(
+                            {
+                                "scope": "web_captures",
+                                "path": "",
+                                "line": 0,
+                                "code": "findings_truncated",
+                                "detail": "further finding details were counted but not retained",
+                                "count": capture_report["findings_omitted"],
+                            }
+                        )
                 document_report: dict[str, Any] = {}
                 for item in iter_documents(manifest.get("documents", []), report=document_report):
                     accept(item)
@@ -515,43 +607,51 @@ def build_library(
                 library.connection.execute(
                     f"PRAGMA max_page_count={max(1, (working_budget - receipt_bytes) // page_size)}"
                 )
-                if progress:
-                    progress({"stage": "index_blocks", "accepted": report["accepted_observations"]})
+                emit({"stage": "index_blocks", "accepted": report["accepted_observations"]})
                 report["phase"] = "indexing"
+                # index_blocks ends with Library.status(), so the next event also marks
+                # the index and the status summary as committed.
                 report["status"] = library.index_blocks(
                     check_callback=check_bound,
                     **({"uids": sorted(changed_uids)} if resume_mode == "indexed" else {}),
                 )
                 check_bound()
+            emit({"stage": "fingerprint", "records": report["status"]["records"]})
             report["record_fingerprint"] = digest_json(
                 [
                     (row["uid"], row["current_digest"], row["current_version"])
                     for row in library.rows()
                 ]
             )
-            report["evidence_fingerprint"] = digest_json(
-                {
-                    "library": library.evidence_fingerprint(),
-                    "sources": report["sources"],
-                    "findings": report["findings"],
-                    "manifest": report["source_manifest_hash"],
-                    "resume_source": report.get("resume_source"),
-                }
-            )
-            problems = [] if resume_mode == "export" else library.verify(check_callback=check_bound)
+            report["evidence_fingerprint_schema"] = EVIDENCE_FINGERPRINT_SCHEMA
+            report["evidence_fingerprint"] = candidate_evidence_fingerprint(library, report)
+            problems = []
+            if resume_mode != "export":
+                emit({"stage": "verify", "records": report["status"]["records"]})
+                problems = library.verify(check_callback=check_bound)
             if problems:
                 raise ValueError("library verification failed: " + "; ".join(problems[:10]))
-            if progress:
-                progress({"stage": "export", "records": report["status"]["records"]})
+            emit({"stage": "export", "records": report["status"]["records"]})
             report["phase"] = "exporting"
             report["exports"] = library_export.export_library(
-                library, destination, check_callback=check_bound
+                library, destination, check_callback=check_bound, vault_profile=vault_profile
             )
         check_bound()
+        emit(
+            {
+                "stage": "verify_export",
+                "database_bytes": measured_database_bytes,
+                "planned_output_bytes": planned_output_bytes,
+                "working_budget": working_budget,
+            }
+        )
         report["phase"] = "verifying"
         problems = library_export.verify_export(destination, check_callback=check_bound)
         if problems:
             raise ValueError("library export verification failed: " + "; ".join(problems[:10]))
+        # Hashing every artifact re-reads the whole output; announce it so the run is not
+        # mistaken for a stall after the export verification event.
+        emit({"stage": "artifacts"})
         artifacts = {}
         for file in sorted(destination.rglob("*")):
             if file.is_symlink():
@@ -566,7 +666,11 @@ def build_library(
                 }
         report["artifact_bytes"] = sum(item["bytes"] for item in artifacts.values())
         if report["artifact_bytes"] > limits["max_output_bytes"]:
-            raise ValueError("library output byte limit exceeded")
+            raise ValueError(
+                "library output byte limit exceeded: "
+                f"artifacts={report['artifact_bytes']} "
+                f"max_output_bytes={limits['max_output_bytes']}"
+            )
         report["artifacts"] = artifacts
         report["coverage_complete"] = (
             not report["findings"]
@@ -643,7 +747,10 @@ def verify_candidate(generation: Path) -> dict[str, Any]:
                 raise ValueError(f"candidate contains unexpected file: {relative}")
             total += path.stat().st_size
     if total > report["limits"]["max_output_bytes"]:
-        raise ValueError("candidate output byte limit exceeded including receipts")
+        raise ValueError(
+            "candidate output byte limit exceeded including receipts: "
+            f"total={total} max_output_bytes={report['limits']['max_output_bytes']}"
+        )
     for relative, expected in report["artifacts"].items():
         path = generation / relative
         if (

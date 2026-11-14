@@ -14,6 +14,7 @@ from conversation_corpus_engine.archive_model import (
     finalize_conversation,
     write_jsonl_atomic,
 )
+from conversation_corpus_engine.archive_shard import ShardWriter, month_key
 
 BASE_EPOCH = 1_700_000_000.0
 XSS = "<script>alert('x')</script>"
@@ -657,6 +658,26 @@ def write_store(paths: ArchivePaths, conversations: list[Conversation]) -> None:
     for provider, items in by_provider.items():
         write_jsonl_atomic(paths.conversations(provider), [c.to_dict() for c in items])
         write_jsonl_atomic(paths.index(provider), [c.index_row() for c in items])
+
+
+def write_sharded_store(
+    paths: ArchivePaths, conversations: list[Conversation], *, shard_bytes: int = 48 * 1024 * 1024
+) -> None:
+    """The bounded layout: each provider's conversations in provider-month shards."""
+    by_provider: dict[str, list[Conversation]] = {}
+    for conversation in conversations:
+        finalize_conversation(conversation)
+        by_provider.setdefault(conversation.provider, []).append(conversation)
+    for provider, items in by_provider.items():
+        directory = paths.provider_dir(provider)
+        writer = ShardWriter(directory, provider, shard_bytes=shard_bytes)
+        for item in items:
+            writer.add(
+                month_key(item.created or item.last_activity),
+                (json.dumps(item.to_dict(), sort_keys=True, ensure_ascii=False) + "\n").encode(),
+                (json.dumps(item.index_row(), sort_keys=True, ensure_ascii=False) + "\n").encode(),
+            )
+        writer.close()
 
 
 def topical_corpus() -> list[Conversation]:

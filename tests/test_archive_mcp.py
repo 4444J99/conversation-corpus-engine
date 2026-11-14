@@ -99,3 +99,33 @@ def test_stdio_round_trip_lists_the_archive_tool(archive_server) -> None:
     names = [tool["name"] for tool in response["result"]["tools"]]
     assert names[-1] == ARCHIVE_TOOL
     assert json.dumps(response)
+
+
+def test_default_cce_search_falls_back_to_the_configured_archive(archive_server) -> None:
+    response = archive_server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "cce_search", "arguments": {"query": "the"}},
+        }
+    )
+    assert response is not None
+    result = response["result"]
+    assert not result.get("isError")
+    assert "count" in result["structuredContent"]
+
+
+def test_cce_search_without_archive_or_registry_still_errors(tmp_path: Path) -> None:
+    server = CceMcpServer(default_project_root=tmp_path)
+    response = server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "cce_search", "arguments": {"query": "x"}},
+        }
+    )
+    assert response is not None
+    assert response["result"]["isError"] is True
+    assert "No searchable corpus" in response["result"]["content"][0]["text"]

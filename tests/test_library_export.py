@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import html
 import json
 import sys
 import zipfile
@@ -9,7 +10,12 @@ from pathlib import Path
 import pytest
 
 from conversation_corpus_engine.archive_model import Conversation, Message
-from conversation_corpus_engine.library_export import _agent_entry, export_library, verify_export
+from conversation_corpus_engine.library_export import (
+    _agent_entry,
+    _plain,
+    export_library,
+    verify_export,
+)
 from conversation_corpus_engine.library_store import Library
 
 REPEATED = "This is a shared paragraph explaining a recurring research idea, with enough precise original wording to remain a meaningful passage across independent records and source observations."
@@ -321,3 +327,43 @@ def test_verifier_returns_findings_for_malformed_manifest(tmp_path: Path) -> Non
     destination.mkdir()
     (destination / "export-manifest.json").write_text("[]")
     assert any("manifest" in problem for problem in verify_export(destination))
+
+
+def test_plain_escapes_each_special_once() -> None:
+    assert _plain("C# title") == "C&#35; title"
+    assert (
+        _plain("[bracket] _under_ *star* `tick`")
+        == "&#91;bracket&#93; &#95;under&#95; &#42;star&#42; &#96;tick&#96;"
+    )
+    assert _plain("A & B") == "A &amp; B"
+
+
+def test_plain_leaves_already_escaped_entities_alone() -> None:
+    assert _plain("&#35; already") == "&#35; already"
+    assert _plain("&#35; and #") == "&#35; and &#35;"
+    assert _plain("A &amp; B") == "A &amp; B"
+    assert _plain("100&#37; sure") == "100&#37; sure"
+    # Hex entities pass through with either case of x (PR #115 review).
+    assert _plain("&#x41; hex") == "&#x41; hex"
+    assert _plain("&#X41; hex") == "&#X41; hex"
+
+
+def test_plain_is_idempotent() -> None:
+    title = "A [bracket] #tag & stuff"
+    once = _plain(title)
+    assert "&&#35;" not in once
+    assert _plain(once) == once
+
+
+def test_plain_shows_the_character_a_literal_entity_names() -> None:
+    # Escaping is idempotent because an entity already present passes through unchanged. The
+    # price is stated in docs/knowledge-library.md: a source title that literally contains an
+    # entity is not told apart from an escaped character, so the reader sees the character the
+    # entity names ("Q&A", "see [1]"), not the entity text the title spelled out.
+    assert _plain("Q&amp;A") == "Q&amp;A"
+    assert html.unescape(_plain("Q&amp;A")) == "Q&A"
+    assert html.unescape(_plain("see &#91;1&#93;")) == "see [1]"
+    assert _plain("see [1]") == _plain("see &#91;1&#93;")
+    # Only the entities the escaper itself writes, or a reader already sees as inert text, pass
+    # through; an incomplete or unknown one is escaped like any other ampersand.
+    assert _plain("AT&T; &copy; &#;") == "AT&amp;T; &amp;copy; &amp;&#35;;"

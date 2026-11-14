@@ -19,6 +19,7 @@ from conversation_corpus_engine.archive_ingest import (
     DEFAULT_ARCHIVE_DIRNAME,
     PROVIDER_SPECS,
     ArchivePaths,
+    ProviderDropRefused,
     authorize_archive,
     failed_providers,
     ingest,
@@ -43,10 +44,18 @@ def test_ingest_builds_store_manifest_and_denominators(archive_env) -> None:
         export_root=archive_env.export, paths=archive_env.paths, authorization=archive_env.auth
     )
     providers = manifest["providers"]
-    assert {n: i["status"] for n, i in providers.items()} == {
-        **dict.fromkeys(["chatgpt", "claude", "gemini", "notebooklm", "grok", "perplexity"], "ok"),
-        "copilot": "absent",
-    }
+    # The web providers read the export; every other family is absent without its own source.
+    statuses = {n: i["status"] for n, i in providers.items()}
+    assert [n for n, status in statuses.items() if status == "ok"] == [
+        "chatgpt",
+        "claude",
+        "gemini",
+        "notebooklm",
+        "grok",
+        "perplexity",
+    ]
+    assert set(statuses.values()) == {"ok", "absent"}
+    assert list(statuses) == list(PROVIDER_SPECS)
     assert providers["chatgpt"]["conversations"] == 3
     assert providers["chatgpt"]["empty_conversations"] == 1
     assert providers["claude"]["kinds"] == {"chat": 3, "memory": 1, "notebook": 1}
@@ -82,6 +91,142 @@ def test_ingest_is_byte_identical_on_rerun(archive_env) -> None:
     }
     assert snapshot == again
     assert snapshot, "the second run compared something"
+
+
+def test_manifest_distinguishes_live_delta_and_records_effective_options(
+    archive_env, tmp_path: Path
+) -> None:
+    delta = tmp_path / "live-delta.json"
+    delta.write_text(json.dumps([gpt_conversation("live-1", "Live", [("user", "new")])]))
+    manifest = ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["chatgpt"],
+        options={"chatgpt_extra_files": [delta], "shard_bytes": 4000},
+        folder_entries=12,
+    )
+    info = manifest["providers"]["chatgpt"]
+    inputs = {item["source_file"]: item for item in info["inputs"]}
+    assert inputs["live-delta.json"]["origin"] == "live_capture"
+    assert inputs["live-delta.json"]["size_bytes"] == delta.stat().st_size
+    assert inputs["conversations-000.json"]["origin"] == "account_export"
+    assert info["build_options"]["chatgpt_extra_files"] == [str(delta.resolve())]
+    assert info["build_options"]["shard_bytes"] == 4000
+    assert info["build_options"]["folder_entries"] == 12
+    assert any("1 extra live capture" in item for item in info["channels"]["read"])
+    record = next(c for c in iter_store(archive_env.paths) if c.source_id == "live-1")
+    assert record.provenance["source_origin"] == "live_capture"
+    before = archive_env.paths.manifest.read_bytes()
+    with pytest.raises(ValueError, match="live capture.*allow-input-loss"):
+        ingest(
+            export_root=archive_env.export,
+            paths=archive_env.paths,
+            authorization=archive_env.auth,
+            providers=["chatgpt"],
+            merge=True,
+        )
+    assert archive_env.paths.manifest.read_bytes() == before
+
+
+def test_live_capture_can_be_the_only_input_and_empty_captures_remain_accounted_for(
+    archive_env, tmp_path: Path
+) -> None:
+    delta = tmp_path / "standalone.json"
+    delta.write_text(json.dumps([gpt_conversation("only-live", "Live", [("user", "hello")])]))
+    kwargs = {
+        "export_root": tmp_path / "no-account-export",
+        "paths": archive_env.paths,
+        "authorization": archive_env.auth,
+        "providers": ["chatgpt"],
+        "options": {"chatgpt_extra_files": [delta]},
+    }
+    info = ingest(**kwargs)["providers"]["chatgpt"]
+    assert info["status"] == "ok" and info["conversations"] == 1
+    assert info["inputs"][0]["origin"] == "live_capture"
+    delta.write_text("[]")
+    info = ingest(**kwargs)["providers"]["chatgpt"]
+    assert info["conversations"] == 0 and info["inputs"][0]["size_bytes"] == 2
+
+
+@pytest.mark.parametrize("same_basename", [False, True])
+def test_merge_keeps_previous_live_capture_identities_when_inputs_are_refreshed(
+    archive_env, tmp_path: Path, same_basename: bool
+) -> None:
+    first, second = tmp_path / "capture-a" / "live.json", tmp_path / "capture-b" / "live.json"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    a = gpt_conversation("delta-a", "A", [("user", "first capture")])
+    b = gpt_conversation("delta-b", "B", [("user", "second capture")])
+    first.write_text(json.dumps([a] if same_basename else [a, b]))
+    second.write_text(json.dumps([b]))
+    ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["chatgpt"],
+        options={"chatgpt_extra_files": [first, second] if same_basename else [first]},
+    )
+    before = {str(p): p.read_bytes() for p in archive_env.paths.root.rglob("*") if p.is_file()}
+    first.write_text(json.dumps([a]))
+    with pytest.raises(ValueError, match="live capture.*allow-input-loss"):
+        ingest(
+            export_root=archive_env.export,
+            paths=archive_env.paths,
+            authorization=archive_env.auth,
+            providers=["claude", "chatgpt"],
+            options={"chatgpt_extra_files": [first]},
+            merge=True,
+        )
+    assert {
+        str(p): p.read_bytes() for p in archive_env.paths.root.rglob("*") if p.is_file()
+    } == before
+    # Replacing the capture with a complete account export preserves the same identities.
+    (archive_env.export / "chatgpt" / "conversations-999.json").write_text(json.dumps([a, b]))
+    manifest = ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["chatgpt"],
+        merge=True,
+    )
+    assert manifest["providers"]["chatgpt"]["status"] == "ok"
+    assert {"chatgpt-delta-a", "chatgpt-delta-b"} <= {c.uid for c in iter_store(archive_env.paths)}
+    # The protection must survive absorption into an account export and later merges.
+    (archive_env.export / "chatgpt" / "conversations-999.json").unlink()
+    with pytest.raises(ValueError, match="live capture.*allow-input-loss"):
+        ingest(
+            export_root=archive_env.export,
+            paths=archive_env.paths,
+            authorization=archive_env.auth,
+            providers=["chatgpt"],
+            merge=True,
+        )
+
+
+def test_failed_merge_retains_the_previous_input_protection_receipt(
+    archive_env, tmp_path: Path
+) -> None:
+    delta = tmp_path / "delta.json"
+    delta.write_text(json.dumps([gpt_conversation("delta-only", "Live", [("user", "keep me")])]))
+    kwargs = {
+        "export_root": archive_env.export,
+        "paths": archive_env.paths,
+        "authorization": archive_env.auth,
+        "providers": ["chatgpt"],
+    }
+    original = ingest(**kwargs, options={"chatgpt_extra_files": [delta]})["providers"]["chatgpt"]
+    bad = archive_env.export / "chatgpt" / "conversations-999.json"
+    bad.write_text("{invalid json")
+    failed = ingest(**kwargs, options={"chatgpt_extra_files": [delta]}, merge=True)["providers"][
+        "chatgpt"
+    ]
+    assert failed["status"] == "failed"
+    assert failed["live_capture_uids"] == original["live_capture_uids"]
+    assert failed["layout"] == original["layout"]
+    bad.unlink()
+    with pytest.raises(ValueError, match="live capture.*allow-input-loss"):
+        ingest(**kwargs, merge=True)
 
 
 def test_ingest_isolates_a_failing_provider(archive_env) -> None:
@@ -363,3 +508,32 @@ def test_topics_handle_an_empty_store(archive_env) -> None:
     assert summary["documents"] == 0 and summary["hubs"] == 0
     write_store(archive_env.paths, [conv("grok", "solo", "Solo")])
     assert build_analysis(archive_env.paths)["documents"] == 1
+
+
+def test_subset_build_without_merge_refuses_to_drop_held_providers(archive_env) -> None:
+    ingest(export_root=archive_env.export, paths=archive_env.paths, authorization=archive_env.auth)
+    before = archive_env.paths.manifest.read_bytes()
+    with pytest.raises(ProviderDropRefused, match="--merge.*--drop-providers"):
+        ingest(
+            export_root=archive_env.export,
+            paths=archive_env.paths,
+            authorization=archive_env.auth,
+            providers=["claude"],
+        )
+    assert archive_env.paths.manifest.read_bytes() == before
+    merged = ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["claude"],
+        merge=True,
+    )
+    assert merged["providers"]["chatgpt"]["status"] == "ok"
+    dropped = ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["claude"],
+        drop_providers=True,
+    )
+    assert "chatgpt" not in dropped["providers"]

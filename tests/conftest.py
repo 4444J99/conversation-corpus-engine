@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,6 +14,32 @@ from conversation_corpus_engine.archive_ingest import (
     authorize_archive,
 )
 from conversation_corpus_engine.corpus_store import register_corpus_store
+
+# Every CCE_* variable the engine reads (corpus_store, library_commands, mcp_server, paths and
+# provider_catalog). Named here so the intent is reviewable; the fixture below also sweeps any
+# other CCE_* key, so a variable added later cannot leak in from a developer shell.
+CCE_ENVIRONMENT_VARIABLES = (
+    "CCE_CORPUS_STORE_ROOT",
+    "CCE_LIBRARY_STORE_ROOT",
+    "CCE_ARCHIVE_ROOT",
+    "CCE_WORKSPACE_ROOT",
+    "CCE_PROJECT_ROOT",
+    "CCE_SOURCE_DROP_ROOT",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolate_cce_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with no CCE_* variable exported by the developer's shell.
+
+    A shell that exports CCE_CORPUS_STORE_ROOT (a symlinked legacy store) made tests that assert
+    the unconfigured path see the configured one instead (issue #81). Clearing happens before the
+    test body, so tests that deliberately set a variable with monkeypatch.setenv or
+    patch.dict("os.environ", ...) still do. monkeypatch restores the original values afterwards.
+    """
+    ambient = sorted(name for name in os.environ if name.startswith("CCE_"))
+    for name in (*CCE_ENVIRONMENT_VARIABLES, *ambient):
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture

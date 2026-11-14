@@ -9,7 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from .archive_database import open_database, search, search_titles
+from . import archive_search
 from .archive_ingest import ArchivePaths
 from .archive_layout import SITE_HOME_FILENAME
 
@@ -122,26 +122,33 @@ class ArchiveHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "limit must be an integer"})
             return
         try:
-            connection = open_database(self.server.paths)
-        except FileNotFoundError:
-            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "search database not built"})
-            return
-        try:
             if path == "/api/titles":
-                results = search_titles(connection, text, limit=limit)
+                results = archive_search.search_titles(
+                    self.server.paths,
+                    text,
+                    providers=_csv(query.get("provider", [])) or None,
+                    months=_csv(query.get("month", [])) or None,
+                    limit=limit,
+                )
             else:
-                results = search(
-                    connection,
+                results = archive_search.search(
+                    self.server.paths,
                     text,
                     providers=_csv(query.get("provider", [])) or None,
                     kinds=_csv(query.get("kind", [])) or None,
+                    authors=_csv(query.get("author", [])) or None,
+                    months=_csv(query.get("month", [])) or None,
                     limit=limit,
                 )
+        except FileNotFoundError:
+            self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "search database not built"})
+            return
+        except archive_search.FilterNotSupported as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
         except sqlite3.Error as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": f"query rejected: {exc}"})
             return
-        finally:
-            connection.close()
         self._json(HTTPStatus.OK, {"query": text, "results": results})
 
 

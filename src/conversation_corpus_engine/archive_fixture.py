@@ -15,6 +15,11 @@ The fixture also drives the projector's exclusion paths: a Claude user turn that
 attachment (`empty-text`), a Claude memory archive and a project (`kind-memory`, `kind-notebook`),
 assistant and tool turns (`role-assistant`, `role-tool`), and a ChatGPT edit that leaves an
 abandoned branch (`alternate_rows`).
+
+`--stress` adds what the bounded layout exists for: one ChatGPT thread whose reply is hundreds of
+kilobytes (many lines, a long fenced block and one line of 120,000 characters), so a note must be
+split into parts, and a crowd of short conversations in a single month (spread over several days),
+so a small folder limit must spill the month into day folders. The default fixture is unchanged.
 """
 
 from __future__ import annotations
@@ -28,6 +33,9 @@ from typing import Any
 from . import archive_layout as layout
 
 FIXTURE_SCHEMA = "archive-fixture.v1"
+STRESS_CONVERSATIONS = 120
+STRESS_DAYS = 20
+LONG_THREAD_ID = "fixture-long-thread"
 SHARED_ASK = "How often should a lantern wick be trimmed to keep the flame steady?"
 EDITED_ASK = "How frequently should a lantern wick be trimmed?"
 BASE_EPOCH = 1_760_000_000.0
@@ -134,8 +142,47 @@ def _claude_conversation(
     }
 
 
-def _chatgpt_export() -> list[dict[str, Any]]:
-    return [
+def _long_reply() -> str:
+    """An invented reply of several hundred kilobytes: prose lines, a fenced block, one wide line."""
+    prose = [
+        f"Row {number:05d}: the lantern wick log continues with an invented trimming entry."
+        for number in range(3000)
+    ]
+    code = [
+        "```python",
+        *(f"step_{number:04d} = {number} * 3  # invented" for number in range(400)),
+    ]
+    code.append("```")
+    return "\n".join([*prose[:1500], *code, *prose[1500:], "wick" * 30_000])
+
+
+def _stress_chatgpt(count: int) -> list[dict[str, Any]]:
+    """The long thread, then `count` short conversations spread over STRESS_DAYS days of one month."""
+    stress = [
+        _chatgpt_conversation(
+            LONG_THREAD_ID,
+            "A very long thread",
+            2,
+            [("user", "Write out the whole wick log."), ("assistant", _long_reply())],
+        )
+    ]
+    for number in range(count):
+        stress.append(
+            _chatgpt_conversation(
+                f"fixture-stress-{number:04d}",
+                f"Stress conversation {number:04d}",
+                3 + number % STRESS_DAYS,
+                [
+                    ("user", f"Stress ask {number:04d}: how tight should knot {number} be?"),
+                    ("assistant", f"Snug, but not tight enough to cut: answer {number}."),
+                ],
+            )
+        )
+    return stress
+
+
+def _chatgpt_export(stress: int = 0) -> list[dict[str, Any]]:
+    base = [
         _chatgpt_conversation(
             "fixture-lantern-1",
             "Lantern care",
@@ -158,6 +205,7 @@ def _chatgpt_export() -> list[dict[str, Any]]:
             ],
         ),
     ]
+    return base + _stress_chatgpt(stress) if stress else base
 
 
 def _claude_export() -> list[dict[str, Any]]:
@@ -253,11 +301,11 @@ def _claude_memory() -> dict[str, Any]:
     }
 
 
-def expected_counts() -> dict[str, Any]:
+def expected_counts(stress: int = 0) -> dict[str, Any]:
     """What the feed projector must yield from the fixture, derived from the fixture's own data."""
     chatgpt_rows = sum(
         1
-        for conversation in _chatgpt_export()
+        for conversation in _chatgpt_export(stress)
         for node in conversation["mapping"].values()
         if node["message"] and node["message"]["author"]["role"] == "user"
     )
@@ -269,7 +317,7 @@ def expected_counts() -> dict[str, Any]:
     )
     alternates = sum(
         1
-        for conversation in _chatgpt_export()
+        for conversation in _chatgpt_export(stress)
         if f"{conversation['id']}-edit" in conversation["mapping"]
     )
     return {
@@ -278,9 +326,12 @@ def expected_counts() -> dict[str, Any]:
     }
 
 
-def write_fixture(out: Path) -> dict[str, Any]:
-    """Write the synthetic exports under `out`; return a payload that lists what was written."""
-    _dump(out / "chatgpt" / "conversations-000.json", _chatgpt_export())
+def write_fixture(out: Path, *, stress: int = 0) -> dict[str, Any]:
+    """Write the synthetic exports under `out`; return a payload that lists what was written.
+
+    `stress` is the number of extra short conversations to add beside the one very long thread
+    (0 writes the plain fixture)."""
+    _dump(out / "chatgpt" / "conversations-000.json", _chatgpt_export(stress))
     claude = out / "claude"
     _dump(claude / "conversations.json", _claude_export())
     _zip(claude / "projects-000.zip", {"projects/project-1.json": _claude_project()})
@@ -289,8 +340,14 @@ def write_fixture(out: Path) -> dict[str, Any]:
         "schema": FIXTURE_SCHEMA,
         "shared_ask_sha256": hashlib.sha256(SHARED_ASK.encode("utf-8")).hexdigest(),
         "shared_ask_providers": ["chatgpt", "claude"],
-        "providers": expected_counts(),
+        "providers": expected_counts(stress),
     }
+    if stress:
+        note["stress"] = {
+            "long_thread_id": LONG_THREAD_ID,
+            "short_conversations": stress,
+            "days": STRESS_DAYS,
+        }
     _dump(out / layout.FIXTURE_FILENAME, note)
     files = sorted(str(path.relative_to(out)) for path in out.rglob("*") if path.is_file())
     return {"out": str(out), "files": files, **note}

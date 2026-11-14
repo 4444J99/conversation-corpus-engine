@@ -6,6 +6,7 @@ import csv
 import html
 import json
 import shutil
+import sys
 import tempfile
 import zipfile
 from collections import Counter
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .answering import load_json, slugify, write_json, write_markdown
+from .corpus_store import git_visible_refusal
 from .import_markdown_document_corpus import import_markdown_document_corpus
 from .provider_catalog import get_provider_config
 from .provider_exports import collect_supported_export_files
@@ -447,6 +449,11 @@ def import_document_export_corpus(
 
 def main() -> int:
     args = parse_args()
+    # The corpus is the export's text as plaintext, and --output-root defaults to the working
+    # directory: refuse a folder Git can see before the export is read.
+    if (refusal := git_visible_refusal(args.output_root)) is not None:
+        print(f"output refused: {refusal}", file=sys.stderr)
+        return 2
     result = import_document_export_corpus(
         args.input_path,
         args.output_root,

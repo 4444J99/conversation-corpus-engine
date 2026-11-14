@@ -10,12 +10,52 @@ from html.parser import HTMLParser
 import pytest
 from archive_support import XSS, conv, topical_corpus, write_store
 
+from conversation_corpus_engine import archive_site
 from conversation_corpus_engine.archive_database import build_database
 from conversation_corpus_engine.archive_ingest import ingest
+from conversation_corpus_engine.archive_limits import Limits
 from conversation_corpus_engine.archive_model import Message
 from conversation_corpus_engine.archive_serve import ArchiveServer, start_in_thread
 from conversation_corpus_engine.archive_site import build_site, render_message_html, render_page
 from conversation_corpus_engine.archive_topics import build_analysis
+
+
+def test_page_navigation_resolves_only_the_neighbours(monkeypatch) -> None:
+    calls: list[int] = []
+    real = archive_site._relative
+
+    def counting(target: str, source: str) -> str:
+        calls.append(1)
+        return real(target, source)
+
+    monkeypatch.setattr(archive_site, "_relative", counting)
+    count = 60
+    pages = archive_site.render_pages(
+        conv("chatgpt", "long", "Long thread"),
+        [[f"<p>{number}</p>"] for number in range(count)],
+        [f"pages/undated/page-{number:03d}.html" for number in range(count)],
+        related=[],
+        topics=[],
+        titles={},
+        page_of=lambda _uid: None,
+        note_bytes=Limits().note_bytes,
+    )
+    assert len(pages) == count
+    assert len(calls) <= 6 * count, "navigation links must not cost a path per page per page"
+    assert "Previous" not in pages[0] and "Next" in pages[0]
+    assert "Next" not in pages[-1] and "Previous" in pages[-1]
+    assert '<a href="page-004.html">← Previous</a>' in pages[5]
+    assert '<a href="page-006.html">Next →</a>' in pages[5]
+
+
+def test_a_small_page_cap_still_holds_a_conversation_that_fits_one_page() -> None:
+    pages = render_page(
+        conv("chatgpt", "tiny", "test"), related=[], topics=[], titles={}, note_bytes=4096
+    )
+    assert len(pages) == 1 and len(pages[0].encode("utf-8")) <= 4096
+    heavy = conv("chatgpt", "heavy", "test", [("user", "word " * 2000), ("assistant", "ok")])
+    with pytest.raises(ValueError, match="no room"):
+        render_page(heavy, related=[], topics=[], titles={}, note_bytes=4096)
 
 
 class _Scripts(HTMLParser):
@@ -54,8 +94,9 @@ def test_site_has_shell_data_and_one_page_per_conversation(built) -> None:
         "index-all-topic-graph.js",
     ):
         assert (root / name).is_file(), name
-    page = root / "conversations" / "conversation-chatgpt-aaaa1111.html"
-    assert page.is_file() and page == env.paths.site_page("chatgpt", "chatgpt-aaaa1111")
+    page = env.paths.site_page("chatgpt", "chatgpt-aaaa1111")
+    assert page.is_file() and page.parent.parent == root / "conversations"
+    assert page.parent.name == "month-all-202311"
     payload = (root / "index-all-conversations.js").read_text(encoding="utf-8")
     assert payload.startswith("window.CCE = ")
     data = json.loads(payload.removeprefix("window.CCE = ").rstrip(";\n"))
@@ -131,7 +172,7 @@ def test_collapsed_kinds_use_details_and_hostile_titles_are_escaped() -> None:
     )
     assert "<details><summary>Assistant · reasoning" in render_message_html(message)
     conversation = conv("grok", "t", '"><img src=x onerror=alert(1)>')
-    page = render_page(conversation, related=[], topics=['x"><b>'], titles={})
+    page = "\n".join(render_page(conversation, related=[], topics=['x"><b>'], titles={}))
     assert "<img" not in page and "onerror=alert" not in page.replace(
         "&quot;&gt;&lt;img src=x onerror=alert(1)&gt;", ""
     )
@@ -189,7 +230,8 @@ def test_server_serves_static_pages_and_security_headers(server) -> None:
     assert headers["Cache-Control"] == "no-store"
     status, headers, _ = _get(server, "/home-all.js")
     assert status == 200 and headers["Content-Type"].startswith("text/javascript")
-    assert _get(server, "/conversations/conversation-chatgpt-aaaa1111.html")[0] == 200
+    page = server.paths.site_page("chatgpt", "chatgpt-aaaa1111")
+    assert _get(server, "/" + page.relative_to(server.paths.site).as_posix())[0] == 200
     assert _get(server, "/index.html")[0] == 404, "the old entry-point name is gone"
 
 
@@ -254,6 +296,6 @@ def test_api_reports_missing_search_database(archive_env) -> None:
 def test_pages_survive_empty_conversations_and_missing_fields() -> None:
     conversation = conv("grok", "e", "")
     conversation.messages = []
-    page = render_page(conversation, related=[], topics=[], titles={})
+    (page,) = render_page(conversation, related=[], topics=[], titles={})
     assert "<title>Untitled</title>" in page
     assert "0 messages" in page

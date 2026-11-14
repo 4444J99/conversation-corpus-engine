@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from collections.abc import Callable
@@ -8,14 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import archive_layout as layout
+from . import archive_read_library, archive_search
+from .archive_author import AUTHORS, reconcile
 from .archive_corpus import CorpusProjectionError, project_corpus
-from .archive_database import (
-    build_database,
-    open_database,
-    search,
-    search_titles,
-    verify_database,
-)
 from .archive_feed import FeedError, project_feed
 from .archive_fixture import write_fixture
 from .archive_graph import build_graph
@@ -23,31 +20,65 @@ from .archive_ingest import (
     DEFAULT_ARCHIVE_DIRNAME,
     PROVIDER_SPECS,
     ArchivePaths,
+    MergeInputLoss,
     authorize_archive,
+    check_export_zips,
     failed_providers,
+    has_bounded_layout,
     ingest,
     load_manifest,
+    retained_after_failure,
 )
+from .archive_limits import Limits, census_problems, take_census
+from .archive_lineage import LineageError
 from .archive_naming import names_payload, render_names_text, verify_names
 from .archive_serve import serve
-from .archive_site import build_site
+from .archive_site import build_site, count_conversation_pages
 from .archive_topics import build_analysis
-from .archive_vault import build_vault, verify_vault
+from .archive_turns import list_turns
+from .archive_vault import build_vault, count_conversation_notes, verify_vault
+from .archive_wiki import verify_site_wiki
 from .corpus_store import (
+    CorpusReadAuthorization,
     CorpusStoreError,
+    CorpusStoreUnavailableError,
     CorpusWriteAuthorization,
+    authorize_corpus_read,
+    require_write_authorization,
     resolve_configured_corpus_store_root,
 )
 from .paths import default_project_root
 
 STAGES = ("ingest", "analyze", "vault", "database", "graph", "site")
+# The actions that only read an archive: they attach without the write-custody tree walks.
+READ_ONLY_ACTIONS = frozenset({"search", "turns", "serve"})
 
 
 @dataclass(frozen=True)
 class ArchiveContext:
     paths: ArchivePaths
-    authorization: CorpusWriteAuthorization
+    authorization: CorpusWriteAuthorization | CorpusReadAuthorization
     export_root: Path | None
+    library_root: Path | None = None
+
+    def write_authorization(self) -> CorpusWriteAuthorization:
+        """The write custody a stage needs; refused when the context was opened read-only."""
+        return require_write_authorization(self.authorization)
+
+
+def library_source_folder(library_root: Path) -> Path:
+    """The folder custody must treat as the library source: the narrowest one that holds it.
+
+    A library is often built in the same store the archive is written to (`<store>/library-all`
+    beside `<store>/archive-all`); handing custody the store itself would make the source an
+    ancestor of the destination. So the source is the `library-all` folder (or the generation),
+    not the store that contains it.
+    """
+    try:
+        database, pointer = archive_read_library.locate(library_root)
+    except (OSError, ValueError, KeyError):
+        return library_root
+    return pointer.parent if pointer is not None else database.parent
 
 
 def open_context(
@@ -56,31 +87,167 @@ def open_context(
     corpus_store_root: Path | None,
     archive_root: Path | None,
     export_root: Path | None = None,
+    library_root: Path | None = None,
+    source_overrides: tuple[Path, ...] = (),
+    read_only: bool = False,
 ) -> ArchiveContext:
+    """Attach to the archive under the custody the command's effect calls for.
+
+    `read_only` is for a command that writes nothing: it keeps every cheap custody property and
+    skips the two whole-store tree walks that write custody runs. The context it returns holds a
+    `CorpusReadAuthorization`, which no stage can write with.
+    """
     store = resolve_configured_corpus_store_root(corpus_store_root)
+    archive = archive_root or store / DEFAULT_ARCHIVE_DIRNAME
+    if read_only:
+        if export_root or library_root or source_overrides:
+            raise ValueError("a read-only archive context takes no source roots")
+        read = authorize_corpus_read(project_root, archive, store)
+        return ArchiveContext(ArchivePaths(read.destination), read, None, None)
+    sources = [
+        *([export_root] if export_root else []),
+        *([library_source_folder(library_root)] if library_root else []),
+    ]
     authorization = authorize_archive(
         project_root=project_root,
-        archive_root=archive_root or store / DEFAULT_ARCHIVE_DIRNAME,
+        archive_root=archive,
         corpus_store_root=store,
-        source_roots=(export_root.resolve(),) if export_root else (),
+        source_roots=tuple(path.resolve() for path in [*sources, *source_overrides]),
     )
-    return ArchiveContext(ArchivePaths(authorization.destination), authorization, export_root)
+    return ArchiveContext(
+        ArchivePaths(authorization.destination), authorization, export_root, library_root
+    )
 
 
 def _say(message: str) -> None:
     print(f"[archive] {message}", file=sys.stderr, flush=True)
 
 
-def verify_archive(paths: ArchivePaths) -> list[str]:
-    """Cross-check every surface against the ingest manifest; empty list means consistent."""
+def oversize_row_files(manifest: dict[str, Any]) -> frozenset[str]:
+    """The normalized shards that are one conversation larger than a shard, by relative path.
+
+    The manifest records each one at ingest (`oversize_row`); the census exempts exactly these
+    files from the data ceiling and lists them with the reason.
+    """
+    return frozenset(
+        f"{layout.provider_dirname(name)}/{layout.shard_filename(name, shard['subject'])}"
+        for name, info in manifest.get("providers", {}).items()
+        for shard in info.get("layout", {}).get("shards", [])
+        if shard.get("oversize_row")
+    )
+
+
+def reconcile_source(name: str, info: dict[str, Any]) -> list[str]:
+    """Hold a provider's counts to its source's own account of itself.
+
+    A library family must have read every record and message the library lists for it, and
+    `conversations + folded duplicates` must equal that record count (a ChatGPT page the export
+    already held is folded, never lost). Local memory must account for every file as a record,
+    a folded conversation payload or a deliberate exclusion.
+    """
+    counters = info.get("reader_counters", {})
+    problems: list[str] = []
+    if counters.get("library_unclaimed"):
+        problems.append(
+            f"{counters['library_unclaimed']} library record(s) belong to no family and were "
+            "not read"
+        )
+    if "library_records" in counters:
+        for read, listed in (
+            ("bridge_records", "library_records"),
+            ("bridge_messages", "library_messages"),
+        ):
+            if counters.get(read, 0) != counters[listed]:
+                problems.append(
+                    f"read {counters.get(read, 0)} {read.split('_')[1]} of the "
+                    f"{counters[listed]} the library lists"
+                )
+        if name != "chatgpt":
+            held = info["conversations"] + info.get("duplicates_folded", 0)
+            if held != counters["library_records"]:
+                problems.append(
+                    f"{info['conversations']} conversation(s) + {info.get('duplicates_folded', 0)} "
+                    f"folded != {counters['library_records']} library record(s)"
+                )
+    if counters.get("folded_ids_missing"):
+        problems.append(
+            f"{counters['folded_ids_missing']} folded conversation id(s) are not conversations "
+            "of the owning provider"
+        )
+    if counters.get("folded_ids_unowned"):
+        problems.append(
+            f"{counters['folded_ids_unowned']} folded conversation id(s) sit in a capture folder "
+            "no provider owns"
+        )
+    if "files_seen" in counters:
+        accounted = (
+            info["conversations"]
+            + counters.get("files_folded", 0)
+            + counters.get("files_excluded", 0)
+        )
+        if accounted != counters["files_seen"]:
+            problems.append(
+                f"{counters['files_seen']} file(s) seen, {accounted} accounted for as records, "
+                "folded payloads or exclusions"
+            )
+    return problems
+
+
+def verify_layout(paths: ArchivePaths, manifest: dict[str, Any]) -> list[str]:
+    """Check the bounded layout's own promises: shards, author counts, notes, pages and limits."""
+    problems: list[str] = []
+    for name, info in manifest["providers"].items():
+        if info.get("status") != "ok" and not retained_after_failure(info):
+            continue
+        problems += [
+            f"{name}: {item}" for item in reconcile(info.get("authors", {}), info["messages"])
+        ]
+        problems += [f"{name}: {item}" for item in reconcile_source(name, info)]
+        shards = info.get("layout", {}).get("shards", [])
+        if sum(shard["conversations"] for shard in shards) != info["conversations"]:
+            problems.append(f"{name}: shard conversation counts do not sum to the manifest")
+        on_disk = {shard_path.name: shard_path for shard_path in paths.shard_files(name)}
+        if len(on_disk) != len(shards):
+            problems.append(
+                f"{name}: {len(on_disk)} shard file(s) on disk, manifest lists {len(shards)}"
+            )
+        for shard in shards:
+            path = paths.provider_dir(name) / layout.shard_filename(name, shard["subject"])
+            if not path.is_file():
+                problems.append(f"{name}: shard {shard['subject']} is missing")
+            elif path.stat().st_size != shard["bytes"]:
+                problems.append(
+                    f"{name}: shard {shard['subject']} differs in size from the manifest"
+                )
+    totals = manifest["totals"]
+    problems += [
+        f"totals: {item}" for item in reconcile(totals.get("authors", {}), totals["messages"])
+    ]
+    return problems
+
+
+def verify_archive(
+    paths: ArchivePaths, limits: Limits | None = None, *, report: dict[str, Any] | None = None
+) -> list[str]:
+    """Cross-check every surface against the ingest manifest; empty list means consistent.
+
+    A caller that passes a `report` dict gets the wiki block (what the site checked, with counts)
+    under its `wiki` key.
+    """
     try:
         manifest = load_manifest(paths)
     except FileNotFoundError as exc:
         return [str(exc)]
-    problems = [
-        f"provider {name} failed: {manifest['providers'][name].get('error', '')}"
-        for name in failed_providers(manifest)
-    ]
+    problems = []
+    for name in failed_providers(manifest):
+        info = manifest["providers"][name]
+        kept = (
+            f" (serving the {info.get('conversations', 0)} conversation(s) retained from the "
+            "previous build)"
+            if retained_after_failure(info)
+            else ""
+        )
+        problems.append(f"provider {name} failed: {info.get('error', '')}{kept}")
     total = manifest["totals"]["conversations"]
     enrichment = paths.enrichment
     if not enrichment.is_file():
@@ -88,8 +255,11 @@ def verify_archive(paths: ArchivePaths) -> list[str]:
     elif sum(1 for _ in enrichment.open(encoding="utf-8")) != total:
         problems.append("analysis row count differs from the manifest")
     problems += verify_vault(paths)
+    notes = count_conversation_notes(paths)
+    if notes != total:
+        problems.append(f"vault has {notes} conversation note(s), manifest has {total}")
     try:
-        problems += verify_database(paths)
+        problems += archive_search.verify_search_store(paths)
     except FileNotFoundError as exc:
         problems.append(str(exc))
     graph_summary = paths.graph_summary
@@ -100,10 +270,28 @@ def verify_archive(paths: ArchivePaths) -> list[str]:
         != total
     ):
         problems.append("graph conversation node count differs from the manifest")
-    pages = sum(1 for _ in paths.site_pages.glob("*.html")) if paths.site_pages.is_dir() else 0
+    pages = count_conversation_pages(paths)
     if pages != total:
         problems.append(f"site has {pages} conversation page(s), manifest has {total}")
+    wiki = verify_site_wiki(paths)
+    problems += wiki["problems"]
+    if report is not None:
+        report["wiki"] = wiki
+    if has_bounded_layout(manifest):
+        problems += verify_layout(paths, manifest)
+        problems += census_problems(
+            take_census(paths.root, limits, exempt=oversize_row_files(manifest))
+        )
     return problems
+
+
+def limits_from_args(args: argparse.Namespace) -> Limits:
+    """The limits a command was asked for; anything left out keeps its default."""
+    return Limits.scaled(
+        note_bytes=getattr(args, "note_bytes", None),
+        folder_entries=getattr(args, "folder_entries", None),
+        shard_bytes=getattr(args, "shard_bytes", None),
+    )
 
 
 def run_stages(
@@ -113,15 +301,26 @@ def run_stages(
     providers: list[str] | None = None,
     overrides: dict[str, Path] | None = None,
     options: dict[str, Any] | None = None,
+    limits: Limits | None = None,
+    merge: bool = False,
+    allow_input_loss: bool = False,
+    drop_providers: bool = False,
+    rebuild_lineage: bool = False,
 ) -> dict[str, Any]:
-    paths, authorization = context.paths, context.authorization
+    paths, authorization = context.paths, context.write_authorization()
+    limits = limits or Limits()
+    options = {
+        "shard_bytes": limits.shard_bytes,
+        "folder_entries": limits.folder_entries,
+        **(options or {}),
+    }
     result: dict[str, Any] = {}
     runners: dict[str, Callable[[], dict[str, Any]]] = {
         "analyze": lambda: build_analysis(paths),
-        "vault": lambda: build_vault(paths, authorization),
-        "database": lambda: build_database(paths, authorization),
+        "vault": lambda: build_vault(paths, authorization, limits=limits),
+        "database": lambda: archive_search.build_search_store(paths, authorization),
         "graph": lambda: build_graph(paths, authorization),
-        "site": lambda: build_site(paths, authorization),
+        "site": lambda: build_site(paths, authorization, limits=limits),
     }
     for stage in stages:
         _say(f"{stage} …")
@@ -135,11 +334,21 @@ def run_stages(
                 providers=providers,
                 overrides=overrides,
                 options=options,
+                library_root=context.library_root,
+                merge=merge,
+                allow_input_loss=allow_input_loss,
+                drop_providers=drop_providers,
+                rebuild_lineage=rebuild_lineage,
             )
             result[stage] = {
                 "totals": manifest["totals"],
                 "providers": {
-                    name: {k: info.get(k) for k in ("status", "conversations", "messages", "error")}
+                    name: {
+                        **{
+                            k: info.get(k) for k in ("status", "conversations", "messages", "error")
+                        },
+                        **({"retained": True} if retained_after_failure(info) else {}),
+                    }
                     for name, info in manifest["providers"].items()
                 },
             }
@@ -161,6 +370,23 @@ def add_archive_parser(subparsers: Any) -> None:
         parser.add_argument("--archive-root", type=Path)
         parser.add_argument("--json", action="store_true")
 
+    def limit_args(parser: argparse.ArgumentParser) -> None:
+        parser.add_argument(
+            "--note-bytes",
+            type=int,
+            help="cut a note or page into parts at this many bytes (default 102400)",
+        )
+        parser.add_argument(
+            "--folder-entries",
+            type=int,
+            help="spill a folder into sub-folders past this many entries (default 1800)",
+        )
+        parser.add_argument(
+            "--shard-bytes",
+            type=int,
+            help="roll a provider-month shard to a numbered sibling at this size (default 48 MiB)",
+        )
+
     def export_args(parser: argparse.ArgumentParser) -> None:
         parser.add_argument("--export-root", type=Path, required=True)
         parser.add_argument("--provider", action="append", choices=sorted(PROVIDER_SPECS))
@@ -178,33 +404,106 @@ def add_archive_parser(subparsers: Any) -> None:
             default=[],
             help="extra ChatGPT conversation JSON (live delta); wins over export shards",
         )
+        parser.add_argument(
+            "--export-zip",
+            action="append",
+            default=[],
+            metavar="PROVIDER=PATH",
+            help="the outer export ZIP a provider's folder was unpacked from: its SHA-256 and "
+            "size are recorded in the manifest (the ZIP itself is not read)",
+        )
         parser.add_argument("--include-attachment-text", action="store_true")
+        parser.add_argument(
+            "--library-root",
+            type=Path,
+            help="a knowledge-library store, `library-all` folder or generation: the source of "
+            "the coding-CLI, notes, Drive, document, agent memory and plan families",
+        )
+        parser.add_argument(
+            "--merge",
+            action="store_true",
+            help="keep the manifest entries of providers this call does not read, so a store "
+            "is built one provider at a time",
+        )
+        parser.add_argument(
+            "--allow-input-loss",
+            action="store_true",
+            help="explicitly allow --merge to omit a previous library or live-capture input",
+        )
+        parser.add_argument(
+            "--drop-providers",
+            action="store_true",
+            help="without --merge, allow the manifest to stop listing providers this call does "
+            "not read (their shards stay in the store)",
+        )
+        parser.add_argument(
+            "--rebuild-lineage",
+            action="store_true",
+            help="accept a lineage that cannot be trusted (a damaged ledger, or a digest "
+            "baseline the ledger does not describe): re-baseline from the current sources and "
+            "append one generation flagged rebuilt; no ledger row is deleted",
+        )
 
     ingest_parser = sub.add_parser("ingest", help="Read raw exports into the normalized store")
     common(ingest_parser)
     export_args(ingest_parser)
+    limit_args(ingest_parser)
     for name, text in (
         ("analyze", "Topic hubs and similarity"),
         ("vault", "Obsidian vault (the wiki)"),
-        ("database", "SQLite FTS5 search database"),
+        ("database", "Turn store: SQLite shards by author, provider and month"),
         ("graph", "Graph as JSONL + GraphML"),
         ("site", "Static archive site"),
         ("verify", "Cross-check every surface against the manifest"),
     ):
-        common(sub.add_parser(name, help=text))
+        stage_parser = sub.add_parser(name, help=text)
+        common(stage_parser)
+        if name in {"vault", "site", "verify"}:
+            limit_args(stage_parser)
     build = sub.add_parser(
         "build", help="ingest + analyze + vault + database + graph + site + verify"
     )
     common(build)
     export_args(build)
+    limit_args(build)
 
     search_parser = sub.add_parser("search", help="Full-text search the search database")
     common(search_parser)
     search_parser.add_argument("query")
     search_parser.add_argument("--provider", action="append", choices=sorted(PROVIDER_SPECS))
     search_parser.add_argument("--kind", action="append")
+    search_parser.add_argument(
+        "--author",
+        action="append",
+        choices=list(AUTHORS),
+        help="search only turns by this author (human = typed by the person)",
+    )
+    search_parser.add_argument(
+        "--month", action="append", help="search only this month, yyyymm or undated"
+    )
     search_parser.add_argument("--limit", type=int, default=15)
     search_parser.add_argument("--titles", action="store_true", help="search titles only")
+
+    turns_parser = sub.add_parser(
+        "turns", help="List the turns of one slice of the turn store, in reading order"
+    )
+    common(turns_parser)
+    turns_parser.add_argument("--author", choices=list(AUTHORS))
+    turns_parser.add_argument("--provider", choices=sorted(PROVIDER_SPECS))
+    turns_parser.add_argument("--month", help="yyyymm or undated")
+    turns_parser.add_argument("--uid", help="only the turns of this conversation")
+    turns_parser.add_argument("--limit", type=int, default=20)
+    turns_parser.add_argument("--offset", type=int, default=0)
+
+    census_parser = sub.add_parser(
+        "census", help="Check a tree against the size and folder limits (exit 1 on a violation)"
+    )
+    census_parser.add_argument("--root", type=Path, required=True)
+    census_parser.add_argument(
+        "--deadline", type=float, help="stop the walk after this many seconds"
+    )
+    census_parser.add_argument("--json", action="store_true")
+    limit_args(census_parser)
 
     serve_parser = sub.add_parser("serve", help="Serve the site with full-text search on loopback")
     common(serve_parser)
@@ -224,6 +523,15 @@ def add_archive_parser(subparsers: Any) -> None:
         help="Write deterministic synthetic exports (two providers sharing one ask) for tests",
     )
     fixture_parser.add_argument("--out", type=Path, required=True)
+    fixture_parser.add_argument(
+        "--stress",
+        nargs="?",
+        type=int,
+        const=120,
+        default=0,
+        metavar="N",
+        help="also write one very long thread and N short conversations in one month (default 120)",
+    )
 
     project = sub.add_parser("project", help="Project the normalized archive into another shape")
     project_sub = project.add_subparsers(dest="target", required=True)
@@ -248,6 +556,18 @@ def _overrides(raw: list[str]) -> dict[str, Path]:
         if not sep or name not in PROVIDER_SPECS or not value:
             raise ValueError(f"--source must be PROVIDER=PATH with a known provider, got: {item}")
         out[name] = Path(value)
+    return out
+
+
+def _export_zips(raw: list[str]) -> dict[str, list[Path]]:
+    out: dict[str, list[Path]] = {}
+    for item in raw:
+        name, sep, value = item.partition("=")
+        if not sep or name not in PROVIDER_SPECS or not value:
+            raise ValueError(
+                f"--export-zip must be PROVIDER=PATH with a known provider, got: {item}"
+            )
+        out.setdefault(name, []).append(Path(value))
     return out
 
 
@@ -289,69 +609,159 @@ def handle_archive(args: argparse.Namespace) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if report["ok"] else 1
     if action == "fixture":
-        print(json.dumps(write_fixture(args.out), indent=2, sort_keys=True))
+        print(json.dumps(write_fixture(args.out, stress=args.stress), indent=2, sort_keys=True))
         return 0
+    if action == "census":
+        exempt: frozenset[str] = frozenset()
+        with contextlib.suppress(FileNotFoundError, ValueError):
+            exempt = oversize_row_files(load_manifest(ArchivePaths(args.root)))
+        try:
+            report = take_census(
+                args.root, limits_from_args(args), deadline_seconds=args.deadline, exempt=exempt
+            )
+        except NotADirectoryError:
+            print(f"census root not found: {args.root}", file=sys.stderr)
+            return 2
+        report["problems"] = census_problems(report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report["ok"] else 1
     if action == "project":
         return _handle_project(args)
 
     export_root = getattr(args, "export_root", None)
+    library_root = getattr(args, "library_root", None)
     try:
         context = open_context(
             project_root=args.project_root,
             corpus_store_root=args.corpus_store_root,
             archive_root=args.archive_root,
             export_root=export_root,
+            library_root=library_root,
+            source_overrides=tuple(_overrides(getattr(args, "source", [])).values()),
+            read_only=action in READ_ONLY_ACTIONS,
         )
     except CorpusStoreError as exc:
         print(f"archive custody refused: {exc}", file=sys.stderr)
-        print(
-            "Register a private store first: cce corpus-store register --root <dir>",
-            file=sys.stderr,
-        )
+        if isinstance(exc, CorpusStoreUnavailableError):
+            print(
+                "Check that the store's volume is mounted and that the store and archive "
+                "roots exist.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "Register a private store first: cce corpus-store register --root <dir>",
+                file=sys.stderr,
+            )
         return 2
     paths = context.paths
 
     if action in {"ingest", "build"}:
         providers = args.provider or None
+        try:
+            export_zips = _export_zips(args.export_zip)
+            check_export_zips(export_zips, providers or list(PROVIDER_SPECS))
+        except ValueError as exc:
+            print(f"archive refused: {exc}", file=sys.stderr)
+            return 2
         options = {
             "chatgpt_extra_files": args.chatgpt_extra,
             "include_attachment_text": args.include_attachment_text,
+            "export_zips": export_zips,
         }
         stages = ("ingest",) if action == "ingest" else STAGES
-        result = run_stages(
-            context, stages, providers=providers, overrides=_overrides(args.source), options=options
-        )
-        problems = verify_archive(paths) if action == "build" else []
+        limits = limits_from_args(args)
+        try:
+            result = run_stages(
+                context,
+                stages,
+                providers=providers,
+                overrides=_overrides(args.source),
+                options=options,
+                limits=limits,
+                merge=args.merge,
+                allow_input_loss=args.allow_input_loss,
+                drop_providers=args.drop_providers,
+                rebuild_lineage=args.rebuild_lineage,
+            )
+        except MergeInputLoss as exc:
+            print(f"archive merge refused: {exc}", file=sys.stderr)
+            return 2
+        except LineageError as exc:
+            print(f"archive lineage refused: {exc}", file=sys.stderr)
+            return 2
+        verified: dict[str, Any] = {}
+        problems = verify_archive(paths, limits, report=verified) if action == "build" else []
         failed = [n for n, i in result["ingest"]["providers"].items() if i["status"] == "failed"]
-        payload = {"stages": result, "problems": problems, "ok": not problems and not failed}
+        payload = {
+            "stages": result,
+            "problems": problems,
+            "ok": not problems and not failed,
+            **({"wiki": verified["wiki"]} if "wiki" in verified else {}),
+        }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0 if payload["ok"] else 1
 
     if action in {"analyze", "vault", "database", "graph", "site"}:
-        result = run_stages(context, (action,))
+        try:
+            result = run_stages(context, (action,), limits=limits_from_args(args))
+        except LineageError as exc:
+            print(f"archive lineage refused: {exc}", file=sys.stderr)
+            return 2
         print(json.dumps(result[action], indent=2, sort_keys=True))
         return 0
 
     if action == "verify":
-        problems = verify_archive(paths)
-        print(json.dumps({"ok": not problems, "problems": problems}, indent=2))
+        verified = {}
+        problems = verify_archive(paths, limits_from_args(args), report=verified)
+        print(json.dumps({"ok": not problems, "problems": problems, **verified}, indent=2))
         return 0 if not problems else 1
 
+    if action == "turns":
+        try:
+            rows = list_turns(
+                paths,
+                author=args.author,
+                provider=args.provider,
+                month=args.month,
+                uid=args.uid,
+                limit=args.limit,
+                offset=args.offset,
+            )
+        except FileNotFoundError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(rows, indent=2))
+        else:
+            for row in rows:
+                preview = " ".join(row["text"].split())[:100]
+                print(f"{row['author']:<7} {row['provider']:<10} {row['ts'][:16]:<16} {preview}")
+            print(f"{len(rows)} turn(s)")
+        return 0
+
     if action == "search":
-        connection = open_database(paths)
         try:
             if args.titles:
-                results = search_titles(connection, args.query, limit=args.limit)
+                results = archive_search.search_titles(
+                    paths, args.query, providers=args.provider, months=args.month, limit=args.limit
+                )
             else:
-                results = search(
-                    connection,
+                results = archive_search.search(
+                    paths,
                     args.query,
                     providers=args.provider,
                     kinds=args.kind,
+                    authors=args.author,
+                    months=args.month,
                     limit=args.limit,
                 )
-        finally:
-            connection.close()
+        except FileNotFoundError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        except archive_search.FilterNotSupported as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
         if args.json:
             print(json.dumps(results, indent=2))
         else:

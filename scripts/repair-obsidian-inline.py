@@ -427,6 +427,7 @@ def main():
     parser.add_argument("--max-output-bytes", type=int, default=8 * 1024**3)
     parser.add_argument("--max-seconds", type=int, default=1800)
     args = parser.parse_args()
+    base.require_private_output(parser, args.output)
     os.nice(10)
     print(
         json.dumps(

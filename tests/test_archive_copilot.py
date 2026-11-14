@@ -34,9 +34,8 @@ from archive_support import (
     write_copilot_page,
 )
 
-from conversation_corpus_engine import archive_read_copilot
+from conversation_corpus_engine import archive_read_copilot, archive_search
 from conversation_corpus_engine.archive_commands import add_archive_parser, verify_archive
-from conversation_corpus_engine.archive_database import open_database, search
 from conversation_corpus_engine.archive_feed import project_feed
 from conversation_corpus_engine.archive_ingest import (
     PROVIDER_SPECS,
@@ -497,6 +496,8 @@ def test_the_standard_page_maps_every_conversation_field(tmp_path: Path) -> None
     assert conversation.provenance == {
         "source_file": COPILOT_PAGE_NAME,
         "source_sha256": hashlib.sha256(page.read_bytes()).hexdigest(),
+        "source_origin": "unspecified",
+        "source_size_bytes": page.stat().st_size,
         "reader": archive_read_copilot.READER,
     }
 
@@ -1781,7 +1782,8 @@ def test_an_id_with_uppercase_underscore_and_hyphen_survives_finalize_and_naming
 
 
 def test_copilot_is_registered_last(tmp_path: Path) -> None:
-    assert list(PROVIDER_SPECS) == [
+    # The seven web providers come first and in this order; the other families follow them.
+    assert list(PROVIDER_SPECS)[:7] == [
         "chatgpt",
         "claude",
         "gemini",
@@ -1957,15 +1959,11 @@ def test_command_line_build_ingest_verify_feed_site_and_vault(
     uid = conversation.uid
 
     # search database
-    connection = open_database(paths)
-    try:
-        hits = search(connection, "wick", providers=["copilot"], kinds=None, limit=5)
-    finally:
-        connection.close()
+    hits = archive_search.search(paths, "wick", providers=["copilot"], limit=5)
     assert hits and {hit["provider"] for hit in hits} == {"copilot"}
 
     # the vault: one note, tagged, with the Copilot colour group in the graph view
-    (note,) = paths.vault_conversations.glob("*.md")
+    (note,) = paths.vault_conversations.rglob("*.md")
     text = note.read_text(encoding="utf-8")
     head = text.partition("\n---\n")[0]
     assert head.startswith(f'---\nuid: "{uid}"')
@@ -2026,4 +2024,4 @@ def test_command_line_ingest_with_a_source_override_outside_the_export(
     assert code == 0, err
     providers = json.loads(out)["stages"]["ingest"]["providers"]
     assert providers["copilot"]["status"] == "ok" and providers["copilot"]["conversations"] == 1
-    assert archive_env.paths.conversations("copilot").is_file()
+    assert archive_env.paths.provider_present("copilot")

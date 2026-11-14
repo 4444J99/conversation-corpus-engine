@@ -174,7 +174,14 @@ def test_claude_turns_carry_the_message_uuid_and_the_rest_are_minted_later(archi
     assert [m.channel for m in chat.messages] == ["typed", "thinking", "reply", "tool"]
     project = items["project-p1"]
     finalize_conversation(project)
-    assert {m.channel for m in project.messages} == {"project"}
+    # A project's instructions and documents are text the person put there (`written`, human);
+    # a memory is something Claude wrote about the person (`memory`, machine).
+    assert {m.channel for m in project.messages} == {"written"}
+    assert {m.role for m in project.messages} == {"user"}
+    assert {m.meta["author_basis"] for m in project.messages} == {
+        "user-supplied:project-instructions",
+        "user-supplied:project-document",
+    }
     memory = items["memories"]
     finalize_conversation(memory)
     assert {m.channel for m in memory.messages} == {"memory"}
