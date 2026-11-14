@@ -10,6 +10,7 @@ import argparse
 import json
 from pathlib import Path
 
+from . import app_cache_perplexity
 from .app_cache_chatgpt import default_roots, scan, write_staging
 from .corpus_store import CorpusStoreError, require_git_private
 
@@ -31,6 +32,14 @@ def add_app_cache_parser(subparsers: argparse._SubParsersAction) -> argparse.Arg
     )
     chatgpt.add_argument("--out", type=Path, required=True, help="new empty staging directory")
     chatgpt.add_argument("--json", action="store_true")
+    perplexity = sub.add_parser(
+        "perplexity",
+        help="Stage Space notes and follow-up suggestions cached by the Perplexity macOS app",
+    )
+    perplexity.add_argument("--cache-db", type=Path, help="default: the app's Cache.db")
+    perplexity.add_argument("--body-dir", type=Path, help="default: fsCachedData beside Cache.db")
+    perplexity.add_argument("--out", type=Path, required=True, help="new empty staging directory")
+    perplexity.add_argument("--json", action="store_true")
     return parser
 
 
@@ -49,7 +58,31 @@ def handle_app_cache(args: argparse.Namespace) -> int:
             return 2
         print(json.dumps(report, indent=2) if args.json else _summary(report))
         return 0
+    if args.action == "perplexity":
+        return _perplexity(args)
     return 2
+
+
+def _perplexity(args: argparse.Namespace) -> int:
+    default_db, default_bodies = app_cache_perplexity.default_paths(Path.home())
+    database = args.cache_db or default_db
+    bodies = args.body_dir or (database.parent / "fsCachedData")
+    shared = Path.home().joinpath(*app_cache_perplexity.SHARED_CONTAINER)
+    try:
+        require_git_private(args.out)
+        result = app_cache_perplexity.scan(database, bodies)
+        report = app_cache_perplexity.write_staging(result, args.out, shared)
+    except (FileExistsError, CorpusStoreError, app_cache_perplexity.SnapshotError) as error:
+        print(f"error: {error}")
+        return 2
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(
+            f"space notes: {report['space_notes']} in {report['spaces_with_notes']} space(s)\n"
+            f"threads with follow-up suggestions: {report['threads_with_followup_suggestions']}"
+        )
+    return 0
 
 
 def _summary(report: dict) -> str:
