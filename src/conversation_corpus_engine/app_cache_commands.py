@@ -10,7 +10,7 @@ import argparse
 import json
 from pathlib import Path
 
-from . import app_cache_perplexity
+from . import app_cache_gemini, app_cache_perplexity
 from .app_cache_chatgpt import default_roots, scan, write_staging
 from .corpus_store import CorpusStoreError, require_git_private
 
@@ -40,6 +40,13 @@ def add_app_cache_parser(subparsers: argparse._SubParsersAction) -> argparse.Arg
     perplexity.add_argument("--body-dir", type=Path, help="default: fsCachedData beside Cache.db")
     perplexity.add_argument("--out", type=Path, required=True, help="new empty staging directory")
     perplexity.add_argument("--json", action="store_true")
+    gemini = sub.add_parser(
+        "gemini",
+        help="Census of the Gemini macOS app's chat store (metadata only; bodies are encrypted)",
+    )
+    gemini.add_argument("--store", type=Path, help="default: the app's ChatInfo2.store")
+    gemini.add_argument("--out", type=Path, required=True, help="new empty output directory")
+    gemini.add_argument("--json", action="store_true")
     return parser
 
 
@@ -60,7 +67,30 @@ def handle_app_cache(args: argparse.Namespace) -> int:
         return 0
     if args.action == "perplexity":
         return _perplexity(args)
+    if args.action == "gemini":
+        return _gemini(args)
     return 2
+
+
+def _gemini(args: argparse.Namespace) -> int:
+    store = args.store or app_cache_gemini.default_store(Path.home())
+    try:
+        require_git_private(args.out)
+        report = app_cache_gemini.write_report(app_cache_gemini.census(store), args.out)
+    except (FileExistsError, CorpusStoreError, app_cache_gemini.SnapshotError) as error:
+        print(f"error: {error}")
+        return 2
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        export = report["owner_export"]
+        print(
+            f"chats: {report['chats']} ({report['chats_updated_first']} .. "
+            f"{report['chats_updated_last']}); cached messages: {report['cached_messages']}\n"
+            f"bodies: encrypted, not read. Owner export: {export['takeout_product']} "
+            f"-> {export['file_the_reader_detects']}"
+        )
+    return 0
 
 
 def _perplexity(args: argparse.Namespace) -> int:
