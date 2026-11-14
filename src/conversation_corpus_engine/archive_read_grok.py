@@ -14,9 +14,10 @@ from .archive_model import (
     normalize_role,
     to_iso,
 )
+from .archive_provenance import BASIS_KEY
 
 PROVIDER = "grok"
-READER = "archive_read_grok@1"
+READER = "archive_read_grok@2"
 BACKEND = "prod-grok-backend.json"
 TASK_TEXT_KEYS = ("title", "name", "prompt", "description", "instruction", "message", "text")
 
@@ -113,11 +114,13 @@ def _chat(item: dict[str, Any], tracker: SourceTracker, source: Path) -> Convers
 def _project(item: dict[str, Any], tracker: SourceTracker, source: Path) -> Conversation:
     messages = []
     if item.get("custom_personality"):
+        # The personality text is what the account holder wrote into the project settings.
         messages.append(
             Message(
-                role="system",
+                role="user",
                 text=clean_text(item["custom_personality"]),
-                meta={"kind": "custom-personality"},
+                channel="written",
+                meta={"kind": "custom-personality", BASIS_KEY: "user-supplied:custom-personality"},
             )
         )
     for starter in item.get("conversation_starters") or []:

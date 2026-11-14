@@ -341,7 +341,9 @@ def export_analysis(
     try:
         with library.sql_progress(budget.check, instructions=1000):
             if query is not None:
-                result = library.search(query, limit=limit)
+                # The selection keeps its exact AND semantics and exact matched count; the
+                # planner and the capped total are for interactive retrieval.
+                result = library.search(query, limit=limit, plan="and", count_cap=None)
                 selected = [hit["uid"] for hit in result["hits"]]
                 total = result["total"]
             else:

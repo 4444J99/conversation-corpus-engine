@@ -7,9 +7,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from . import __version__, library_mcp
+from . import __version__, archive_search, library_mcp
 from .answering import build_answer, render_answer_text, search_documents_v4
-from .archive_database import open_database, search, search_titles
 from .archive_ingest import ArchivePaths
 from .federation import list_registered_corpora, validate_corpus_root
 from .library_commands import STORE_ENV
@@ -29,6 +28,12 @@ JSONRPC_INTERNAL_ERROR = -32603
 
 ARCHIVE_ROOT_ENV = "CCE_ARCHIVE_ROOT"
 ARCHIVE_TOOL = "cce_archive_search"
+
+
+class NoSearchableCorpusError(ValueError):
+    """No registered or direct federation corpus could be resolved for cce_search."""
+
+
 ARCHIVE_LIMIT_MAX = 25
 
 
@@ -147,6 +152,19 @@ class CceMcpServer:
                         "items": {"type": "string"},
                         "description": "Restrict to kinds: chat, search, activity, notebook, memory.",
                     },
+                    "author": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["human", "machine"]},
+                        "description": (
+                            "Restrict to turns by an author: human (typed by the person) or "
+                            "machine (replies, reasoning, tool output, memories)."
+                        ),
+                    },
+                    "month": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict to months, e.g. ['202506'], or 'undated'.",
+                    },
                     "titles_only": {"type": "boolean", "description": "Search titles only."},
                     "limit": {"type": "integer", "description": "Maximum conversations (25)."},
                 },
@@ -264,7 +282,7 @@ class CceMcpServer:
                     result = library_mcp.call_tool(self.library_store_root, name, args)
                 except KeyError as exc:
                     raise ValueError("library record, version or digest not found") from exc
-                return text_result(pretty_json(result), result)
+                return text_result(library_mcp.render_text(name, args, result), result)
         except (ValueError, FileNotFoundError) as exc:
             return text_result(str(exc), {"error": str(exc)}, is_error=True)
         raise KeyError(name)
@@ -309,7 +327,7 @@ class CceMcpServer:
         if validation["valid"]:
             return project_root
         missing = ", ".join(validation["missing_files"]) or "registry entries"
-        raise ValueError(
+        raise NoSearchableCorpusError(
             "No searchable corpus found. Provide corpus_root or register a corpus; "
             f"missing {missing}."
         )
@@ -320,7 +338,19 @@ class CceMcpServer:
         if mode not in {None, "action", "unresolved", "timeline", "family_brief"}:
             raise ValueError("mode must be one of action, unresolved, timeline, or family_brief")
         limit = optional_limit(arguments)
-        corpus_root = self.corpus_root_from_args(arguments)
+        try:
+            corpus_root = self.corpus_root_from_args(arguments)
+        except NoSearchableCorpusError:
+            explicit = any(
+                optional_string(arguments, key)
+                for key in ("corpus_root", "corpus_id", "project_root")
+            )
+            # The default configuration of this server is an archive (and optionally a
+            # library), not a federation registry. Without an explicit federation target,
+            # answer from the configured archive instead of failing.
+            if explicit or self.archive_root is None or mode is not None:
+                raise
+            return self.archive_search({"query": query, "limit": limit})
         validation = validate_corpus_root(corpus_root)
         if not validation["valid"]:
             missing = ", ".join(validation["missing_files"])
@@ -345,7 +375,7 @@ class CceMcpServer:
         limit = optional_limit(arguments, default=10, maximum=ARCHIVE_LIMIT_MAX)
         titles_only = optional_bool(arguments, "titles_only", default=False)
         filters: dict[str, list[str] | None] = {}
-        for key in ("provider", "kind"):
+        for key in ("provider", "kind", "author", "month"):
             value = arguments.get(key)
             if value is None:
                 filters[key] = None
@@ -353,23 +383,30 @@ class CceMcpServer:
                 filters[key] = value or None
             else:
                 raise ValueError(f"{key} must be an array of strings")
-        try:
-            connection = open_database(ArchivePaths(self.archive_root))
-        except FileNotFoundError as exc:
-            raise ValueError(f"The archive search database is not built: {exc}") from exc
+        archive_paths = ArchivePaths(self.archive_root)
         try:
             if titles_only:
-                results = search_titles(connection, query, limit=limit)
+                results = archive_search.search_titles(
+                    archive_paths,
+                    query,
+                    providers=filters["provider"],
+                    months=filters["month"],
+                    limit=limit,
+                )
             else:
-                results = search(
-                    connection,
+                results = archive_search.search(
+                    archive_paths,
                     query,
                     providers=filters["provider"],
                     kinds=filters["kind"],
+                    authors=filters["author"],
+                    months=filters["month"],
                     limit=limit,
                 )
-        finally:
-            connection.close()
+        except FileNotFoundError as exc:
+            raise ValueError(f"The archive search database is not built: {exc}") from exc
+        except archive_search.FilterNotSupported as exc:
+            raise ValueError(str(exc)) from exc
         structured = {"query": query, "count": len(results), "results": results}
         lines = [
             f"{hit['provider']} · {hit['created'][:10]} · {hit['title']} ({hit['uid']})"

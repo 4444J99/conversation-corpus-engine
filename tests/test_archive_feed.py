@@ -29,6 +29,7 @@ from conversation_corpus_engine.archive_ingest import (
     ArchivePaths,
     authorize_archive,
     ingest,
+    iter_store,
     latest_activity_day,
     load_manifest,
 )
@@ -210,7 +211,7 @@ def test_feed_rows_carry_exactly_what_the_ledger_reads(fixture_archive) -> None:
     for provider in ("chatgpt", "claude"):
         rows = _read_feed(out / f"feed-{provider}-prompts.jsonl")
         assert len(rows) == expected[provider]["asks"]
-        uids = {c.uid for c in iter_conversations(fixture_archive.paths.conversations(provider))}
+        uids = {c.uid for c in iter_store(fixture_archive.paths, [provider])}
         for index, row in enumerate(rows):
             allowed = set(ROW_FIELDS) | ({"branch"} if row.get("branch") else set())
             assert set(row) == allowed

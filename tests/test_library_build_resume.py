@@ -70,7 +70,11 @@ def test_resume_compacts_seed_without_reading_original_sources_and_keeps_evidenc
     monkeypatch.setattr(Library, "create", classmethod(tracked_create))
     monkeypatch.setattr(library_build, "iter_estate", no_native_read)
     result = library_build.build_library(manifest, project_root=project, store_root=store)
-    assert copied == [{"previous": seed / "library.sqlite", "compact_previous": True}]
+    assert len(copied) == 1
+    assert copied[0]["previous"] == seed / "library.sqlite"
+    assert copied[0]["compact_previous"] is True
+    assert 0 < copied[0]["max_bytes"] < manifest["limits"]["max_output_bytes"]
+    assert callable(copied[0]["check_callback"])
     assert result["complete"] is True and result["coverage_complete"] is False
     assert result["accepted_observations"] == 3 and result["new_observations"] == 1
     assert result["baseline_accepted_observations"] == 2

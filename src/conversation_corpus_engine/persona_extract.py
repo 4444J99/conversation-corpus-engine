@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -8,10 +9,15 @@ from pathlib import Path
 from typing import Any
 
 from .answering import STOP_WORDS, load_json, shorten, tokenize
+from .attributed_knowledge import collect_owner_segments
+from .attribution import ASSURANCE, attributed_spans, owner_profile_eligible
+from .library_store import Library
 from .sharded_collection import collection_exists, iter_corpus_collection
 
 # Persona identifiers that denote the assistant/model side of a transcript.
 # Everything else (rob, user, human, operator, ...) is treated as a human persona.
+CURATED_ASSURANCE = "curated_scaffold_not_owner_evidence"
+
 ASSISTANT_PERSONAS = {
     "assistant",
     "ai",
@@ -286,6 +292,41 @@ def _collect_segments(source: Path, persona_id: str) -> tuple[list[str], list[st
     return persona_parts, other_parts
 
 
+def _attributed_turns(obj: Any) -> list[dict[str, Any]]:
+    """Keep exact message text and attribution together; never infer from its role."""
+    if isinstance(obj, list):
+        return [turn for item in obj for turn in _attributed_turns(item)]
+    if not isinstance(obj, dict):
+        return [{"text": obj}] if isinstance(obj, str) else []
+    for key in ("messages", "turns", "conversation", "dialog", "dialogue"):
+        if isinstance(obj.get(key), list):
+            return _attributed_turns(obj[key])
+    if isinstance(obj.get("mapping"), dict):
+        return [
+            turn
+            for node in obj["mapping"].values()
+            if isinstance(node, dict)
+            for turn in _attributed_turns(node.get("message"))
+        ]
+    text = _turn_text(obj.get("content") if "content" in obj else obj)
+    # Empty text can still carry stale or malformed supplied attribution.
+    meta = obj.get("meta") if isinstance(obj.get("meta"), dict) else {}
+    return [{"text": text, "attribution": obj.get("attribution", meta.get("attribution"))}]
+
+
+def _collect_strict_segments(source: Path, owner_id: str) -> tuple[list[str], list[str]]:
+    owner, other = [], []
+    for path in _iter_transcript_files(source):
+        objects = _load_jsonl(path) if path.suffix == ".jsonl" else [load_json(path, default=None)]
+        for obj in objects:
+            for turn in _attributed_turns(obj):
+                for span in attributed_spans(turn["text"], turn.get("attribution")):
+                    (owner if owner_profile_eligible(span, owner_id) else other).append(
+                        span["text"]
+                    )
+    return owner, other
+
+
 def _frequency_lexicon(
     persona_text: str, other_text: str, *, limit: int = 25
 ) -> tuple[list[dict[str, Any]], int]:
@@ -348,7 +389,7 @@ def _shadow_terms(persona_text: str, *, limit: int = 15) -> list[dict[str, Any]]
 
 
 def _divine_yearning(
-    persona_id: str, vocabulary: list[dict[str, Any]]
+    persona_id: str, vocabulary: list[dict[str, Any]], *, allow_curated: bool = True
 ) -> tuple[str | None, str | None, str]:
     """Pass C — Yearning Diviner.
 
@@ -356,7 +397,7 @@ def _divine_yearning(
     by signature overlap and synthesises a yearning from the dominant vocabulary. Stdlib-only
     stand-in for an LLM-assisted pass (``method`` records which path produced the result).
     """
-    curated = CURATED_YEARNINGS.get(persona_id.strip().lower())
+    curated = CURATED_YEARNINGS.get(persona_id.strip().lower()) if allow_curated else None
     if curated:
         return curated["ideal_yearning"], curated["archetypal_pattern"], "curated"
 
@@ -377,7 +418,15 @@ def _divine_yearning(
 
 
 def extract_persona_lexicon(
-    project_root: Path, persona_id: str, source_corpus: Path | None = None, dry_run: bool = False
+    project_root: Path,
+    persona_id: str,
+    source_corpus: Path | None = None,
+    dry_run: bool = False,
+    *,
+    mode: str = "strict",
+    library: Library | None = None,
+    annotations: list[dict[str, Any]] | None = None,
+    allow_curated: bool = False,
 ) -> dict[str, Any]:
     """Extract vocabulary, friction terms, and yearning for a persona from transcripts.
 
@@ -386,9 +435,24 @@ def extract_persona_lexicon(
       B. Shadow Catcher     — forbidden terms via moment-of-friction detection
       C. Yearning Diviner   — curated or derived ideal yearning + archetype
 
-    With no ``source_corpus`` the function returns the curated scaffold (backward compatible).
+    Strict mode accepts only explicit evidenced owner spans; provider roles are not
+    authorship evidence. ``mode="legacy-role"`` explicitly opts into historical heuristics.
+    A canonical Library plus message annotations can replace transcript input.
+    Strict mode never substitutes curated assistant-generated text: without owner-evidenced
+    spans the profile is empty and says so (``owner_evidence: "none"``). Only the explicit
+    ``allow_curated=True`` opt-in restores the curated scaffold, labelled
+    ``curated_fallback: true``; owner-evidenced vocabulary always replaces it. Legacy-role
+    mode keeps its historical curated behaviour regardless of this option.
     """
+    if mode not in {"strict", "legacy-role"}:
+        raise ValueError("mode must be strict or legacy-role")
+    if library is not None and (source_corpus is not None or mode != "strict"):
+        raise ValueError("canonical library profiles require strict mode and no transcript source")
+    if library is None and annotations is not None:
+        raise ValueError("canonical annotations require a library")
     result: dict[str, Any] = {
+        "attribution_mode": mode,
+        "assurance": ASSURANCE if mode == "strict" else "role_heuristic_not_authorship",
         "persona_id": persona_id,
         "source_corpus": str(source_corpus) if source_corpus is not None else None,
         "dry_run": dry_run,
@@ -400,23 +464,42 @@ def extract_persona_lexicon(
         "stats": {"turns_scanned": 0, "persona_tokens": 0, "other_tokens": 0},
         "status": "VACUUM (SCAFFOLDED)",
     }
+    strict = mode == "strict"
+    if strict:
+        result["owner_evidence"] = "none"
+        result["curated_fallback"] = False
+        if not allow_curated and source_corpus is None and library is None:
+            result["status"] = "VACUUM (NO OWNER-EVIDENCED SPANS)"
+            result["empty_reason"] = (
+                "no source input was supplied, so there are no owner-evidenced spans; "
+                "strict profiles never substitute curated assistant text"
+            )
 
-    # Curated yearning applies even without a source so known personas stay populated.
-    yearning, archetype, method = _divine_yearning(persona_id, [])
+    # Legacy mode keeps its curated values; strict mode only with the explicit opt-in.
+    use_curated = allow_curated if strict else True
+    yearning, archetype, method = _divine_yearning(persona_id, [], allow_curated=use_curated)
     if method == "curated":
         result["ideal_yearning"] = yearning
         result["archetypal_pattern"] = archetype
         result["yearning_method"] = "curated"
+        if strict:
+            result["curated_fallback"] = True
+            result["assurance"] = CURATED_ASSURANCE
 
-    if source_corpus is None:
+    if library is not None:
+        persona_parts, other_parts = collect_owner_segments(
+            library, [] if annotations is None else annotations, persona_id
+        )
+        result["source_corpus"] = str(library.path)
+    elif source_corpus is None:
         return result
-
-    source = Path(source_corpus)
-    if not source.exists():
-        result["status"] = "VACUUM (SOURCE NOT FOUND)"
-        return result
-
-    persona_parts, other_parts = _collect_segments(source, persona_id)
+    else:
+        source = Path(source_corpus)
+        if not source.exists():
+            result["status"] = "VACUUM (SOURCE NOT FOUND)"
+            return result
+        collector = _collect_strict_segments if mode == "strict" else _collect_segments
+        persona_parts, other_parts = collector(source, persona_id)
     persona_text = "\n".join(persona_parts)
     other_text = "\n".join(other_parts)
     result["stats"]["turns_scanned"] = len(persona_parts) + len(other_parts)
@@ -427,7 +510,12 @@ def extract_persona_lexicon(
 
     vocabulary, persona_token_count = _frequency_lexicon(persona_text, other_text)
     forbidden = _shadow_terms(persona_text)
-    yearning, archetype, method = _divine_yearning(persona_id, vocabulary)
+    # Strict: owner-evidenced vocabulary replaces any curated fallback entirely.
+    yearning, archetype, method = _divine_yearning(persona_id, vocabulary, allow_curated=not strict)
+    if strict:
+        result["owner_evidence"] = "spans"
+        result["curated_fallback"] = False
+        result["assurance"] = ASSURANCE
 
     result["vocabulary"] = vocabulary
     result["forbidden_terms"] = forbidden
@@ -448,8 +536,23 @@ def render_persona_extract_markdown(payload: dict[str, Any]) -> str:
         f"# Persona Extract — {payload['persona_id']}",
         "",
         f"- **Status:** {payload['status']}",
+        f"- **Attribution mode:** {payload.get('attribution_mode', 'unspecified')}",
+        f"- **Assurance:** {payload.get('assurance', 'unspecified')}",
         f"- **Archetype:** {payload.get('archetypal_pattern') or '—'}",
         f"- **Yearning method:** {payload.get('yearning_method') or '—'}",
+        *(
+            [
+                f"- **Owner evidence:** {payload['owner_evidence']}",
+                "- **Curated fallback:** "
+                + (
+                    "yes (explicit opt-in; not owner evidence)"
+                    if payload.get("curated_fallback")
+                    else "no"
+                ),
+            ]
+            if "owner_evidence" in payload
+            else []
+        ),
         f"- **Ideal yearning:** {payload.get('ideal_yearning') or '—'}",
         "",
         "## Lexicon",
@@ -481,20 +584,78 @@ def render_persona_extract_markdown(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def write_persona_extract_artifacts(project_root: Path, payload: dict[str, Any]) -> list[Path]:
-    """Write the extracted candidates to the generated storefront docs (JSON + markdown)."""
-    output_dir = project_root / "docs" / "storefront" / "_generated"
-    output_dir.mkdir(parents=True, exist_ok=True)
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+_MAX_FILENAME_TOKEN = 64
+GENERATED_DIR = Path("docs") / "storefront" / "_generated"
 
+
+def _safe_filename_token(value: object, name: str) -> str:
+    """Return a filesystem-safe token for ``value`` or raise ``ValueError``.
+
+    Path separators, NUL bytes, empty values and dots-only values are rejected. Any other
+    unsafe character is replaced by ``-``; when that changes the value a short digest of the
+    original is appended so different identifiers cannot collide on one filename.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a nonempty string to build a filename")
+    if any(char in value for char in ("/", "\\", "\x00")):
+        raise ValueError(f"{name} must not contain path separators or NUL bytes")
+    if not value.strip(". \t\r\n"):
+        raise ValueError(f"{name} must not consist only of dots")
+    token = _UNSAFE_FILENAME_CHARS.sub("-", value).strip("-.")
+    if not token:
+        raise ValueError(f"{name} has no filename-safe characters")
+    if token != value or len(token) > _MAX_FILENAME_TOKEN:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+        token = f"{token[: _MAX_FILENAME_TOKEN - 9]}-{digest}"
+    return token
+
+
+def _generated_marker(payload: dict[str, Any], *, overwrites_existing: bool) -> dict[str, Any]:
+    return {
+        "generated_by": "cce persona-extract --write",
+        "attribution_mode": payload.get("attribution_mode", "unspecified"),
+        "assurance": payload.get("assurance", "unspecified"),
+        "curated_fallback": bool(payload.get("curated_fallback", False)),
+        "overwrites_existing": overwrites_existing,
+        "notice": (
+            "May contain private owner text. This directory is git-ignored; do not publish."
+            + (" The -latest file is overwritten by every write." if overwrites_existing else "")
+        ),
+    }
+
+
+def write_persona_extract_artifacts(project_root: Path, payload: dict[str, Any]) -> list[Path]:
+    """Write the extracted candidates to the generated storefront docs (JSON + markdown).
+
+    Filenames are ``persona-extract-<persona>-<timestamp>``; both parts are sanitised to safe
+    tokens. Without a ``timestamp`` the stem ends in ``latest``, and an existing ``-latest``
+    file is **overwritten** on every write (dated stems are never reused implicitly). Each
+    file starts with a marker naming the attribution mode.
+    """
+    persona_token = _safe_filename_token(payload.get("persona_id"), "persona id")
     timestamp = payload.get("timestamp", "latest")
-    persona_id = payload["persona_id"]
-    stem = f"persona-extract-{persona_id}-{timestamp}"
+    timestamp_token = _safe_filename_token(timestamp, "timestamp")
+    overwrites_existing = timestamp_token == "latest"
+    stem = f"persona-extract-{persona_token}-{timestamp_token}"
+
+    output_dir = project_root / GENERATED_DIR
+    output_dir.mkdir(parents=True, exist_ok=True)
+    marker = _generated_marker(payload, overwrites_existing=overwrites_existing)
 
     json_path = output_dir / f"{stem}.json"
     with json_path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
+        json.dump({"generated_marker": marker, **payload}, handle, indent=2)
 
+    header = (
+        "<!-- generated by cce persona-extract --write; "
+        f"attribution_mode={marker['attribution_mode']}; "
+        f"curated_fallback={'true' if marker['curated_fallback'] else 'false'}; "
+        f"assurance={marker['assurance']}"
+        + ("; -latest file is overwritten on every write" if overwrites_existing else "")
+        + "; may contain private owner text, git-ignored, do not publish -->\n\n"
+    )
     markdown_path = output_dir / f"{stem}.md"
-    markdown_path.write_text(render_persona_extract_markdown(payload), encoding="utf-8")
+    markdown_path.write_text(header + render_persona_extract_markdown(payload), encoding="utf-8")
 
     return [json_path, markdown_path]

@@ -1,0 +1,86 @@
+node_modules/
+dist/
+*.log
+.env
+.DS_Store
+
+# Database files (keep schema, ignore data)
+db/*.db
+db/*.db-shm
+db/*.db-wal
+
+# Raw exports (too large for git)
+raw/
+
+# Atomized data (generated, contains sensitive info)
+atomized/
+
+sync/
+
+# Sensitive intake files (passwords, tokens, API keys)
+intake/**/user_profile/
+intake/**/Login*/
+intake/**/*PW.md
+intake/**/*.webarchive
+intake/**/pieces-desktop-*/
+
+# Raw imported data (too large, many false positives in secret scanner)
+intake/omni-root-import/
+
+# Large ChatGPT export files (exceed GitHub 100MB limit)
+intake/**/conversations.json
+intake/**/chat.html
+
+# Copilot activity exports
+intake/*.csv
+intake/*.zip
+intake/_Archives/
+intake/data-*/
+intake/ttl/
+intake/Takeout*/
+intake/absorb-alchemize/
+intake/extract-unique/
+intake/thread_synthesizer/
+
+# Intake lifecycle buckets (generated/raw content)
+intake/archive-batches/
+intake/artifacts/
+intake/canonical/
+intake/incoming/
+
+# Intake organizer reports (run artifacts)
+intake/reports/organize-*/
+intake/reports/universe-ingest-*.json
+
+# Local git clones captured in exports; keep untracked
+intake/Takeout\ 4/Drive/My\ Mac/Development/stage/Wires/GitHub/desktop-tutorial/
+intake/Takeout\ 4/Drive/My\ Mac/Development/stage/Wires/scoop/apps/scoop/current/
+intake/Takeout\ 4/Drive/My\ Mac/Development/stage/Wires/scoop/buckets/extras/
+intake/Takeout\ 4/Drive/My\ Mac/Development/stage/Wires/scoop/buckets/main/
+
+# Local git clones captured in exports; keep untracked
+intake/Takeout\ 4/Drive/My\ Mac/Development/stage/Wires/GitHub/desktop-tutorial/
+intake/Takeout\ 4/Drive/My\ Mac/Development/stage/Wires/scoop/apps/scoop/current/
+intake/Takeout\ 4/Drive/My\ Mac/Development/stage/Wires/scoop/buckets/extras/
+intake/Takeout\ 4/Drive/My\ Mac/Development/stage/Wires/scoop/buckets/main/
+
+# Playwright browser sessions (contains auth cookies)
+.playwright/
+
+# Debug scripts
+src/debug-*.ts
+
+# Test artifacts
+.test-tmp/
+
+# Large index files
+atomized/json/index.jsonl
+.batch-checkpoints/
+.history/
+.lh/
+.specstory/
+compiled-wiki/
+test-ai.ts
+test-env.ts
+
+intake/drafts

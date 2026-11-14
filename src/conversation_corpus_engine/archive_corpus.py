@@ -45,10 +45,11 @@ from .archive_feed import ELIGIBLE_KINDS, ask_text
 from .archive_ingest import (
     ArchivePaths,
     LegacyArchiveStore,
+    iter_store,
     load_manifest,
     require_current_store,
 )
-from .archive_model import Conversation, iter_conversations, message_reference
+from .archive_model import Conversation, message_reference
 from .archive_naming import NAMING_VERSION, InvalidName, NameCollision, NameLedger
 from .corpus_store import require_git_private
 from .corpus_text import (
@@ -444,7 +445,7 @@ def _project_provider(
     excluded: Counter[str] = Counter()
     seen = messages = 0
     try:
-        for conversation in iter_conversations(paths.conversations(provider)):
+        for conversation in iter_store(paths, [provider]):
             seen += 1
             messages += len(conversation.messages)
             if conversation.kind not in ELIGIBLE_KINDS:
@@ -517,7 +518,7 @@ def project_corpus(
     ready = [
         name
         for name, info in manifest["providers"].items()
-        if info.get("status") == "ok" and paths.conversations(name).is_file()
+        if info.get("status") == "ok" and paths.provider_present(name)
     ]
     chosen = list(providers) if providers else ready
     unready = [name for name in chosen if name not in ready]

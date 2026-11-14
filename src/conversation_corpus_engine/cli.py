@@ -4,7 +4,11 @@ import argparse
 import json
 from pathlib import Path
 
+from .app_cache_commands import add_app_cache_parser, handle_app_cache
 from .archive_commands import add_archive_parser, handle_archive
+from .archive_sealed_commands import add_sealed_parser
+from .archive_sealed_commands import run as run_sealed
+from .attribution_commands import add_attribute_parser, handle_attribute
 from .chatgpt_local_session import (
     discover_chatgpt_projects,
     fetch_chatgpt_project,
@@ -23,7 +27,7 @@ from .corpus_candidates import (
     rollback_corpus_promotion,
     stage_corpus_candidate,
 )
-from .corpus_store import register_corpus_store
+from .corpus_store import CorpusStoreError, register_corpus_store, require_git_private
 from .dashboard import build_dashboard, render_dashboard_text
 from .evaluation import run_corpus_evaluation
 from .evaluation_bootstrap import bootstrap_provider_evaluation
@@ -155,6 +159,20 @@ def build_parser() -> argparse.ArgumentParser:
     corpus_extract.add_argument("--persona", required=True, help="Persona ID (e.g. rob, claude)")
     corpus_extract.add_argument("--source-corpus", type=Path, help="Path to session transcripts")
     corpus_extract.add_argument("--project-root", type=Path, default=default_project_root())
+    corpus_extract.add_argument(
+        "--mode",
+        choices=("strict", "legacy-role"),
+        default="strict",
+        help="Strict explicit owner assertions (default), or labelled legacy role heuristics",
+    )
+    corpus_extract.add_argument(
+        "--allow-curated",
+        action="store_true",
+        help=(
+            "Strict mode only: explicitly permit the curated assistant-generated scaffold when "
+            "no owner-evidenced spans exist; output is labelled curated_fallback"
+        ),
+    )
     corpus_extract.add_argument("--dry-run", action="store_true")
     corpus_extract.add_argument("--write", action="store_true")
     corpus_extract.add_argument("--json", action="store_true")
@@ -728,7 +746,9 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--json", action="store_true")
 
     add_archive_parser(subparsers)
-    add_library_parser(subparsers)
+    add_attribute_parser(add_library_parser(subparsers))
+    add_sealed_parser(subparsers)
+    add_app_cache_parser(subparsers)
 
     return parser
 
@@ -737,10 +757,18 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
+    if args.group == "sealed":
+        raise SystemExit(run_sealed(args))
+
+    if args.group == "app-cache":
+        raise SystemExit(handle_app_cache(args))
+
     if args.group == "archive":
         raise SystemExit(handle_archive(args))
     if args.group == "library":
-        raise SystemExit(handle_library(args))
+        raise SystemExit(
+            handle_attribute(args) if args.action == "attribute" else handle_library(args)
+        )
 
     if args.group == "corpus" and args.action == "list":
         corpora = list_registered_corpora(args.project_root)
@@ -761,6 +789,8 @@ def main() -> None:
             args.persona,
             source_corpus=args.source_corpus,
             dry_run=args.dry_run,
+            mode=args.mode,
+            allow_curated=args.allow_curated,
         )
         if args.write and not args.dry_run:
             artifacts = write_persona_extract_artifacts(args.project_root, payload)
@@ -769,6 +799,11 @@ def main() -> None:
             print(json.dumps(payload, indent=2))
         else:
             print(f"persona: {payload['persona_id']}  status: {payload['status']}")
+            print(f"  attribution: {payload['attribution_mode']} ({payload['assurance']})")
+            if payload.get("curated_fallback"):
+                print("  curated fallback: yes (explicit opt-in; not owner evidence)")
+            elif payload.get("owner_evidence") == "none":
+                print("  owner evidence: none (empty strict profile)")
             print(f"  archetype: {payload.get('archetypal_pattern') or '-'}")
             print(f"  yearning: {payload.get('ideal_yearning') or '-'}")
             print(f"  lexicon terms: {len(payload.get('vocabulary') or [])}")
@@ -918,6 +953,14 @@ def main() -> None:
         return
 
     if args.group == "project" and args.action == "extract":
+        # The extract is the project's files and conversations as plaintext, written wherever
+        # --output says: refuse a directory Git can see before anything is fetched. (The routed
+        # destinations of `project route` and `project sync` deliver into organ and repo
+        # checkouts by design and are not covered.)
+        try:
+            require_git_private(args.output)
+        except CorpusStoreError as exc:
+            parser.error(str(exc))
         payload = fetch_chatgpt_project(
             args.project_id,
             args.output,

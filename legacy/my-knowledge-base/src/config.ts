@@ -1,0 +1,677 @@
+/**
+ * Configuration system with YAML and JSON support
+ */
+
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { createHash } from 'crypto';
+import { dirname } from 'path';
+import { logger } from './logger.js';
+import * as YAML from 'js-yaml';
+
+export interface ExportConfig {
+  headless?: boolean;
+  exportPath?: string;
+  incremental?: boolean;
+  withEmbeddings?: boolean;
+  maxRetries?: number;
+  retryDelayMs?: number;
+  navigationTimeoutMs?: number;
+  loginTimeoutMs?: number;
+  timeoutMs?: number;
+}
+
+export interface EmbeddingConfig {
+  model?: string;
+  provider?: 'openai' | 'local' | 'mock';
+  batchSize?: number;
+  cachePath?: string;
+  useCache?: boolean;
+  maxTokens?: number;
+}
+
+export type SearchPolicy = 'degrade' | 'strict';
+
+export interface SearchConfig {
+  semanticPolicy?: SearchPolicy;
+  hybridPolicy?: SearchPolicy;
+  maxSearchWindow?: number;
+  enforceVectorSqlParity?: boolean;
+}
+
+export type EmbeddingProvider = 'openai' | 'local' | 'mock';
+
+export interface EmbeddingProfile {
+  provider: EmbeddingProvider;
+  model: string;
+  dimensions: number;
+  maxTokens: number;
+  batchSize: number;
+  profileId: string;
+}
+
+export interface LlmConfig {
+  provider?: 'anthropic' | 'openai' | 'ollama' | 'local' | 'custom';
+  apiKey?: string;
+  /** Name of an env var to read the API key from (e.g. 'GROQ_API_KEY') */
+  apiKeyEnv?: string;
+  baseUrl?: string;
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+}
+
+export interface ClaudeConfig {
+  model?: string;
+  temperature?: number;
+  maxTokens?: number;
+  useCache?: boolean;
+  cacheSavingsTarget?: number; // percent, 0-100
+}
+
+export interface DatabaseConfig {
+  path?: string;
+  type?: 'sqlite' | 'postgres';
+  connectionPool?: number;
+}
+
+export interface ApiConfig {
+  port?: number;
+  host?: string;
+  rateLimit?: {
+    windowMs?: number;
+    maxRequests?: number;
+  };
+}
+
+export interface RedactionConfig {
+  /** Enable redaction during atomization (default: true) */
+  enabled?: boolean;
+  /** Enable secret detection (default: true) */
+  detectSecrets?: boolean;
+  /** Enable PII detection (default: true) */
+  detectPII?: boolean;
+  /** Minimum confidence threshold for redaction (0-1, default: 0.5) */
+  confidenceThreshold?: number;
+  /** Mask format: 'full' = [REDACTED:TYPE], 'partial' = sk-...xyz (default: 'full') */
+  maskFormat?: 'full' | 'partial';
+  /** Log redactions for audit (default: false) */
+  auditLog?: boolean;
+}
+
+export interface FederationConfig {
+  enabled?: boolean;
+  maxFileSizeBytes?: number;
+  maxFilesPerScan?: number;
+  defaultIncludePatterns?: string[];
+  defaultExcludePatterns?: string[];
+  allowedRoots?: string[];
+  allowedExtensions?: string[];
+  scanConcurrency?: number;
+}
+
+export interface AppConfig {
+  llm?: LlmConfig;
+  export?: ExportConfig;
+  embedding?: EmbeddingConfig;
+  embeddings?: EmbeddingConfig;
+  claude?: ClaudeConfig;
+  database?: DatabaseConfig;
+  api?: ApiConfig;
+  search?: SearchConfig;
+  redaction?: RedactionConfig;
+  federation?: FederationConfig;
+  logLevel?: 'debug' | 'info' | 'warn' | 'error';
+  costTrackingEnabled?: boolean;
+  [key: string]: unknown;
+}
+
+export const DEFAULT_CONFIG: AppConfig = {
+  export: {
+    headless: true,
+    exportPath: './raw/claude-app',
+    incremental: false,
+    withEmbeddings: false,
+    maxRetries: 3,
+    retryDelayMs: 1000,
+    navigationTimeoutMs: 60000,
+    loginTimeoutMs: 30000,
+    timeoutMs: 30000
+  },
+  embedding: {
+    model: 'text-embedding-3-small',
+    provider: 'openai',
+    batchSize: 100,
+    cachePath: './cache/embeddings',
+    useCache: true,
+    maxTokens: 8191
+  },
+  claude: {
+    model: 'claude-3-5-sonnet-20241022',
+    temperature: 0.7,
+    maxTokens: 2000,
+    useCache: true,
+    cacheSavingsTarget: 80
+  },
+  llm: {
+    provider: 'anthropic',
+    model: 'claude-3-5-sonnet-20241022',
+    temperature: 0.7,
+    maxTokens: 2000
+  },
+  database: {
+    path: './db/knowledge.db',
+    type: 'sqlite',
+    connectionPool: 5
+  },
+  api: {
+    port: 3000,
+    host: 'localhost',
+    rateLimit: {
+      windowMs: 60000, // 1 minute
+      maxRequests: 100
+    }
+  },
+  search: {
+    semanticPolicy: 'degrade',
+    hybridPolicy: 'degrade',
+    maxSearchWindow: 2000,
+    enforceVectorSqlParity: true,
+  },
+  redaction: {
+    enabled: true,
+    detectSecrets: true,
+    detectPII: true,
+    confidenceThreshold: 0.5,
+    maskFormat: 'full',
+    auditLog: false
+  },
+  federation: {
+    enabled: true,
+    maxFileSizeBytes: 1_000_000,
+    maxFilesPerScan: 2_500,
+    defaultIncludePatterns: ['**/*'],
+    defaultExcludePatterns: [],
+    allowedRoots: [],
+    allowedExtensions: [],
+    scanConcurrency: 1,
+  },
+  logLevel: 'info',
+  costTrackingEnabled: true
+};
+
+function cloneConfig(config: AppConfig): AppConfig {
+  if (typeof structuredClone === 'function') {
+    return structuredClone(config);
+  }
+  return JSON.parse(JSON.stringify(config)) as AppConfig;
+}
+
+/**
+ * Configuration manager
+ */
+export class ConfigManager {
+  private config: AppConfig;
+  private configPath: string;
+  private isDirty = false;
+
+  constructor(configPath: string = './config.yaml') {
+    this.configPath = configPath;
+    this.config = this.loadConfig();
+  }
+
+  /**
+   * Load configuration from file or use defaults
+   */
+  private loadConfig(): AppConfig {
+    if (!existsSync(this.configPath)) {
+      logger.info(
+        `Config file not found: ${this.configPath}, using defaults`,
+        { path: this.configPath },
+        'ConfigManager'
+      );
+      return cloneConfig(DEFAULT_CONFIG);
+    }
+
+    try {
+      const content = readFileSync(this.configPath, 'utf-8');
+      let config: unknown;
+
+      if (this.configPath.endsWith('.json')) {
+        config = JSON.parse(content);
+      } else if (this.configPath.endsWith('.yaml') || this.configPath.endsWith('.yml')) {
+        config = YAML.load(content);
+      } else {
+        throw new Error(`Unsupported config format: ${this.configPath}`);
+      }
+
+      if (config && typeof config === 'object') {
+        const typed = config as Record<string, unknown>;
+        if (!typed.embedding && typed.embeddings) {
+          typed.embedding = typed.embeddings;
+          delete typed.embeddings;
+        }
+        config = typed;
+      }
+
+      logger.info(
+        `Loaded configuration from ${this.configPath}`,
+        undefined,
+        'ConfigManager'
+      );
+
+      const userConfig: Partial<AppConfig> =
+        config && typeof config === 'object' ? (config as Partial<AppConfig>) : {};
+
+      // Merge with defaults
+      return this.mergeConfigs(cloneConfig(DEFAULT_CONFIG), userConfig);
+    } catch (error) {
+      logger.warn(
+        `Failed to load config: ${error instanceof Error ? error.message : String(error)}`,
+        undefined,
+        'ConfigManager'
+      );
+      return cloneConfig(DEFAULT_CONFIG);
+    }
+  }
+
+  /**
+   * Merge user config with defaults (user config takes precedence)
+   */
+  private mergeConfigs(defaults: AppConfig, user: Partial<AppConfig>): AppConfig {
+    const merged: AppConfig = { ...defaults };
+
+    for (const [key, value] of Object.entries(user)) {
+      if (value === null || value === undefined) continue;
+
+      if (typeof value === 'object' && !Array.isArray(value)) {
+        merged[key] = {
+          ...((merged[key] as object) || {}),
+          ...(value as object)
+        };
+      } else {
+        merged[key] = value;
+      }
+    }
+
+    return merged;
+  }
+
+  /**
+   * Get complete configuration
+   */
+  getAll(): AppConfig {
+    return cloneConfig(this.config);
+  }
+
+  /**
+   * Get complete configuration (legacy helper)
+   */
+  getConfig(): AppConfig {
+    return this.getAll();
+  }
+
+  /**
+   * Get nested configuration value
+   */
+  get<T = unknown>(path: string, defaultValue?: T): T {
+    const parts = path.split('.');
+    let value: unknown = this.config;
+
+    for (const part of parts) {
+      if (value === null || value === undefined || typeof value !== 'object') {
+        return defaultValue as T;
+      }
+      value = (value as Record<string, unknown>)[part];
+    }
+
+    return (value ?? defaultValue) as T;
+  }
+
+  /**
+   * Set configuration value
+   */
+  set<T>(path: string, value: T): void {
+    const parts = path.split('.');
+    const lastKey = parts.pop();
+
+    if (!lastKey) return;
+
+    let obj = this.config as Record<string, unknown>;
+    for (const part of parts) {
+      const current = obj[part];
+      if (!current || typeof current !== 'object' || Array.isArray(current)) {
+        obj[part] = {};
+      }
+      obj = obj[part] as Record<string, unknown>;
+    }
+
+    obj[lastKey] = value as unknown;
+    this.isDirty = true;
+
+    logger.debug(`Config updated: ${path}`, { value }, 'ConfigManager');
+  }
+
+  /**
+   * Save configuration (legacy helper)
+   */
+  saveConfig(config: AppConfig): void {
+    this.config = cloneConfig(config);
+    this.isDirty = true;
+    this.save();
+  }
+
+  /**
+   * Save configuration to file
+   */
+  save(): void {
+    if (!this.isDirty) return;
+
+    try {
+      mkdirSync(dirname(this.configPath), { recursive: true });
+      let content: string;
+
+      if (this.configPath.endsWith('.json')) {
+        content = JSON.stringify(this.config, null, 2);
+      } else {
+        content = YAML.dump(this.config, { indent: 2 });
+      }
+
+      writeFileSync(this.configPath, content);
+      this.isDirty = false;
+
+      logger.info(
+        `Configuration saved to ${this.configPath}`,
+        undefined,
+        'ConfigManager'
+      );
+    } catch (error) {
+      logger.error(
+        `Failed to save config: ${error instanceof Error ? error.message : String(error)}`,
+        error instanceof Error ? error : undefined,
+        'ConfigManager'
+      );
+    }
+  }
+
+  /**
+   * Reset to defaults
+   */
+  reset(): void {
+    this.config = cloneConfig(DEFAULT_CONFIG);
+    this.isDirty = true;
+    logger.info('Configuration reset to defaults', undefined, 'ConfigManager');
+  }
+
+  /**
+   * Validate configuration
+   */
+  validate(): { valid: boolean; errors: string[] } {
+    const errors: string[] = [];
+
+    // Validate port
+    if (this.config.api?.port && (this.config.api.port < 1 || this.config.api.port > 65535)) {
+      errors.push('Invalid port number (must be 1-65535)');
+    }
+
+    // Validate batch sizes
+    if (this.config.embedding?.batchSize && this.config.embedding.batchSize < 1) {
+      errors.push('Embedding batch size must be at least 1');
+    }
+
+    if (this.config.embedding?.maxTokens && this.config.embedding.maxTokens < 1) {
+      errors.push('Embedding maxTokens must be at least 1');
+    }
+
+    if (this.config.embedding?.provider) {
+      const provider = this.config.embedding.provider;
+      if (!['openai', 'local', 'mock'].includes(provider)) {
+        errors.push('Embedding provider must be one of: openai, local, mock');
+      }
+    }
+
+    // Validate model
+    if (this.config.claude?.model && typeof this.config.claude.model !== 'string') {
+      errors.push('Claude model must be a string');
+    }
+
+    // Validate temperature
+    if (
+      this.config.claude?.temperature &&
+      (this.config.claude.temperature < 0 || this.config.claude.temperature > 2)
+    ) {
+      errors.push('Temperature must be between 0 and 2');
+    }
+
+    if (this.config.search?.semanticPolicy && !['degrade', 'strict'].includes(this.config.search.semanticPolicy)) {
+      errors.push('search.semanticPolicy must be one of: degrade, strict');
+    }
+
+    if (this.config.search?.hybridPolicy && !['degrade', 'strict'].includes(this.config.search.hybridPolicy)) {
+      errors.push('search.hybridPolicy must be one of: degrade, strict');
+    }
+
+    if (
+      this.config.search?.maxSearchWindow !== undefined &&
+      (!Number.isInteger(this.config.search.maxSearchWindow) || this.config.search.maxSearchWindow < 1)
+    ) {
+      errors.push('search.maxSearchWindow must be a positive integer');
+    }
+
+    if (
+      this.config.search?.enforceVectorSqlParity !== undefined &&
+      typeof this.config.search.enforceVectorSqlParity !== 'boolean'
+    ) {
+      errors.push('search.enforceVectorSqlParity must be a boolean');
+    }
+
+    return {
+      valid: errors.length === 0,
+      errors
+    };
+  }
+
+  /**
+   * Export configuration as JSON
+   */
+  toJSON(): string {
+    return JSON.stringify(this.config, null, 2);
+  }
+
+  /**
+   * Export configuration as YAML
+   */
+  toYAML(): string {
+    return YAML.dump(this.config);
+  }
+
+  /**
+   * Get config file path
+   */
+  getPath(): string {
+    return this.configPath;
+  }
+}
+
+/**
+ * Global config instance
+ */
+let globalConfig: ConfigManager | null = null;
+
+/**
+ * Get or create global config instance
+ */
+export function getConfig(path?: string): ConfigManager {
+  if (!globalConfig) {
+    globalConfig = new ConfigManager(path);
+  }
+  return globalConfig;
+}
+
+/**
+ * Create example config file
+ */
+export function createExampleConfig(outputPath: string = './config.example.yaml'): void {
+  const exampleConfig = {
+    export: {
+      headless: true,
+      exportPath: './raw/claude-app',
+      incremental: false,
+      withEmbeddings: false,
+      maxRetries: 3,
+      retryDelayMs: 1000,
+      navigationTimeoutMs: 60000,
+      loginTimeoutMs: 30000,
+      timeoutMs: 30000
+    },
+    embedding: {
+      model: 'text-embedding-3-small',
+      provider: 'openai',
+      batchSize: 100,
+      cachePath: './cache/embeddings',
+      useCache: true,
+      maxTokens: 8191
+    },
+    claude: {
+      model: 'claude-3-5-sonnet-20241022',
+      temperature: 0.7,
+      maxTokens: 2000,
+      useCache: true,
+      cacheSavingsTarget: 80
+    },
+    database: {
+      path: './db/knowledge.db',
+      type: 'sqlite',
+      connectionPool: 5
+    },
+    api: {
+      port: 3000,
+      host: 'localhost',
+      rateLimit: {
+        windowMs: 60000,
+        maxRequests: 100
+      }
+    },
+    search: {
+      semanticPolicy: 'degrade',
+      hybridPolicy: 'degrade',
+      maxSearchWindow: 2000,
+      enforceVectorSqlParity: true,
+    },
+    redaction: {
+      enabled: true,
+      detectSecrets: true,
+      detectPII: true,
+      confidenceThreshold: 0.5,
+      maskFormat: 'full',
+      auditLog: false
+    },
+    logLevel: 'info',
+    costTrackingEnabled: true
+  };
+
+  const content = YAML.dump(exampleConfig);
+  writeFileSync(outputPath, content);
+  logger.info(`Example config created at ${outputPath}`, undefined, 'ConfigManager');
+}
+
+export function normalizeSearchPolicy(value: unknown, fallback: SearchPolicy = 'degrade'): SearchPolicy {
+  return value === 'strict' ? 'strict' : fallback;
+}
+
+export function buildEmbeddingProfileId(input: {
+  provider: EmbeddingProvider;
+  model: string;
+  dimensions: number;
+  maxTokens: number;
+}): string {
+  const profileMaterial = [input.provider, input.model, String(input.dimensions), String(input.maxTokens)].join(':');
+  return `emb_${createHash('sha256').update(profileMaterial).digest('hex').slice(0, 12)}`;
+}
+
+export function resolveModelProfile(
+  model: string,
+  configuredMaxTokens?: number
+): { dimensions: number; maxTokens: number } {
+  const normalized = model.toLowerCase();
+
+  if (normalized.includes('nomic-embed-text')) {
+    return {
+      dimensions: 768,
+      maxTokens: configuredMaxTokens ?? 1024,
+    };
+  }
+
+  if (normalized.includes('text-embedding-3-large')) {
+    return {
+      dimensions: 3072,
+      maxTokens: configuredMaxTokens ?? 8191,
+    };
+  }
+
+  if (normalized.includes('text-embedding-3-small') || normalized.includes('mock-embeddings')) {
+    return {
+      dimensions: 1536,
+      maxTokens: configuredMaxTokens ?? 8191,
+    };
+  }
+
+  return {
+    dimensions: 1536,
+    maxTokens: configuredMaxTokens ?? 2000,
+  };
+}
+
+function normalizeEmbeddingProvider(value: unknown): EmbeddingProvider {
+  if (typeof value !== 'string') {
+    return 'openai';
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'local') {
+    return 'local';
+  }
+  if (normalized === 'mock') {
+    return 'mock';
+  }
+  return 'openai';
+}
+
+function defaultEmbeddingModel(provider: EmbeddingProvider): string {
+  if (provider === 'local') {
+    return 'nomic-embed-text';
+  }
+  if (provider === 'mock') {
+    return 'mock-embeddings';
+  }
+  return 'text-embedding-3-small';
+}
+
+export function resolveEmbeddingProfile(
+  appConfig: AppConfig = getConfig().getAll(),
+  env: NodeJS.ProcessEnv = process.env
+): EmbeddingProfile {
+  const embeddingConfig = appConfig.embedding || appConfig.embeddings || {};
+  const provider = normalizeEmbeddingProvider(env.KB_EMBEDDINGS_PROVIDER ?? embeddingConfig.provider ?? 'openai');
+  const configuredModel = typeof embeddingConfig.model === 'string' ? embeddingConfig.model.trim() : '';
+  const model = configuredModel.length > 0 ? configuredModel : defaultEmbeddingModel(provider);
+  const profile = resolveModelProfile(model, embeddingConfig.maxTokens);
+  const batchSize = Math.max(
+    1,
+    embeddingConfig.batchSize || appConfig.embedding?.batchSize || DEFAULT_CONFIG.embedding?.batchSize || 100
+  );
+  const profileId = buildEmbeddingProfileId({
+    provider,
+    model,
+    dimensions: profile.dimensions,
+    maxTokens: profile.maxTokens,
+  });
+
+  return {
+    provider,
+    model,
+    dimensions: profile.dimensions,
+    maxTokens: profile.maxTokens,
+    batchSize,
+    profileId,
+  };
+}

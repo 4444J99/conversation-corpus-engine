@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import stat
+import subprocess
 import sys
 import warnings
 import zipfile
@@ -295,3 +296,41 @@ def test_completion_fsync_failure_prevents_published_manifest(tmp_path, monkeypa
     assert not (output / "run-receipt.json").exists()
     assert not (output / "manifest.json").exists()
     assert json.loads((output / "failure.json").read_bytes())["complete"] is False
+
+
+def _git_work_tree(path):
+    path.mkdir()
+    subprocess.run(["git", "-C", str(path), "init", "-q"], check=True, capture_output=True)
+    return path
+
+
+def test_cli_refuses_a_git_visible_output_before_reading_the_source(tmp_path, monkeypatch, capsys):
+    work_tree = _git_work_tree(tmp_path / "work")
+    source = source_zip(tmp_path / "full.zip", [("vault/a.md", b"private text")])
+
+    def packaged(*args, **kwargs):
+        raise AssertionError("the source was read before the output was authorised")
+
+    monkeypatch.setattr(batches, "package", packaged)
+    monkeypatch.setattr(batches.os, "nice", lambda increment: 0)
+    visible = work_tree / "visible"
+    monkeypatch.setattr(
+        sys, "argv", ["package-notion-batches", str(source), "--output", str(visible)]
+    )
+    with pytest.raises(SystemExit) as refused:
+        batches.main()
+    assert refused.value.code == 2 and "Git-visible" in capsys.readouterr().err
+    assert not visible.exists() and sorted(p.name for p in work_tree.iterdir()) == [".git"]
+
+
+def test_cli_packages_into_an_output_git_ignores(tmp_path, monkeypatch, capsys):
+    work_tree = _git_work_tree(tmp_path / "work")
+    (work_tree / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    source = source_zip(tmp_path / "full.zip", [("vault/a.md", b"private text")])
+    monkeypatch.setattr(batches.os, "nice", lambda increment: 0)
+    monkeypatch.setattr(
+        sys, "argv", ["package-notion-batches", str(source), "--output", str(work_tree / "ignored")]
+    )
+    batches.main()
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])["complete"] is True
+    assert (work_tree / "ignored").is_dir()

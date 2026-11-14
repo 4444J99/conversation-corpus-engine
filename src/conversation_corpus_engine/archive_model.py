@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .answering import shorten, slugify
+from .archive_author import HUMAN, author_of
 from .archive_naming import (
     PROVIDER_SCOPES,
     InvalidName,
@@ -25,8 +26,20 @@ SCHEMA = "archive-conversation.v2"
 LEGACY_SCHEMA = "cce.archive.conversation.v1"
 ACCEPTED_SCHEMAS = frozenset({SCHEMA, LEGACY_SCHEMA})
 ROLES = ("user", "assistant", "system", "tool")
-KINDS = ("chat", "search", "activity", "notebook", "memory")
-CHANNELS = ("typed", "reply", "thinking", "tool", "system", "memory", "project")
+KINDS = (
+    "chat",
+    "search",
+    "activity",
+    "notebook",
+    "memory",
+    "session",
+    "note",
+    "document",
+    "plan",
+    "page",
+    "artifact",
+)
+CHANNELS = ("typed", "reply", "thinking", "tool", "system", "memory", "project", "written")
 SNIPPET_LIMIT = 240
 DERIVED_ID_PREFIX = "derived"
 _PLAIN_ID_RE = re.compile(r"[a-z0-9-]{1,64}")
@@ -75,6 +88,11 @@ class Message:
     def __post_init__(self) -> None:
         if self.typed_chars is None:
             self.typed_chars = len(self.text)
+
+    @property
+    def author(self) -> str:
+        """`human` for a typed user turn, `machine` for every other (see `archive_author`)."""
+        return author_of(self.role, self.channel)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -140,8 +158,10 @@ class Conversation:
         return max(stamps) if stamps else (self.updated or self.created)
 
     def first_user_text(self) -> str:
+        """The first words the person themselves put in: a harness-injected turn or a prompt a
+        parent agent wrote (both user-role, neither human) never becomes a snippet."""
         for message in self.messages:
-            if message.role == "user" and message.text.strip():
+            if message.author == HUMAN and message.text.strip():
                 return message.text
         return ""
 
@@ -403,10 +423,23 @@ def sha256_file(path: Path, cache: dict[Path, str] | None = None) -> str:
 class SourceTracker:
     """Per-export provenance: relative source path plus a lazily cached sha256."""
 
-    def __init__(self, root: Path, reader: str) -> None:
+    def __init__(
+        self,
+        root: Path,
+        reader: str,
+        *,
+        origin: str = "unspecified",
+        path_origins: dict[Path, str] | None = None,
+        hash_cache: dict[Path, str] | None = None,
+    ) -> None:
         self.root = root.resolve()
         self.reader = reader
+        self.origin = origin
+        self.path_origins = {path.resolve(): value for path, value in (path_origins or {}).items()}
         self._hashes: dict[Path, str] = {}
+        self._hash_cache = hash_cache if hash_cache is not None else {}
+        self._inputs: dict[Path, dict[str, Any]] = {}
+        self.metadata: dict[str, Any] = {}
         self.files_read: list[str] = []
         self.counters: Counter[str] = Counter()
 
@@ -419,16 +452,73 @@ class SourceTracker:
         except ValueError:
             return path.name
 
-    def hashes(self) -> dict[str, str]:
-        return {self.relative(path): digest for path, digest in sorted(self._hashes.items())}
+    def _keys(self) -> dict[Path, str]:
+        """The manifest key of every input read, unique across the inputs.
 
-    def provenance(self, path: Path, *, member: str = "") -> dict[str, Any]:
+        A file under the root keeps its relative path. A file outside it (a delta, a library
+        database) is keyed by its basename, so two of them with one name would collapse into one
+        entry; those, and any that share a name with a file under the root, are qualified by a
+        prefix of their own content digest (`external/<digest>/<name>`). The key never holds an
+        absolute path, and an input nobody collides with keeps its plain name.
+        """
+        names = {path: self.relative(path) for path in self._inputs}
+        counts = Counter(names.values())
+        keys: dict[Path, str] = {}
+        for path, name in names.items():
+            inside = path.is_relative_to(self.root)
+            if counts[name] > 1 and not inside:
+                digest = self._inputs[path]["sha256"][:12]
+                keys[path] = f"external/{digest}/{name}"
+            else:
+                keys[path] = name
+        return keys
+
+    def hashes(self) -> dict[str, str]:
+        keys = self._keys()
+        return {keys[path]: digest for path, digest in sorted(self._hashes.items())}
+
+    def inputs(self) -> list[dict[str, Any]]:
+        """Files actually read, including container bytes and the caller-declared origin."""
+        keys = self._keys()
+        return sorted(
+            ({**item, "source_file": keys[path]} for path, item in self._inputs.items()),
+            key=lambda item: (item["source_file"], item["sha256"]),
+        )
+
+    def declare_input(self, path: Path, *, origin: str) -> None:
+        """Record a file the build was handed but no reader opens (the outer export ZIP the
+        export was unpacked from): its SHA-256, size and origin join `inputs`, not `hashes`."""
+        resolved = path.resolve()
+        if resolved not in self._inputs:
+            self._inputs[resolved] = {
+                "source_file": self.relative(path),
+                "sha256": sha256_file(path, self._hash_cache),
+                "size_bytes": resolved.stat().st_size,
+                "origin": origin,
+            }
+
+    def provenance(
+        self, path: Path, *, member: str = "", origin: str | None = None
+    ) -> dict[str, Any]:
+        resolved = path.resolve()
         rel = self.relative(path)
         if rel not in self.files_read:
             self.files_read.append(rel)
+        if resolved not in self._inputs:
+            digest = sha256_file(path, self._hash_cache)
+            self._hashes[resolved] = digest
+            self._inputs[resolved] = {
+                "source_file": rel,
+                "sha256": digest,
+                "size_bytes": resolved.stat().st_size,
+                "origin": origin or self.path_origins.get(resolved, self.origin),
+            }
+        source = self._inputs[resolved]
         info: dict[str, Any] = {
             "source_file": rel,
-            "source_sha256": sha256_file(path, self._hashes),
+            "source_sha256": source["sha256"],
+            "source_size_bytes": source["size_bytes"],
+            "source_origin": source["origin"],
             "reader": self.reader,
         }
         if member:

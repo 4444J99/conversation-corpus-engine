@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import itertools
 import json
+import shutil
+import sqlite3
+import zlib
 from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -10,14 +15,20 @@ from typing import Any
 
 from . import archive_layout as layout
 from . import (
+    archive_read_captures,
     archive_read_chatgpt,
     archive_read_claude,
     archive_read_copilot,
     archive_read_gemini,
     archive_read_grok,
+    archive_read_library,
+    archive_read_localmemory,
     archive_read_notebooklm,
     archive_read_perplexity,
 )
+from .archive_author import AUTHORS, author_of, container_of
+from .archive_limits import SHARD_BYTES
+from .archive_lineage import check_lineage, record_generation
 from .archive_model import (
     SCHEMA,
     Conversation,
@@ -25,33 +36,95 @@ from .archive_model import (
     finalize_conversation,
     iter_conversations,
     iter_jsonl,
+    sha256_file,
     write_json_atomic,
 )
 from .archive_naming import NAMING_VERSION, day_of
-from .corpus_store import CorpusStoreError, CorpusWriteAuthorization, authorize_corpus_write
+from .archive_shard import ShardWriter, month_key, plan_flat_folders, shard_sort_key
+from .corpus_store import (
+    CorpusStoreError,
+    CorpusWriteAuthorization,
+    authorize_corpus_write,
+    require_write_authorization,
+)
 
 MANIFEST_SCHEMA = "archive-manifest.v2"
 LEGACY_MANIFEST_SCHEMA = "cce.archive.manifest.v1"
 ACCEPTED_MANIFEST_SCHEMAS = frozenset({MANIFEST_SCHEMA, LEGACY_MANIFEST_SCHEMA})
 SCHEMA_VERSION = 2
+# The layout of the folders and files, not of the rows: 3 is the bounded layout (provider-month
+# shards, an author count on every provider, parts and fan-out limits in the vault and site). A
+# manifest with no `layout_version` is a first-generation layout and still reads.
+LAYOUT_VERSION = 3
+# Where a provider's shards are written before they replace the previous ones.
+BUILD_DIRNAME = ".build"
 DEFAULT_ARCHIVE_DIRNAME = layout.ARCHIVE_DIRNAME
 # Per-provider manifest keys that hold absolute paths or host-specific error text; they are
 # dropped from the copy the source fingerprint hashes.
-FINGERPRINT_EXCLUDED_KEYS = frozenset({"source_root", "error"})
+FINGERPRINT_EXCLUDED_KEYS = frozenset({"source_root", "error", "build_options", "failed_attempt"})
+
+
+SOURCE_EXPORT = "export"
+SOURCE_LIBRARY = "library"
+# The origin of an outer export ZIP named with `--export-zip`: hashed, never opened by a reader.
+EXPORT_ARCHIVE_ORIGIN = "export_archive"
 
 
 @dataclass(frozen=True)
 class ProviderSpec:
+    """One provider (a source family) and how to open its source.
+
+    `source` says where the root comes from: a folder of a provider's export under the export
+    root (`export`), or a published knowledge-library generation given by `--library-root`
+    (`library`). A `--source PROVIDER=PATH` override wins over both.
+    """
+
     name: str
     display: str
     default_rel: str
     module: Any
     open_reader: Callable[[Path, SourceTracker, dict[str, Any]], Iterator[Conversation]]
+    source: str = SOURCE_EXPORT
+    # A second source that makes the provider present even when its own folder is not: the
+    # options say whether it has anything (the ChatGPT pages a library holds).
+    supplement: Callable[[dict[str, Any]], bool] | None = None
+
+
+def _library_pages(options: dict[str, Any]) -> bool:
+    """True when `--library-root` names a library that holds ChatGPT pages."""
+    library_root = options.get("library_root")
+    if library_root is None or not archive_read_library.detect(Path(library_root)):
+        return False
+    return bool(
+        archive_read_library.expected(Path(library_root), archive_read_library.CHATGPT_PAGES)[
+            "records"
+        ]
+    )
 
 
 def _chatgpt(root: Path, tracker: SourceTracker, options: dict[str, Any]) -> Iterator[Conversation]:
-    return archive_read_chatgpt.iter_conversations(
-        root, tracker, extra_files=options.get("chatgpt_extra_files", ())
+    export: Iterator[Conversation] = iter(())
+    if options.get("chatgpt_extra_files") or (root.exists() and archive_read_chatgpt.detect(root)):
+        export = archive_read_chatgpt.iter_conversations(
+            root, tracker, extra_files=options.get("chatgpt_extra_files", ())
+        )
+    if not _library_pages(options):
+        return export
+    # The library also holds ChatGPT pages the account export lacks; an id the export already has
+    # is folded by the ingest (the export's version stays).
+    return itertools.chain(
+        export,
+        archive_read_library.iter_family(
+            Path(options["library_root"]), tracker, archive_read_library.CHATGPT_PAGES
+        ),
+    )
+
+
+def _localmemory(
+    root: Path, tracker: SourceTracker, options: dict[str, Any]
+) -> Iterator[Conversation]:
+    return archive_read_localmemory.iter_conversations(
+        root, tracker, known_uids=options.get("known_uids")
     )
 
 
@@ -70,10 +143,32 @@ def _plain(module: Any) -> Callable[[Path, SourceTracker, dict[str, Any]], Itera
     return opener
 
 
+def _library_spec(family: archive_read_library.Family) -> ProviderSpec:
+    reader = archive_read_library.reader_for(family.name)
+    return ProviderSpec(
+        family.name,
+        family.display,
+        "library-all",
+        reader,
+        _plain(reader),
+        source=SOURCE_LIBRARY,
+    )
+
+
+# The seven web providers come from account exports; the rest of the families come from a
+# knowledge-library generation (the coding CLIs, notes, Drive, documents, agent memory and
+# plans) or from their own capture folders (Copilot captures, local-session memory).
 PROVIDER_SPECS: dict[str, ProviderSpec] = {
     spec.name: spec
     for spec in (
-        ProviderSpec("chatgpt", "ChatGPT", "chatgpt", archive_read_chatgpt, _chatgpt),
+        ProviderSpec(
+            "chatgpt",
+            "ChatGPT",
+            "chatgpt",
+            archive_read_chatgpt,
+            _chatgpt,
+            supplement=_library_pages,
+        ),
         ProviderSpec("claude", "Claude", "claude", archive_read_claude, _claude),
         ProviderSpec(
             "gemini", "Gemini", "gemini", archive_read_gemini, _plain(archive_read_gemini)
@@ -95,6 +190,21 @@ PROVIDER_SPECS: dict[str, ProviderSpec] = {
         ),
         ProviderSpec(
             "copilot", "Copilot", "copilot", archive_read_copilot, _plain(archive_read_copilot)
+        ),
+        *(_library_spec(family) for family in archive_read_library.FAMILIES),
+        ProviderSpec(
+            "copilotreports",
+            "Copilot reports",
+            "copilot",
+            archive_read_captures,
+            _plain(archive_read_captures),
+        ),
+        ProviderSpec(
+            "localmemory",
+            "Local memory",
+            "local-memory",
+            archive_read_localmemory,
+            _localmemory,
         ),
     )
 }
@@ -126,6 +236,21 @@ class ArchivePaths:
         return self.root / layout.TOPICS_FILENAME
 
     @property
+    def lineage(self) -> Path:
+        """The ledger of generations (what each ingest added, changed or removed)."""
+        return self.root / layout.LINEAGE_FILENAME
+
+    @property
+    def digests(self) -> Path:
+        """The content digest of every conversation as of the latest generation."""
+        return self.root / layout.DIGESTS_FILENAME
+
+    @property
+    def digests_pending(self) -> Path:
+        """The new baseline while a generation is being committed (see `record_generation`)."""
+        return self.digests.with_name(self.digests.name + ".pending")
+
+    @property
     def vault(self) -> Path:
         return self.root / layout.VAULT_DIRNAME
 
@@ -147,10 +272,82 @@ class ArchivePaths:
         return self.root / layout.provider_dirname(provider)
 
     def conversations(self, provider: str) -> Path:
+        """The first-generation single file of a provider's conversations (read-only legacy)."""
         return self.provider_dir(provider) / layout.conversations_filename(provider)
 
     def index(self, provider: str) -> Path:
+        """The first-generation single index file of a provider (read-only legacy)."""
         return self.provider_dir(provider) / layout.index_filename(provider)
+
+    def _shards(self, provider: str, prefix: str) -> list[Path]:
+        directory = self.provider_dir(provider)
+        if not directory.is_dir():
+            return []
+        stem = f"{prefix}-{provider}-"
+        found: list[tuple[tuple[int, str, int], Path]] = []
+        # Flat (legacy) layout, plus one level of grouping (e.g. by year) so a
+        # provider with enough shards to exceed the folder limit stays readable.
+        candidates = list(directory.glob(f"{stem}*.jsonl"))
+        # Descend into non-hidden sub-directories (grouped/bucketed layouts).
+        for child in directory.iterdir():
+            if child.is_dir() and not child.name.startswith("."):
+                for p in child.rglob(f"{stem}*.jsonl"):
+                    if not any(part.startswith(".") for part in p.relative_to(directory).parts):
+                        candidates.append(p)
+        for path in candidates:
+            subject = path.name[len(stem) : -len(".jsonl")]
+            try:
+                found.append((shard_sort_key(subject), path))
+            except ValueError as exc:
+                # Only fail loudly for names that look like real shard subjects
+                # (they start with a digit, e.g. 202506). Legacy monoliths such as
+                # `conversations` and arbitrary foreign files are skipped quietly.
+                if subject and subject[0].isdigit():
+                    raise ValueError(f"unparseable shard-like file {path}: {exc}") from exc
+                continue
+        return [path for _, path in sorted(found)]
+
+    def shard_files(self, provider: str) -> list[Path]:
+        """The provider's conversation shards in reading order (months, then `undated`)."""
+        return self._shards(provider, "shard")
+
+    def index_shard_files(self, provider: str) -> list[Path]:
+        """The index rows of the same shards, in the same order."""
+        return self._shards(provider, "index")
+
+    def conversation_files(self, provider: str) -> list[Path]:
+        """Where a provider's conversations are: its shards, else the first-generation file."""
+        shards = self.shard_files(provider)
+        if shards:
+            return shards
+        legacy = self.conversations(provider)
+        return [legacy] if legacy.is_file() else []
+
+    def index_files(self, provider: str) -> list[Path]:
+        shards = self.index_shard_files(provider)
+        if shards:
+            return shards
+        legacy = self.index(provider)
+        return [legacy] if legacy.is_file() else []
+
+    def provider_present(self, provider: str) -> bool:
+        # A provider re-ingested with zero conversations still counts as present
+        # when the manifest records it as ingested successfully, so its (empty)
+        # feed and receipt are written instead of silently reusing the old ones.
+        try:
+            manifest = load_manifest(self)
+        except (FileNotFoundError, ValueError, OSError, json.JSONDecodeError):
+            manifest = None
+        if isinstance(manifest, dict):
+            info = manifest.get("providers", {}).get(provider)
+            if isinstance(info, dict) and "status" in info:
+                if info.get("status") == "ok":
+                    return True
+                # A failed rebuild keeps the previous shards and their receipt, and the totals
+                # still count them: every reader of the store must see them, and `verify` flags
+                # the provider as failed.
+                return retained_after_failure(info) and bool(self.conversation_files(provider))
+        return bool(self.conversation_files(provider))
 
     def feed(self, provider: str) -> Path:
         return self.root / layout.feed_filename(provider)
@@ -159,7 +356,27 @@ class ArchivePaths:
         return self.root / layout.receipt_filename(provider, fingerprint, day)
 
     def providers_present(self) -> list[str]:
-        return [name for name in PROVIDER_SPECS if self.conversations(name).is_file()]
+        return [name for name in PROVIDER_SPECS if self.provider_present(name)]
+
+    # --- the turn store: one container per author ---
+
+    @property
+    def turns(self) -> Path:
+        return self.root / layout.TURNS_DIRNAME
+
+    @property
+    def turns_manifest(self) -> Path:
+        return self.turns / layout.TURNS_MANIFEST_FILENAME
+
+    def container(self, author: str) -> Path:
+        return self.turns / layout.container_dirname(container_of(author))
+
+    def turn_shard(self, author: str, provider: str, subject: str) -> Path:
+        return (
+            self.container(author)
+            / layout.provider_dirname(provider)
+            / layout.turn_shard_filename(provider, subject)
+        )
 
     # --- the vault ---
 
@@ -200,11 +417,32 @@ class ArchivePaths:
         return self.site / layout.SITE_PAGES_DIRNAME
 
     @property
+    def site_hubs(self) -> Path:
+        return self.site / layout.SITE_HUBS_DIRNAME
+
+    @property
     def site_home(self) -> Path:
         return self.site / layout.SITE_HOME_FILENAME
 
     def site_page(self, provider: str, uid: str) -> Path:
-        return self.site_pages / f"{layout.conversation_note(provider, uid)}.html"
+        """The first page of a conversation. Pages sit in month folders (and deeper when a month
+        outgrew the folder limit), so the page is found by its name; a conversation not yet built
+        answers with the flat path a first-generation site used."""
+        name = f"{layout.conversation_note(provider, uid)}.html"
+        if self.site_pages.is_dir():
+            found = next(self.site_pages.rglob(name), None)
+            if found is not None:
+                return found
+        return self.site_pages / name
+
+    def vault_note(self, provider: str, uid: str) -> Path:
+        """The conversation note, found by name for the same reason as `site_page`."""
+        name = f"{layout.conversation_note(provider, uid)}.md"
+        if self.vault_conversations.is_dir():
+            found = next(self.vault_conversations.rglob(name), None)
+            if found is not None:
+                return found
+        return self.vault_conversations / name
 
 
 def latest_activity_day(manifest: dict[str, Any]) -> str:
@@ -238,6 +476,7 @@ def authorize_archive(
 
 
 def require_inside(authorization: CorpusWriteAuthorization, path: Path) -> Path:
+    require_write_authorization(authorization)  # a read-only attachment never reaches a write
     resolved = path.resolve(strict=False)
     try:
         resolved.relative_to(authorization.destination)
@@ -247,16 +486,23 @@ def require_inside(authorization: CorpusWriteAuthorization, path: Path) -> Path:
 
 
 def resolve_sources(
-    export_root: Path, providers: list[str] | None, overrides: dict[str, Path] | None = None
+    export_root: Path,
+    providers: list[str] | None,
+    overrides: dict[str, Path] | None = None,
+    library_root: Path | None = None,
 ) -> dict[str, Path]:
+    """Where each chosen provider is read from: an override, else the library root for a library
+    family, else the provider's folder under the export root."""
     chosen = providers or list(PROVIDER_SPECS)
     unknown = [name for name in chosen if name not in PROVIDER_SPECS]
     if unknown:
         raise KeyError(f"Unknown archive provider(s): {', '.join(unknown)}")
     sources: dict[str, Path] = {}
     for name in chosen:
-        override = (overrides or {}).get(name)
-        sources[name] = (override or export_root / PROVIDER_SPECS[name].default_rel).resolve()
+        spec = PROVIDER_SPECS[name]
+        base = library_root if spec.source == SOURCE_LIBRARY and library_root else None
+        override = (overrides or {}).get(name) or base
+        sources[name] = (override or export_root / spec.default_rel).resolve()
     return sources
 
 
@@ -274,81 +520,386 @@ def content_digest(conversation: Conversation) -> str:
     ).hexdigest()
 
 
+def conversation_stamp(conversation: Conversation) -> str:
+    """The timestamp that decides a conversation's month: when it began, else its last activity."""
+    return conversation.created or conversation.last_activity
+
+
+def _publish_shards(
+    paths: ArchivePaths, provider: str, build: Path, folder_entries: int | None = None
+) -> None:
+    """Replace a provider's previous conversation files with the freshly built shards.
+
+    Everything the previous build (or the first-generation layout) left is removed only after
+    the new shards are complete, so a failed ingest leaves the previous store readable.
+    """
+    directory = paths.provider_dir(provider)
+    for stale in [
+        *paths.shard_files(provider),
+        *paths.index_shard_files(provider),
+        paths.conversations(provider),
+        paths.index(provider),
+    ]:
+        stale.unlink(missing_ok=True)
+    built_files = sorted(build.iterdir())
+    limit = folder_entries if folder_entries is not None else None
+    # Number of shard subjects (each contributes two files).
+    subjects = []
+    for built in built_files:
+        name = built.name
+        for prefix in (f"shard-{provider}-", f"index-{provider}-"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :].replace(".jsonl", "")
+                break
+        if name not in subjects and not name.startswith("index-"):
+            subjects.append(name)
+    # Actually collect unique subjects from shard files only.
+    subjects = []
+    for built in built_files:
+        name = built.name
+        if not name.startswith(f"shard-{provider}-"):
+            continue
+        subj = name[len(f"shard-{provider}-") :].replace(".jsonl", "")
+        if subj not in subjects:
+            subjects.append(subj)
+    nshards = len(subjects)
+    # Flat while it fits; otherwise spill subjects into (possibly nested) buckets.
+    if limit is None or (nshards * 2) <= limit:
+        targets = [(built, directory / built.name) for built in built_files]
+    else:
+        folder_plan = plan_flat_folders(subjects, limit // 2 if limit // 2 > 0 else 1)
+        # plan_flat_folders returns subject -> relative folder (may be nested).
+        targets = []
+        for built in built_files:
+            name = built.name
+            subj = name
+            for prefix in (f"shard-{provider}-", f"index-{provider}-"):
+                if subj.startswith(prefix):
+                    subj = subj[len(prefix) :].replace(".jsonl", "")
+                    break
+            rel = folder_plan.get(subj, "")
+            dest_dir = directory
+            if rel:
+                dest_dir = directory.joinpath(*rel.split("/"))
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            targets.append((built, dest_dir / built.name))
+    for built, target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        built.replace(target)
+    build.rmdir()
+
+
+def _safe_channels(spec: ProviderSpec, root: Path) -> dict[str, list[str]]:
+    """The reader's account of its source, or the reason it cannot give one (a damaged library)."""
+    try:
+        return spec.module.channels(root)
+    except (OSError, ValueError, KeyError, sqlite3.Error, zlib.error) as exc:
+        return {"read": [], "not_read": [f"source unreadable: {type(exc).__name__}: {exc}"]}
+
+
+def known_uids(paths: ArchivePaths, provider: str) -> set[str]:
+    """The uids a provider already holds in this store, from its index shards."""
+    return {str(row["uid"]) for path in paths.index_files(provider) for row in iter_jsonl(path)}
+
+
+class MergeInputLoss(ValueError):
+    """A merge would omit inputs which contributed to the existing provider."""
+
+
+class ProviderDropRefused(MergeInputLoss):
+    """A build without --merge would drop providers the manifest already holds."""
+
+
+# What a reader or its source can raise while a provider is read; the ingest isolates the
+# provider on any of these, and the merge check treats them as "cannot be checked".
+READ_ERRORS = (
+    OSError,
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+    IndexError,
+    sqlite3.Error,
+    zlib.error,
+)
+
+
+def receipt_holds_shards(info: dict[str, Any]) -> bool:
+    """True when a provider's receipt describes conversation shards that exist in the store."""
+    return info.get("status") in {"ok", "failed"} and (
+        bool(info.get("conversations")) or bool(info.get("layout", {}).get("shards"))
+    )
+
+
+def retained_after_failure(info: dict[str, Any]) -> bool:
+    """True for a failed provider whose previous shards and receipt were kept (`failed_attempt`
+    holds the new, failed receipt)."""
+    return (
+        info.get("status") == "failed" and "failed_attempt" in info and receipt_holds_shards(info)
+    )
+
+
+def _would_be_absent(spec: ProviderSpec, root: Path, options: dict[str, Any]) -> bool:
+    """True when this call has nothing to read for the provider: no source of its own, no extra
+    live-capture file and no supplement (the library pages a ChatGPT build can take)."""
+    own = root.exists() and spec.module.detect(root)
+    extra_files = options.get("chatgpt_extra_files", []) if spec.name == "chatgpt" else []
+    return not (own or extra_files or (spec.supplement is not None and spec.supplement(options)))
+
+
+def _check_merge_inputs(
+    previous: dict[str, Any], sources: dict[str, Path], options: dict[str, Any]
+) -> None:
+    """Check every selected provider before any provider's shards can be replaced."""
+    for name, root in sources.items():
+        old = previous.get(name, {})
+        required_library = set(old.get("library_uids", []))
+        old_count = int(old.get("reader_counters", {}).get("library_records", 0))
+        if required_library or old_count:
+            spec = PROVIDER_SPECS[name]
+            library_root = root if spec.source == SOURCE_LIBRARY else options.get("library_root")
+            family = archive_read_library.FAMILY_BY_NAME.get(
+                name, archive_read_library.CHATGPT_PAGES
+            )
+            available: set[str] = set()
+            if library_root is not None and archive_read_library.detect(Path(library_root)):
+                available = archive_read_library.family_uids(Path(library_root), family)
+            # Older manifests only bound the count, so require at least that many records.
+            missing = required_library - available
+            if missing or (not required_library and len(available) < old_count):
+                raise MergeInputLoss(
+                    f"{name}: library inputs would be lost; provide the complete --library-root "
+                    "(or library --source), or explicitly acknowledge removal with --allow-input-loss"
+                )
+        _check_live_capture_inputs(name, root, old, options)
+    # The specific refusals above come first; this one covers a source that is simply not there.
+    for name, root in sources.items():
+        if receipt_holds_shards(previous.get(name, {})) and _would_be_absent(
+            PROVIDER_SPECS[name], root, options
+        ):
+            raise MergeInputLoss(
+                f"{name}: the source is absent, so its previous conversations would be orphaned; "
+                "supply the source, or explicitly acknowledge removal with --allow-input-loss"
+            )
+
+
+def _check_live_capture_inputs(
+    name: str, root: Path, old: dict[str, Any], options: dict[str, Any]
+) -> None:
+    """Refuse a merge that would drop a captured identity the provider already holds.
+
+    Every provider whose inputs are live captures (the ChatGPT delta files, the Copilot pages
+    and reports, the local-session memory) records the normalized ids it read; the new inputs
+    must still carry each of them, in a capture or, for ChatGPT, in an account export.
+    """
+    spec = PROVIDER_SPECS[name]
+    required_uids = set(old.get("live_capture_uids", []))
+    if required_uids:
+        available_uids: set[str] = set()
+        if not _would_be_absent(spec, root, options):
+            tracker = SourceTracker(
+                root, spec.module.READER, hash_cache=options.get("source_hash_cache")
+            )
+            try:
+                for conversation in spec.open_reader(root, tracker, options):
+                    finalize_conversation(conversation)
+                    available_uids.add(conversation.uid)
+                    if required_uids <= available_uids:
+                        break
+            except READ_ERRORS as exc:
+                raise MergeInputLoss(
+                    f"{name}: live capture inputs cannot be checked; supply complete readable "
+                    "inputs or explicitly acknowledge removal with --allow-input-loss"
+                ) from exc
+        if required_uids - available_uids:
+            where = (
+                "in --chatgpt-extra or the account export"
+                if name == "chatgpt"
+                else "in the capture source"
+            )
+            raise MergeInputLoss(
+                f"{name}: live capture records would be lost; supply the previous records "
+                f"{where}, or acknowledge removal with --allow-input-loss"
+            )
+        return
+    if name == "chatgpt":
+        old_files = old.get("build_options", {}).get("chatgpt_extra_files", [])
+        required = {Path(path).resolve() for path in old_files}
+        current = {
+            Path(path).resolve()
+            for path in options.get("chatgpt_extra_files", [])
+            if Path(path).is_file()
+        }
+        if required - current:
+            raise MergeInputLoss(
+                "chatgpt: live capture inputs would be lost; repeat --chatgpt-extra, "
+                "or explicitly acknowledge removal with --allow-input-loss"
+            )
+
+
+def _export_zips(options: dict[str, Any], provider: str) -> list[Path]:
+    """The outer export ZIPs the caller named for a provider (`--export-zip PROVIDER=PATH`)."""
+    return [Path(path) for path in (options.get("export_zips") or {}).get(provider, ())]
+
+
+def check_export_zips(export_zips: dict[str, list[Path]], selected: list[str]) -> None:
+    """Refuse an `--export-zip` for an unknown or unselected provider, or for a missing file."""
+    for name, zips in export_zips.items():
+        if name not in PROVIDER_SPECS:
+            raise ValueError(f"--export-zip names an unknown provider: {name}")
+        if name not in selected:
+            raise ValueError(f"--export-zip {name}: the provider is not part of this build")
+        for path in zips:
+            if not Path(path).is_file():
+                raise ValueError(f"--export-zip {name}: not a file: {path}")
+
+
+def _provider_build_options(
+    spec: ProviderSpec, root: Path, options: dict[str, Any]
+) -> dict[str, Any]:
+    library_root = root if spec.source == SOURCE_LIBRARY else options.get("library_root")
+    return {
+        "source_root": str(root),
+        "library_root": str(Path(library_root).resolve()) if library_root is not None else None,
+        "chatgpt_extra_files": [
+            str(Path(path).resolve()) for path in options.get("chatgpt_extra_files", [])
+        ]
+        if spec.name == "chatgpt"
+        else [],
+        "export_zips": [str(Path(path).resolve()) for path in _export_zips(options, spec.name)],
+        "include_attachment_text": bool(options.get("include_attachment_text")),
+        "shard_bytes": int(options.get("shard_bytes") or SHARD_BYTES),
+        "folder_entries": options.get("folder_entries"),
+    }
+
+
 def _ingest_provider(
     spec: ProviderSpec, root: Path, paths: ArchivePaths, options: dict[str, Any]
 ) -> dict[str, Any]:
-    if not root.exists() or not spec.module.detect(root):
+    extra_files = options.get("chatgpt_extra_files", []) if spec.name == "chatgpt" else []
+    build_options = _provider_build_options(spec, root, options)
+    if _would_be_absent(spec, root, options):
         return {
             "status": "absent",
             "source_root": str(root),
             "channels": {"read": [], "not_read": []},
+            "build_options": build_options,
         }
-    tracker = SourceTracker(root, spec.module.READER)
+    origin = (
+        "library_generation"
+        if spec.source == SOURCE_LIBRARY
+        else "live_capture"
+        if spec.name in {"copilot", "copilotreports", "localmemory"}
+        else "account_export"
+    )
+    tracker = SourceTracker(
+        root,
+        spec.module.READER,
+        origin=origin,
+        path_origins={Path(path): "live_capture" for path in extra_files},
+        hash_cache=options.get("source_hash_cache"),
+    )
+    for zip_path in _export_zips(options, spec.name):
+        tracker.declare_input(zip_path, origin=EXPORT_ARCHIVE_ORIGIN)
     seen: dict[str, str] = {}
+    library_uids: set[str] = set()
+    live_capture_uids: set[str] = set()
     kinds: Counter[str] = Counter()
     roles: Counter[str] = Counter()
+    turn_channels: Counter[str] = Counter()
+    authors: Counter[str] = Counter()
     totals: Counter[str] = Counter()
     created: list[str] = []
     activity: list[str] = []
-    conv_path = paths.conversations(spec.name)
-    index_path = paths.index(spec.name)
-    conv_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_conv = conv_path.with_name(f".{conv_path.name}.tmp")
-    temp_index = index_path.with_name(f".{index_path.name}.tmp")
+    shard_bytes = int(options.get("shard_bytes") or SHARD_BYTES)
+    directory = paths.provider_dir(spec.name)
+    directory.mkdir(parents=True, exist_ok=True)
+    build = directory / BUILD_DIRNAME
+    shutil.rmtree(build, ignore_errors=True)
+    writer = ShardWriter(build, spec.name, shard_bytes=shard_bytes)
     error = ""
+    shards: list[dict[str, Any]] = []
     try:
-        with (
-            temp_conv.open("w", encoding="utf-8") as conv_out,
-            temp_index.open("w", encoding="utf-8") as index_out,
-        ):
-            for conversation in spec.open_reader(root, tracker, options):
-                derived = finalize_conversation(conversation)
-                uid = conversation.uid
-                content = content_digest(conversation)
-                if uid in seen:
-                    _bump(totals, "duplicates_folded")
-                    kept = "identical" if seen[uid] == content else "differing"
-                    _bump(totals, f"duplicates_folded_{kept}")
-                    continue
-                seen[uid] = content
-                if derived:
-                    _bump(totals, "derived_ids")
-                    if derived == "unnameable":
-                        _bump(totals, "unnameable_ids")
-                conv_out.write(
-                    json.dumps(conversation.to_dict(), sort_keys=True, ensure_ascii=False)
-                )
-                conv_out.write("\n")
-                index_out.write(
-                    json.dumps(conversation.index_row(), sort_keys=True, ensure_ascii=False)
-                )
-                index_out.write("\n")
-                _bump(totals, "conversations")
-                _bump(kinds, conversation.kind)
-                if not conversation.messages:
-                    _bump(totals, "empty_conversations")
-                _bump(totals, "messages", conversation.message_count)
-                _bump(totals, "words", conversation.word_count)
-                _bump(totals, "attachments", conversation.attachment_count)
-                for message in conversation.messages:
-                    _bump(roles, message.role)
-                if conversation.created:
-                    created.append(conversation.created)
-                if conversation.last_activity:
-                    activity.append(conversation.last_activity)
-    except (OSError, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
+        for conversation in spec.open_reader(root, tracker, options):
+            if library_uid := conversation.provenance.get("library_uid"):
+                library_uids.add(library_uid)
+            derived = finalize_conversation(conversation)
+            uid = conversation.uid
+            if conversation.provenance.get("source_origin") == "live_capture":
+                live_capture_uids.add(uid)
+            content = content_digest(conversation)
+            if uid in seen:
+                _bump(totals, "duplicates_folded")
+                kept = "identical" if seen[uid] == content else "differing"
+                _bump(totals, f"duplicates_folded_{kept}")
+                continue
+            seen[uid] = content
+            if derived:
+                _bump(totals, "derived_ids")
+                if derived == "unnameable":
+                    _bump(totals, "unnameable_ids")
+            writer.add(
+                month_key(conversation_stamp(conversation)),
+                (
+                    json.dumps(conversation.to_dict(), sort_keys=True, ensure_ascii=False) + "\n"
+                ).encode("utf-8"),
+                (
+                    json.dumps(conversation.index_row(), sort_keys=True, ensure_ascii=False) + "\n"
+                ).encode("utf-8"),
+            )
+            _bump(totals, "conversations")
+            _bump(kinds, conversation.kind)
+            if not conversation.messages:
+                _bump(totals, "empty_conversations")
+            _bump(totals, "messages", conversation.message_count)
+            _bump(totals, "words", conversation.word_count)
+            _bump(totals, "attachments", conversation.attachment_count)
+            for message in conversation.messages:
+                _bump(roles, message.role)
+                _bump(turn_channels, message.channel)
+                _bump(authors, author_of(message.role, message.channel))
+            if conversation.created:
+                created.append(conversation.created)
+            if conversation.last_activity:
+                activity.append(conversation.last_activity)
+        shards = writer.close()
+    except READ_ERRORS as exc:
         error = f"{type(exc).__name__}: {exc}"
     if error:
-        temp_conv.unlink(missing_ok=True)
-        temp_index.unlink(missing_ok=True)
+        writer.close()
+        shutil.rmtree(build, ignore_errors=True)
         return {
             "status": "failed",
             "error": error,
             "source_root": str(root),
-            "channels": spec.module.channels(root),
+            "channels": _safe_channels(spec, root),
+            "build_options": build_options,
+            "inputs": tracker.inputs(),
         }
-    temp_conv.replace(conv_path)
-    temp_index.replace(index_path)
+    _publish_shards(paths, spec.name, build, folder_entries=options.get("folder_entries"))
+    # The digests of what this provider now holds, for the lineage of generations.
+    options.setdefault("lineage_digests", {})[spec.name] = seen
+    # Resolve each shard's on-disk path (flat or grouped) for its checksum.
+    on_disk = {p.name: p for p in paths.shard_files(spec.name)}
+    for shard in shards:
+        filename = layout.shard_filename(spec.name, shard["subject"])
+        target = on_disk.get(filename)
+        if target is None:
+            raise FileNotFoundError(f"published shard missing: {filename}")
+        shard["sha256"] = sha256_file(target)
+    basis = archive_read_library.counter_report(dict(tracker.counters))
+    # A captured identity remains protected after a newer account export absorbs it.
+    # An explicit allow-loss merge releases only identities absent from the new store.
+    live_capture_uids.update(
+        set(options.get("protected_capture_uids", {}).get(spec.name, [])) & seen.keys()
+    )
+    channels = spec.module.channels(root)
+    if extra_files:
+        channels["read"].append(
+            f"{len(extra_files)} extra live capture file(s), read before export shards"
+        )
+    if spec.name == "chatgpt" and tracker.metadata.get("library_generation"):
+        channels["read"].append(f"{len(library_uids)} library page record(s)")
     return {
         "status": "ok",
         "source_root": str(root),
@@ -364,12 +915,21 @@ def _ingest_provider(
         "attachments": totals["attachments"],
         "kinds": dict(sorted(kinds.items())),
         "roles": dict(sorted(roles.items())),
+        "turn_channels": dict(sorted(turn_channels.items())),
+        "authors": {author: authors[author] for author in AUTHORS},
+        **({"author_basis": basis} if any(basis.values()) else {}),
         "created_min": min(created) if created else "",
         "last_activity_max": max(activity) if activity else "",
         "reader": spec.module.READER,
         "reader_counters": dict(sorted(tracker.counters.items())),
-        "channels": spec.module.channels(root),
+        "channels": channels,
         "source_files": tracker.hashes(),
+        "inputs": tracker.inputs(),
+        "build_options": build_options,
+        **({"library_uids": sorted(library_uids)} if library_uids else {}),
+        **({"live_capture_uids": sorted(live_capture_uids)} if live_capture_uids else {}),
+        **tracker.metadata,
+        "layout": {"version": LAYOUT_VERSION, "shard_bytes": shard_bytes, "shards": shards},
     }
 
 
@@ -381,14 +941,84 @@ def ingest(
     providers: list[str] | None = None,
     overrides: dict[str, Path] | None = None,
     options: dict[str, Any] | None = None,
+    library_root: Path | None = None,
+    merge: bool = False,
+    allow_input_loss: bool = False,
+    drop_providers: bool = False,
+    folder_entries: int | None = None,
+    rebuild_lineage: bool = False,
 ) -> dict[str, Any]:
+    """Read the chosen providers into the normalized shards and write the archive manifest.
+
+    With `merge`, the providers the manifest already lists and this call does not touch keep
+    their entries, so a store is built one provider at a time and a failed one is re-read alone.
+    Without it the manifest lists exactly the providers of this call, so a call that names
+    fewer providers than the existing manifest holds is refused (`ProviderDropRefused`) unless
+    `drop_providers` says the omitted ones are to be dropped from the manifest.
+
+    A lineage that cannot be trusted (a damaged ledger, or a digest baseline that the ledger does
+    not describe) raises `LineageError` before anything is read or written; `rebuild_lineage`
+    records the generation anyway as a rebuilt one (see `archive_lineage.record_generation`).
+    """
     require_inside(authorization, paths.root)
+    check_lineage(paths, rebuild=rebuild_lineage)
     options = dict(options or {})
-    sources = resolve_sources(export_root, providers, overrides)
+    options["source_hash_cache"] = {}
+    options["protected_capture_uids"] = {}
+    if folder_entries is not None:
+        options.setdefault("folder_entries", folder_entries)
+    options.setdefault("known_uids", lambda provider: known_uids(paths, provider))
+    if library_root is not None:
+        options["library_root"] = library_root.resolve()
+    sources = resolve_sources(export_root, providers, overrides, library_root)
+    export_zips = {
+        name: [Path(path) for path in zips]
+        for name, zips in (options.get("export_zips") or {}).items()
+    }
+    check_export_zips(export_zips, list(sources))
+    options["export_zips"] = export_zips
     report: dict[str, Any] = {}
+    if merge and paths.manifest.is_file():
+        report.update(load_manifest(paths)["providers"])
+        options["protected_capture_uids"] = {
+            name: info.get("live_capture_uids", []) for name, info in report.items()
+        }
+        if not allow_input_loss:
+            _check_merge_inputs(report, sources, options)
+    # Without --merge the manifest lists only this call's providers, but a provider that fails
+    # still has its previous shards on disk: its previous receipt is the one to keep. An
+    # unreadable previous manifest keeps nothing; it never blocks a rebuild.
+    prior: dict[str, Any] = {}
+    if not merge and paths.manifest.is_file():
+        with contextlib.suppress(ValueError, OSError, KeyError, TypeError):
+            prior = load_manifest(paths)["providers"]
+        held = sorted(n for n, i in prior.items() if n not in sources and receipt_holds_shards(i))
+        if held and not drop_providers:
+            raise ProviderDropRefused(
+                f"the manifest holds {', '.join(held)} which this call does not read, and the "
+                "manifest would stop listing them while their shards stay in the store, so "
+                "`verify` would fail; run the full build, add --merge to refresh only the named "
+                "providers, or add --drop-providers to drop the others on purpose"
+            )
     for name, root in sources.items():
-        report[name] = _ingest_provider(PROVIDER_SPECS[name], root, paths, options)
-    reader_versions = {name: PROVIDER_SPECS[name].module.READER for name in report}
+        previous = report.get(name) if merge else prior.get(name)
+        result = _ingest_provider(PROVIDER_SPECS[name], root, paths, options)
+        if previous and result["status"] == "failed" and (merge or receipt_holds_shards(previous)):
+            # _ingest_provider leaves the previous shards in place on failure. Keep their
+            # original input/identity receipt too, so a later retry cannot bypass protection.
+            result = {
+                **previous,
+                "status": "failed",
+                "error": result["error"],
+                "failed_attempt": result,
+            }
+        report[name] = result
+    report = {name: report[name] for name in PROVIDER_SPECS if name in report}
+    # A provider carried over by `merge` keeps the reader version it was read with.
+    reader_versions = {
+        name: info.get("reader") or PROVIDER_SPECS[name].module.READER
+        for name, info in report.items()
+    }
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "conversation_schema": SCHEMA,
@@ -398,14 +1028,48 @@ def ingest(
         "source_fingerprint": source_fingerprint(
             report, reader_versions=reader_versions, naming_version=NAMING_VERSION
         ),
+        "layout_version": LAYOUT_VERSION,
+        "build_options": {
+            "export_root": str(export_root.resolve()),
+            "providers": list(sources),
+            "source_overrides": {
+                name: str(path.resolve()) for name, path in (overrides or {}).items()
+            },
+            "library_root": str(library_root.resolve()) if library_root is not None else None,
+            "export_zips": {
+                name: [str(path.resolve()) for path in zips] for name, zips in export_zips.items()
+            },
+            "merge": merge,
+            "allow_input_loss": allow_input_loss,
+        },
         "providers": report,
         "totals": {
             "conversations": sum(info.get("conversations", 0) for info in report.values()),
             "messages": sum(info.get("messages", 0) for info in report.values()),
             "words": sum(info.get("words", 0) for info in report.values()),
+            "authors": {
+                author: sum(info.get("authors", {}).get(author, 0) for info in report.values())
+                for author in AUTHORS
+            },
         },
     }
     write_json_atomic(paths.manifest, manifest)
+    try:
+        day = latest_activity_day(manifest)
+    except ValueError:  # no provider reports any activity: the generation has no day
+        day = ""
+    record_generation(
+        paths,
+        manifest,
+        options.get("lineage_digests", {}),
+        read=sources.keys(),
+        day=day,
+        digest_store=lambda name: {
+            conversation.uid: content_digest(conversation)
+            for conversation in iter_store(paths, [name])
+        },
+        rebuild=rebuild_lineage,
+    )
     return manifest
 
 
@@ -439,18 +1103,21 @@ def source_fingerprint(
 def iter_store(paths: ArchivePaths, providers: list[str] | None = None) -> Iterator[Conversation]:
     """Stream every normalized conversation in provider-registry then file order."""
     for name in providers or paths.providers_present():
-        path = paths.conversations(name)
-        if path.is_file():
+        for path in paths.conversation_files(name):
             yield from iter_conversations(path)
 
 
 def load_index(paths: ArchivePaths, providers: list[str] | None = None) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for name in providers or paths.providers_present():
-        path = paths.index(name)
-        if path.is_file():
+        for path in paths.index_files(name):
             rows.extend(iter_jsonl(path))
     return rows
+
+
+def has_bounded_layout(manifest: dict[str, Any]) -> bool:
+    """True for a manifest written by the bounded layout (shards, author counts, limits)."""
+    return int(manifest.get("layout_version") or 0) >= LAYOUT_VERSION
 
 
 def load_manifest(paths: ArchivePaths) -> dict[str, Any]:

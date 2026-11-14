@@ -12,7 +12,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .library_store import Library, canonical_json, digest_json
+from .library_store import Library, candidate_evidence_fingerprint, canonical_json, digest_json
+from .web_capture import normalized_source_path
 
 
 def _safe(path: Path) -> None:
@@ -118,6 +119,7 @@ def prepare_resume(
         ):
             raise ValueError("inherited resume baseline count mismatch")
     native_paths: list[str] = []
+    capture_paths: list[str] = []
     for index, source in enumerate(sources):
         check()
         if not isinstance(source, dict):
@@ -129,6 +131,15 @@ def prepare_resume(
             native = source.get("report", {})
             total += _count(native.get("records", 0), kind)
             native_paths.append(source.get("path"))
+        elif kind == "web_captures" and index < len(sources) - 1:
+            counts = source.get("report", {}).get("counts", {})
+            total += _count(counts.get("records", 0), "web capture records")
+            declared = source.get("report", {}).get("sources", [])
+            if not isinstance(declared, list) or any(
+                not isinstance(item, dict) for item in declared
+            ):
+                raise ValueError("invalid web capture source collection receipt")
+            capture_paths.extend(item.get("path") for item in declared)
         elif kind == "documents" and index == len(sources) - 1:
             counts = source.get("report", {}).get("counts", {})
             total += _count(counts.get("ingested", 0), "documents ingested")
@@ -137,6 +148,13 @@ def prepare_resume(
             raise ValueError("invalid or incomplete resume source sequence")
     if native_paths != manifest.get("estate_databases", []):
         raise ValueError("resume native source collection differs from declared sources")
+    declared_captures = manifest.get("web_captures", [])
+    if not isinstance(declared_captures, list) or any(
+        not isinstance(path, str) or not Path(path).is_absolute() for path in declared_captures
+    ):
+        raise ValueError("invalid resume web capture source collection declaration")
+    if capture_paths != [str(normalized_source_path(path)) for path in declared_captures]:
+        raise ValueError("resume web capture source collection differs from declared sources")
     if total != _count(report.get("accepted_observations"), "accepted_observations"):
         raise ValueError("resume accepted observations differ from source counts")
     phase = state.get("phase", report.get("phase"))
@@ -175,15 +193,7 @@ def prepare_resume(
             )
             if record_fingerprint != report.get("record_fingerprint"):
                 raise ValueError("resume record fingerprint differs from database")
-            evidence_fingerprint = digest_json(
-                {
-                    "library": library.evidence_fingerprint(),
-                    "sources": report["sources"],
-                    "findings": report["findings"],
-                    "manifest": report["source_manifest_hash"],
-                    "resume_source": report.get("resume_source"),
-                }
-            )
+            evidence_fingerprint = candidate_evidence_fingerprint(library, report)
             if evidence_fingerprint != report.get("evidence_fingerprint"):
                 raise ValueError("resume evidence fingerprint differs from database")
     digest = hashlib.sha256()

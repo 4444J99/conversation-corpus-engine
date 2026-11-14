@@ -184,13 +184,18 @@ def _inline(escaped: str) -> str:
     )
 
 
-def render_markdown_html(text: str) -> str:
-    """Render a conservative markdown subset to HTML. Input is escaped before any transform."""
+def render_markdown_html(text: str, heading_prefix: str = "") -> str:
+    """Render a conservative markdown subset to HTML. Input is escaped before any transform.
+
+    With a `heading_prefix` every heading carries the id `<prefix>-h<N>` (N counts from 1 in this
+    text), so a page can link to it. The prefix is the caller's own minted anchor, never text.
+    """
     out: list[str] = []
     paragraph: list[str] = []
     list_kind = ""
     tracker = FenceTracker()
     code: list[str] = []
+    headings = 0
 
     def flush_paragraph() -> None:
         if paragraph:
@@ -229,7 +234,9 @@ def render_markdown_html(text: str) -> str:
             flush_paragraph()
             close_list()
             level = min(6, len(heading.group(1)) + 2)
-            out.append(f"<h{level}>{_inline(html.escape(heading.group(2)))}</h{level}>")
+            headings += 1
+            anchor = f' id="{heading_prefix}-h{headings}"' if heading_prefix else ""
+            out.append(f"<h{level}{anchor}>{_inline(html.escape(heading.group(2)))}</h{level}>")
         elif item := bullet or numbered:
             flush_paragraph()
             kind = "ul" if bullet else "ol"
