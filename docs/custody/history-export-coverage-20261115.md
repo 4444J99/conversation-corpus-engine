@@ -36,7 +36,24 @@ No archive reader exists for single-conversation Markdown exports, so the normal
 no authorship credit is given). The files were copied (hashes recorded) into a 0700 directory under
 the custody staging root, and a candidate generation was built with `max_seconds` 3000, under
 `nice` and `timeout`, against the registered store; the published pointer and the existing
-generation were not touched. The outcome of that run is recorded in the pull request description.
+generation were not touched. 
+### Outcome of the bounded build (2026-11-15)
+
+- Ingest phase: 8 observations accepted (the 8 files), no failures.
+- The `index_blocks` stage then hit the manifest's 3000-second deadline (`library execution deadline
+  exceeded`, observed at 1320 s of its own stage clock when the last progress line printed; the run
+  was stopped by the library's deadline, not by `timeout`). The candidate generation
+  (`generation-20261115T112506Z-6a27693ffcf7`, about 10 GiB, phase `ingested`) is a failed
+  candidate: it was not verified, not published, and `library-all/current.json` still points at
+  generation `20261031T162115Z`. Nothing in v1 was modified.
+- Why: a build over the 27,382-record base re-indexes the block graph (1.6 million blocks), which
+  took 6,875 s on the last full build. A supplemental build with 8 small documents does not escape
+  that cost. The 8 files are therefore **not yet searchable** in the published library.
+- To finish: run the documented resume (`resume_generation` pointing at the failed candidate, with
+  `limits.max_seconds` of at least 14400 and `declare only supplemental sources`) as a scheduled
+  or owner-started job, then `cce library verify` and `cce library publish`. The staged inputs and
+  their SHA-256 sums are in the custody staging root under `history-exports-find-20261115/`.
+
 
 Document records do not carry `chatgpt-<id>` or Perplexity uids, so `cce app-cache gap` still
 counts those conversations as missing from the provider archive; the library finds them by search.
