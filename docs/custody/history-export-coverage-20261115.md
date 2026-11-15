@@ -15,7 +15,7 @@ missing. It carries counts, dates and path classes only: no titles, file names o
 | Dropbox (`rclone dropbox:`, list only; the connector plugin needed authorization) | name filter, complete (exit 0) | Google Takeout zips dated 2025-09-28/29 (about 20 files, tens of GiB) and older files. All end before 2026-10-17. |
 
 No extracted Takeout (`MyActivity.json`, a `Gemini Apps` folder) exists outside the archived
-2026-10-16 export. No credential, cookie or token store was read.
+2026-10-16 export. No application credential, cookie or token store was read or replayed. The Drive and Dropbox listings used the already-configured rclone remotes (list only; nothing downloaded), which authenticate with their stored tokens.
 
 ## Coverage per source after this change
 
@@ -50,9 +50,7 @@ generation were not touched.
 - Why: a build over the 27,382-record base re-indexes the block graph (1.6 million blocks), which
   took 6,875 s on the last full build. A supplemental build with 8 small documents does not escape
   that cost. The 8 files are therefore **not yet searchable** in the published library.
-- To finish: run the documented resume (`resume_generation` pointing at the failed candidate, with
-  `limits.max_seconds` of at least 14400 and declaring only the supplemental documents source) as a scheduled
-  or owner-started job, then `cce library verify` and `cce library publish`. The staged inputs and
+- To finish: run the documented resume (`resume_generation` pointing at the failed candidate, declaring only the supplemental documents source, with `limits.max_seconds` of at least 14400 and `limits.max_output_bytes` of 25769803776, because the omitted default of 8 GiB is below the 9.57 GiB base database) as a scheduled or owner-started job, then `cce library publish GENERATION_PATH` with the generation path the build prints (publish verifies the candidate before the pointer moves). The staged inputs and
   their SHA-256 sums are in the custody staging root under `history-exports-find-20261115/`.
 
 
