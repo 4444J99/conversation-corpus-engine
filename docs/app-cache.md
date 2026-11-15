@@ -62,6 +62,11 @@ archive's gemini uids derive from Takeout activity entries, which carry no app c
 ids cannot be matched; a chat the app saw after the archive's end is in the gap.
 Perplexity records carry synthetic ids, so only dates are compared.
 
+The archive index is read as a stable snapshot (shard names, sizes and times must match before and
+after the read, retried a few times, otherwise the command refuses), staged message text is dropped
+while the files are parsed, and the report directory is moved into place in one rename so a failed
+run leaves nothing that blocks a retry. See `docs/logos/app-cache-gap.md`.
+
 `gap-report.json` lists ids and titles and stays in the private `--out` directory (0700/0600);
 `coverage.json` and stdout carry counts, dates and the owner export path for each provider.
 
