@@ -2,7 +2,7 @@
 
 An archive of provider conversations ends on some date. The desktop apps keep going: they hold
 recent conversations in local caches that the export a person last requested does not contain.
-`cce app-cache gap` answers one question about each provider, without reading anyone's words:
+`cce app-cache gap` answers one question about each provider, using no message text and reporting none:
 what do the staged caches know that the archive does not, and for that part, can it be ingested
 now or does the person have to request the provider's export.
 
