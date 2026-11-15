@@ -21,6 +21,7 @@ from .archive_naming import (
     parse_name,
     validate_name,
 )
+from .credential_redaction import mask_conversation
 
 SCHEMA = "archive-conversation.v2"
 LEGACY_SCHEMA = "cce.archive.conversation.v1"
@@ -310,8 +311,10 @@ def assign_message_fields(conversation: Conversation) -> None:
     """Fill every blank message id, channel and typed character count; keep what readers set.
 
     A vendor id that repeats inside the conversation keeps its first holder; later holders are
-    re-minted rather than failing the whole provider. Idempotent.
+    re-minted rather than failing the whole provider. Pasted credentials are masked first, so no
+    secret reaches a message id or a digest. Idempotent.
     """
+    mask_conversation(conversation)
     provider, uid = conversation.provider, conversation.uid
     used: set[str] = set()
     repeats: Counter[tuple[str, str, str]] = Counter()
@@ -339,6 +342,7 @@ def assign_message_fields(conversation: Conversation) -> None:
 
 def finalize_conversation(conversation: Conversation) -> str:
     """Resolve the conversation id, then every message field. Returns the derived-id reason."""
+    mask_conversation(conversation)
     reason = resolve_source_id(conversation)
     assign_message_fields(conversation)
     return reason
