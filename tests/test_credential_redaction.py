@@ -350,6 +350,29 @@ def test_url_userinfo_password_is_masked_and_plain_urls_survive() -> None:
         assert mask_credentials(text) == text
 
 
+def test_repeated_pem_headers_without_end_mask_in_linear_time() -> None:
+    header = "-----BEGIN " + "PRIVATE KEY-----"
+    started = time.monotonic()
+    assert mask_credentials(header * 10000) == header * 10000
+    assert time.monotonic() - started < 2.0
+    body = "QUJD" * 6000
+    assert mask_credentials(f"intro {header}\n{body}\ntail " + body) == "intro " + MARKER
+    assert mask_credentials(f"{header} is how a key starts. {header}\n{body}") == (
+        f"{header} is how a key starts. " + MARKER
+    )
+
+
+def test_url_password_containing_at_signs_is_masked_through_the_last_separator() -> None:
+    assert mask_credentials("postgresql://app:Qx9L@m2Va7P@k4Nr8@db.internal/appdb") == (
+        "postgresql://app:" + MARKER + "@db.internal/appdb"
+    )
+    assert mask_credentials("mysql://root:p@ss@w0rd9@host") == "mysql://root:" + MARKER + "@host"
+    # Whitespace still ends the authority: a later address in prose is not userinfo.
+    assert mask_credentials("https://u:pw1234@host.example mail me@x.example") == (
+        "https://u:" + MARKER + "@host.example mail me@x.example"
+    )
+
+
 def test_url_userinfo_does_not_cross_query_or_fragment_and_keeps_percent_encoding_secret() -> None:
     for text in (
         "https://host.example?next=user:pass1234word@other.example",

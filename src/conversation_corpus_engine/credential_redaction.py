@@ -26,13 +26,6 @@ _RIGHT = r"(?![A-Za-z0-9_\-])"
 # Whole-match shapes: the entire match is replaced by the marker.
 _WHOLE: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
-        "pem-private-key",
-        re.compile(
-            r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"
-            r"(?:[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|(?=\s*[A-Za-z0-9+/]{16})[\s\S]*)"
-        ),
-    ),
-    (
         "jwt",
         re.compile(_LEFT + r"eyJ[A-Za-z0-9_\-]{8,}\.eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),
     ),
@@ -60,6 +53,38 @@ _WHOLE: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("slack-app-token", re.compile(_LEFT + r"xapp-\d-[A-Za-z0-9\-]{10,}")),
 )
 
+_PEM_BEGIN = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----")
+_PEM_END = re.compile(r"-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----")
+_PEM_BODY = re.compile(r"\s*[A-Za-z0-9+/]{16}")
+
+
+def _mask_pem(text: str) -> str:
+    """Mask private-key blocks in one linear pass.
+
+    A block runs to its END line; an unterminated block that has key-like body runs to the end of
+    the text, so no remainder survives. A bare header with no body (prose quoting the header) is
+    left alone. Once no END exists after a position none exists later, so the scan never repeats.
+    """
+    out: list[str] = []
+    pos = 0
+    end_exhausted = False
+    while (begin := _PEM_BEGIN.search(text, pos)) is not None:
+        end = None if end_exhausted else _PEM_END.search(text, begin.end())
+        if end is None:
+            end_exhausted = True
+            if _PEM_BODY.match(text, begin.end()) is None:
+                out.append(text[pos : begin.end()])
+                pos = begin.end()
+                continue
+            out.append(text[pos : begin.start()] + MARKER)
+            pos = len(text)
+            break
+        out.append(text[pos : begin.start()] + MARKER)
+        pos = end.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
 # Value-only shapes: group 1 is kept, group 2 is replaced.
 _BEARER = re.compile(
     r"(\bBearer\s+)((?=[A-Za-z0-9._~+/\-]*\d)[A-Za-z0-9._~+/\-]{20,}=*)", re.IGNORECASE
@@ -71,9 +96,10 @@ _AUTH_HEADER = re.compile(
     r"(\bAuthorization[\"']?\s*:\s*[\"']?(?:Bearer|Basic|Token)\s+)([A-Za-z0-9._~+/\-]+=*)",
     re.IGNORECASE,
 )
-# Passwords inside URI userinfo, e.g. a pasted database connection string.
+# Passwords inside URI userinfo, e.g. a pasted database connection string. The value is greedy up to
+# the last '@' of the authority, so a password that itself holds '@' is masked whole.
 _URL_PASSWORD = re.compile(
-    r"(?P<head>\b[A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s/:@?#\"'<>]+:)(?P<value>[^\s/@?#\"'<>]+)(?P<tail>@)"
+    r"(?P<head>\b[A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s/:@?#\"'<>]+:)(?P<value>[^\s/?#\"'<>]+)(?P<tail>@)"
 )
 # Only template markers count as placeholders in a URL; "%40" is a percent-encoded character.
 _URL_PLACEHOLDER = re.compile(r"^(?:\$|<|\{|%[A-Za-z_][A-Za-z0-9_]*%|\[REDACTED)")
@@ -207,6 +233,8 @@ def mask_credentials(text: str) -> str:
     """Return `text` with every recognized credential replaced by `[REDACTED-CREDENTIAL]`."""
     if not text or not _TRIGGER.search(text):
         return text
+    if "-----BEGIN" in text:
+        text = _mask_pem(text)
     for _name, pattern in _WHOLE:
         text = pattern.sub(MARKER, text)
     text = _AUTH_HEADER.sub(_auth_header, text)
