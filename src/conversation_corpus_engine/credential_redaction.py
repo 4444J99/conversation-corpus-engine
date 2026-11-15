@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import re
+import sys
 import unicodedata
 from collections import Counter
 
@@ -265,6 +266,23 @@ _LOOKALIKES = str.maketrans(
 # encoded: they are data inside a value, not structure.
 _PCT = re.compile(r"%([0-9A-Fa-f]{2})")
 _PCT_DECODED = frozenset("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz=:_-.")
+_PCT_DECODED_OR_PAD = _PCT_DECODED | {" ", "\t"}
+
+
+_FORMAT_CHARS = re.compile(
+    "["
+    + "".join(chr(c) for c in range(sys.maxunicode + 1) if unicodedata.category(chr(c)) == "Cf")
+    + "]"
+)
+
+
+def _needs_view(text: str) -> bool:
+    """Whether detection needs a rewritten view: skips the per-character pass for ordinary text."""
+    if _FORMAT_CHARS.search(text) is not None:
+        return True
+    if not text.isascii() and unicodedata.normalize("NFKC", text).translate(_LOOKALIKES) != text:
+        return True
+    return any(chr(int(m.group(1), 16)) in _PCT_DECODED_OR_PAD for m in _PCT.finditer(text))
 
 
 def _fold(text: str) -> str:
@@ -281,7 +299,7 @@ def _view(text: str) -> tuple[str, list[tuple[int, int]] | None]:
     spans, so everything outside a credential is preserved byte for byte. Plain ASCII text without
     a percent sign is its own view (no map).
     """
-    if text.isascii() and "%" not in text:
+    if not _needs_view(text):
         return text, None
     chars: list[str] = []
     spans: list[tuple[int, int]] = []
@@ -290,7 +308,9 @@ def _view(text: str) -> tuple[str, list[tuple[int, int]] | None]:
     while i < size:
         if text[i] == "%" and (match := _PCT.match(text, i)) is not None:
             decoded = chr(int(match.group(1), 16))
-            if decoded in _PCT_DECODED:
+            # A space or tab right after a decoded ':' or '=' is the separator padding of "name: value".
+            after_delimiter = bool(chars) and chars[-1] in ":=" and decoded in " \t"
+            if decoded in _PCT_DECODED or after_delimiter:
                 chars.append(decoded)
                 spans.append((i, i + 3))
                 i += 3

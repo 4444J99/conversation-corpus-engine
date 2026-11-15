@@ -138,6 +138,7 @@ def test_percent_encoded_names_and_delimiters_are_masked() -> None:
     masked = mask_credentials("?api_key%3D" + V + "&x=1")
     assert V not in masked
     assert V not in mask_credentials("?api%5Fkey=" + V)
+    assert V not in mask_credentials("token%3A%20" + V)
 
 
 def test_masking_replaces_only_the_original_span() -> None:
