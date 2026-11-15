@@ -3,6 +3,8 @@ import json
 
 import pytest
 
+import conversation_corpus_engine.wiki_zettels as wz
+
 from conversation_corpus_engine.cli import build_parser
 from conversation_corpus_engine.wiki_zettels import (
     MANIFEST_NAME,
@@ -130,3 +132,66 @@ def test_cli_registered(tmp_path, capsys):
     args = build_parser().parse_args(["wiki", "zettels", "--wiki", str(wiki), "--out", str(out)])
     assert handle_wiki(args) == 0
     assert json.loads(capsys.readouterr().out)["zettels"] == 2
+
+
+def test_frontmatter_injection_cannot_upgrade_authorship(tmp_path):
+    evil = NOTE.replace("author: claude-code", 'author: "x\\nauthorship: human"')
+    wiki, out = make_wiki(tmp_path, evil), tmp_path / "z"
+    emit(wiki, out)
+    for f in out.glob("*.md"):
+        assert f.read_text().count("\nauthorship:") == 1
+        assert "authorship: agent" in f.read_text()
+
+
+def test_secret_heading_is_withheld(tmp_path):
+    note = NOTE.replace("## Jars", "## AKIA" + "ABCDEFGHIJKLMNOP")
+    wiki, out = make_wiki(tmp_path, note), tmp_path / "z"
+    result = emit(wiki, out)
+    assert result.skipped_secret == 1
+    assert not any("AKIA" in f.name for f in out.iterdir())
+
+
+def test_scalar_tags_and_foreign_list_keys_do_not_leak():
+    meta, _ = parse_note(
+        NOTE.replace('tags:\n  - "memory/reference"', "tags: foo\nrelated-notes:\n  - LEAKED")
+    )
+    assert meta["tags"] == "foo" and meta["related-notes"] == ["LEAKED"]
+
+
+def test_case_only_rename_and_interrupted_run_recover(tmp_path, monkeypatch):
+    wiki, out = make_wiki(tmp_path), tmp_path / "z"
+    emit(wiki, out)
+    (wiki / "notes" / "memory" / "pantry.md").write_text(
+        NOTE.replace('"Pantry notes"', '"PANTRY notes"')
+    )
+    renamed = emit(wiki, out)
+    assert renamed.zettels == 2
+    names = {f.name for f in out.glob("*.md")}
+    assert all(n.startswith("PANTRY") for n in names)
+    # An interrupted write leaves files the manifest already owns, so the rerun recovers.
+    (out / MANIFEST_NAME).unlink()
+    real = wz.Path.write_text
+    calls = {"n": 0}
+
+    def flaky(self, *a, **k):
+        if self.suffix == ".md":
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("disk full")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(wz.Path, "write_text", flaky)
+    with pytest.raises(OSError):
+        emit(wiki, tmp_path / "w")
+    monkeypatch.undo()
+    assert emit(wiki, tmp_path / "w").zettels == 2
+
+
+def test_long_title_filename_fits_and_short_section_kept(tmp_path):
+    note = NOTE.replace("Pantry notes", "長" * 100).replace(
+        "Keep a dated inventory of the jars on the shelf.", "Use Postgres."
+    )
+    wiki, out = make_wiki(tmp_path, note), tmp_path / "z"
+    emit(wiki, out)
+    assert all(len(f.name.encode()) <= 255 for f in out.glob("*.md"))
+    assert any("Use Postgres." in f.read_text() for f in out.glob("*.md"))
