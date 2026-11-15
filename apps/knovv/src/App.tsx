@@ -11,7 +11,7 @@ import type {
 } from "./contracts";
 import { terms } from "./search";
 import { EvidencePicker } from "./EvidencePicker";
-import { headingIds } from "./markdown";
+import { headingIds, webReference } from "./markdown";
 
 const screens = [
   ["home", "◉", "Workspace"],
@@ -1132,7 +1132,7 @@ export function App() {
                             </button>
                           ) : (
                             <a
-                              href={href}
+                              href={webReference(href)}
                               target="_blank"
                               rel="noreferrer noopener"
                             >
@@ -1144,10 +1144,10 @@ export function App() {
                       {content.body}
                     </ReactMarkdown>
                   </div>
-                  {content.source_url && (
+                  {webReference(content.source_url) && (
                     <a
                       className="reference"
-                      href={content.source_url}
+                      href={webReference(content.source_url)}
                       target="_blank"
                       rel="noreferrer noopener"
                     >

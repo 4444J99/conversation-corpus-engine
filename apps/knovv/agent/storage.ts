@@ -47,6 +47,21 @@ export async function privateOutput(path: string, value: unknown) {
     await handle.close();
   }
 }
+async function staleLock(path: string) {
+  let pid: unknown;
+  try {
+    pid = JSON.parse((await privateRead(path, 1024)).toString()).pid;
+  } catch {
+    return false;
+  }
+  if (!Number.isSafeInteger(pid) || (pid as number) <= 0) return false;
+  try {
+    process.kill(pid as number, 0);
+    return false;
+  } catch (error: any) {
+    return error.code === "ESRCH";
+  }
+}
 // Every value is protected credential material, ciphertext or opaque checkpoint metadata.
 // The process-wide exclusive lock prevents simultaneous cache/draft writers.
 export class FileStorage implements StoragePort {
@@ -73,7 +88,16 @@ export class FileStorage implements StoragePort {
     );
     if (marker.schema !== "knovv-agent-state.v1")
       throw new Error("unowned-agent-state");
-    await privateOutput(join(root, ".lock"), { pid: process.pid });
+    const lock = join(root, ".lock");
+    try {
+      await privateOutput(lock, { pid: process.pid });
+    } catch (error: any) {
+      if (error.code !== "EEXIST" || !(await staleLock(lock))) throw error;
+      // The recorded owner no longer exists: reclaim once; a live competing
+      // writer that wins the race still gets EEXIST from the exclusive create.
+      await fs.unlink(lock);
+      await privateOutput(lock, { pid: process.pid });
+    }
     return new FileStorage(root);
   }
   async close() {

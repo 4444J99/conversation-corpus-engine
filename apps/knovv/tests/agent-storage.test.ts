@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { mkdtemp, rm, symlink, mkdir } from "node:fs/promises";
+import { mkdtemp, rm, symlink, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileStorage } from "../agent/storage";
@@ -42,6 +42,28 @@ it("reopens encrypted drafts and checkpoints without a competing state writer", 
     await expect(FileStorage.open(join(root, "alias"))).rejects.toThrow(
       "symlink-refused",
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}, 30000);
+
+it("reclaims a lock left by a dead process but never one held by a live process", async () => {
+  const root = await mkdtemp(join(tmpdir(), "knovv-agent-lock-"));
+  try {
+    const dir = join(root, "device");
+    await (await FileStorage.open(dir)).close();
+    await writeFile(join(dir, ".lock"), JSON.stringify({ pid: 2 ** 22 + 1 }), {
+      mode: 0o600,
+    });
+    const store = await FileStorage.open(dir);
+    await expect(FileStorage.open(dir)).rejects.toMatchObject({
+      code: "EEXIST",
+    });
+    await store.close();
+    await writeFile(join(dir, ".lock"), "not json", { mode: 0o600 });
+    await expect(FileStorage.open(dir)).rejects.toMatchObject({
+      code: "EEXIST",
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
