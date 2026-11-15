@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from conversation_corpus_engine import app_cache_commands, app_cache_gap  # noqa: E402
 from conversation_corpus_engine.archive_ingest import ArchivePaths  # noqa: E402
+from conversation_corpus_engine.archive_model import stable_uid  # noqa: E402
 
 
 def _archive(root: Path) -> Path:
@@ -29,7 +30,11 @@ def _archive(root: Path) -> Path:
             },
         ],
         "gemini": [
-            {"uid": "gemini-c_known", "updated": "2026-10-16T00:00:00Z", "last_activity": None}
+            {
+                "uid": stable_uid("gemini", "c_known"),
+                "updated": None,
+                "last_activity": "2026-10-16T00:00:00Z",
+            }
         ],
         "perplexity": [
             {"uid": "perplexity-x", "updated": None, "last_activity": "2026-10-16T16:36:05Z"}
@@ -77,6 +82,12 @@ def _chatgpt(path: Path) -> Path:
         },
     ]
     (path / "cache-index.json").write_text(json.dumps({"schema": "x", "conversations": entries}))
+    bodies = [
+        {"conversation_id": "aaa", "update_time": "2026-10-10T00:00:00Z", "mapping": {}},
+        {"conversation_id": "bbb", "update_time": "2026-10-20T00:00:00Z", "mapping": {}},
+        {"conversation_id": "ddd", "update_time": "2026-11-02T00:00:00Z", "mapping": {}},
+    ]
+    (path / "conversations-000.json").write_text(json.dumps(bodies))
     return path
 
 
@@ -106,32 +117,25 @@ def test_epoch_and_iso_times_compare_alike() -> None:
     assert app_cache_gap._parse("not a time") is None and app_cache_gap._parse(None) is None
 
 
-def test_gemini_gap_counts_chats_after_the_archive_end_and_skips_known_ids(tmp_path: Path) -> None:
+def test_gemini_gap_matches_ids_exactly_through_stable_uid(tmp_path: Path) -> None:
     archive = _archive(tmp_path / "archive")
     staged = tmp_path / "gem"
     staged.mkdir()
     inventory = [
-        {
-            "chat_uuid": "c_known",
-            "robin_conversation_id": None,
-            "last_updated": "2026-11-05T00:00:00Z",
-        },
+        {"chat_uuid": "c_known", "last_updated": "2026-11-05T00:00:00Z"},
         {
             "chat_uuid": "c_new",
             "robin_conversation_id": "c_r",
             "last_updated": "2026-10-20T00:00:00Z",
-            "cached_messages": 3,
         },
-        {
-            "chat_uuid": "c_old",
-            "robin_conversation_id": None,
-            "last_updated": "2026-09-01T00:00:00Z",
-        },
+        {"chat_uuid": "c_old", "last_updated": "2026-09-01T00:00:00Z"},
+        {"chat_uuid": "c", "last_updated": "2026-11-09T00:00:00Z"},
     ]
     (staged / "gemini-store-inventory.json").write_text(json.dumps({"inventory": inventory}))
     info = app_cache_gap.build_report(archive, {"gemini": staged})["providers"]["gemini"]
-    assert info["counts"] == {"newer_metadata_only": 1}
-    assert info["already_covered"] == 2 and info["needs_owner_export"] == 1
+    # c_known is held and seen after the end (newer); c_new, c_old and the substring id "c" are new.
+    assert info["counts"] == {"new_metadata_only": 3, "newer_metadata_only": 1}
+    assert info["already_covered"] == 0 and info["needs_owner_export"] == 4
     assert "Takeout" in info["owner_export"]
 
 
@@ -216,3 +220,52 @@ def test_a_held_conversation_restamped_before_the_archive_end_is_drift_not_a_gap
     (staged / "cache-index.json").write_text(json.dumps({"conversations": entries}))
     info = app_cache_gap.build_report(archive, {"chatgpt": staged})["providers"]["chatgpt"]
     assert info["already_covered"] == 1 and info["needs_owner_export"] == 0
+
+
+def test_a_stale_body_under_newer_metadata_is_metadata_only(tmp_path: Path) -> None:
+    archive = _archive(tmp_path / "archive")
+    staged = tmp_path / "gpt"
+    staged.mkdir()
+    entries = [
+        {"id": "bbb", "title": "t", "update_time": "2026-11-01T00:00:00Z", "body_cached": True}
+    ]
+    (staged / "cache-index.json").write_text(json.dumps({"conversations": entries}))
+    stale = [{"conversation_id": "bbb", "update_time": "2026-10-01T00:00:00Z", "mapping": {}}]
+    (staged / "conversations-000.json").write_text(json.dumps(stale))
+    info = app_cache_gap.build_report(archive, {"chatgpt": staged})["providers"]["chatgpt"]
+    assert info["counts"]["newer_metadata_only"] == 1 and info["ingestible_now"] == 0
+
+
+def test_ids_the_archive_hashes_are_matched_through_stable_uid(tmp_path: Path) -> None:
+    archive = _archive(tmp_path / "archive")
+    uid = stable_uid("chatgpt", "ABC_1")
+    assert uid != "chatgpt-ABC_1"
+    shard = ArchivePaths(archive).index("chatgpt")
+    shard.write_text(
+        shard.read_text() + json.dumps({"uid": uid, "last_activity": "2026-05-01T00:00:00Z"}) + "\n"
+    )
+    staged = tmp_path / "gpt"
+    staged.mkdir()
+    entries = [{"id": "ABC_1", "title": "t", "update_time": "2026-05-02T00:00:00Z"}]
+    (staged / "cache-index.json").write_text(json.dumps({"conversations": entries}))
+    info = app_cache_gap.build_report(archive, {"chatgpt": staged})["providers"]["chatgpt"]
+    assert info["already_covered"] == 1
+
+
+def test_offset_times_normalise_to_utc_and_the_archive_path_is_not_reported(tmp_path: Path) -> None:
+    assert app_cache_gap._day(app_cache_gap._parse("2026-11-01T00:30:00+02:00")) == "2026-10-31"
+    archive = _archive(tmp_path / "archive")
+    report = app_cache_gap.build_report(archive, {"chatgpt": _chatgpt(tmp_path / "gpt")})
+    assert str(archive) not in json.dumps(app_cache_gap.write_report(report, tmp_path / "o"))
+
+
+def test_malformed_inputs_are_named_errors(tmp_path: Path) -> None:
+    archive = _archive(tmp_path / "archive")
+    staged = tmp_path / "gem"
+    staged.mkdir()
+    (staged / "gemini-store-inventory.json").write_text("[]")
+    with pytest.raises(app_cache_gap.GapError, match="inventory"):
+        app_cache_gap.build_report(archive, {"gemini": staged})
+    ArchivePaths(archive).index("gemini").write_text("{not json\n")
+    with pytest.raises(app_cache_gap.GapError, match="cannot read the gemini index"):
+        app_cache_gap.build_report(archive, {"gemini": staged})

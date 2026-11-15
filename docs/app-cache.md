@@ -49,12 +49,16 @@ contains for these chats is known only after the reader has read it.
 ## Gap report (`cce app-cache gap`)
 
 `cce app-cache gap --archive ARCHIVE_ROOT [--chatgpt DIR] [--perplexity DIR] [--gemini DIR] --out DIR`
-compares staged directories with the archive's index shards. No message text is read. ChatGPT
-conversations are matched by id (`chatgpt-<id>`): `new_*` means the archive has no such id,
+compares staged directories with the archive's index shards. No message text is used for the comparison (the staged files are read locally; ids and times are kept). ChatGPT
+conversations are matched by uid (`chatgpt-<id>`): `new_*` means the archive has no such id,
 `newer_*` means the archive has it and the app saw activity after the archive's last activity, and
 `*_with_body` / `*_metadata_only` says whether a full body was staged. A held conversation the app
 restamped to a time before the archive's end is timestamp drift and counts as covered (list pages
-restamp many conversations at once). Gemini chats are matched by chat id and compared by date.
+restamp many conversations at once). A `*_with_body` count needs a staged body that is itself newer
+than the archive's end (or a new conversation); a stale body under newer list metadata counts as
+metadata-only. `newer_*` counts are an upper bound: the app's time is its own stamp, not proof of new
+messages. Ids are matched through the archive's own `stable_uid`. Gemini chats are matched by exact
+uid; one the archive lacks is new whatever its date, a held one is newer only after the archive's end.
 Perplexity records carry synthetic ids, so only dates are compared.
 
 `gap-report.json` lists ids and titles and stays in the private `--out` directory (0700/0600);

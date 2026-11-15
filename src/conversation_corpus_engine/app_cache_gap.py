@@ -25,7 +25,7 @@ from typing import Any
 
 from .app_cache_output import prepare_directory, write_private
 from .archive_ingest import ArchivePaths
-from .archive_model import iter_jsonl
+from .archive_model import iter_jsonl, stable_uid
 
 SCHEMA = "cce-app-cache-gap/v1"
 REPORT_NAME = "gap-report.json"
@@ -68,7 +68,7 @@ def _parse(value: Any) -> datetime | None:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
 
 
 def _day(moment: datetime | None) -> str | None:
@@ -76,14 +76,21 @@ def _day(moment: datetime | None) -> str | None:
 
 
 def archive_provider(archive_root: Path, provider: str) -> dict[str, Any]:
-    """What the archive holds for one provider: uid -> latest known time, plus the overall end."""
+    """What the archive holds for one provider: uid -> last activity, plus the overall end.
+
+    The cutoff is ``last_activity`` (when the conversation last had a message); ``updated`` is the
+    source's metadata stamp and only fills in when no activity time exists.
+    """
     paths = ArchivePaths(archive_root.expanduser().absolute())
     held: dict[str, datetime | None] = {}
-    for shard in paths.index_files(provider):
-        for row in iter_jsonl(shard):
-            times = [_parse(row.get("updated")), _parse(row.get("last_activity"))]
-            known = [t for t in times if t]
-            held[str(row["uid"])] = max(known) if known else None
+    try:
+        for shard in paths.index_files(provider):
+            for row in iter_jsonl(shard):
+                held[str(row["uid"])] = _parse(row.get("last_activity")) or _parse(
+                    row.get("updated")
+                )
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise GapError(f"cannot read the {provider} index of {archive_root}: {error}") from error
     latest = max((t for t in held.values() if t), default=None)
     return {"held": held, "conversations": len(held), "last_activity_max": latest}
 
@@ -112,13 +119,36 @@ def _classify(
     return "covered"
 
 
+def _body_times(staged: Path) -> dict[str, datetime | None]:
+    """When each staged full body was last updated. Only ids and times are kept; the message
+    mapping is parsed with the file and dropped."""
+    path = staged / "conversations-000.json"
+    if not path.is_file():
+        return {}
+    bodies = _read_json(path)
+    if not isinstance(bodies, list):
+        raise GapError(f"{path} is not a list of conversations")
+    return {
+        str(b.get("conversation_id") or b.get("id")): _parse(b.get("update_time"))
+        for b in bodies
+        if isinstance(b, dict)
+    }
+
+
 def chatgpt_gap(archive: dict[str, Any], staged: Path) -> dict[str, Any]:
-    """Compare ``cache-index.json`` (every conversation the app knows) with the archive's uids."""
+    """Compare ``cache-index.json`` (every conversation the app knows) with the archive's uids.
+
+    A conversation counts as having a usable body only when a body was staged and that body is
+    itself newer than the archive's end (or the conversation is new): a stale body under newer list
+    metadata is metadata-only for this purpose.
+    """
     index = _read_json(staged / "cache-index.json")
     entries = index.get("conversations") if isinstance(index, dict) else None
     if not isinstance(entries, list):
         raise GapError(f"{staged / 'cache-index.json'} has no conversations list")
+    body_times = _body_times(staged)
     held: dict[str, datetime | None] = archive["held"]
+    end = archive["last_activity_max"]
     buckets: dict[str, list[dict[str, Any]]] = {
         "new_with_body": [],
         "newer_with_body": [],
@@ -128,14 +158,17 @@ def chatgpt_gap(archive: dict[str, Any], staged: Path) -> dict[str, Any]:
     covered = 0
     for entry in entries:
         conversation_id = str(entry.get("id") or "")
-        uid = f"chatgpt-{conversation_id}"
+        uid = stable_uid("chatgpt", conversation_id)
         updated = _parse(entry.get("update_time"))
-        state = _classify(updated, held.get(uid), uid in held, archive["last_activity_max"])
+        state = _classify(updated, held.get(uid), uid in held, end)
         if state == "covered":
             covered += 1
             continue
-        body = "with_body" if entry.get("body_cached") else "metadata_only"
-        buckets[f"{state}_{body}"].append(
+        body_time = body_times.get(conversation_id)
+        fresh = bool(entry.get("body_cached")) and (
+            state == "new" or (body_time is not None and end is not None and body_time > end)
+        )
+        buckets[f"{state}_{'with_body' if fresh else 'metadata_only'}"].append(
             {
                 "id": conversation_id,
                 "title": entry.get("title"),
@@ -176,29 +209,40 @@ def _summary(
 
 
 def gemini_gap(archive: dict[str, Any], staged: Path) -> dict[str, Any]:
-    """Compare the Gemini store inventory (ids and times only) with the archive's gemini uids."""
-    inventory = _read_json(staged / "gemini-store-inventory.json").get("inventory")
+    """Compare the Gemini store inventory (ids and times only) with the archive's gemini uids.
+
+    Ids are matched exactly through the archive's own uid function. A chat the archive lacks is
+    new whatever its date; a held chat counts as newer only when the app saw it after the
+    archive's end. Neither can be ingested: the bodies are encrypted.
+    """
+    payload = _read_json(staged / "gemini-store-inventory.json")
+    inventory = payload.get("inventory") if isinstance(payload, dict) else None
     if not isinstance(inventory, list):
         raise GapError(f"{staged / 'gemini-store-inventory.json'} has no inventory list")
-    held_ids = " ".join(archive["held"])
+    held = archive["held"]
     end = archive["last_activity_max"]
-    after: list[dict[str, Any]] = []
+    buckets: dict[str, list[dict[str, Any]]] = {"new_metadata_only": [], "newer_metadata_only": []}
+    covered = 0
     for chat in inventory:
-        updated = _parse(chat.get("last_updated"))
-        in_archive = any(
-            str(chat.get(key) or "") and str(chat[key]) in held_ids
+        uids = {
+            stable_uid("gemini", str(chat[key]))
             for key in ("chat_uuid", "robin_conversation_id")
+            if chat.get(key)
+        }
+        present = any(uid in held for uid in uids)
+        updated = _parse(chat.get("last_updated"))
+        state = _classify(updated, None, present, end)
+        if state == "covered":
+            covered += 1
+            continue
+        buckets[f"{state}_metadata_only"].append(
+            {
+                "id": chat.get("chat_uuid"),
+                "updated": _day(updated),
+                "cached_messages": chat.get("cached_messages"),
+            }
         )
-        if (updated and (end is None or updated > end)) and not in_archive:
-            after.append(
-                {
-                    "id": chat.get("chat_uuid"),
-                    "updated": _day(updated),
-                    "cached_messages": chat.get("cached_messages"),
-                }
-            )
-    buckets = {"newer_metadata_only": after}
-    return _summary("gemini", archive, inventory, buckets, len(inventory) - len(after))
+    return _summary("gemini", archive, inventory, buckets, covered)
 
 
 def perplexity_gap(archive: dict[str, Any], staged: Path) -> dict[str, Any]:
@@ -210,6 +254,8 @@ def perplexity_gap(archive: dict[str, Any], staged: Path) -> dict[str, Any]:
     """
     payload = _read_json(staged / "conversations-000.json")
     records = payload.get("conversations", []) if isinstance(payload, dict) else payload
+    if not isinstance(records, list):
+        raise GapError(f"{staged / 'conversations-000.json'} has no conversations list")
     end = archive["last_activity_max"]
     new: list[dict[str, Any]] = []
     for record in records:
@@ -247,7 +293,6 @@ def build_report(archive_root: Path, staged: dict[str, Path]) -> dict[str, Any]:
     return {
         "schema": SCHEMA,
         "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "archive": str(archive_root),
         "providers": providers,
     }
 
@@ -257,7 +302,7 @@ def write_report(report: dict[str, Any], out: Path) -> dict[str, Any]:
     out = prepare_directory(out)
     write_private(out / REPORT_NAME, json.dumps(report, indent=1, ensure_ascii=False))
     coverage = {
-        **{k: v for k, v in report.items() if k != "providers"},
+        **{k: v for k, v in report.items() if k not in ("providers", "archive")},
         "providers": {
             name: {k: v for k, v in info.items() if k != "rows"}
             for name, info in report["providers"].items()

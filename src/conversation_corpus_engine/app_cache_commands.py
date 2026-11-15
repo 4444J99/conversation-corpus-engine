@@ -110,7 +110,7 @@ def _gap(args: argparse.Namespace) -> int:
         print(
             f"{name}: archive ends {info['archive_last_activity']}; ingestible now "
             f"{info['ingestible_now']}; needs owner export {info['needs_owner_export']}; "
-            f"gap {info['gap_updated_first']} .. {info['gap_updated_last']}"
+            f"gap {info['gap_updated_first']} .. {info['gap_updated_last']}\n  export: {info['owner_export']}"
         )
     return 0
 
