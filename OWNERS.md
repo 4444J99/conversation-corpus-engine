@@ -13,7 +13,7 @@ parsing, API clients, import pipelines, provider catalog, source authority.
 **Boundary:** Writes to corpus directories and source-drop state. Never writes to
 federation state or governance state.
 
-**Modules (16):**
+**Modules (19):**
 
 | Module | Role |
 |--------|------|
@@ -25,8 +25,11 @@ federation state or governance state.
 | `import_claude_local_session_corpus` | Claude live session → corpus artifacts |
 | `import_document_export_corpus` | Generic multi-format document → corpus |
 | `import_markdown_document_corpus` | Markdown → corpus artifacts |
-| `provider_catalog` | 8-provider config registry (`PROVIDER_CONFIG`) |
+| `provider_catalog` | Validated runtime provider-manifest loader and compatibility read model |
 | `provider_discovery` | Source-drop inbox scanner |
+| `source_adapter_registry` | Provider-neutral redacted-bundle format adapters |
+| `authority_projection` | Role-aware authority, lane, and adoption projection |
+| `authority_ingest` | Deterministic envelope/event generation plus coverage and parity receipts |
 | `provider_exports` | Export format detection functions |
 | `provider_import` | Import routing dispatcher |
 | `provider_readiness` | Cross-provider status aggregation |
@@ -149,9 +152,9 @@ that all other archetypes depend on.
 
 | Archetype | Modules | % |
 |-----------|---------|---|
-| ACQUISITOR | 16 | 48% |
-| GOVERNOR | 5 | 15% |
-| OPERATOR | 6 | 18% |
-| EVALUATOR | 3 | 9% |
-| FEDERATOR | 3 | 9% |
-| **Total** | **33** | **100%** |
+| ACQUISITOR | 19 | 53% |
+| GOVERNOR | 5 | 14% |
+| OPERATOR | 6 | 17% |
+| EVALUATOR | 3 | 8% |
+| FEDERATOR | 3 | 8% |
+| **Total** | **36** | **100%** |

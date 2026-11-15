@@ -60,10 +60,12 @@ FORBIDDEN = "forbidden"
 
 SCOPE_ALL = "all"
 # Every provider the engine knows: the provider catalog plus archive-only readers. A test holds
-# this list to be a superset of both, so adding a provider forces a conscious edit here.
+# this list to be a superset of both, so adding a provider forces a conscious edit here. Scope
+# words are single tokens, so a hyphenated catalog id appears here with its hyphens removed.
 PROVIDER_SCOPES: tuple[str, ...] = (
     "agentmemory",
     "agentplans",
+    "agy",
     "antigravity",
     "applenotes",
     "chatgpt",
@@ -77,6 +79,7 @@ PROVIDER_SCOPES: tuple[str, ...] = (
     "documents",
     "gemini",
     "geminicli",
+    "gitartifact",
     "googledrive",
     "grok",
     "localmemory",

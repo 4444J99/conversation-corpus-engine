@@ -9,6 +9,12 @@ from .archive_commands import add_archive_parser, handle_archive
 from .archive_sealed_commands import add_sealed_parser
 from .archive_sealed_commands import run as run_sealed
 from .attribution_commands import add_attribute_parser, handle_attribute
+from .authority_cadence import run_authority_classify_stage, run_authority_parse_stage
+from .authority_cadence_predicate import (
+    assert_classify_predicate,
+    assert_parse_predicate,
+)
+from .authority_ingest import ingest_authority_bundle
 from .chatgpt_local_session import (
     discover_chatgpt_projects,
     fetch_chatgpt_project,
@@ -49,7 +55,7 @@ from .library_commands import add_library_parser, handle_library
 from .migration import migrate_corpus_v2, seed_registry_from_staging
 from .paths import default_project_root
 from .persona_extract import extract_persona_lexicon, write_persona_extract_artifacts
-from .provider_catalog import default_source_drop_root
+from .provider_catalog import PROVIDER_CONFIG, default_source_drop_root
 from .provider_discovery import discover_provider_uploads, render_provider_discovery_text
 from .provider_import import import_provider_corpus
 from .provider_readiness import (
@@ -117,6 +123,8 @@ from .triage import (
     write_entity_alias_review_sample_summary_artifacts,
     write_entity_alias_review_scoreboard_artifacts,
 )
+
+PROVIDER_CHOICES = sorted(PROVIDER_CONFIG)
 
 
 def parse_threshold_overrides(values: list[str] | None) -> dict[str, float]:
@@ -234,16 +242,7 @@ def build_parser() -> argparse.ArgumentParser:
     provider_import.add_argument("--project-root", type=Path, default=default_project_root())
     provider_import.add_argument(
         "--provider",
-        choices=[
-            "chatgpt",
-            "claude",
-            "gemini",
-            "grok",
-            "perplexity",
-            "copilot",
-            "deepseek",
-            "mistral",
-        ],
+        choices=PROVIDER_CHOICES,
         required=True,
     )
     provider_import.add_argument("--mode", choices=["upload", "local-session"], default="upload")
@@ -263,16 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     provider_bootstrap.add_argument(
         "--provider",
-        choices=[
-            "chatgpt",
-            "claude",
-            "gemini",
-            "grok",
-            "perplexity",
-            "copilot",
-            "deepseek",
-            "mistral",
-        ],
+        choices=PROVIDER_CHOICES,
         required=True,
     )
     provider_bootstrap.add_argument("--project-root", type=Path, default=default_project_root())
@@ -286,16 +276,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     provider_refresh.add_argument(
         "--provider",
-        choices=[
-            "chatgpt",
-            "claude",
-            "gemini",
-            "grok",
-            "perplexity",
-            "copilot",
-            "deepseek",
-            "mistral",
-        ],
+        choices=PROVIDER_CHOICES,
         required=True,
     )
     provider_refresh.add_argument("--project-root", type=Path, default=default_project_root())
@@ -319,6 +300,54 @@ def build_parser() -> argparse.ArgumentParser:
         help="Voluntary CPU yield interval in hot loops (0=disabled, 0.001=recommended for background)",
     )
     provider_refresh.add_argument("--json", action="store_true")
+    provider_authority_ingest = provider_sub.add_parser(
+        "authority-ingest",
+        help="Project a frozen session-meta redacted bundle into authority-aware contracts",
+    )
+    provider_authority_ingest.add_argument("--source-root", type=Path)
+    provider_authority_ingest.add_argument("--source-census", type=Path)
+    provider_authority_ingest.add_argument("--provider-manifest", type=Path)
+    provider_authority_ingest.add_argument("--output-root", type=Path, required=True)
+    provider_authority_ingest.add_argument("--snapshot-id", required=True)
+    provider_authority_ingest.add_argument("--captured-at", required=True)
+    provider_authority_ingest.add_argument("--custody-pointer", required=True)
+    provider_authority_parse = provider_sub.add_parser(
+        "authority-parse-cadence",
+        help="Run or prove the bounded parse projection for a frozen authority snapshot",
+    )
+    provider_authority_parse.add_argument("--source-root", type=Path, required=True)
+    provider_authority_parse.add_argument("--source-census", type=Path, required=True)
+    provider_authority_parse.add_argument("--provider-manifest", type=Path, required=True)
+    provider_authority_parse.add_argument("--output-root", type=Path, required=True)
+    provider_authority_parse.add_argument("--snapshot-id", required=True)
+    provider_authority_parse.add_argument("--captured-at", required=True)
+    provider_authority_parse.add_argument("--custody-pointer", required=True)
+    provider_authority_classify = provider_sub.add_parser(
+        "authority-classify-cadence",
+        help="Project the parse transaction into a byte-identical classify stage",
+    )
+    provider_authority_classify.add_argument("--input-root", type=Path, required=True)
+    provider_authority_classify.add_argument("--output-root", type=Path, required=True)
+    provider_authority_classify.add_argument("--snapshot-id", required=True)
+    provider_authority_parse_predicate = provider_sub.add_parser(
+        "authority-parse-predicate",
+        help="Independently verify the complete parse projection",
+    )
+    provider_authority_parse_predicate.add_argument("--source-root", type=Path, required=True)
+    provider_authority_parse_predicate.add_argument("--source-census", type=Path, required=True)
+    provider_authority_parse_predicate.add_argument("--provider-manifest", type=Path, required=True)
+    provider_authority_parse_predicate.add_argument("--output-root", type=Path, required=True)
+    provider_authority_parse_predicate.add_argument("--snapshot-id", required=True)
+    provider_authority_parse_predicate.add_argument("--captured-at", required=True)
+    provider_authority_parse_predicate.add_argument("--custody-pointer", required=True)
+    provider_authority_classify_predicate = provider_sub.add_parser(
+        "authority-classify-predicate",
+        help="Independently verify the classify projection and parse-byte parity",
+    )
+    provider_authority_classify_predicate.add_argument("--input-root", type=Path, required=True)
+    provider_authority_classify_predicate.add_argument("--output-root", type=Path, required=True)
+    provider_authority_classify_predicate.add_argument("--snapshot-id", required=True)
+    provider_authority_classify_predicate.add_argument("--captured-at", required=True)
 
     project = subparsers.add_parser("project", help="ChatGPT project extraction and lifecycle")
     project_sub = project.add_subparsers(dest="action", required=True)
@@ -390,16 +419,7 @@ def build_parser() -> argparse.ArgumentParser:
     source_policy_show.add_argument("--project-root", type=Path, default=default_project_root())
     source_policy_show.add_argument(
         "--provider",
-        choices=[
-            "chatgpt",
-            "claude",
-            "gemini",
-            "grok",
-            "perplexity",
-            "copilot",
-            "deepseek",
-            "mistral",
-        ],
+        choices=PROVIDER_CHOICES,
         required=True,
     )
     source_policy_show.add_argument("--json", action="store_true")
@@ -407,16 +427,7 @@ def build_parser() -> argparse.ArgumentParser:
     source_policy_set.add_argument("--project-root", type=Path, default=default_project_root())
     source_policy_set.add_argument(
         "--provider",
-        choices=[
-            "chatgpt",
-            "claude",
-            "gemini",
-            "grok",
-            "perplexity",
-            "copilot",
-            "deepseek",
-            "mistral",
-        ],
+        choices=PROVIDER_CHOICES,
         required=True,
     )
     source_policy_set.add_argument("--primary-root", type=Path, required=True)
@@ -483,16 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
     candidate_stage.add_argument("--live-corpus-id")
     candidate_stage.add_argument(
         "--provider",
-        choices=[
-            "chatgpt",
-            "claude",
-            "gemini",
-            "grok",
-            "perplexity",
-            "copilot",
-            "deepseek",
-            "mistral",
-        ],
+        choices=PROVIDER_CHOICES,
     )
     candidate_stage.add_argument("--note", default="")
     candidate_stage.add_argument("--json", action="store_true")
@@ -793,8 +795,8 @@ def main() -> None:
             allow_curated=args.allow_curated,
         )
         if args.write and not args.dry_run:
-            artifacts = write_persona_extract_artifacts(args.project_root, payload)
-            payload["artifacts_written"] = [str(p) for p in artifacts]
+            persona_artifact_paths = write_persona_extract_artifacts(args.project_root, payload)
+            payload["artifacts_written"] = [str(path) for path in persona_artifact_paths]
         if args.json:
             print(json.dumps(payload, indent=2))
         else:
@@ -952,6 +954,64 @@ def main() -> None:
         print(json.dumps(payload, indent=2))
         return
 
+    if args.group == "provider" and args.action == "authority-ingest":
+        payload = ingest_authority_bundle(
+            output_root=args.output_root,
+            source_root=args.source_root,
+            source_census=args.source_census,
+            provider_manifest=args.provider_manifest,
+            snapshot_id=args.snapshot_id,
+            captured_at=args.captured_at,
+            custody_pointer=args.custody_pointer,
+        )
+        print(json.dumps(payload, indent=2))
+        return
+
+    if args.group == "provider" and args.action == "authority-parse-cadence":
+        payload = run_authority_parse_stage(
+            source_root=args.source_root,
+            source_census=args.source_census,
+            provider_manifest=args.provider_manifest,
+            output_root=args.output_root,
+            snapshot_id=args.snapshot_id,
+            captured_at=args.captured_at,
+            custody_pointer=args.custody_pointer,
+        )
+        print(json.dumps(payload, indent=2))
+        return
+
+    if args.group == "provider" and args.action == "authority-classify-cadence":
+        payload = run_authority_classify_stage(
+            input_root=args.input_root,
+            output_root=args.output_root,
+            snapshot_id=args.snapshot_id,
+        )
+        print(json.dumps(payload, indent=2))
+        return
+
+    if args.group == "provider" and args.action == "authority-parse-predicate":
+        assert_parse_predicate(
+            source_root=args.source_root,
+            source_census=args.source_census,
+            provider_manifest=args.provider_manifest,
+            output_root=args.output_root,
+            snapshot_id=args.snapshot_id,
+            captured_at=args.captured_at,
+            custody_pointer=args.custody_pointer,
+        )
+        print(json.dumps({"stage": "parse", "predicate": "passed"}, indent=2))
+        return
+
+    if args.group == "provider" and args.action == "authority-classify-predicate":
+        assert_classify_predicate(
+            input_root=args.input_root,
+            output_root=args.output_root,
+            snapshot_id=args.snapshot_id,
+            captured_at=args.captured_at,
+        )
+        print(json.dumps({"stage": "classify", "predicate": "passed"}, indent=2))
+        return
+
     if args.group == "project" and args.action == "extract":
         # The extract is the project's files and conversations as plaintext, written wherever
         # --output says: refuse a directory Git can see before anything is fetched. (The routed
@@ -1056,8 +1116,8 @@ def main() -> None:
             args.project_root,
             source_drop_root=args.source_drop_root,
         )
-        artifacts = write_surface_manifest_artifacts(args.project_root, payload)
-        print(json.dumps({**payload, "artifacts_written": artifacts}, indent=2))
+        manifest_artifacts = write_surface_manifest_artifacts(args.project_root, payload)
+        print(json.dumps({**payload, "artifacts_written": manifest_artifacts}, indent=2))
         return
 
     if args.group == "surface" and args.action == "context":
@@ -1065,8 +1125,8 @@ def main() -> None:
             args.project_root,
             source_drop_root=args.source_drop_root,
         )
-        artifacts = write_mcp_context_artifacts(args.project_root, payload)
-        print(json.dumps({**payload, "artifacts_written": artifacts}, indent=2))
+        context_artifacts = write_mcp_context_artifacts(args.project_root, payload)
+        print(json.dumps({**payload, "artifacts_written": context_artifacts}, indent=2))
         return
 
     if args.group == "surface" and args.action == "bundle":
@@ -1324,23 +1384,27 @@ def main() -> None:
                 sample_batches=args.sample_batches,
                 batch_offset=args.batch_offset,
             )
-        artifacts = None
+        assist_artifacts = None
         if args.write:
             if args.sample_groups:
-                artifacts = write_entity_alias_review_sample_artifacts(args.project_root, payload)
+                assist_artifacts = write_entity_alias_review_sample_artifacts(
+                    args.project_root, payload
+                )
             else:
-                artifacts = write_entity_alias_review_assist_artifacts(args.project_root, payload)
+                assist_artifacts = write_entity_alias_review_assist_artifacts(
+                    args.project_root, payload
+                )
         if args.json:
-            print(json.dumps({**payload, "artifacts": artifacts}, indent=2))
+            print(json.dumps({**payload, "artifacts": assist_artifacts}, indent=2))
             return
         if args.sample_groups:
             print(render_entity_alias_review_sample(payload))
         else:
             print(render_entity_alias_review_assist(payload, group_limit=args.group_limit))
-        if artifacts:
+        if assist_artifacts:
             print("")
             print("Artifacts:")
-            for key, path in artifacts.items():
+            for key, path in assist_artifacts.items():
                 print(f"  {key.removesuffix('_path')}: {path}")
         return
 
@@ -1353,19 +1417,19 @@ def main() -> None:
             )
         except ValueError as exc:
             parser.error(str(exc))
-        artifacts = (
+        campaign_artifacts = (
             write_entity_alias_review_campaign_artifacts(args.project_root, payload)
             if args.write
             else None
         )
         if args.json:
-            print(json.dumps({**payload, "artifacts": artifacts}, indent=2))
+            print(json.dumps({**payload, "artifacts": campaign_artifacts}, indent=2))
             return
         print(render_entity_alias_review_campaign(payload))
-        if artifacts:
+        if campaign_artifacts:
             print("")
             print("Artifacts:")
-            for key, value in artifacts.items():
+            for key, value in campaign_artifacts.items():
                 if key == "scenario_artifacts":
                     for label, scenario_artifacts in value.items():
                         print(f"  scenario {label}:")
@@ -1380,37 +1444,37 @@ def main() -> None:
 
     if args.group == "review" and args.action == "campaign-index":
         payload = build_entity_alias_review_campaign_index(args.project_root)
-        artifacts = (
+        campaign_index_artifacts = (
             write_entity_alias_review_campaign_index_artifacts(args.project_root, payload)
             if args.write
             else None
         )
         if args.json:
-            print(json.dumps({**payload, "artifacts": artifacts}, indent=2))
+            print(json.dumps({**payload, "artifacts": campaign_index_artifacts}, indent=2))
             return
         print(render_entity_alias_review_campaign_index(payload))
-        if artifacts:
+        if campaign_index_artifacts:
             print("")
             print("Artifacts:")
-            for key, path in artifacts.items():
+            for key, path in campaign_index_artifacts.items():
                 print(f"  {key.removesuffix('_path')}: {path}")
         return
 
     if args.group == "review" and args.action == "packet-hydrate":
         payload = hydrate_entity_alias_review_sample_packet(args.path)
-        artifacts = (
+        packet_hydration_artifacts = (
             write_entity_alias_review_packet_hydration_artifacts(args.project_root, payload)
             if args.write
             else None
         )
         if args.json:
-            print(json.dumps({**payload, "artifacts": artifacts}, indent=2))
+            print(json.dumps({**payload, "artifacts": packet_hydration_artifacts}, indent=2))
             return
         print(render_entity_alias_review_packet_hydration(payload))
-        if artifacts:
+        if packet_hydration_artifacts:
             print("")
             print("Artifacts:")
-            for key, path in artifacts.items():
+            for key, path in packet_hydration_artifacts.items():
                 print(f"  {key.removesuffix('_path')}: {path}")
         return
 
@@ -1420,19 +1484,19 @@ def main() -> None:
             min_reject_precision=args.min_reject_precision,
             min_adjudicated=args.min_adjudicated,
         )
-        artifacts = (
+        scoreboard_artifacts = (
             write_entity_alias_review_scoreboard_artifacts(args.project_root, payload)
             if args.write
             else None
         )
         if args.json:
-            print(json.dumps({**payload, "artifacts": artifacts}, indent=2))
+            print(json.dumps({**payload, "artifacts": scoreboard_artifacts}, indent=2))
             return
         print(render_entity_alias_review_scoreboard(payload))
-        if artifacts:
+        if scoreboard_artifacts:
             print("")
             print("Artifacts:")
-            for key, path in artifacts.items():
+            for key, path in scoreboard_artifacts.items():
                 print(f"  {key.removesuffix('_path')}: {path}")
         return
 
@@ -1444,19 +1508,19 @@ def main() -> None:
             packet_ids=args.packet_ids,
             campaign_ids=args.campaign_ids,
         )
-        artifacts = (
+        rollup_artifacts = (
             write_entity_alias_review_rollup_artifacts(args.project_root, payload)
             if args.write
             else None
         )
         if args.json:
-            print(json.dumps({**payload, "artifacts": artifacts}, indent=2))
+            print(json.dumps({**payload, "artifacts": rollup_artifacts}, indent=2))
             return
         print(render_entity_alias_review_rollup(payload))
-        if artifacts:
+        if rollup_artifacts:
             print("")
             print("Artifacts:")
-            for key, path in artifacts.items():
+            for key, path in rollup_artifacts.items():
                 print(f"  {key.removesuffix('_path')}: {path}")
         return
 
@@ -1470,19 +1534,19 @@ def main() -> None:
             min_reject_precision=args.min_reject_precision,
             min_adjudicated=args.min_adjudicated,
         )
-        artifacts = (
+        reject_stage_artifacts = (
             write_entity_alias_reject_stage_artifacts(args.project_root, payload)
             if args.write
             else None
         )
         if args.json:
-            print(json.dumps({**payload, "artifacts": artifacts}, indent=2))
+            print(json.dumps({**payload, "artifacts": reject_stage_artifacts}, indent=2))
             return
         print(render_entity_alias_reject_stage(payload))
-        if artifacts:
+        if reject_stage_artifacts:
             print("")
             print("Artifacts:")
-            for key, path in artifacts.items():
+            for key, path in reject_stage_artifacts.items():
                 print(f"  {key.removesuffix('_path')}: {path}")
         return
 
@@ -1496,55 +1560,55 @@ def main() -> None:
             min_reject_precision=args.min_reject_precision,
             min_adjudicated=args.min_adjudicated,
         )
-        artifacts = (
+        apply_plan_artifacts = (
             write_entity_alias_review_apply_plan_artifacts(args.project_root, payload)
             if args.write
             else None
         )
         if args.json:
-            print(json.dumps({**payload, "artifacts": artifacts}, indent=2))
+            print(json.dumps({**payload, "artifacts": apply_plan_artifacts}, indent=2))
             return
         print(render_entity_alias_review_apply_plan(payload))
-        if artifacts:
+        if apply_plan_artifacts:
             print("")
             print("Artifacts:")
-            for key, path in artifacts.items():
+            for key, path in apply_plan_artifacts.items():
                 print(f"  {key.removesuffix('_path')}: {path}")
         return
 
     if args.group == "review" and args.action == "sample-summary":
         payload = summarize_entity_alias_review_sample(args.path)
-        artifacts = (
+        sample_summary_artifacts = (
             write_entity_alias_review_sample_summary_artifacts(args.project_root, payload)
             if args.write
             else None
         )
         if args.json:
-            print(json.dumps({**payload, "artifacts": artifacts}, indent=2))
+            print(json.dumps({**payload, "artifacts": sample_summary_artifacts}, indent=2))
             return
         print(render_entity_alias_review_sample_summary(payload))
-        if artifacts:
+        if sample_summary_artifacts:
             print("")
             print("Artifacts:")
-            for key, path in artifacts.items():
+            for key, path in sample_summary_artifacts.items():
                 print(f"  {key.removesuffix('_path')}: {path}")
         return
 
     if args.group == "review" and args.action == "sample-propose":
         payload = propose_entity_alias_review_sample(args.path)
-        artifacts = (
+        sample_proposal_artifacts = (
             write_entity_alias_review_sample_proposal_artifacts(args.project_root, payload)
             if args.write
             else None
         )
         if args.json:
-            print(json.dumps({**payload, "artifacts": artifacts}, indent=2))
+            print(json.dumps({**payload, "artifacts": sample_proposal_artifacts}, indent=2))
             return
         print(render_entity_alias_review_sample_proposal(payload))
-        if artifacts:
+        if sample_proposal_artifacts:
             print("")
             print("Artifacts:")
-            for key, path in artifacts.items():
+            for key, path in sample_proposal_artifacts.items():
                 print(f"  {key.removesuffix('_path')}: {path}")
         return
 
@@ -1553,19 +1617,19 @@ def main() -> None:
             args.sample_path,
             args.proposal_path,
         )
-        artifacts = (
+        sample_comparison_artifacts = (
             write_entity_alias_review_sample_comparison_artifacts(args.project_root, payload)
             if args.write
             else None
         )
         if args.json:
-            print(json.dumps({**payload, "artifacts": artifacts}, indent=2))
+            print(json.dumps({**payload, "artifacts": sample_comparison_artifacts}, indent=2))
             return
         print(render_entity_alias_review_sample_comparison(payload))
-        if artifacts:
+        if sample_comparison_artifacts:
             print("")
             print("Artifacts:")
-            for key, path in artifacts.items():
+            for key, path in sample_comparison_artifacts.items():
                 print(f"  {key.removesuffix('_path')}: {path}")
         return
 

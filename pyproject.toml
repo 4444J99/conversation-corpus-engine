@@ -19,7 +19,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Topic :: Text Processing :: Indexing",
 ]
-dependencies = []
+dependencies = ["rfc8785==0.1.4"]
 
 [project.urls]
 Repository = "https://github.com/4444J99/conversation-corpus-engine"
