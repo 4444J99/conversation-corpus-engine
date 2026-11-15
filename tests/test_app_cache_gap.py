@@ -264,3 +264,117 @@ def test_malformed_inputs_are_named_errors(tmp_path: Path) -> None:
     ArchivePaths(archive).index("gemini").write_text("{not json\n")
     with pytest.raises(app_cache_gap.GapError, match="cannot read the gemini index"):
         app_cache_gap.build_report(archive, {"gemini": staged})
+
+
+def test_staged_message_text_is_dropped_while_parsing(tmp_path: Path) -> None:
+    marker = "message body words that must not survive"
+    path = tmp_path / "conversations-000.json"
+    path.write_text(
+        json.dumps(
+            {
+                "conversations": [
+                    {
+                        "context_uuid": "space-1",
+                        "updated_at": "2026-11-09T20:01:00Z",
+                        "entries": [{"answer": marker}],
+                    }
+                ]
+            }
+        )
+    )
+    parsed = app_cache_gap._read_json(path)
+    assert marker not in json.dumps(parsed)
+    assert parsed["conversations"][0]["context_uuid"] == "space-1"
+    archive = _archive(tmp_path / "archive")
+    staged = tmp_path / "px"
+    staged.mkdir()
+    path.rename(staged / "conversations-000.json")
+    report = app_cache_gap.build_report(archive, {"perplexity": staged})
+    assert marker not in json.dumps(report)
+
+
+def test_archive_read_repeats_when_shards_change_underneath_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _archive(tmp_path / "archive")
+    shard = ArchivePaths(archive).index("chatgpt")
+    real = app_cache_gap.iter_jsonl
+    calls = {"n": 0}
+
+    def republish_during_first_read(path: Path):
+        calls["n"] += 1
+        rows = list(real(path))
+        if calls["n"] == 1:  # an ingest replaces the shard after this read began
+            shard.write_text(
+                "".join(json.dumps(r) + "\n" for r in rows)
+                + json.dumps({"uid": "chatgpt-ccc", "last_activity": "2026-10-20T00:00:00Z"})
+                + "\n"
+            )
+        return iter(rows)
+
+    monkeypatch.setattr(app_cache_gap, "iter_jsonl", republish_during_first_read)
+    monkeypatch.setattr(app_cache_gap, "SNAPSHOT_PAUSE_SECONDS", 0)
+    info = app_cache_gap.archive_provider(archive, "chatgpt")
+    assert calls["n"] == 2
+    assert info["conversations"] == 3
+    assert "chatgpt-ccc" in info["held"]
+
+
+def test_archive_read_refuses_a_store_that_never_settles(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _archive(tmp_path / "archive")
+    shard = ArchivePaths(archive).index("chatgpt")
+    real = app_cache_gap.iter_jsonl
+    counter = {"n": 0}
+
+    def always_republishing(path: Path):
+        rows = list(real(path))
+        counter["n"] += 1
+        shard.write_text(
+            "".join(json.dumps(r) + "\n" for r in rows)
+            + json.dumps({"uid": f"chatgpt-n{counter['n']}"})
+            + "\n"
+        )
+        return iter(rows)
+
+    monkeypatch.setattr(app_cache_gap, "iter_jsonl", always_republishing)
+    monkeypatch.setattr(app_cache_gap, "SNAPSHOT_PAUSE_SECONDS", 0)
+    with pytest.raises(app_cache_gap.GapError, match="stable chatgpt index"):
+        app_cache_gap.archive_provider(archive, "chatgpt")
+
+
+def test_interrupted_report_write_leaves_out_absent_and_retryable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    archive = _archive(tmp_path / "archive")
+    report = app_cache_gap.build_report(archive, {"chatgpt": _chatgpt(tmp_path / "gpt")})
+    out = tmp_path / "out"
+    real = app_cache_gap.write_private
+    calls = {"n": 0}
+
+    def fail_on_second_file(path: Path, text: str) -> None:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OSError("disk full")
+        real(path, text)
+
+    monkeypatch.setattr(app_cache_gap, "write_private", fail_on_second_file)
+    with pytest.raises(OSError, match="disk full"):
+        app_cache_gap.write_report(report, out)
+    assert not out.exists()
+    assert [p.name for p in tmp_path.iterdir() if ".partial-" in p.name] == []
+    monkeypatch.setattr(app_cache_gap, "write_private", real)
+    app_cache_gap.write_report(report, out)
+    assert sorted(p.name for p in out.iterdir()) == ["coverage.json", "gap-report.json"]
+    assert (out.stat().st_mode & 0o777) == 0o700
+
+
+def test_report_goes_into_an_existing_empty_directory(tmp_path: Path) -> None:
+    archive = _archive(tmp_path / "archive")
+    report = app_cache_gap.build_report(archive, {"chatgpt": _chatgpt(tmp_path / "gpt")})
+    out = tmp_path / "out"
+    out.mkdir(mode=0o755)
+    app_cache_gap.write_report(report, out)
+    assert (out.stat().st_mode & 0o777) == 0o700
+    assert (out / "gap-report.json").is_file()

@@ -18,6 +18,9 @@ stdout and the coverage file carry counts and dates only.
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import time
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
@@ -75,29 +78,85 @@ def _day(moment: datetime | None) -> str | None:
     return moment.date().isoformat() if moment else None
 
 
+SNAPSHOT_ATTEMPTS = 5
+SNAPSHOT_PAUSE_SECONDS = 0.2
+
+
+def _shard_signature(shards: list[Path]) -> list[tuple[str, int, int]]:
+    """Name, size and mtime of each index shard; a vanished shard raises ``OSError``."""
+    signature = []
+    for shard in shards:
+        info = shard.stat()
+        signature.append((str(shard), info.st_size, info.st_mtime_ns))
+    return signature
+
+
+def _read_index(paths: ArchivePaths, provider: str) -> dict[str, datetime | None]:
+    held: dict[str, datetime | None] = {}
+    for shard in paths.index_files(provider):
+        for row in iter_jsonl(shard):
+            held[str(row["uid"])] = _parse(row.get("last_activity")) or _parse(row.get("updated"))
+    return held
+
+
 def archive_provider(archive_root: Path, provider: str) -> dict[str, Any]:
     """What the archive holds for one provider: uid -> last activity, plus the overall end.
 
     The cutoff is ``last_activity`` (when the conversation last had a message); ``updated`` is the
     source's metadata stamp and only fills in when no activity time exists.
+
+    An ingest replaces a provider's shards one file at a time, so a read that overlaps a publish
+    could mix two generations or lose a shard. The shard set is read only when its names, sizes and
+    modification times are identical before and after the read; otherwise the read is repeated, and
+    after ``SNAPSHOT_ATTEMPTS`` tries the comparison refuses rather than report a mixed archive.
     """
     paths = ArchivePaths(archive_root.expanduser().absolute())
-    held: dict[str, datetime | None] = {}
-    try:
-        for shard in paths.index_files(provider):
-            for row in iter_jsonl(shard):
-                held[str(row["uid"])] = _parse(row.get("last_activity")) or _parse(
-                    row.get("updated")
+    held: dict[str, datetime | None] | None = None
+    last_error: Exception | None = None
+    for attempt in range(SNAPSHOT_ATTEMPTS):
+        if attempt:
+            time.sleep(SNAPSHOT_PAUSE_SECONDS)
+        before: list[tuple[str, int, int]] | None = None
+        try:
+            before = _shard_signature(paths.index_files(provider))
+            candidate = _read_index(paths, provider)
+            if _shard_signature(paths.index_files(provider)) == before:
+                held = candidate
+                break
+            last_error = GapError("the index shards changed while they were being read")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            last_error = error
+            try:
+                settled = (
+                    before is not None and _shard_signature(paths.index_files(provider)) == before
                 )
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        raise GapError(f"cannot read the {provider} index of {archive_root}: {error}") from error
+            except OSError:
+                settled = False
+            if settled and not isinstance(error, FileNotFoundError):
+                # Unchanged shards that still do not parse are damaged, not mid-publish.
+                raise GapError(
+                    f"cannot read the {provider} index of {archive_root}: {error}"
+                ) from error
+    if held is None:
+        raise GapError(
+            f"cannot read a stable {provider} index of {archive_root}: {last_error}"
+        ) from last_error
     latest = max((t for t in held.values() if t), default=None)
     return {"held": held, "conversations": len(held), "last_activity_max": latest}
 
 
+# Keys that carry message text in the staged files. They are discarded as each object is parsed,
+# so the comparison never holds, returns or writes conversation text.
+MESSAGE_KEYS = frozenset({"entries", "mapping", "messages"})
+
+
+def _drop_message_text(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    return {key: value for key, value in pairs if key not in MESSAGE_KEYS}
+
+
 def _read_json(path: Path) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=_drop_message_text)
     except (OSError, ValueError) as error:
         raise GapError(f"cannot read staged file {path}: {error}") from error
 
@@ -121,7 +180,7 @@ def _classify(
 
 def _body_times(staged: Path) -> dict[str, datetime | None]:
     """When each staged full body was last updated. Only ids and times are kept; the message
-    mapping is parsed with the file and dropped."""
+    mapping is dropped as the file is parsed."""
     path = staged / "conversations-000.json"
     if not path.is_file():
         return {}
@@ -289,15 +348,37 @@ def build_report(archive_root: Path, staged: dict[str, Path]) -> dict[str, Any]:
 
 
 def write_report(report: dict[str, Any], out: Path) -> dict[str, Any]:
-    """Write the full report (ids, titles) and a coverage file with counts and dates only."""
-    out = prepare_directory(out)
-    write_private(out / REPORT_NAME, json.dumps(report, indent=1, ensure_ascii=False))
-    coverage = {
-        **{k: v for k, v in report.items() if k not in ("providers", "archive")},
-        "providers": {
-            name: {k: v for k, v in info.items() if k != "rows"}
-            for name, info in report["providers"].items()
-        },
-    }
-    write_private(out / COVERAGE_NAME, json.dumps(coverage, indent=1, ensure_ascii=False) + "\n")
+    """Write the full report (ids, titles) and a coverage file with counts and dates only.
+
+    Both files are written into a private sibling directory and moved onto ``out`` in one rename,
+    so an interrupted or concurrent run never leaves ``out`` partly populated (which a retry would
+    then refuse). ``out`` must be absent or an empty directory.
+    """
+    out = out.expanduser().absolute()
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        raise FileExistsError(f"output directory already exists and is not empty: {out}")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    staging = out.parent / f".{out.name}.partial-{os.getpid()}-{time.monotonic_ns()}"
+    staging = prepare_directory(staging)
+    try:
+        write_private(staging / REPORT_NAME, json.dumps(report, indent=1, ensure_ascii=False))
+        coverage = {
+            **{k: v for k, v in report.items() if k not in ("providers", "archive")},
+            "providers": {
+                name: {k: v for k, v in info.items() if k != "rows"}
+                for name, info in report["providers"].items()
+            },
+        }
+        write_private(
+            staging / COVERAGE_NAME, json.dumps(coverage, indent=1, ensure_ascii=False) + "\n"
+        )
+        if out.is_dir():
+            out.rmdir()
+        try:
+            staging.rename(out)
+        except OSError as error:
+            raise FileExistsError(f"output directory was taken by another run: {out}") from error
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     return coverage
