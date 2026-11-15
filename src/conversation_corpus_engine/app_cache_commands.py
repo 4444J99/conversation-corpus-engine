@@ -10,7 +10,7 @@ import argparse
 import json
 from pathlib import Path
 
-from . import app_cache_gemini, app_cache_perplexity
+from . import app_cache_gap, app_cache_gemini, app_cache_perplexity
 from .app_cache_chatgpt import default_roots, scan, write_staging
 from .corpus_store import CorpusStoreError, require_git_private
 
@@ -47,6 +47,18 @@ def add_app_cache_parser(subparsers: argparse._SubParsersAction) -> argparse.Arg
     gemini.add_argument("--store", type=Path, help="default: the app's ChatInfo2.store")
     gemini.add_argument("--out", type=Path, required=True, help="new empty output directory")
     gemini.add_argument("--json", action="store_true")
+    gap = sub.add_parser(
+        "gap",
+        help="Compare staged app-cache directories with an archive: what they add, what needs an export",
+    )
+    gap.add_argument(
+        "--archive", type=Path, required=True, help="archive root (holds manifest-all.json)"
+    )
+    gap.add_argument("--chatgpt", type=Path, help="a staged `app-cache chatgpt` directory")
+    gap.add_argument("--perplexity", type=Path, help="a staged `app-cache perplexity` directory")
+    gap.add_argument("--gemini", type=Path, help="a staged `app-cache gemini` directory")
+    gap.add_argument("--out", type=Path, required=True, help="new empty private directory")
+    gap.add_argument("--json", action="store_true")
     return parser
 
 
@@ -69,7 +81,38 @@ def handle_app_cache(args: argparse.Namespace) -> int:
         return _perplexity(args)
     if args.action == "gemini":
         return _gemini(args)
+    if args.action == "gap":
+        return _gap(args)
     return 2
+
+
+def _gap(args: argparse.Namespace) -> int:
+    staged = {
+        name: path
+        for name, path in (
+            ("chatgpt", args.chatgpt),
+            ("perplexity", args.perplexity),
+            ("gemini", args.gemini),
+        )
+        if path
+    }
+    try:
+        require_git_private(args.out)
+        report = app_cache_gap.build_report(args.archive, staged)
+        coverage = app_cache_gap.write_report(report, args.out)
+    except (FileExistsError, CorpusStoreError, app_cache_gap.GapError) as error:
+        print(f"error: {error}")
+        return 2
+    if args.json:
+        print(json.dumps(coverage, indent=2))
+        return 0
+    for name, info in coverage["providers"].items():
+        print(
+            f"{name}: archive ends {info['archive_last_activity']}; ingestible now "
+            f"{info['ingestible_now']}; needs owner export {info['needs_owner_export']}; "
+            f"gap {info['gap_updated_first']} .. {info['gap_updated_last']}"
+        )
+    return 0
 
 
 def _gemini(args: argparse.Namespace) -> int:

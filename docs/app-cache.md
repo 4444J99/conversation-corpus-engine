@@ -46,6 +46,20 @@ To bring the text in, use the export the reader already understands: Google Take
 History` and `Gemini/gemini_scheduled_actions_data.html` are read when present. What a given export
 contains for these chats is known only after the reader has read it.
 
+## Gap report (`cce app-cache gap`)
+
+`cce app-cache gap --archive ARCHIVE_ROOT [--chatgpt DIR] [--perplexity DIR] [--gemini DIR] --out DIR`
+compares staged directories with the archive's index shards. No message text is read. ChatGPT
+conversations are matched by id (`chatgpt-<id>`): `new_*` means the archive has no such id,
+`newer_*` means the archive has it and the app saw activity after the archive's last activity, and
+`*_with_body` / `*_metadata_only` says whether a full body was staged. A held conversation the app
+restamped to a time before the archive's end is timestamp drift and counts as covered (list pages
+restamp many conversations at once). Gemini chats are matched by chat id and compared by date.
+Perplexity records carry synthetic ids, so only dates are compared.
+
+`gap-report.json` lists ids and titles and stays in the private `--out` directory (0700/0600);
+`coverage.json` and stdout carry counts, dates and the owner export path for each provider.
+
 ## Rebuilding the library
 
 Staging does not rebuild anything. The new-generation library build takes hours and is started by the
