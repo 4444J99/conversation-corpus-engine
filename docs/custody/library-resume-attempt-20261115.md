@@ -64,9 +64,26 @@ Result (2026-11-15, one run, no second attempt needed):
   (470 s of margin). Artifact bytes 17,241,454,789 against the 25,769,803,776 limit.
 - The build's own verification passed. `cce library publish GENERATION_PATH` then verified the
   candidate and moved the pointer (`changed: true`, `published_at` 2026-11-15T19:18:37Z).
-- Rollback: the pointer before publish is kept as `cce-resume-20261115/rollback-current-pre-publish.json`
-  in the custody staging root (SHA-256 `3524767f...`); restoring it returns the library to
-  generation `20261031T162115Z-614ce4c057f6`, which was not modified by this work.
+- Rollback pointer (the whole `current.json` before publish; hashes and names only):
+
+  ```json
+  {"coverage_complete": false,
+   "evidence_fingerprint": "12f1f564b18c4d4b9fa2f177d4f3693f4b39af7e978bd675bf4b795788fc043c",
+   "generation": "generations/generation-20261031T162115Z-614ce4c057f6",
+   "published_at": "2026-10-31T20:47:59.777378+00:00",
+   "record_fingerprint": "baf1153b4107bf626c27f490d7ac6c32df0f173eb182d4a5bb583a95b5334e77",
+   "report_sha256": "4663047580584a5ab2e29275eb1d8f722dfd7c978524900038b4a02e59496ecb",
+   "schema": "cce.library-current.v1",
+   "source_manifest_hash": "29f76de0585c36d9380b4f8d5e0f20dfcc481df43fbc25e312afc719c61140b9"}
+  ```
+
+  A copy is in the custody staging root (`cce-resume-20261115/rollback-current-pre-publish.json`,
+  file SHA-256 `3524767fa3ec8d01d888ed322504942432579da3e4715336696625cfe58d68e3`). The previous
+  generation was not modified by this work: its `library.sqlite` mtime is still 08:22:04 (written
+  before this run started) and it has no `-wal`, `-shm` or `-journal` file. Rollback is a manual
+  copy of that JSON over `library-all/current.json` (respect `publication.lock`), not
+  `cce library publish`: publish verifies the generation first, and the previous generation fails
+  `verify_candidate` (see the diagnosis above), so the tool would refuse it.
 - Searchability: `cce library search` against the new generation returns the 8 staged exports
   as `documents` records (wing `ai`, lane `support`, kind `document`), found by content terms (7
   of 8) and by title (the 8th). Document records rose from 8,788 to 8,796.
@@ -75,4 +92,4 @@ Result (2026-11-15, one run, no second attempt needed):
   08:22 to 08:32) on the previous generation remains unattributed. Its `agent-entry.md` hash
   mismatch and two `.DS_Store` files are unrepaired (a generation held as rollback should not be
   edited here).
-- Host: load 3 to 5 throughout, free space 160 GiB before and 138 GiB at a mid-export observation.
+- Host: load average between 2.7 and 5.7 at the points observed; free space 160 GiB before and 138 GiB at a mid-export observation.
