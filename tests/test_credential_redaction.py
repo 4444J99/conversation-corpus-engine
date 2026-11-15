@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import tempfile
+import time
 import uuid
 import zlib
 from pathlib import Path
@@ -161,7 +162,7 @@ def test_mask_conversation_masks_text_title_attachments_and_keeps_typed_chars() 
     assert changed == 3
     assert conversation.messages[0].text == "plain words"
     assert conversation.messages[1].text == 'JULES_API_KEY="' + MARKER + '"'
-    assert conversation.messages[1].typed_chars == len(text)
+    assert conversation.messages[1].typed_chars == len(conversation.messages[1].text)
     assert MARKER in conversation.title
     assert MARKER in conversation.messages[1].attachments[0].ref
     assert mask_conversation(conversation) == 0
@@ -243,7 +244,7 @@ def test_alternate_messages_are_masked_with_their_attachments_and_typed_chars() 
     assert mask_conversation(conversation) == 2
     first, second = conversation.extra["alternate_messages"]
     assert first["text"] == "token " + MARKER
-    assert first["typed_chars"] == len(text)
+    assert first["typed_chars"] == len(first["text"])
     assert MARKER in first["attachments"][0]["ref"]
     assert second["text"] == "plain"
     assert mask_conversation(conversation) == 0
@@ -402,3 +403,53 @@ def test_message_meta_strings_are_masked_in_messages_and_alternates() -> None:
     }
     assert conversation.extra["alternate_messages"][0]["meta"]["u"].count(MARKER) == 1
     assert mask_conversation(conversation) == 0
+
+
+def test_typed_boundary_follows_the_masked_text() -> None:
+    typed = "use api_key=" + "q8Zt3Lm0Xv2Pb7Rn5Wc1" + " now"
+    attachment_text = "\n[attachment] notes"
+    message = Message(role="user", text=typed + attachment_text, typed_chars=len(typed))
+    conversation = Conversation(
+        provider="gemini", source_id="synthetic-typed", title="t", messages=[message]
+    )
+    assert mask_conversation(conversation) == 1
+    assert message.text == "use api_key=" + MARKER + " now" + attachment_text
+    assert message.typed_chars == len("use api_key=" + MARKER + " now")
+    assert message.text[message.typed_chars :] == attachment_text
+
+
+def test_collection_extra_and_provenance_strings_are_masked() -> None:
+    url = "https://bot:" + "Qx9Lm2Va7Pk4Nr8Tu3Wy" + "@host.example/r"
+    conversation = Conversation(
+        provider="claude",
+        source_id="synthetic-extra",
+        title="t",
+        collection="c " + POSITIVE["github-ghp"],
+        messages=[Message(role="user", text="hi")],
+        provenance={"source_url": url},
+        extra={"system_prompt": POSITIVE["jules-aq"], "nested": {"k": [url]}, "n": 1},
+    )
+    assert mask_conversation(conversation) == 4
+    dump = repr(conversation.to_dict())
+    assert B[:8] not in dump and "Qx9Lm2Va7" not in dump and "a1B2c3D4e5" not in dump
+    assert mask_conversation(conversation) == 0
+
+
+@pytest.mark.parametrize("filler", ["-", ".", "a-", "a.", "-a"])
+def test_long_separator_runs_do_not_blow_up(filler: str) -> None:
+    started = time.monotonic()
+    text = "key " + filler * 150_000 + " token"
+    assert mask_credentials(text) == text
+    assert time.monotonic() - started < 5
+
+
+def test_prose_lookalikes_survive() -> None:
+    for text in (
+        "Authorization: Token expired",
+        "Authorization: Bearer of bad news",
+        'the token: "was invalid for this request"',
+        "secret = 'meeting notes from last tuesday'",
+        "the file starts with -----BEGIN " + "PRIVATE KEY----- then base64 data follows",
+        "plain text with no trigger words at all",
+    ):
+        assert mask_credentials(text) == text

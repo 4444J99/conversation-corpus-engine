@@ -29,7 +29,7 @@ _WHOLE: tuple[tuple[str, re.Pattern[str]], ...] = (
         "pem-private-key",
         re.compile(
             r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"
-            r"(?:[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|[\s\S]*)"
+            r"(?:[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|(?=\s*[A-Za-z0-9+/]{16})[\s\S]*)"
         ),
     ),
     (
@@ -64,22 +64,23 @@ _WHOLE: tuple[tuple[str, re.Pattern[str]], ...] = (
 _BEARER = re.compile(
     r"(\bBearer\s+)((?=[A-Za-z0-9._~+/\-]*\d)[A-Za-z0-9._~+/\-]{20,}=*)", re.IGNORECASE
 )
-# Credentials in an Authorization header have no length or alphabet floor (RFC 6750 b64token), so
-# the header name is the anchor and prose such as "Bearer of bad news" stays untouched.
+# Credentials in an Authorization header may be letters only (RFC 6750 b64token), so the header name
+# is the anchor; a token must be long or carry a non-letter, so "Authorization: Token expired"
+# stays untouched.
 _AUTH_HEADER = re.compile(
     r"(\bAuthorization[\"']?\s*:\s*[\"']?(?:Bearer|Basic|Token)\s+)([A-Za-z0-9._~+/\-]+=*)",
     re.IGNORECASE,
 )
 # Passwords inside URI userinfo, e.g. a pasted database connection string.
 _URL_PASSWORD = re.compile(
-    r"(?P<head>\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@?#\"'<>]+:)(?P<value>[^\s/@?#\"'<>]+)(?P<tail>@)"
+    r"(?P<head>\b[A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s/:@?#\"'<>]+:)(?P<value>[^\s/@?#\"'<>]+)(?P<tail>@)"
 )
 # Only template markers count as placeholders in a URL; "%40" is a percent-encoded character.
 _URL_PLACEHOLDER = re.compile(r"^(?:\$|<|\{|%[A-Za-z_][A-Za-z0-9_]*%|\[REDACTED)")
 _NAME = (
-    r"[A-Za-z0-9_.\-]*(?:api[\s_\-]?key|secret[\s_\-]key|secret|token|passwd|password|passphrase"
+    r"[A-Za-z0-9_.\-]{0,40}(?:api[\s_\-]?key|secret[\s_\-]key|secret|token|passwd|password|passphrase"
     r"|access[\s_\-]?key|private[\s_\-]?key|auth[\s_\-]?key|credential)"
-    r"[A-Za-z0-9_.\-]*"
+    r"[A-Za-z0-9_.\-]{0,40}"
 )
 _GENERIC = re.compile(
     r"(?P<head>(?<![A-Za-z0-9_])" + _NAME + r"[\"'`]?\s*[:=]\s*[\"'`]?)"
@@ -96,6 +97,24 @@ _GENERIC_QUOTED = re.compile(
 # Words that mark a quoted value as a template rather than a passphrase.
 _TEMPLATE_WORDS = frozenset(
     {
+        "is",
+        "was",
+        "are",
+        "were",
+        "for",
+        "this",
+        "that",
+        "and",
+        "not",
+        "with",
+        "from",
+        "has",
+        "have",
+        "had",
+        "will",
+        "expired",
+        "invalid",
+        "missing",
         "your",
         "enter",
         "paste",
@@ -169,39 +188,61 @@ def _url_password(match: re.Match[str]) -> str:
     return match.group("head") + MARKER + match.group("tail")
 
 
+def _auth_header(match: re.Match[str]) -> str:
+    value = match.group(2)
+    long_enough = len(value) >= 20
+    mixed = len(value) >= 8 and re.search(r"[\d._~+/=\-]", value) is not None
+    return match.group(1) + MARKER if long_enough or mixed else match.group(0)
+
+
+# Cheap necessary condition for every rule above: most text carries none of these and returns early.
+_TRIGGER = re.compile(
+    r"AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA|gh[pousr]_|github_pat_|AIza|ya29\.|AQ\.|sk-|sk_|rk_"
+    r"|whsec_|xox|xapp-|eyJ|-----BEGIN|bearer|authorization|://|api|key|secret|token|pass|credential",
+    re.IGNORECASE,
+)
+
+
 def mask_credentials(text: str) -> str:
     """Return `text` with every recognized credential replaced by `[REDACTED-CREDENTIAL]`."""
-    if not text:
+    if not text or not _TRIGGER.search(text):
         return text
     for _name, pattern in _WHOLE:
         text = pattern.sub(MARKER, text)
-    text = _AUTH_HEADER.sub(lambda m: m.group(1) + MARKER, text)
+    text = _AUTH_HEADER.sub(_auth_header, text)
     text = _BEARER.sub(lambda m: m.group(1) + MARKER, text)
     text = _URL_PASSWORD.sub(_url_password, text)
     text = _GENERIC_QUOTED.sub(_generic_quoted, text)
     return _GENERIC.sub(_generic, text)
 
 
-def mask_conversation(conversation: object) -> int:
-    """Mask a `Conversation` in place; return how many fields changed.
+def _typed_after_masking(text: str, typed: int | None) -> int:
+    """The typed boundary of `text` once masked: the masked length of what was typed.
 
-    `typed_chars` is the number of characters the person typed, so it is fixed from the original
-    text before the text is masked.
+    `typed_chars` marks where the person's own typing ends (an attachment's text may follow), so it
+    is recomputed from the masked typed prefix rather than kept as a stale offset.
     """
+    if typed is None or typed >= len(text):
+        return len(mask_credentials(text))
+    return len(mask_credentials(text[: max(typed, 0)]))
+
+
+def mask_conversation(conversation: object) -> int:
+    """Mask a `Conversation` in place; return how many fields changed."""
     changed = 0
 
     def masked(value: str) -> str | None:
         result = mask_credentials(value)
         return result if result != value else None
 
-    title = getattr(conversation, "title", "")
-    if isinstance(title, str) and (result := masked(title)) is not None:
-        conversation.title = result  # type: ignore[attr-defined]
-        changed += 1
+    for name in ("title", "collection", "model"):
+        value = getattr(conversation, name, "")
+        if isinstance(value, str) and (result := masked(value)) is not None:
+            setattr(conversation, name, result)
+            changed += 1
     for message in getattr(conversation, "messages", []):
-        if getattr(message, "typed_chars", None) is None:
-            message.typed_chars = len(message.text)
         if (result := masked(message.text)) is not None:
+            message.typed_chars = _typed_after_masking(message.text, message.typed_chars)
             message.text = result
             changed += 1
         changed += _mask_json(message.meta)
@@ -213,14 +254,23 @@ def mask_conversation(conversation: object) -> int:
                 attachment.ref = result
                 changed += 1
     extra = getattr(conversation, "extra", None)
-    alternates = extra.get("alternate_messages") if isinstance(extra, dict) else None
-    for row in alternates if isinstance(alternates, list) else []:
-        changed += _mask_message_dict(row)
+    if isinstance(extra, dict):
+        for key, value in list(extra.items()):
+            if key == "alternate_messages":
+                for row in value if isinstance(value, list) else []:
+                    changed += _mask_message_dict(row)
+            elif isinstance(value, str):
+                if (result := masked(value)) is not None:
+                    extra[key] = result
+                    changed += 1
+            else:
+                changed += _mask_json(value)
+    changed += _mask_json(getattr(conversation, "provenance", None))
     return changed
 
 
 def _mask_message_dict(row: object) -> int:
-    """Mask one serialized message (an off-branch alternate), keeping its typed length."""
+    """Mask one serialized message (an off-branch alternate), keeping its typed boundary valid."""
     if not isinstance(row, dict):
         return 0
     changed = 0
@@ -229,8 +279,9 @@ def _mask_message_dict(row: object) -> int:
         masked = mask_credentials(text)
         if masked != text:
             typed = row.get("typed_chars")
-            if not isinstance(typed, int) or isinstance(typed, bool):
-                row["typed_chars"] = len(text)
+            row["typed_chars"] = _typed_after_masking(
+                text, typed if isinstance(typed, int) and not isinstance(typed, bool) else None
+            )
             row["text"] = masked
             changed += 1
     changed += _mask_json(row.get("meta"))
