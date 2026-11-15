@@ -37,5 +37,8 @@
     "typescript": "^5.9.0",
     "vite": "^7.0.0",
     "vitest": "^3.2.0"
+  },
+  "overrides": {
+    "workerd": "1.20261104.1"
   }
 }
