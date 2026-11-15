@@ -1,5 +1,13 @@
 import { expect, it } from "vitest";
-import { mkdtemp, rm, symlink, mkdir, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  rm,
+  symlink,
+  mkdir,
+  writeFile,
+  readFile,
+  unlink,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FileStorage } from "../agent/storage";
@@ -68,3 +76,49 @@ it("reclaims a lock left by a dead process but never one held by a live process"
     await rm(root, { recursive: true, force: true });
   }
 }, 30000);
+
+it("close never removes a lock now held by another owner", async () => {
+  const root = await mkdtemp(join(tmpdir(), "knovv-agent-close-"));
+  try {
+    const dir = join(root, "device");
+    const store = await FileStorage.open(dir);
+    await unlink(join(dir, ".lock"));
+    const foreign = JSON.stringify({ pid: process.pid, token: "someone-else" }); // allow-secret: test lock owner id
+    await writeFile(join(dir, ".lock"), foreign, { mode: 0o600 });
+    await store.close();
+    expect(await readFile(join(dir, ".lock"), "utf8")).toBe(foreign);
+    await expect(FileStorage.open(dir)).rejects.toMatchObject({
+      code: "EEXIST",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}, 30000);
+
+it("lets exactly one of many racing openers reclaim a dead owner's lock", async () => {
+  const root = await mkdtemp(join(tmpdir(), "knovv-agent-race-"));
+  try {
+    for (let round = 0; round < 25; round++) {
+      const dir = join(root, "device" + round);
+      await (await FileStorage.open(dir)).close();
+      await writeFile(
+        join(dir, ".lock"),
+        JSON.stringify({ pid: 2 ** 22 + 1 }),
+        { mode: 0o600 },
+      );
+      const results = await Promise.allSettled([
+        FileStorage.open(dir),
+        FileStorage.open(dir),
+        FileStorage.open(dir),
+      ]);
+      const won = results.filter((r) => r.status === "fulfilled");
+      expect(won.length).toBe(1);
+      for (const r of results)
+        if (r.status === "rejected")
+          expect((r.reason as any).code).toBe("EEXIST");
+      await (won[0] as PromiseFulfilledResult<FileStorage>).value.close();
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}, 60000);

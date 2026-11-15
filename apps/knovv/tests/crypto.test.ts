@@ -13,6 +13,8 @@ import {
   sha256,
   hex,
   unhex,
+  MAX_OBJECT,
+  MAX_CIPHERTEXT,
 } from "../src/crypto";
 
 describe("device custody and encrypted revision primitives", () => {
@@ -85,5 +87,26 @@ describe("device custody and encrypted revision primitives", () => {
     expect(verify(signed, d.signing_public)).toBe(true);
     expect(verify({ ...signed, z: ["changed"] }, d.signing_public)).toBe(false);
     expect(sha256(new Uint8Array())).toHaveLength(64);
+  });
+});
+
+describe("signature verification trust-root hygiene", () => {
+  const zeros = (n: number) => "00".repeat(n);
+  const smallOrder = [
+    zeros(32),
+    "01" + zeros(31),
+    "ecff" + "ff".repeat(29) + "7f",
+  ];
+  it("rejects small-order public keys even for degenerate signatures", () => {
+    for (const key of smallOrder.slice(0, 3)) {
+      const signed = { a: 1, signature: "01" + zeros(31) + zeros(32) };
+      expect(verify(signed, key)).toBe(false);
+    }
+  });
+  it("keeps the largest valid plaintext's ciphertext within the advertised ciphertext bound", () => {
+    const key = new Uint8Array(32).fill(3);
+    const out = encrypt(key, new Uint8Array(MAX_OBJECT), "max");
+    expect(out.length).toBeLessThanOrEqual(MAX_CIPHERTEXT);
+    expect(out.length).toBe(MAX_CIPHERTEXT);
   });
 });

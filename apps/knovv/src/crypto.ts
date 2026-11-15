@@ -10,6 +10,10 @@ export const encoder = new TextEncoder(),
 export const FORMAT = "cce-sealed.v1",
   KEY_FORMAT = "cce-protected-identity.v1";
 export const MAX_OBJECT = 48 * 1024 * 1024;
+// Largest ciphertext encrypt() can emit for MAX_OBJECT bytes: 12-byte nonce,
+// 4 KiB-padded length-prefixed body, 16-byte Poly1305 tag. Servers must accept it.
+export const MAX_CIPHERTEXT =
+  12 + Math.ceil((MAX_OBJECT + 8) / 4096) * 4096 + 16;
 export interface Identity {
   format: string;
   app_id: string;
@@ -118,11 +122,7 @@ export function decrypt(
   data: Uint8Array,
   context: string,
 ): Uint8Array {
-  if (
-    secret.length !== 32 ||
-    data.length < 36 ||
-    data.length > MAX_OBJECT + 8192
-  )
+  if (secret.length !== 32 || data.length < 36 || data.length > MAX_CIPHERTEXT)
     throw new Error("invalid-object");
   const plain = chacha20poly1305(
     derive(secret, "aead"),
@@ -181,6 +181,10 @@ export function sign<T extends Record<string, unknown>>(
 export function verify(value: unknown, publicKey: string): boolean {
   try {
     const { signature, ...unsigned } = value as Record<string, unknown>;
+    // Small-order (including identity) keys make the verification equation
+    // satisfiable without the secret; a misconfigured trust root must fail closed.
+    const key = ed25519.Point.fromBytes(unhex(publicKey));
+    if (key.isSmallOrder()) return false;
     return (
       typeof signature === "string" &&
       ed25519.verify(
