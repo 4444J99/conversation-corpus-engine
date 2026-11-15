@@ -127,7 +127,9 @@ def archive_provider(archive_root: Path, provider: str) -> dict[str, Any]:
         except (OSError, ValueError, KeyError, TypeError) as error:
             last_error = error
             try:
-                settled = before is not None and _shard_signature(paths.index_files(provider)) == before
+                settled = (
+                    before is not None and _shard_signature(paths.index_files(provider)) == before
+                )
             except OSError:
                 settled = False
             if settled and not isinstance(error, FileNotFoundError):
