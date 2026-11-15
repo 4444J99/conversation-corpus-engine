@@ -347,3 +347,56 @@ def test_url_userinfo_password_is_masked_and_plain_urls_survive() -> None:
         "see https://example.com/a:b@c for details",
     ):
         assert mask_credentials(text) == text
+
+
+def test_url_userinfo_does_not_cross_query_or_fragment_and_keeps_percent_encoding_secret() -> None:
+    for text in (
+        "https://host.example?next=user:pass1234word@other.example",
+        "https://host.example#frag=user:pass1234word@other.example",
+    ):
+        assert mask_credentials(text) == text
+    assert mask_credentials("postgres://app:%40Qx9Lm2Va7Pk4@db/x") == (
+        "postgres://app:" + MARKER + "@db/x"
+    )
+    assert (
+        mask_credentials("postgres://app:%DB_PASSWORD%@db/x") == "postgres://app:%DB_PASSWORD%@db/x"
+    )
+
+
+def test_quoted_values_may_contain_the_other_quote_and_backticks_delimit() -> None:
+    assert mask_credentials('password="don\'t share code 7391"') == 'password="' + MARKER + '"'
+    assert mask_credentials("password='say \"hi\" 4 me now'") == "password='" + MARKER + "'"
+    assert mask_credentials("api_key=`q8Zt3Lm0Xv2Pb7Rn5Wc1`") == "api_key=`" + MARKER + "`"  # allow-secret
+    assert mask_credentials("api_key = `q8Zt3Lm0Xv2Pb7Rn5Wc1`") == "api_key = `" + MARKER + "`"  # allow-secret
+
+
+def test_alphabetic_passphrases_are_masked_but_templates_survive() -> None:
+    assert mask_credentials('passphrase="correct horse battery staple"') == (
+        'passphrase="' + MARKER + '"'
+    )
+    for text in (
+        'password="enter your password here"',
+        'secret="paste the secret value here"',
+        'token = "your token goes here"',
+        'password="changeme please"',
+    ):
+        assert mask_credentials(text) == text
+
+
+def test_message_meta_strings_are_masked_in_messages_and_alternates() -> None:
+    url = "https://bot:" + "Qx9Lm2Va7Pk4Nr8Tu3Wy" + "@host.example/r"
+    message = Message(role="assistant", text="x", meta={"citations": [{"url": url}], "n": 3})
+    conversation = Conversation(
+        provider="copilotcli",
+        source_id="synthetic-meta",
+        title="t",
+        messages=[message],
+        extra={"alternate_messages": [{"role": "user", "text": "p", "meta": {"u": url}}]},
+    )
+    assert mask_conversation(conversation) == 2
+    assert message.meta == {
+        "citations": [{"url": "https://bot:" + MARKER + "@host.example/r"}],
+        "n": 3,
+    }
+    assert conversation.extra["alternate_messages"][0]["meta"]["u"].count(MARKER) == 1
+    assert mask_conversation(conversation) == 0

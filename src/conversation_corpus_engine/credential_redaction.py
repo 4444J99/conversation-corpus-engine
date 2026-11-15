@@ -72,23 +72,50 @@ _AUTH_HEADER = re.compile(
 )
 # Passwords inside URI userinfo, e.g. a pasted database connection string.
 _URL_PASSWORD = re.compile(
-    r"(?P<head>\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@\"'<>]+:)(?P<value>[^\s/@\"'<>]+)(?P<tail>@)"
+    r"(?P<head>\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@?#\"'<>]+:)(?P<value>[^\s/@?#\"'<>]+)(?P<tail>@)"
 )
+# Only template markers count as placeholders in a URL; "%40" is a percent-encoded character.
+_URL_PLACEHOLDER = re.compile(r"^(?:\$|<|\{|%[A-Za-z_][A-Za-z0-9_]*%|\[REDACTED)")
 _NAME = (
     r"[A-Za-z0-9_.\-]*(?:api[\s_\-]?key|secret[\s_\-]key|secret|token|passwd|password|passphrase"
     r"|access[\s_\-]?key|private[\s_\-]?key|auth[\s_\-]?key|credential)"
     r"[A-Za-z0-9_.\-]*"
 )
 _GENERIC = re.compile(
-    r"(?P<head>(?<![A-Za-z0-9_])" + _NAME + r"[\"']?\s*[:=]\s*[\"']?)"
+    r"(?P<head>(?<![A-Za-z0-9_])" + _NAME + r"[\"'`]?\s*[:=]\s*[\"'`]?)"
     r"(?P<value>[^\s\"'`,;<>(){}\[\]]{16,})",
     re.IGNORECASE,
 )
-# A quoted value may hold spaces (a passphrase), so it runs to its closing quote.
+# A quoted value may hold spaces and the other quote characters (a passphrase), so it runs to its
+# own closing delimiter.
 _GENERIC_QUOTED = re.compile(
-    r"(?P<head>(?<![A-Za-z0-9_])" + _NAME + r"[\"']?\s*[:=]\s*(?P<quote>[\"']))"
-    r"(?P<value>[^\"'\n]{8,})(?P=quote)",
+    r"(?P<head>(?<![A-Za-z0-9_])" + _NAME + r"[\"'`]?\s*[:=]\s*(?P<quote>[\"'`]))"
+    r"(?P<value>(?:(?!(?P=quote))[^\n]){8,})(?P=quote)",
     re.IGNORECASE,
+)
+# Words that mark a quoted value as a template rather than a passphrase.
+_TEMPLATE_WORDS = frozenset(
+    {
+        "your",
+        "enter",
+        "paste",
+        "here",
+        "example",
+        "placeholder",
+        "password",
+        "secret",
+        "token",
+        "key",
+        "value",
+        "insert",
+        "replace",
+        "type",
+        "my",
+        "the",
+        "goes",
+        "put",
+        "add",
+    }
 )
 _PLACEHOLDER = re.compile(
     r"^(?:\$|%|<|\{|\[REDACTED|x{4,}|\*{4,}|\.{3,}|your[_\-]|example|changeme|placeholder)",
@@ -114,16 +141,30 @@ def _generic(match: re.Match[str]) -> str:
     return match.group("head") + MARKER if _generic_value_is_secret(value) else match.group(0)
 
 
+def _quoted_value_is_secret(value: str) -> bool:
+    if _generic_value_is_secret(value):
+        return True
+    if _PLACEHOLDER.match(value) or MARKER in value:
+        return False
+    words = value.split()
+    return (
+        len(words) >= 3
+        and all(re.fullmatch(r"[A-Za-z]{3,}", word) for word in words)
+        and not any(word.lower() in _TEMPLATE_WORDS for word in words)
+        and _entropy(value) >= 3.0
+    )
+
+
 def _generic_quoted(match: re.Match[str]) -> str:
     value = match.group("value")
-    if not _generic_value_is_secret(value):
+    if not _quoted_value_is_secret(value):
         return match.group(0)
     return match.group("head") + MARKER + match.group("quote")
 
 
 def _url_password(match: re.Match[str]) -> str:
     value = match.group("value")
-    if _PLACEHOLDER.match(value) or MARKER in value:
+    if _URL_PLACEHOLDER.match(value) or MARKER in value:
         return match.group(0)
     return match.group("head") + MARKER + match.group("tail")
 
@@ -163,6 +204,7 @@ def mask_conversation(conversation: object) -> int:
         if (result := masked(message.text)) is not None:
             message.text = result
             changed += 1
+        changed += _mask_json(message.meta)
         for attachment in message.attachments:
             if (result := masked(attachment.name)) is not None:
                 attachment.name = result
@@ -191,6 +233,7 @@ def _mask_message_dict(row: object) -> int:
                 row["typed_chars"] = len(text)
             row["text"] = masked
             changed += 1
+    changed += _mask_json(row.get("meta"))
     for attachment in row.get("attachments") or []:
         if not isinstance(attachment, dict):
             continue
@@ -199,4 +242,26 @@ def _mask_message_dict(row: object) -> int:
             if isinstance(value, str) and (masked := mask_credentials(value)) != value:
                 attachment[key] = masked
                 changed += 1
+    return changed
+
+
+def _mask_json(value: object) -> int:
+    """Mask every string inside a JSON-like container in place; return how many changed."""
+    changed = 0
+    if isinstance(value, dict):
+        for key, item in list(value.items()):
+            if isinstance(item, str):
+                if (masked := mask_credentials(item)) != item:
+                    value[key] = masked
+                    changed += 1
+            else:
+                changed += _mask_json(item)
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            if isinstance(item, str):
+                if (masked := mask_credentials(item)) != item:
+                    value[index] = masked
+                    changed += 1
+            else:
+                changed += _mask_json(item)
     return changed
