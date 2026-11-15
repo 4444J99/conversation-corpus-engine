@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .corpus_store import require_git_private
-from .library_export import _absolute, _no_symlinks
+from .library_paths import _absolute, _no_symlinks
 
 NOTES_FOLDER = "notes/zettel"
 MANIFEST_NAME = "cce-zettel-notes-manifest.json"
