@@ -1,5 +1,11 @@
 import { control } from "./control";
-import { canonical, encoder, sha256, verify, MAX_OBJECT } from "../src/crypto";
+import {
+  canonical,
+  encoder,
+  sha256,
+  verify,
+  MAX_CIPHERTEXT,
+} from "../src/crypto";
 import type { DeviceGrant, Revision, Publication } from "../src/contracts";
 import type { Database } from "./database";
 
@@ -221,13 +227,13 @@ export async function api(
       if (
         auth.schema !== "knovv-upload.v1" ||
         auth.object !== object ||
-        !integer(auth.size, 1, MAX_OBJECT)
+        !integer(auth.size, 1, MAX_CIPHERTEXT)
       )
         fail(400, "invalid-upload");
       const grant = await enrolled(env, auth.device);
       if (!verify(auth, grant.signing_public))
         fail(403, "invalid-upload-signature");
-      const bytes = await boundedBody(request, MAX_OBJECT);
+      const bytes = await boundedBody(request, MAX_CIPHERTEXT);
       if (bytes.length !== auth.size || sha256(bytes) !== object)
         fail(400, "ciphertext-digest-mismatch");
       const old = await env.DB.prepare(

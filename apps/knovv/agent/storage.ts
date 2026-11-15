@@ -47,16 +47,20 @@ export async function privateOutput(path: string, value: unknown) {
     await handle.close();
   }
 }
-async function staleLock(path: string) {
+async function lockOwner(path: string): Promise<number | undefined> {
   let pid: unknown;
   try {
     pid = JSON.parse((await privateRead(path, 1024)).toString()).pid;
   } catch {
-    return false;
+    return undefined;
   }
-  if (!Number.isSafeInteger(pid) || (pid as number) <= 0) return false;
+  return Number.isSafeInteger(pid) && (pid as number) > 0
+    ? (pid as number)
+    : undefined;
+}
+function dead(pid: number) {
   try {
-    process.kill(pid as number, 0);
+    process.kill(pid, 0);
     return false;
   } catch (error: any) {
     return error.code === "ESRCH";
@@ -65,7 +69,10 @@ async function staleLock(path: string) {
 // Every value is protected credential material, ciphertext or opaque checkpoint metadata.
 // The process-wide exclusive lock prevents simultaneous cache/draft writers.
 export class FileStorage implements StoragePort {
-  private constructor(private root: string) {}
+  private constructor(
+    private root: string,
+    private token: string, // allow-secret: runtime-only lock owner id
+  ) {}
   static async open(root: string) {
     await noLinks(root);
     try {
@@ -88,20 +95,51 @@ export class FileStorage implements StoragePort {
     );
     if (marker.schema !== "knovv-agent-state.v1")
       throw new Error("unowned-agent-state");
-    const lock = join(root, ".lock");
+    const lock = join(root, ".lock"),
+      token = randomUUID(); // allow-secret: runtime-only lock owner id
     try {
-      await privateOutput(lock, { pid: process.pid });
+      await privateOutput(lock, { pid: process.pid, token });
     } catch (error: any) {
-      if (error.code !== "EEXIST" || !(await staleLock(lock))) throw error;
-      // The recorded owner no longer exists: reclaim once; a live competing
-      // writer that wins the race still gets EEXIST from the exclusive create.
-      await fs.unlink(lock);
-      await privateOutput(lock, { pid: process.pid });
+      if (error.code !== "EEXIST") throw error;
+      const owner = await lockOwner(lock);
+      if (owner === undefined || !dead(owner)) throw error;
+      // Reclaiming is serialized by an exclusive guard so two openers cannot both
+      // unlink the lock and each delete the other's freshly created one.
+      const guard = join(root, ".lock.reclaim");
+      try {
+        await privateOutput(guard, { pid: process.pid });
+      } catch (guardError: any) {
+        const holder = await lockOwner(guard);
+        if (
+          guardError.code === "EEXIST" &&
+          holder !== undefined &&
+          dead(holder)
+        )
+          await fs.unlink(guard).catch(() => undefined);
+        throw error;
+      }
+      try {
+        // Re-validate under the guard: the lock must still be the dead owner's.
+        if ((await lockOwner(lock)) !== owner) throw error;
+        await fs.unlink(lock);
+        await privateOutput(lock, { pid: process.pid, token });
+      } finally {
+        await fs.unlink(guard).catch(() => undefined);
+      }
     }
-    return new FileStorage(root);
+    return new FileStorage(root, token);
   }
   async close() {
-    await fs.unlink(join(this.root, ".lock"));
+    const lock = join(this.root, ".lock");
+    let held: unknown;
+    try {
+      held = JSON.parse((await privateRead(lock, 1024)).toString()).token;
+    } catch (error: any) {
+      if (error.code === "ENOENT") return;
+      throw error;
+    }
+    // Only the owner that wrote this token may release the lock.
+    if (held === this.token) await fs.unlink(lock);
   }
   private path(key: string) {
     return join(this.root, sha256(encoder.encode(key)) + ".entry");
