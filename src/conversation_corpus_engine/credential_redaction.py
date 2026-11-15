@@ -157,10 +157,11 @@ def _mask_message_dict(row: object) -> int:
     changed = 0
     text = row.get("text")
     if isinstance(text, str):
-        if not isinstance(row.get("typed_chars"), int) or isinstance(row.get("typed_chars"), bool):
-            row["typed_chars"] = len(text)
         masked = mask_credentials(text)
         if masked != text:
+            typed = row.get("typed_chars")
+            if not isinstance(typed, int) or isinstance(typed, bool):
+                row["typed_chars"] = len(text)
             row["text"] = masked
             changed += 1
     for attachment in row.get("attachments") or []:

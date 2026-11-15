@@ -292,3 +292,16 @@ def test_derived_source_id_ignores_the_credential_value() -> None:
     finalize_conversation(second)
     assert first.source_id == second.source_id
     assert first.uid == second.uid
+
+
+def test_clean_alternate_messages_are_left_byte_identical() -> None:
+    row = {"role": "user", "text": "plain", "branch": "alternate"}
+    conversation = Conversation(
+        provider="chatgpt",
+        source_id="synthetic-alt-3",
+        title="t",
+        messages=[Message(role="user", text="hi")],
+        extra={"alternate_messages": [dict(row)]},
+    )
+    assert mask_conversation(conversation) == 0
+    assert conversation.extra["alternate_messages"] == [row]
