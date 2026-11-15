@@ -130,9 +130,64 @@ _META_SUFFIX = re.compile(
     re.IGNORECASE,
 )
 _PATH_VALUE = re.compile(r"^(?:/|\./|\.\./|~/)")
-_IDENT_VALUE = re.compile(
-    r"^(?:[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+)$"
+# First words of a dotted code reference ("settings.OPENAI_API_KEY2"); a dotted passphrase or a
+# three-part chat token does not start with one.
+_CODE_ROOTS = frozenset(
+    {
+        "self",
+        "this",
+        "os",
+        "process",
+        "env",
+        "settings",
+        "config",
+        "cfg",
+        "conf",
+        "args",
+        "params",
+        "secrets",
+        "vault",
+        "ctx",
+        "context",
+        "window",
+        "module",
+        "request",
+        "app",
+        "st",
+        "options",
+        "opts",
+        "constants",
+        "keys",
+        "creds",
+        "credentials",
+    }
 )
+_DOTTED_REF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+$")
+
+
+def _random_run(segment: str) -> bool:
+    """A path segment or a value that looks generated: long and mixing upper, lower and digits."""
+    return (
+        len(segment) >= 8
+        and re.search(r"[A-Z]", segment) is not None
+        and re.search(r"[a-z]", segment) is not None
+        and re.search(r"\d", segment) is not None
+    )
+
+
+def _looks_like_path(value: str) -> bool:
+    """A filesystem path; a base64 secret that happens to start with '/' is not one."""
+    if not _PATH_VALUE.match(value) or "+" in value or "=" in value:
+        return False
+    return not any(_random_run(segment) for segment in re.split(r"[/.]", value))
+
+
+def _looks_like_code_reference(value: str) -> bool:
+    return _DOTTED_REF.match(value) is not None and value.split(".", 1)[0].lower() in _CODE_ROOTS
+
+
+# Bare "name: value" matches need a value of 16 or more characters (shorter passwords are too
+# ambiguous with ordinary words and are a documented, deliberate survivor); quoted values from 8.
 _GENERIC = re.compile(
     r"(?P<head>(?<![A-Za-z0-9_])" + _NAME + r"[\"'`]?\s*[:=]\s*[\"'`]?)"
     r"(?P<value>[^\s\"'`,;<>(){}\[\]]{16,})",
@@ -201,11 +256,16 @@ def _entropy(value: str) -> float:
 def _generic_value_is_secret(value: str) -> bool:
     if _PLACEHOLDER.match(value) or MARKER in value:
         return False
-    if _PATH_VALUE.match(value) or _IDENT_VALUE.match(value):
+    if _looks_like_path(value) or _looks_like_code_reference(value):
         return False
     if not (re.search(r"\d", value) and re.search(r"[A-Za-z]", value)):
         return False
     return _entropy(value) >= 3.0
+
+
+def _metadata_value_is_secret(value: str) -> bool:
+    """Under a metadata name (``*_id``, ``*_file``) only a generated-looking value is a secret."""
+    return len(value) >= 20 and _random_run(value) and _generic_value_is_secret(value)
 
 
 def _head_names_metadata(head: str) -> bool:
@@ -370,14 +430,18 @@ def _credential_spans(text: str) -> list[tuple[int, int]]:
         if not _URL_PLACEHOLDER.match(value) and MARKER not in value:
             spans.append(match.span("value"))
     for match in _GENERIC_QUOTED.finditer(text):
-        if _quoted_value_is_secret(match.group("value")) and not _head_names_metadata(
-            match.group("head")
-        ):
+        value = match.group("value")
+        if _head_names_metadata(match.group("head")):
+            if _metadata_value_is_secret(value):
+                spans.append(match.span("value"))
+        elif _quoted_value_is_secret(value):
             spans.append(match.span("value"))
     for match in _GENERIC.finditer(text):
-        if _generic_value_is_secret(match.group("value")) and not _head_names_metadata(
-            match.group("head")
-        ):
+        value = match.group("value")
+        if _head_names_metadata(match.group("head")):
+            if _metadata_value_is_secret(value):
+                spans.append(match.span("value"))
+        elif _generic_value_is_secret(value):
             spans.append(match.span("value"))
     return spans
 
@@ -493,7 +557,7 @@ def _mask_message_dict(row: object) -> int:
 # A dictionary key whose last word names a credential: the structure itself says the value is one.
 _KEY_ENDS_IN_CREDENTIAL = re.compile(
     r"(?:api[\s_\-]?key|secret[\s_\-]?key|secret|token|passwd|password|passphrase"
-    r"|access[\s_\-]?key|private[\s_\-]?key|auth[\s_\-]?key|credentials?|authorization)$",
+    r"|access[\s_\-]?key|private[\s_\-]?key|auth[\s_\-]?key|credential|authorization)s?$",
     re.IGNORECASE,
 )
 _AUTHORIZATION_KEY = re.compile(r"(?:^|[\s_.\-])authorization$", re.IGNORECASE)
@@ -551,29 +615,30 @@ def _mask_keys(container: dict) -> int:
     return len(renames)
 
 
-def _mask_json(value: object) -> int:
+def _mask_json(value: object, key: object = None) -> int:
     """Mask every string inside a JSON-like container in place; return how many changed.
 
     A dictionary key that names a credential (``api_key``, ``password``, ``Authorization`` ...)
-    marks its string value as one, because the value alone carries no trigger.
+    marks its string value as one, because the value alone carries no trigger. The key also governs
+    the strings of a list (and nested lists) held under it.
     """
     changed = 0
     if isinstance(value, dict):
-        for key, item in list(value.items()):
+        for name, item in list(value.items()):
             if isinstance(item, str):
-                masked = _mask_keyed_string(key, item)
+                masked = _mask_keyed_string(name, item)
                 if masked != item:
-                    value[key] = masked
+                    value[name] = masked
                     changed += 1
             else:
-                changed += _mask_json(item)
+                changed += _mask_json(item, name)
         changed += _mask_keys(value)
     elif isinstance(value, list):
         for index, item in enumerate(value):
             if isinstance(item, str):
-                if (masked := mask_credentials(item)) != item:
+                if (masked := _mask_keyed_string(key, item)) != item:
                     value[index] = masked
                     changed += 1
             else:
-                changed += _mask_json(item)
+                changed += _mask_json(item, key)
     return changed
