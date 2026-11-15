@@ -453,3 +453,32 @@ def test_prose_lookalikes_survive() -> None:
         "plain text with no trigger words at all",
     ):
         assert mask_credentials(text) == text
+
+
+def test_quoted_value_with_escaped_quote_is_masked_to_the_real_closing_quote() -> None:
+    text = r'{"password":"Qx9Lm2Va7Pk4\"Nr8Tu3Wy5Az6"}'
+    masked = mask_credentials(text)
+    assert masked == '{"password":"' + MARKER + '"}'
+    assert "Nr8Tu3Wy5Az6" not in masked
+    assert mask_credentials(masked) == masked
+
+
+def test_credential_named_keys_mask_their_values_in_metadata_extra_and_provenance() -> None:
+    value = "q8Zt3Lm0Xv2Pb7Rn5Wc1"
+    message = Message(role="user", text="x", meta={"api_key": value, "note": "keep me", "n": 1})
+    conversation = Conversation(
+        provider="claude",
+        source_id="synthetic-keys",
+        title="t",
+        messages=[message],
+        provenance={"client_secret": value},
+        extra={"auth": {"password": value, "user": "alice"}, "alternate_messages": []},
+    )
+    assert mask_conversation(conversation) == 3
+    assert message.meta == {"api_key": MARKER, "note": "keep me", "n": 1}
+    assert conversation.provenance == {"client_secret": MARKER}
+    assert conversation.extra["auth"] == {"password": MARKER, "user": "alice"}
+    assert mask_conversation(conversation) == 0
+    short = Message(role="user", text="x", meta={"token": "short1", "keyword": value})
+    clean = Conversation(provider="claude", source_id="s", title="t", messages=[short])
+    assert mask_conversation(clean) == 0

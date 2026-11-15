@@ -91,7 +91,7 @@ _GENERIC = re.compile(
 # own closing delimiter.
 _GENERIC_QUOTED = re.compile(
     r"(?P<head>(?<![A-Za-z0-9_])" + _NAME + r"[\"'`]?\s*[:=]\s*(?P<quote>[\"'`]))"
-    r"(?P<value>(?:(?!(?P=quote))[^\n]){8,})(?P=quote)",
+    r"(?P<value>(?:\\.|(?!(?P=quote))[^\n\\]){8,})(?P=quote)",
     re.IGNORECASE,
 )
 # Words that mark a quoted value as a template rather than a passphrase.
@@ -296,13 +296,27 @@ def _mask_message_dict(row: object) -> int:
     return changed
 
 
+_NAME_ONLY = re.compile(_NAME, re.IGNORECASE)
+
+
 def _mask_json(value: object) -> int:
-    """Mask every string inside a JSON-like container in place; return how many changed."""
+    """Mask every string inside a JSON-like container in place; return how many changed.
+
+    A dictionary key that names a credential (``api_key``, ``password`` ...) marks its string value
+    as one when the value looks like a secret, because the value alone carries no trigger.
+    """
     changed = 0
     if isinstance(value, dict):
         for key, item in list(value.items()):
             if isinstance(item, str):
-                if (masked := mask_credentials(item)) != item:
+                named = (
+                    isinstance(key, str)
+                    and len(item) >= 12
+                    and _NAME_ONLY.fullmatch(key) is not None
+                    and _quoted_value_is_secret(item)
+                )
+                masked = MARKER if named else mask_credentials(item)
+                if masked != item:
                     value[key] = masked
                     changed += 1
             else:
