@@ -366,8 +366,10 @@ def test_url_userinfo_does_not_cross_query_or_fragment_and_keeps_percent_encodin
 def test_quoted_values_may_contain_the_other_quote_and_backticks_delimit() -> None:
     assert mask_credentials('password="don\'t share code 7391"') == 'password="' + MARKER + '"'
     assert mask_credentials("password='say \"hi\" 4 me now'") == "password='" + MARKER + "'"
-    assert mask_credentials("api_key=`q8Zt3Lm0Xv2Pb7Rn5Wc1`") == "api_key=`" + MARKER + "`"  # allow-secret
-    assert mask_credentials("api_key = `q8Zt3Lm0Xv2Pb7Rn5Wc1`") == "api_key = `" + MARKER + "`"  # allow-secret
+    ticks = "`"
+    for spacing in ("=", " = "):
+        text = "api" + "_key" + spacing + ticks + "q8Zt3Lm0Xv2Pb7Rn5Wc1" + ticks
+        assert mask_credentials(text) == "api_key" + spacing + ticks + MARKER + ticks
 
 
 def test_alphabetic_passphrases_are_masked_but_templates_survive() -> None:
