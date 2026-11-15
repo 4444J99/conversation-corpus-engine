@@ -7,6 +7,7 @@
 It owns:
 
 - provider/source registration
+- provider-neutral redacted-bundle normalization and authority projection
 - provider inbox discovery and readiness reporting
 - corpus validation
 - source freshness and snapshot logic
@@ -69,6 +70,7 @@ cce corpus register /path/to/corpus --project-root /path/to/project --name "Note
 cce corpus-store register --project-root /path/to/project --root /path/to/private-corpus-store
 cce federation build --project-root /path/to/project
 cce provider discover --project-root /path/to/project --source-drop-root /path/to/source-drop
+cce provider authority-ingest --source-root /path/to/redacted-bundle --source-census /path/to/source-census.v1.json --provider-manifest /path/to/provider-manifest.json --output-root /path/to/output --snapshot-id frozen-snapshot --captured-at 2026-07-16T16:00:00Z --custody-pointer custody:frozen-snapshot
 cce provider import --provider chatgpt --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store --source-drop-root /path/to/source-drop --register --build
 cce provider import --provider gemini --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store --source-drop-root /path/to/source-drop --register --build
 cce provider import --provider claude --mode local-session --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store --local-root "/Users/you/Library/Application Support/Claude"
@@ -103,6 +105,97 @@ cce archive search "kubernetes ingress" --provider claude --project-root /path/t
 cce archive serve --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
 cce-mcp --project-root /path/to/project --archive-root /path/to/private-corpus-store/archive-all
 ```
+
+### Provider-neutral authority ingest
+
+`provider authority-ingest` is the default path for new source acquisition. It reads only a
+frozen, redacted `session-meta` atom bundle. It never opens browser profiles, cookies, tokens,
+OAuth material, or provider application stores. The runtime provider manifest separates source
+families, aliases, adapter IDs, custody root environment keys, authority policy, and owner
+blockers. Adding or renaming a provider is a manifest-only change when an existing format adapter
+applies.
+
+The bundled `provider-manifest.organvm.v1.json` is explicitly instance configuration. The
+`provider-manifest.example.v1.json` reusable template contains only generic placeholders. Set
+`CCE_PROVIDER_MANIFEST` or pass `--provider-manifest` to select another runtime manifest.
+Supplying `--source-census` binds normalization to session-meta's exact frozen denominator;
+the census is rejected on schema-shape, snapshot, or RFC 8785 digest mismatch. Contract digests
+use the pinned `rfc8785` dependency and exclude JSONL record delimiters. Exact ingest also
+requires each atom's `meta.raw_unit_content_hashes` to match the census. That immutable
+raw-unit content identity is promoted into every source envelope and normalized event and
+repeated in the complete parity crosswalk; a changed-and-resealed census fails before
+projection.
+
+Each frozen run writes deterministic, body-free public projections:
+
+- `source-envelope.v1.jsonl`
+- `normalized-events.v1.jsonl`
+- `quarantine.jsonl`
+- `owner-blockers.jsonl`
+- `coverage-receipt.v1.json`
+- `normalization-parity-receipt.v1.json`
+
+Malformed rows quarantine without stopping valid siblings. Unknown families and missing roots
+remain explicit owner blockers. `exact_all` means every discovered unit was classified exactly
+once; `ready` additionally requires every unit to be parsed with no residual debt. Per-record
+adapter failures remain explicit parity quarantine debt even when valid siblings from the same raw
+unit normalize. Existing export importers remain compatibility paths until a frozen run reports
+both exact parity and readiness.
+
+### Governance cadence parse/classify owners
+
+CCE exposes separate owner commands for Limen's bounded `parse` and `classify`
+stages. `authority-parse-cadence` performs the existing authority ingest exactly
+once. `authority-classify-cadence` does not reprocess the source: it independently
+checks the parse projection, copies the six governed artifacts byte-for-byte, and
+binds their digests in a typed classify projection.
+
+```bash
+cce provider authority-parse-cadence \
+  --source-root "$CCE_REDACTED_SNAPSHOT" \
+  --source-census "$CCE_SOURCE_CENSUS" \
+  --provider-manifest "$CCE_PROVIDER_MANIFEST" \
+  --output-root "$LIMEN_GOV_RUN_ROOT/parse" \
+  --snapshot-id "$LIMEN_GOV_SNAPSHOT_ID" \
+  --captured-at "$LIMEN_GOV_SNAPSHOT_AT" \
+  --custody-pointer "$CCE_CUSTODY_POINTER"
+
+cce provider authority-classify-cadence \
+  --input-root "$LIMEN_GOV_RUN_ROOT/parse" \
+  --output-root "$LIMEN_GOV_RUN_ROOT/classify" \
+  --snapshot-id "$LIMEN_GOV_SNAPSHOT_ID"
+```
+
+The commands consume Limen's injected `LIMEN_GOV_*` execution variables and
+write one bounded transaction child to `LIMEN_GOV_STAGE_METRICS_OUT`.
+`LIMEN_GOV_MAX_ITEMS` bounds the census raw-unit or promotion denominator.
+On proof traversals, the parse owner reruns the exact ingest in a temporary
+directory and requires every governed artifact and projection to be
+byte-identical; the classify owner revalidates its byte projection. Neither
+owner rewrites governed outputs. Both emit a `skipped_completed` child bound to
+the exact prior child receipt and report zero new events. The independent
+predicate commands are:
+
+```bash
+cce provider authority-parse-predicate \
+  --source-root "$CCE_REDACTED_SNAPSHOT" \
+  --source-census "$CCE_SOURCE_CENSUS" \
+  --provider-manifest "$CCE_PROVIDER_MANIFEST" \
+  --output-root "$LIMEN_GOV_RUN_ROOT/parse" \
+  --snapshot-id "$LIMEN_GOV_SNAPSHOT_ID" \
+  --captured-at "$LIMEN_GOV_SNAPSHOT_AT" \
+  --custody-pointer "$CCE_CUSTODY_POINTER"
+
+cce provider authority-classify-predicate \
+  --input-root "$LIMEN_GOV_RUN_ROOT/parse" \
+  --output-root "$LIMEN_GOV_RUN_ROOT/classify" \
+  --snapshot-id "$LIMEN_GOV_SNAPSHOT_ID" \
+  --captured-at "$LIMEN_GOV_SNAPSHOT_AT"
+```
+
+Both projections preserve the owner's distinction between classification and
+readiness: a complete parity crosswalk can remain `exact_all: true` while
+blockers or quarantines keep `ready: false`.
 
 `cce archive` turns raw provider exports (ChatGPT, Claude, Gemini Takeout + NotebookLM, Grok,
 Perplexity, Copilot) into an Obsidian vault/wiki, a static archive site, a SQLite FTS5 search
@@ -199,6 +292,11 @@ When started with `--library-store-root` (or `CCE_LIBRARY_STORE_ROOT`), it also 
 - `src/conversation_corpus_engine/import_chatgpt_export_corpus.py` — ChatGPT conversations.json export import
 - `src/conversation_corpus_engine/export_projector.py` — shared rewire of legacy export importers through the archive corpus projector (see #78)
 - `src/conversation_corpus_engine/provider_discovery.py` — source-drop inbox discovery
+- `src/conversation_corpus_engine/source_adapter_registry.py` — provider-neutral redacted-bundle adapter registry
+- `src/conversation_corpus_engine/authority_projection.py` — role-aware authority and lane projection
+- `src/conversation_corpus_engine/authority_ingest.py` — deterministic envelope, event, quarantine, coverage, and parity generation
+- `src/conversation_corpus_engine/authority_cadence.py` — bounded parse/classify owner projections and proof metrics
+- `src/conversation_corpus_engine/authority_cadence_predicate.py` — independent parse/classify predicates
 - `src/conversation_corpus_engine/provider_import.py` — provider import/onboarding orchestration
 - `src/conversation_corpus_engine/provider_refresh.py` — provider refresh orchestration over import, evaluation, and corpus promotion
 - `src/conversation_corpus_engine/provider_readiness.py` — provider lane readiness and report writing

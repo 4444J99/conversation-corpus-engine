@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--project-root", type=Path, default=DEFAULT_PROJECT_ROOT)
     parser.add_argument("--corpus-store-root", type=Path)
-    parser.add_argument("--provider", choices=["claude", "gemini", "grok", "perplexity", "copilot"])
+    parser.add_argument("--provider")
     parser.add_argument("--target-root", type=Path)
     parser.add_argument("--policy-path", type=Path, default=DEFAULT_CLAUDE_POLICY_PATH)
     parser.add_argument(

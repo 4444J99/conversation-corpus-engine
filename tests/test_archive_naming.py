@@ -252,7 +252,9 @@ def test_scope_values_follow_the_kind() -> None:
 
 
 def test_scope_list_covers_the_provider_catalog_and_the_archive_readers() -> None:
-    assert set(PROVIDER_CONFIG) <= set(naming.PROVIDER_SCOPES)
+    assert {provider.replace("-", "") for provider in PROVIDER_CONFIG} <= set(
+        naming.PROVIDER_SCOPES
+    )
     assert set(PROVIDER_SPECS) <= set(naming.PROVIDER_SCOPES)
     assert naming.SCOPES[-1] == "all"
     assert len(set(naming.SCOPES)) == len(naming.SCOPES)
