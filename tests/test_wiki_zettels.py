@@ -4,7 +4,6 @@ import json
 import pytest
 
 import conversation_corpus_engine.wiki_zettels as wz
-
 from conversation_corpus_engine.cli import build_parser
 from conversation_corpus_engine.wiki_zettels import (
     MANIFEST_NAME,
