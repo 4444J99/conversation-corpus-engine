@@ -51,8 +51,28 @@ from `library-all/generations/`.
 The seed is unusable (its base moved). The documented alternative is a build with the same documents
 manifest and no `resume_generation`, with the measured limits (`max_seconds` 14400,
 `max_output_bytes` 25769803776), under `taskpolicy -c utility`, `nice -n 10`, a 15000 s alarm and
-bounded logs. Its result is recorded in the section below.
+bounded logs.
 
 ## Outcome of attempt 2
 
-OUTCOME_PLACEHOLDER_REPLACED_BEFORE_COMMIT
+Result (2026-11-15, one run, no second attempt needed):
+
+- Candidate `generation-20261115T151135Z-fc76b8f1bdb1`: 27,390 records (27,382 base plus the 8
+  documents), 1,629,052 blocks, 0 findings, `coverage_complete` false (inherited from the base).
+  Stage clocks: `index_blocks` began at 2,393 s and ended at 5,866 s, `export` began at 6,378 s,
+  `verify_export` at 11,889 s, `artifacts` at 13,696 s, finished at 13,930 s of the 14,400 s limit
+  (470 s of margin). Artifact bytes 17,241,454,789 against the 25,769,803,776 limit.
+- The build's own verification passed. `cce library publish GENERATION_PATH` then verified the
+  candidate and moved the pointer (`changed: true`, `published_at` 2026-11-15T19:18:37Z).
+- Rollback: the pointer before publish is kept as `cce-resume-20261115/rollback-current-pre-publish.json`
+  in the custody staging root (SHA-256 `3524767f...`); restoring it returns the library to
+  generation `20261031T162115Z-614ce4c057f6`, which was not modified by this work.
+- Searchability: `cce library search` against the new generation returns the 8 staged exports
+  as `documents` records (wing `ai`, lane `support`, kind `document`), found by content terms (7
+  of 8) and by title (the 8th). Document records rose from 8,788 to 8,796.
+- Not done: the failed seed `generation-20261115T112506Z-6a27693ffcf7` (13.3 GB) stays on disk as
+  a rollback/diagnostic holding; reap it per the headroom plan. The change of three pointer fingerprints (writes at
+  08:22 to 08:32) on the previous generation remains unattributed. Its `agent-entry.md` hash
+  mismatch and two `.DS_Store` files are unrepaired (a generation held as rollback should not be
+  edited here).
+- Host: load 3 to 5 throughout, free space 160 GiB before and 138 GiB at a mid-export observation.
