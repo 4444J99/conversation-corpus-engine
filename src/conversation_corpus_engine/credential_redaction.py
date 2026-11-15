@@ -67,7 +67,12 @@ _BEARER = re.compile(
 # Credentials in an Authorization header have no length or alphabet floor (RFC 6750 b64token), so
 # the header name is the anchor and prose such as "Bearer of bad news" stays untouched.
 _AUTH_HEADER = re.compile(
-    r"(\bAuthorization\s*:\s*(?:Bearer|Basic|Token)\s+)([A-Za-z0-9._~+/\-]+=*)", re.IGNORECASE
+    r"(\bAuthorization[\"']?\s*:\s*[\"']?(?:Bearer|Basic|Token)\s+)([A-Za-z0-9._~+/\-]+=*)",
+    re.IGNORECASE,
+)
+# Passwords inside URI userinfo, e.g. a pasted database connection string.
+_URL_PASSWORD = re.compile(
+    r"(?P<head>\b[A-Za-z][A-Za-z0-9+.\-]*://[^\s/:@\"'<>]+:)(?P<value>[^\s/@\"'<>]+)(?P<tail>@)"
 )
 _NAME = (
     r"[A-Za-z0-9_.\-]*(?:api[\s_\-]?key|secret[\s_\-]key|secret|token|passwd|password|passphrase"
@@ -77,6 +82,12 @@ _NAME = (
 _GENERIC = re.compile(
     r"(?P<head>(?<![A-Za-z0-9_])" + _NAME + r"[\"']?\s*[:=]\s*[\"']?)"
     r"(?P<value>[^\s\"'`,;<>(){}\[\]]{16,})",
+    re.IGNORECASE,
+)
+# A quoted value may hold spaces (a passphrase), so it runs to its closing quote.
+_GENERIC_QUOTED = re.compile(
+    r"(?P<head>(?<![A-Za-z0-9_])" + _NAME + r"[\"']?\s*[:=]\s*(?P<quote>[\"']))"
+    r"(?P<value>[^\"'\n]{8,})(?P=quote)",
     re.IGNORECASE,
 )
 _PLACEHOLDER = re.compile(
@@ -103,6 +114,20 @@ def _generic(match: re.Match[str]) -> str:
     return match.group("head") + MARKER if _generic_value_is_secret(value) else match.group(0)
 
 
+def _generic_quoted(match: re.Match[str]) -> str:
+    value = match.group("value")
+    if not _generic_value_is_secret(value):
+        return match.group(0)
+    return match.group("head") + MARKER + match.group("quote")
+
+
+def _url_password(match: re.Match[str]) -> str:
+    value = match.group("value")
+    if _PLACEHOLDER.match(value) or MARKER in value:
+        return match.group(0)
+    return match.group("head") + MARKER + match.group("tail")
+
+
 def mask_credentials(text: str) -> str:
     """Return `text` with every recognized credential replaced by `[REDACTED-CREDENTIAL]`."""
     if not text:
@@ -111,6 +136,8 @@ def mask_credentials(text: str) -> str:
         text = pattern.sub(MARKER, text)
     text = _AUTH_HEADER.sub(lambda m: m.group(1) + MARKER, text)
     text = _BEARER.sub(lambda m: m.group(1) + MARKER, text)
+    text = _URL_PASSWORD.sub(_url_password, text)
+    text = _GENERIC_QUOTED.sub(_generic_quoted, text)
     return _GENERIC.sub(_generic, text)
 
 

@@ -305,3 +305,45 @@ def test_clean_alternate_messages_are_left_byte_identical() -> None:
     )
     assert mask_conversation(conversation) == 0
     assert conversation.extra["alternate_messages"] == [row]
+
+
+def test_json_quoted_authorization_header_is_masked() -> None:
+    text = '{"Authorization":"Bearer abcdefghijklmnopqrstuvwxyz"}'
+    assert mask_credentials(text) == '{"Authorization":"Bearer ' + MARKER + '"}'
+    text = "{'authorization': 'Basic Zm9vOmJhcg=='}"
+    assert mask_credentials(text) == "{'authorization': 'Basic " + MARKER + "'}"
+
+
+def test_quoted_passphrase_with_spaces_is_masked() -> None:
+    for text in (
+        'password="correct horse battery staple123"',
+        "passphrase: 'orange fish 7 window seat'",
+        '{"client_secret": "two words 4 you now"}',
+    ):
+        masked = mask_credentials(text)
+        assert MARKER in masked, text
+        assert mask_credentials(masked) == masked
+    assert mask_credentials('password="enter your password here"') == (
+        'password="enter your password here"'
+    )
+    assert (
+        mask_credentials('token = "<paste token here 123>"') == 'token = "<paste token here 123>"'
+    )
+
+
+def test_url_userinfo_password_is_masked_and_plain_urls_survive() -> None:
+    pw = "Qx9Lm2Va7Pk4Nr8Tu3Wy"
+    assert mask_credentials(f"DATABASE_URL=postgresql://app:{pw}@db.internal/appdb") == (
+        "DATABASE_URL=postgresql://app:" + MARKER + "@db.internal/appdb"
+    )
+    assert mask_credentials(f"git clone https://bot:{pw}@host.example/r.git") == (
+        "git clone https://bot:" + MARKER + "@host.example/r.git"
+    )
+    for text in (
+        "https://user@host.example/path",
+        "http://host.example:8080/path?x=1",
+        "postgresql://app:${DB_PASSWORD}@db/appdb",
+        "ssh://git@host.example:2222/repo.git",
+        "see https://example.com/a:b@c for details",
+    ):
+        assert mask_credentials(text) == text
