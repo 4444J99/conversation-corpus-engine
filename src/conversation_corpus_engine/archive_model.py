@@ -342,6 +342,7 @@ def assign_message_fields(conversation: Conversation) -> None:
 
 def finalize_conversation(conversation: Conversation) -> str:
     """Resolve the conversation id, then every message field. Returns the derived-id reason."""
+    mask_conversation(conversation)
     reason = resolve_source_id(conversation)
     assign_message_fields(conversation)
     return reason

@@ -20,6 +20,7 @@ from conversation_corpus_engine.archive_model import (
     Conversation,
     Message,
     assign_message_fields,
+    finalize_conversation,
 )
 from conversation_corpus_engine.credential_redaction import (
     MARKER,
@@ -195,3 +196,99 @@ def test_library_put_never_stores_the_secret_and_second_put_is_unchanged() -> No
                 assert needle not in repr(row).encode()
         finally:
             connection.close()
+
+
+def test_authorization_header_masks_short_and_letters_only_tokens() -> None:
+    for token in ("mF_9.B5f-4.1JqM", "abcdefghijklmnopqrstuvwxyz", "Zm9vOmJhcg=="):
+        for scheme in ("Bearer", "Basic"):
+            text = f"Authorization: {scheme} {token}"
+            assert mask_credentials(text) == f"Authorization: {scheme} {MARKER}"
+    assert mask_credentials("Authorization: none") == "Authorization: none"
+
+
+def test_unterminated_pem_block_is_consumed_to_the_end_however_long() -> None:
+    body = ("MIIEvQIBADANBgkqhkiG9w0BAQEFAASC" * 2) + "\n"
+    long_text = "head\n-----BEGIN " + "PRIVATE KEY-----\n" + body * 700 + "tail-after-key"
+    assert len(long_text) > 40_000
+    assert mask_credentials(long_text) == "head\n" + MARKER
+
+
+def test_labels_with_spaces_are_recognized() -> None:
+    value = "q8Zt3Lm0Xv2Pb7Rn5Wc1"
+    for label in ("API key", "api key", "Secret Key", "private key", "access key"):
+        assert mask_credentials(f"{label} = {value}") == f"{label} = {MARKER}"
+        assert mask_credentials(f"{label}: {value}") == f"{label}: {MARKER}"
+    assert mask_credentials("the api key rotates monthly") == "the api key rotates monthly"
+
+
+def test_alternate_messages_are_masked_with_their_attachments_and_typed_chars() -> None:
+    text = POSITIVE["github-ghp"]
+    conversation = Conversation(
+        provider="chatgpt",
+        source_id="synthetic-alt",
+        title="t",
+        messages=[Message(role="user", text="hi")],
+        extra={
+            "alternate_messages": [
+                {
+                    "role": "user",
+                    "text": text,
+                    "attachments": [{"name": "n", "ref": "u?k=" + POSITIVE["google-aiza"]}],
+                    "branch": "alternate",
+                },
+                {"role": "user", "text": "plain"},
+            ]
+        },
+    )
+    assert mask_conversation(conversation) == 2
+    first, second = conversation.extra["alternate_messages"]
+    assert first["text"] == "token " + MARKER
+    assert first["typed_chars"] == len(text)
+    assert MARKER in first["attachments"][0]["ref"]
+    assert second["text"] == "plain"
+    assert mask_conversation(conversation) == 0
+    assert B[:8] not in repr(conversation.to_dict())
+
+
+def test_library_put_masks_alternate_messages_in_object_and_fts() -> None:
+    secret_text = POSITIVE["jules-aq"]
+    with tempfile.TemporaryDirectory() as raw:
+        path = Path(raw) / "library.sqlite"
+        with Library.create(path) as library:
+            conversation = Conversation(
+                provider="chatgpt",
+                source_id="synthetic-alt-2",
+                title="t",
+                messages=[Message(role="user", text="hi")],
+                extra={"alternate_messages": [{"role": "user", "text": secret_text}]},
+            )
+            library.put(conversation)
+            assert library.verify() == []
+        needle = B[:16].encode()
+        assert needle not in path.read_bytes()
+        connection = sqlite3.connect(path)
+        try:
+            for (payload,) in connection.execute("SELECT payload FROM objects"):
+                assert needle not in zlib.decompress(payload)
+            for row in connection.execute("SELECT * FROM record_fts_content"):
+                assert needle not in repr(row).encode()
+        finally:
+            connection.close()
+
+
+def test_derived_source_id_ignores_the_credential_value() -> None:
+    def build(secret: str) -> Conversation:  # allow-secret
+        return Conversation(
+            provider="gemini",
+            source_id="",
+            title="t",
+            created="2026-01-01T00:00:00Z",
+            messages=[Message(role="user", text="deploy with key " + secret)],
+        )
+
+    first = build("AIza" + "Sy" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q")
+    second = build("AIza" + "Sy" + "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J")
+    finalize_conversation(first)
+    finalize_conversation(second)
+    assert first.source_id == second.source_id
+    assert first.uid == second.uid

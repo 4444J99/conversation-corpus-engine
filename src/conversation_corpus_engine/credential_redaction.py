@@ -29,8 +29,7 @@ _WHOLE: tuple[tuple[str, re.Pattern[str]], ...] = (
         "pem-private-key",
         re.compile(
             r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"
-            r"(?:[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"
-            r"|[A-Za-z0-9+/=\s:,.\-]{0,16384})"
+            r"(?:[\s\S]*?-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----|[\s\S]*)"
         ),
     ),
     (
@@ -65,9 +64,14 @@ _WHOLE: tuple[tuple[str, re.Pattern[str]], ...] = (
 _BEARER = re.compile(
     r"(\bBearer\s+)((?=[A-Za-z0-9._~+/\-]*\d)[A-Za-z0-9._~+/\-]{20,}=*)", re.IGNORECASE
 )
+# Credentials in an Authorization header have no length or alphabet floor (RFC 6750 b64token), so
+# the header name is the anchor and prose such as "Bearer of bad news" stays untouched.
+_AUTH_HEADER = re.compile(
+    r"(\bAuthorization\s*:\s*(?:Bearer|Basic|Token)\s+)([A-Za-z0-9._~+/\-]+=*)", re.IGNORECASE
+)
 _NAME = (
-    r"[A-Za-z0-9_.\-]*(?:api[_\-]?key|apikey|secret|token|passwd|password|passphrase"
-    r"|access[_\-]?key|private[_\-]?key|client[_\-]?secret|auth[_\-]?key|credential)"
+    r"[A-Za-z0-9_.\-]*(?:api[\s_\-]?key|secret[\s_\-]key|secret|token|passwd|password|passphrase"
+    r"|access[\s_\-]?key|private[\s_\-]?key|auth[\s_\-]?key|credential)"
     r"[A-Za-z0-9_.\-]*"
 )
 _GENERIC = re.compile(
@@ -105,6 +109,7 @@ def mask_credentials(text: str) -> str:
         return text
     for _name, pattern in _WHOLE:
         text = pattern.sub(MARKER, text)
+    text = _AUTH_HEADER.sub(lambda m: m.group(1) + MARKER, text)
     text = _BEARER.sub(lambda m: m.group(1) + MARKER, text)
     return _GENERIC.sub(_generic, text)
 
@@ -137,5 +142,33 @@ def mask_conversation(conversation: object) -> int:
                 changed += 1
             if (result := masked(attachment.ref)) is not None:
                 attachment.ref = result
+                changed += 1
+    extra = getattr(conversation, "extra", None)
+    alternates = extra.get("alternate_messages") if isinstance(extra, dict) else None
+    for row in alternates if isinstance(alternates, list) else []:
+        changed += _mask_message_dict(row)
+    return changed
+
+
+def _mask_message_dict(row: object) -> int:
+    """Mask one serialized message (an off-branch alternate), keeping its typed length."""
+    if not isinstance(row, dict):
+        return 0
+    changed = 0
+    text = row.get("text")
+    if isinstance(text, str):
+        if not isinstance(row.get("typed_chars"), int) or isinstance(row.get("typed_chars"), bool):
+            row["typed_chars"] = len(text)
+        masked = mask_credentials(text)
+        if masked != text:
+            row["text"] = masked
+            changed += 1
+    for attachment in row.get("attachments") or []:
+        if not isinstance(attachment, dict):
+            continue
+        for key in ("name", "ref"):
+            value = attachment.get(key)
+            if isinstance(value, str) and (masked := mask_credentials(value)) != value:
+                attachment[key] = masked
                 changed += 1
     return changed
