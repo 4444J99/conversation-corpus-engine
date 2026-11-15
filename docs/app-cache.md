@@ -57,8 +57,9 @@ restamped to a time before the archive's end is timestamp drift and counts as co
 restamp many conversations at once). A `*_with_body` count needs a staged body that is itself newer
 than the archive's end (or a new conversation); a stale body under newer list metadata counts as
 metadata-only. `newer_*` counts are an upper bound: the app's time is its own stamp, not proof of new
-messages. Ids are matched through the archive's own `stable_uid`. Gemini chats are matched by exact
-uid; one the archive lacks is new whatever its date, a held one is newer only after the archive's end.
+messages. Ids are matched through the archive's own `stable_uid`. Gemini chats are compared by date only: the
+archive's gemini uids derive from Takeout activity entries, which carry no app chat id, so the app's
+ids cannot be matched; a chat the app saw after the archive's end is in the gap.
 Perplexity records carry synthetic ids, so only dates are compared.
 
 `gap-report.json` lists ids and titles and stays in the private `--out` directory (0700/0600);

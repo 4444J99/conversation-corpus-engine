@@ -209,40 +209,31 @@ def _summary(
 
 
 def gemini_gap(archive: dict[str, Any], staged: Path) -> dict[str, Any]:
-    """Compare the Gemini store inventory (ids and times only) with the archive's gemini uids.
+    """Compare the Gemini store inventory (ids and times only) with the archive's end by date.
 
-    Ids are matched exactly through the archive's own uid function. A chat the archive lacks is
-    new whatever its date; a held chat counts as newer only when the app saw it after the
-    archive's end. Neither can be ingested: the bodies are encrypted.
+    The archive's gemini uids are derived from Takeout activity entries, which carry no app chat
+    id, so the app's ids cannot be matched to them. A chat the app saw after the archive's end is
+    in the gap; an earlier one is counted as covered by date, not by identity. Neither can be
+    ingested: the bodies are encrypted.
     """
     payload = _read_json(staged / "gemini-store-inventory.json")
     inventory = payload.get("inventory") if isinstance(payload, dict) else None
     if not isinstance(inventory, list):
         raise GapError(f"{staged / 'gemini-store-inventory.json'} has no inventory list")
-    held = archive["held"]
     end = archive["last_activity_max"]
-    buckets: dict[str, list[dict[str, Any]]] = {"new_metadata_only": [], "newer_metadata_only": []}
-    covered = 0
+    after: list[dict[str, Any]] = []
     for chat in inventory:
-        uids = {
-            stable_uid("gemini", str(chat[key]))
-            for key in ("chat_uuid", "robin_conversation_id")
-            if chat.get(key)
-        }
-        present = any(uid in held for uid in uids)
         updated = _parse(chat.get("last_updated"))
-        state = _classify(updated, None, present, end)
-        if state == "covered":
-            covered += 1
-            continue
-        buckets[f"{state}_metadata_only"].append(
-            {
-                "id": chat.get("chat_uuid"),
-                "updated": _day(updated),
-                "cached_messages": chat.get("cached_messages"),
-            }
-        )
-    return _summary("gemini", archive, inventory, buckets, covered)
+        if updated and end and updated > end:
+            after.append(
+                {
+                    "id": chat.get("chat_uuid"),
+                    "updated": _day(updated),
+                    "cached_messages": chat.get("cached_messages"),
+                }
+            )
+    buckets = {"newer_metadata_only": after}
+    return _summary("gemini", archive, inventory, buckets, len(inventory) - len(after))
 
 
 def perplexity_gap(archive: dict[str, Any], staged: Path) -> dict[str, Any]:

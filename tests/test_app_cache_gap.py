@@ -117,25 +117,20 @@ def test_epoch_and_iso_times_compare_alike() -> None:
     assert app_cache_gap._parse("not a time") is None and app_cache_gap._parse(None) is None
 
 
-def test_gemini_gap_matches_ids_exactly_through_stable_uid(tmp_path: Path) -> None:
+def test_gemini_gap_is_by_date_because_app_ids_do_not_map_to_archive_uids(tmp_path: Path) -> None:
     archive = _archive(tmp_path / "archive")
     staged = tmp_path / "gem"
     staged.mkdir()
     inventory = [
-        {"chat_uuid": "c_known", "last_updated": "2026-11-05T00:00:00Z"},
-        {
-            "chat_uuid": "c_new",
-            "robin_conversation_id": "c_r",
-            "last_updated": "2026-10-20T00:00:00Z",
-        },
+        {"chat_uuid": "c_known", "last_updated": "2026-11-05T00:00:00+02:00"},
+        {"chat_uuid": "c_new", "last_updated": "2026-10-20T00:00:00Z", "cached_messages": 3},
         {"chat_uuid": "c_old", "last_updated": "2026-09-01T00:00:00Z"},
-        {"chat_uuid": "c", "last_updated": "2026-11-09T00:00:00Z"},
+        {"chat_uuid": "c_end", "last_updated": "2026-10-16T00:00:00Z"},
     ]
     (staged / "gemini-store-inventory.json").write_text(json.dumps({"inventory": inventory}))
     info = app_cache_gap.build_report(archive, {"gemini": staged})["providers"]["gemini"]
-    # c_known is held and seen after the end (newer); c_new, c_old and the substring id "c" are new.
-    assert info["counts"] == {"new_metadata_only": 3, "newer_metadata_only": 1}
-    assert info["already_covered"] == 0 and info["needs_owner_export"] == 4
+    assert info["counts"] == {"newer_metadata_only": 2}
+    assert info["already_covered"] == 2 and info["needs_owner_export"] == 2
     assert "Takeout" in info["owner_export"]
 
 
