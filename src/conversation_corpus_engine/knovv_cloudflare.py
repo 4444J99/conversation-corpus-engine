@@ -224,7 +224,9 @@ class Cloudflare:
                     if timeout <= 0 or not selector.select(timeout):
                         raise ValueError("cloudflare-operation-deadline")
                     chunk = os.read(process.stdout.fileno(), 65536)
-                    if not chunk or len(raw) + len(chunk) > 90 * 1024 * 1024:
+                    if not chunk:
+                        raise ValueError("cloudflare-runner-exited")
+                    if len(raw) + len(chunk) > 90 * 1024 * 1024:
                         raise ValueError("cloudflare-response-bound")
                     raw.extend(chunk)
             response = json.loads(raw)
