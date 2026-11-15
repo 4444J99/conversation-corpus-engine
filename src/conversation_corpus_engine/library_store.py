@@ -25,6 +25,7 @@ from typing import Any
 
 from .archive_database import WORD_RE, fts_terms
 from .archive_model import Conversation, stable_uid
+from .credential_redaction import mask_conversation as mask_credentials_in
 from .library_blocks import split_blocks
 from .library_passages import PASSAGE_LIMIT, PASSAGE_SCHEMA_SQL, index_passages, verify_passages
 from .web_capture import PROVIDER as WEB_CAPTURE_PROVIDER
@@ -559,6 +560,7 @@ class Library:
         self, conversation: Conversation, *, reconcile: bool = False, observation_only: bool = False
     ) -> dict[str, Any]:
         self._write()
+        mask_credentials_in(conversation)
         payload = conversation.to_dict()
         uid = conversation.uid
         if not re.fullmatch(r"[a-z][a-z0-9]*", conversation.provider) or not re.fullmatch(
