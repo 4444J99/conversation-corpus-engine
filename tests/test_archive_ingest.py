@@ -19,6 +19,7 @@ from conversation_corpus_engine.archive_ingest import (
     DEFAULT_ARCHIVE_DIRNAME,
     PROVIDER_SPECS,
     ArchivePaths,
+    ProviderDropRefused,
     authorize_archive,
     failed_providers,
     ingest,
@@ -507,3 +508,32 @@ def test_topics_handle_an_empty_store(archive_env) -> None:
     assert summary["documents"] == 0 and summary["hubs"] == 0
     write_store(archive_env.paths, [conv("grok", "solo", "Solo")])
     assert build_analysis(archive_env.paths)["documents"] == 1
+
+
+def test_subset_build_without_merge_refuses_to_drop_held_providers(archive_env) -> None:
+    ingest(export_root=archive_env.export, paths=archive_env.paths, authorization=archive_env.auth)
+    before = archive_env.paths.manifest.read_bytes()
+    with pytest.raises(ProviderDropRefused, match="--merge.*--drop-providers"):
+        ingest(
+            export_root=archive_env.export,
+            paths=archive_env.paths,
+            authorization=archive_env.auth,
+            providers=["claude"],
+        )
+    assert archive_env.paths.manifest.read_bytes() == before
+    merged = ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["claude"],
+        merge=True,
+    )
+    assert merged["providers"]["chatgpt"]["status"] == "ok"
+    dropped = ingest(
+        export_root=archive_env.export,
+        paths=archive_env.paths,
+        authorization=archive_env.auth,
+        providers=["claude"],
+        drop_providers=True,
+    )
+    assert "chatgpt" not in dropped["providers"]

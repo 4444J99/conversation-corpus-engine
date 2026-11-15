@@ -606,6 +606,10 @@ class MergeInputLoss(ValueError):
     """A merge would omit inputs which contributed to the existing provider."""
 
 
+class ProviderDropRefused(MergeInputLoss):
+    """A build without --merge would drop providers the manifest already holds."""
+
+
 # What a reader or its source can raise while a provider is read; the ingest isolates the
 # provider on any of these, and the merge check treats them as "cannot be checked".
 READ_ERRORS = (
@@ -940,6 +944,7 @@ def ingest(
     library_root: Path | None = None,
     merge: bool = False,
     allow_input_loss: bool = False,
+    drop_providers: bool = False,
     folder_entries: int | None = None,
     rebuild_lineage: bool = False,
 ) -> dict[str, Any]:
@@ -947,7 +952,9 @@ def ingest(
 
     With `merge`, the providers the manifest already lists and this call does not touch keep
     their entries, so a store is built one provider at a time and a failed one is re-read alone.
-    Without it the manifest lists exactly the providers of this call.
+    Without it the manifest lists exactly the providers of this call, so a call that names
+    fewer providers than the existing manifest holds is refused (`ProviderDropRefused`) unless
+    `drop_providers` says the omitted ones are to be dropped from the manifest.
 
     A lineage that cannot be trusted (a damaged ledger, or a digest baseline that the ledger does
     not describe) raises `LineageError` before anything is read or written; `rebuild_lineage`
@@ -985,6 +992,14 @@ def ingest(
     if not merge and paths.manifest.is_file():
         with contextlib.suppress(ValueError, OSError, KeyError, TypeError):
             prior = load_manifest(paths)["providers"]
+        held = sorted(n for n, i in prior.items() if n not in sources and receipt_holds_shards(i))
+        if held and not drop_providers:
+            raise ProviderDropRefused(
+                f"the manifest holds {', '.join(held)} which this call does not read, and the "
+                "manifest would stop listing them while their shards stay in the store, so "
+                "`verify` would fail; run the full build, add --merge to refresh only the named "
+                "providers, or add --drop-providers to drop the others on purpose"
+            )
     for name, root in sources.items():
         previous = report.get(name) if merge else prior.get(name)
         result = _ingest_provider(PROVIDER_SPECS[name], root, paths, options)

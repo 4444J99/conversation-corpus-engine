@@ -63,6 +63,12 @@ MIN_UNRANKED_GRACE_SECONDS = 0.25
 # VM instructions between budget checks. SQLite computes bm25 for a long match list inside a few
 # instructions per row, so the interval stays small; a test lowers it to exercise a tiny library.
 SEARCH_PROGRESS_INSTRUCTIONS = 1000
+# SQLite's snippet() grows with a document's length times how often the query terms occur in it,
+# and a running statement cannot be interrupted inside it: a stop word in one 4 MB record took
+# over a minute, in a 1 MB record several seconds. A hit whose text is longer than this gets its
+# excerpt from the first place a query word occurs (or the start of the text) instead.
+SNIPPET_MAX_CHARS = 150_000
+PLAIN_EXCERPT_CHARS = 360
 BROAD_QUERY_HINT = "quote a phrase or add terms for a faster, more precise search"
 _TERMS_TRUNCATED_NOTICE = (
     f"the query was shortened to its limits ({MAX_QUERY_TERMS} distinct terms, {MAX_TERM_CHARS} "
@@ -237,6 +243,30 @@ def plan_locator_query(query: str, plan: str) -> str:
     if plan == "phrase" and terms.sequence:
         return _match(terms, "phrase")
     return " ".join([*(f'"{phrase}"' for phrase in terms.phrases), *terms.words])
+
+
+def _windowed_excerpt(text: str, terms: QueryTerms) -> str:
+    """The excerpt of a long text without SQLite's snippet(): about a line around the first
+    place a query word occurs, the matches marked like snippet() marks them, or the start of the
+    text when no word occurs as written (a stemmed match, for instance)."""
+    words = {*terms.words, *(word for phrase in terms.phrases for word in phrase.split())}
+    pattern = (
+        re.compile(
+            r"\b(?:"
+            + "|".join(re.escape(word) for word in sorted(words, key=len, reverse=True))
+            + r")\b",
+            re.IGNORECASE,
+        )
+        if words
+        else None
+    )
+    found = pattern.search(text) if pattern else None
+    if found is None:
+        return text[:PLAIN_EXCERPT_CHARS]
+    start = max(0, found.start() - PLAIN_EXCERPT_CHARS // 3)
+    end = min(len(text), start + PLAIN_EXCERPT_CHARS - 80)
+    window = pattern.sub(lambda match: f"[{match.group(0)}]", text[start:end])
+    return ("..." if start else "") + window + ("..." if end < len(text) else "")
 
 
 def _plan_steps(query: str, plan: str) -> tuple[list[tuple[str, str]], QueryTerms]:
@@ -947,6 +977,7 @@ class Library:
         else:
             step_units = [selected_unit] * len(steps)
         conversation_totals: tuple[int, bool] | None = None
+        plain_excerpts = 0
 
         def finish(
             name: str,
@@ -990,6 +1021,13 @@ class Library:
             if terms.lost(name):
                 result["terms_truncated"] = True
                 notices.append(_TERMS_TRUNCATED_NOTICE)
+            if plain_excerpts:
+                result["plain_excerpts"] = plain_excerpts
+                notices.append(
+                    f"{plain_excerpts} of the hits are very long texts, so their excerpts come "
+                    "from the first place a query word occurs (or the start of the text) rather "
+                    "than from the best-scoring passage."
+                )
             if partial:
                 notices.append(
                     f"the {seconds:g} s time budget ran out while running the {expired_in} plan; "
@@ -1086,6 +1124,7 @@ class Library:
             rank = (
                 "bm25(passage_fts,0,1)" if selected_unit == "passage" else "bm25(record_fts,0,5,1)"
             )
+            nonlocal plain_excerpts
             own_snapshot = not self.connection.in_transaction
             if own_snapshot:
                 self.connection.execute("BEGIN")
@@ -1101,7 +1140,6 @@ class Library:
                 ]
                 if not keys:
                     return []
-                marks = ",".join("?" for _ in keys)
                 extra = (
                     "o.message_index AS passage_message,o.start AS passage_start,"
                     "o.end AS passage_end,b.digest AS passage_digest,"
@@ -1109,22 +1147,51 @@ class Library:
                     if selected_unit == "passage"
                     else ""
                 )
-                by_key = {
-                    row["key"]: row
+                columns = (
+                    f"SELECT {table}.rowid AS key,r.uid,r.title,r.provider,r.kind,r.wing,"
+                    "r.lane,r.current_version AS version,r.body_status,r.message_count,"
+                    "r.source_ref,r.current_digest AS capture_digest," + extra
+                )
+                highlighted = f"snippet({table},-1,'[',']','...',28) AS excerpt "
+                marks = ",".join("?" for _ in keys)
+                lengths = {
+                    row[0]: row[1]
                     for row in self.connection.execute(
-                        f"SELECT {table}.rowid AS key,r.uid,r.title,r.provider,r.kind,r.wing,"
-                        "r.lane,r.current_version AS version,r.body_status,r.message_count,"
-                        "r.source_ref,r.current_digest AS capture_digest,"
-                        + extra
-                        + f"snippet({table},-1,'[',']','...',28) AS excerpt "
-                        + text
-                        + f" AND {table}.rowid IN ({marks})",
-                        [*params, *keys],
+                        f"SELECT rowid,length(body) FROM {table} WHERE rowid IN ({marks})", keys
                     )
                 }
+                long_keys = [key for key in keys if (lengths.get(key) or 0) > SNIPPET_MAX_CHARS]
+                short_keys = [key for key in keys if key not in long_keys]
+                by_key: dict[int, Any] = {}
+                if short_keys:
+                    short_marks = ",".join("?" for _ in short_keys)
+                    # One statement per page: the keys are the page's own rows, all short.
+                    by_key.update(
+                        (row["key"], dict(row))
+                        for row in self.connection.execute(
+                            columns + highlighted + text + f" AND {table}.rowid IN ({short_marks})",
+                            [*params, *short_keys],
+                        )
+                    )
+                for key in long_keys:
+                    check()
+                    row = self.connection.execute(
+                        columns
+                        + "substr(body,1,2000000) AS excerpt,1 AS plain_excerpt "
+                        + text
+                        + f" AND {table}.rowid=?",
+                        [*params, key],
+                    ).fetchone()
+                    if row is not None:
+                        hit = dict(row)
+                        hit["excerpt"] = _windowed_excerpt(hit["excerpt"], terms)
+                        by_key[key] = hit
             finally:
                 if own_snapshot and self.connection.in_transaction:
                     self.connection.execute("ROLLBACK")
+            plain_excerpts = sum(
+                1 for key in keys[:limit] if key in by_key and "plain_excerpt" in by_key[key]
+            )
             return [by_key[key] for key in keys if key in by_key]
 
         def shape(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
@@ -1132,6 +1199,8 @@ class Library:
             for row in rows[:limit]:
                 hit = dict(row)
                 hit.pop("key", None)
+                if hit.pop("plain_excerpt", 0):
+                    hit["excerpt_plain"] = True
                 capture_digest = hit.pop("capture_digest")
                 hit["title"] = hit["title"][:512]
                 hit["source_ref"] = hit["source_ref"][:2048]

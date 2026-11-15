@@ -34,6 +34,25 @@ def _surface(
     question_text: str,
 ) -> dict[str, Any]:
     (root / "corpus").mkdir(parents=True, exist_ok=True)
+    _write_json(
+        root / "corpus" / "contract.json",
+        {
+            "contract_name": MODULE.FEDERATION_CONTRACT,
+            "contract_version": MODULE.FEDERATION_CONTRACT_VERSION,
+            "adapter_type": f"{corpus_id}-adapter",
+            "corpus_id": corpus_id,
+            "name": name,
+            "generated_at": "2026-03-25T00:00:00+00:00",
+            "required_files": list(MODULE.CORE_CONTRACT_FILES),
+            "counts": {
+                "threads": 1,
+                "families": 1,
+                "actions": 1,
+                "unresolved": 1,
+                "entities": 1,
+            },
+        },
+    )
     return {
         "summary": {
             "corpus_id": corpus_id,

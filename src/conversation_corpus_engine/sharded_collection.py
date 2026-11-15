@@ -94,9 +94,14 @@ def collection_generations_path(logical_path: Path) -> Path:
     return collection_storage_path(logical_path) / "generations"
 
 
+def _collection_storage_exists(logical_path: Path) -> bool:
+    storage_root = collection_storage_path(logical_path)
+    return storage_root.is_symlink() or storage_root.exists()
+
+
 def collection_exists(logical_path: Path) -> bool:
     logical_path = logical_path.resolve(strict=False)
-    if collection_storage_path(logical_path).exists():
+    if _collection_storage_exists(logical_path):
         validate_collection(logical_path)
         return True
     return logical_path.is_file()
@@ -609,8 +614,7 @@ def iter_collection(
     legacy_wrapper: str | None = None,
 ) -> Iterator[Any]:
     logical_path = logical_path.resolve(strict=False)
-    storage_root = collection_storage_path(logical_path)
-    if storage_root.exists():
+    if _collection_storage_exists(logical_path):
         manifest = validate_collection(logical_path)
         generation_root, _loaded_manifest = _resolve_current_generation(logical_path)
         for envelope in _iter_generation_envelopes(generation_root, manifest):
@@ -640,7 +644,7 @@ def load_collection(
     default: Any = None,
 ) -> Any:
     logical_path = logical_path.resolve(strict=False)
-    if not collection_storage_path(logical_path).exists() and not logical_path.exists():
+    if not _collection_storage_exists(logical_path) and not logical_path.exists():
         return default
     return list(iter_collection(logical_path, legacy_wrapper=legacy_wrapper))
 
@@ -657,7 +661,7 @@ def _atomic_replace(source: Path, destination: Path) -> None:
 def _existing_shard_by_prefix(
     logical_path: Path,
 ) -> tuple[Path | None, dict[str, dict[str, Any]]]:
-    if not collection_storage_path(logical_path).exists():
+    if not _collection_storage_exists(logical_path):
         return None, {}
     manifest = validate_collection(logical_path)
     generation_root, _loaded_manifest = _resolve_current_generation(logical_path)

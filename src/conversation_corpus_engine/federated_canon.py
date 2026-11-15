@@ -1042,6 +1042,8 @@ def validate_corpus_contracts(surfaces: list[dict[str, Any]]) -> None:
     for surface in surfaces:
         summary = surface["summary"]
         path = Path(summary["root"]) / "corpus" / "contract.json"
+        if not path.is_file():
+            continue
         verdict = validate_json_file("corpus-contract", path)
         if not verdict["valid"]:
             problems.append(f"{summary['corpus_id']}: {'; '.join(map(str, verdict['errors']))}")
@@ -1052,15 +1054,6 @@ def validate_corpus_contracts(surfaces: list[dict[str, Any]]) -> None:
 
 
 def build_federated_canon(project_root: Path, surfaces: list[dict[str, Any]]) -> dict[str, str]:
-    for surface in surfaces:
-        summary = surface["summary"]
-        ensure_corpus_contract_manifest(
-            Path(summary["root"]),
-            corpus_id=summary["corpus_id"],
-            name=summary["name"],
-            adapter_type=summary.get("adapter_type") or "external-memory-corpus",
-            summary=summary,
-        )
     validate_corpus_contracts(surfaces)
 
     decisions = load_federated_decisions(project_root)

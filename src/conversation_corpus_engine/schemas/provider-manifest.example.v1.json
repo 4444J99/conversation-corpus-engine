@@ -1,0 +1,35 @@
+{
+  "schema_version": "provider-manifest.v1",
+  "configuration_scope": "reusable-example",
+  "unknown_source_blocker": {
+    "owner_reference": "owner:configure-me",
+    "failed_predicate": "source family is registered in the runtime provider manifest",
+    "next_action": "register the source family and adapter contract, then rerun the frozen snapshot"
+  },
+  "providers": [
+    {
+      "provider_id": "provider-renamed",
+      "display_name": "Configured Provider",
+      "adapter_state": "supported",
+      "default_adapter_id": "session-meta-redacted-jsonl-v1",
+      "adapter_type": "adapter-reusable",
+      "discovery_mode": "redacted-bundle",
+      "inbox_rel": "provider-renamed/inbox",
+      "default_corpus_id": "provider-renamed-memory",
+      "default_corpus_name": "Configured Provider Memory",
+      "source_family_aliases": ["family-renamed"],
+      "source_contract": {
+        "kind": "session-meta-redacted-bundle",
+        "root_env": "CCE_EXAMPLE_REDACTED_BUNDLE_ROOT"
+      },
+      "authority_policy": "native-role",
+      "owner_reference": "owner:configure-me",
+      "blocker": {
+        "owner_reference": "owner:configure-me",
+        "failed_predicate": "redacted source bundle is readable",
+        "next_action": "configure an immutable redacted bundle and rerun authority ingest"
+      },
+      "calibration_only": true
+    }
+  ]
+}

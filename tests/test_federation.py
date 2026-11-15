@@ -200,6 +200,33 @@ class MemoryFederationTests(unittest.TestCase):
             json.dumps({"overall_state": gate_state, "source_reliability_state": "pass"}),
             encoding="utf-8",
         )
+        (root / "corpus" / "contract.json").write_text(
+            json.dumps(
+                {
+                    "contract_name": "conversation-corpus-engine-v1",
+                    "contract_version": 1,
+                    "adapter_type": "test-adapter",
+                    "corpus_id": root.name if root.name != "project" else "primary-corpus",
+                    "name": corpus_title,
+                    "generated_at": "2026-03-25T00:00:00+00:00",
+                    "required_files": [
+                        "corpus/threads-index.json",
+                        "corpus/semantic-v3-index.json",
+                        "corpus/pairs-index.json",
+                        "corpus/doctrine-briefs.json",
+                        "corpus/family-dossiers.json",
+                    ],
+                    "counts": {
+                        "threads": 1,
+                        "families": 1,
+                        "actions": 1,
+                        "unresolved": 1,
+                        "entities": 1,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
 
     def test_bootstrap_registry_uses_current_project_corpus(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -219,6 +246,26 @@ class MemoryFederationTests(unittest.TestCase):
             self.assertEqual(len(registry["corpora"]), 1)
             self.assertEqual(registry["corpora"][0]["root"], str(root))
             self.assertTrue(registry["corpora"][0]["default"])
+
+    def test_build_federation_preserves_corpus_contract_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir) / "project"
+            self.seed_corpus(
+                project_root,
+                corpus_title="Alpha Corpus",
+                family_id="family-alpha",
+                thread_uid="thread-alpha",
+                query_terms=["alpha", "registry", "governance"],
+                action_key="action-alpha",
+                question_key="question-alpha",
+            )
+            contract_path = project_root / "corpus" / "contract.json"
+            before_bytes = contract_path.read_bytes()
+
+            MODULE.build_federation(project_root)
+
+            after_bytes = contract_path.read_bytes()
+            self.assertEqual(before_bytes, after_bytes)
 
     def test_build_federation_materializes_registered_corpora(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

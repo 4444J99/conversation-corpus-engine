@@ -14,6 +14,7 @@ from conversation_corpus_engine.archive_commands import open_context, reconcile_
 from conversation_corpus_engine.archive_ingest import (
     PROVIDER_SPECS,
     SOURCE_LIBRARY,
+    ProviderDropRefused,
     ingest,
     iter_store,
     load_manifest,
@@ -359,7 +360,9 @@ def test_merge_keeps_the_providers_a_call_does_not_read(archive_env, library_roo
     assert ok == {"codex", "applenotes"}
     assert merged["totals"]["conversations"] == 1 + 1
     assert load_manifest(archive_env.paths) == merged
-    replaced = _ingest(archive_env, library_root, ["applenotes"])
+    with pytest.raises(ProviderDropRefused, match="--drop-providers"):
+        _ingest(archive_env, library_root, ["applenotes"])
+    replaced = _ingest(archive_env, library_root, ["applenotes"], drop_providers=True)
     assert set(replaced["providers"]) == {"applenotes"}
 
 

@@ -422,11 +422,16 @@ def _codex(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) -
                 body.add(event, payload["message"], "system", locator, kind="compaction")
 
 
+def _claude_session(record: dict[str, Any]) -> Any:
+    """The session identity of a Claude record, accepting both spellings the producer accepts."""
+    return record.get("sessionId") or record.get("session_id")
+
+
 def _claude(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) -> None:
     parent, separator, agent = body.native_id.partition("/agent/")
     composite = bool(separator and parent and agent and "/" not in agent)
     proven = composite and any(
-        record.get("sessionId") == parent and record.get("agentId") == agent
+        _claude_session(record) == parent and record.get("agentId") == agent
         for _, record in records
     )
     if proven:
@@ -441,16 +446,21 @@ def _claude(records: list[tuple[int, dict[str, Any]]], path: Path, body: _Body) 
             },
         )
     for line, record in records:
+        if not composite and record.get("agentId"):
+            continue  # a subagent record belongs to its own identity, not to the root body
+        if not composite and record.get("isSidechain") is True:
+            # Read as before (tagged as a sidechain), but never silently attributed to the parent.
+            body.finding("sidechain_without_agent_identity", path, str(line))
         mismatch = (
             (
                 not proven
                 or (
-                    bool(record.get("sessionId") or record.get("agentId"))
-                    and (record.get("sessionId") != parent or record.get("agentId") != agent)
+                    bool(_claude_session(record) or record.get("agentId"))
+                    and (_claude_session(record) != parent or record.get("agentId") != agent)
                 )
             )
             if composite
-            else bool(record.get("sessionId") and record["sessionId"] != body.native_id)
+            else bool(_claude_session(record) and _claude_session(record) != body.native_id)
         )
         if mismatch:
             body.finding("identity_mismatch", path, str(line))
@@ -889,6 +899,12 @@ def _read_source(
     path: Path, family: str, body: _Body, object_key: str = "", depth: int = 0
 ) -> None:
     identity = str(path)
+    # Each census row is resolved on its own, so distinct rows of one census stay distinct reads.
+    read_key = (
+        f"{identity}\0{object_key}"
+        if path.suffix == ".json" and "sessions/" in object_key
+        else identity
+    )
     observation: dict[str, Any] = {
         "source_path": identity,
         "object_key": object_key,
@@ -896,7 +912,7 @@ def _read_source(
     }
     if observation in body.observations:
         return
-    if identity in body.read_paths:
+    if read_key in body.read_paths:
         previous = next((item for item in body.observations if item["source_path"] == identity), {})
         body.observations.append({**previous, **observation})
         return
@@ -904,7 +920,7 @@ def _read_source(
     if depth > 3:
         body.finding("source_reference_depth_limit", path)
         return
-    body.read_paths.add(identity)
+    body.read_paths.add(read_key)
     try:
         if path.is_dir():
             files = [
@@ -959,7 +975,9 @@ def _read_source(
         elif base_suffix == ".json":
             payload = json.loads(text)
             if isinstance(payload, dict) and (
-                "sessions" in payload or object_key.startswith("sessions/")
+                "sessions" in payload
+                or object_key.startswith("sessions/")
+                or "/sessions/" in object_key
             ):
                 resolved = _census_path(payload, body.native_id, object_key, path)
                 if resolved:

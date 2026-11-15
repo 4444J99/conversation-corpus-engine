@@ -78,6 +78,36 @@ lookup report an unavailable-store error. An accessible store with no published
 pointer still reports that no generation has been published. Read paths never
 create a missing store.
 
+## Browse as a wiki
+
+`cce library serve` reads the current published generation and serves it as linked pages on a loopback address (default `127.0.0.1:8766`), so the library can be browsed like a wiki without exporting a second copy of private text:
+
+```sh
+cce library serve --store-root /private/store --port 8766
+```
+
+- `/` shows record counts by wing, lane and provider; each is a link to a newest-first listing.
+- `/search?q=...` is the same planned, time-bounded search as `cce library search` (`plan`, `max_seconds`, `wing`, `lane`, `provider`, `offset` query parameters). A result is one line (title, provider, lane, body status); its excerpt opens on demand. A partial page says so.
+- `/record/UID` shows metadata, a table of contents, 20 messages at a time with earlier and later links and `#message-N` anchors, an alternate-sequence switch, and **Related records**: other records that repeat the same eligible passages (the deterministic block index, not an inference). `?q=words` jumps to and marks the first match.
+- A record page decodes the record once. Its contents (headings, or a per-message index) appear inline only for a record of at most 300 messages; a longer record links to `/record/UID/contents` (100 entries a page, `toc_offset`), because the headings of a long record come from reading every message. Related records get 1 s on the record page; when the repeated-passage query needs longer the page links to `/record/UID/related` (up to 20 s), and an interrupted query returns no list rather than a wrongly ranked one (`/api/related/UID` reports `complete`). The home page counts are read once per published generation.
+- `/record/UID/history` lists revisions; `/api/search`, `/api/read/UID` and `/api/related/UID` return the same bounded JSON as the CLI and MCP tools.
+
+The server accepts only loopback binds and loopback `Host` headers, answers GET and HEAD only, runs no script, and shows source text escaped as plain preformatted text, never as HTML or Markdown.
+
+### Atoms
+
+An atom is one deduplicated eligible prose block of the library's block index (a passage of at least 120 characters, stored once however many records repeat it). Its address is the SHA-256 digest of its canonical text, so it is a stable, citable unit, and every occurrence names its record, message and character span, so an atom always leads back to its sources. The wiki shows them as small linked pages:
+
+- `/record/UID/atoms` lists the record's atoms in reading order, 25 a page, each with a bounded preview, how many other records hold it (counted to 50, then "50+") and links to the atom and to its message.
+- `/atom/DIGEST` shows the passage (clipped at 24,000 characters, with a notice), every place it occurs (50 a page, with a link to each record message), and, for a chosen occurrence (`?uid=&message=&block=`, the first occurrence by default), the previous and next atom in that record, so a reader walks a record atom by atom.
+- `/api/atom/DIGEST` returns the same data as JSON. Passages are escaped plain text.
+
+The pages need the block index (built with the library; `Library.index_blocks`). A record with no atoms says so. `library_atoms.py` holds the reads; nothing is written.
+
+## Browser links
+
+`cce library browser-links --canonical DIR --out DIR` turns the browser-state canonical set (`bookmarks`, `reading-list`, `tabs`, `wikipedia` and, only when named with `--kind history`, `history`) into one plain-text note per normalized URL under `OUT/links/<xx>/pg_<24 hex>.md`, and writes `browser-links-receipt.json` with the `documents` entry that reads it (wing `ai`, lane `support`, kind `document`: not an authored family, so the authorship rules never give the owner credit for a page title). The file name is the same page id a web capture row of that URL carries, so a link note and its captured page text meet on one id. A URL held by several lists or browsers is one note that names them all. Notes carry no export time and no local path, so a refresh rewrites only changed notes and never deletes: a note whose link left the set stays and is counted as `retained_not_in_source`. Rows of the wrong shape, non-http(s) addresses, embedded credentials and a missing list are findings by file and line, never by address. `--min-visits` and `--exclude-host` narrow history. The output directory must be outside every Git work tree or ignored by it, and new or an earlier export. Nothing is fetched and no browser store is read. Declared under `documents`, the notes build, search and publish like any other document.
+
 ## Source manifest
 
 ```json
@@ -106,6 +136,48 @@ The manifest is private: it contains local source locations. Native readers reta
 `snapshot_archives` use the same normalized directory layout as `archives`, but add observations without replacing any existing current identity. They recover older or alternate source exports safely; a previously unknown identity is still admitted. Incremental generations inherit the full record ledger and link to the prior coverage report. A remaining inherited coverage gap keeps `coverage_complete` false.
 
 To reuse a failed generation whose source ingestion finished, set `resume_generation` to its absolute generation directory and list only supplemental sources in the new manifest. The builder verifies the failed state, source counts, manifest, publication base, database integrity and every normalized object digest. It hash-binds and compacts a new copy, leaving the seed untouched; baseline observations count against the new record budget. The report retains the seed receipt and all coverage findings. Older candidates without a phase marker are explicitly labeled as weaker legacy ingestion evidence. Set measured `limits` in the manifest for the next invocation; a resume never changes global limits or hides the failed attempt.
+
+## Native inventory
+
+`estate_databases` names SQLite inventories of native coding-agent sessions. `cce library inventory` produces one from source roots you declare; nothing is discovered from a home directory and every flag has no default.
+
+```bash
+cce library inventory \
+  --claude-projects /private/live/claude/projects \
+  --claude-projects /private/archive-2025/claude/projects \
+  --codex-root /private/live/codex \
+  --codex-root /private/archive-2025/codex \
+  --opencode-database /private/live/opencode/opencode.db \
+  --out /private/inventories/native-2026-01
+```
+
+`--out` must be a new directory outside every Git work tree (or ignored by it), because the inventory holds session titles, snippets and project paths. It is created mode 0700 and receives `session-corpus.db` (mode 0600) and `inventory-receipt.json`. Name the database in the next build:
+
+```json
+{ "estate_databases": ["/private/inventories/native-2026-01/session-corpus.db"] }
+```
+
+Source flags, each repeatable and read in the order given (a path declared twice counts once, at its last position):
+
+| Flag | Source |
+| --- | --- |
+| `--claude-projects DIR` | Claude Code projects directory; every `*.jsonl` below it, including subagent transcripts |
+| `--codex-root DIR` | Codex home holding `sessions/`, `archived_sessions/` (`.jsonl` and `.jsonl.zst`) and optionally `state_5.sqlite` |
+| `--codex-census FILE` | Optional Codex census (`sessions[].relative_path`); rollouts are found without one |
+| `--gemini-source FILE` | Gemini census JSON (`sessions[]` with `session_id`) |
+| `--antigravity-source PATH` | Antigravity CLI directory, native `.db` file or census JSON |
+| `--copilot-state-dir DIR` | Copilot `session-state` directory, one folder per session |
+| `--copilot-database FILE` | Copilot session-store database |
+| `--opencode-database FILE` | OpenCode database |
+| `--max-seconds N` | Wall-clock budget (default 7200) |
+
+Identity follows the native record, so the same transcript gets the same session id whichever root holds it: a Claude subagent is `<sessionId>/agent/<agentId>` with the session as its parent, a Codex session is the `id` in its `session_meta` header rather than its file name, and conflicting parent claims become an `unknown` kind with a recorded `conflicting_parent_identity` finding. This holds for every family, OpenCode included: when the same session occurs in several databases (or in both `session` and `session_v2`), a copy that carries no parent evidence never erases a parent or subagent kind another copy established, and copies that name different parents, or one that names a parent where another records none, are recorded as a conflict rather than the last copy winning. One session is one `sessions` row; each distinct source file adds one `source_observations` row. Copies with the same size and SHA-256 within a family are folded: only the first, in declaration order and then sorted path, is observed, and the rest are counted as `folded_duplicates`. Copies that differ are all observed. Empty files are never folded (each is accounted for on its own), and a Copilot session-state directory folds only with a same-named directory, because its name is its identity, and then only when every transcript file the reader can open in it (`events.jsonl`, `session.jsonl`, `messages.jsonl`, `conversation.json`, `messages.json`) is present in both with identical bytes; a directory whose transcript file cannot be trusted (it is not a regular file, or its symlink leaves the declared root) never folds, so no readable body is lost to a fold. When a differing copy of a session is visited later, its fields fill gaps and its location becomes the session's `custody_path`, so the last copy visited is the custody copy; `started_at` keeps the first value seen. Codex reads every state database before any rollout, so parent edges from one root apply to rollouts from another, and a session that has a rollout is custodied by that rollout. A Codex session whose rollout is no longer under any declared root keeps only what its state database says, and its parent link is lost when that database holds no edge for it, so declare every root (including extracted archives) that holds the rollouts you want linked.
+
+Known boundaries, shared with the earlier estate corpus builder so that session ids do not change: a Codex fork (`forked_from_id`) is inventoried as a `root` with no parent, although the reader reports its fork origin; a Codex census row that was recovered by file name, or whose path the reader cannot resolve, is kept as an artifact (`census_row_not_reader_resolvable`) rather than an observation; and an Antigravity census that has `tm_cli/sessions` or `evac_cli/sessions` but no top-level `sessions` key is read as one record, so those sessions are `metadata_only`.
+
+Sources are never written: no byte of any source file, SQLite sidecars included, changes. A SQLite source is read in one of three ways. A database that is not in WAL mode opens in place with `mode=ro`, which writes nothing. A WAL-mode database with both its `-wal` and `-shm` files present is not opened in place, because SQLite may rewrite an existing `-shm` even for a read-only connection; its base file and non-empty `-wal` are copied into a private mode-0700 directory under the system temporary directory (never inside the source's directory or a declared source), the copy is opened, and the directory is removed afterwards, so pending log content is seen and the `-shm` is never opened. The copy is accepted only when the source's size, modification time and inode and its SHA-256 are unchanged across the copy (retried a few times; otherwise the finding `database_changed_during_snapshot`), and a source larger than a fixed ceiling or than the free temporary space is the finding `database_too_large_to_snapshot` instead of an unbounded copy. A temporary directory that lies inside a declared source is the finding `snapshot_location_unsafe`. A WAL-mode database missing either sidecar is read from a stable double-hashed snapshot of its base file for metadata only, and only when no non-empty `-wal` or rollback journal exists (otherwise `database_requires_its_journal`); its historical log custody is recorded as `historical_wal_custody_unverified`. A symlink that leaves its declared root is not followed; an unreadable or malformed source is recorded as a finding (`unresolved_source_observations`) for that source and the run continues. The receipt holds counts and paths only: the schema and implementation versions, the declared roots, per-family session counts by kind, observations, folded duplicates, findings by code, artifacts by classification, the database SHA-256 and the start and end times. The command prints it as JSON and exits 0; it exits 2 when `--out` exists or no source is declared, and 3 when `--max-seconds` ran out (the receipt then says `incomplete` and the database is not a usable inventory).
+
+A build reads each body through the native readers described above. A session whose transcript is not under a declared root stays a metadata-only record, so list the archived copies you want searched.
 
 ## Web captures
 
@@ -359,6 +431,8 @@ The planner stops at the first plan that matches at least one record in the filt
 **Time budget.** `--max-seconds` (command line) and `max_seconds` (MCP) default to 15 seconds and must be above 0 and at most 600; the Python `Library.search` has no budget unless `max_seconds` is passed. One deadline covers the whole call (the phrase probe, the counts and the ranking) and is enforced through the SQLite progress handler, so a slow ranking is interrupted rather than waited for. When it runs out the call does not fail: it returns the first matches of one plan in index order (the order records were added) with `partial: true`, `ranked: false`, a `notice` saying so and the same `hint`; their `score` is null. Running out of time while a plan is still being probed means "unknown", not "empty": each plan not yet proven empty gets its own short bounded probe (the further allowance below), and the page comes from the first plan that matches, so a slow phrase probe does not hide an AND plan that has matches. `plan` names the plan that supplied the page and the `notice` also names the plan that was running when time ran out. Producing a page, and each probe, gets a short further allowance of its own (the smaller of `max_seconds` and 2 seconds, but never less than a quarter of a second, so even a tiny budget can produce a page), so a call can exceed `max_seconds` by a few of those. If that allowance cuts the page before its first row, or no plan could be probed in time, `hits` is empty but the plan is not proven empty: `next_offset` repeats the same offset so a pager can retry, and the notice says that having no hits does not mean there are none. If every plan finishes its probe and finds nothing, the empty answer is complete and `partial` is false. A call that finishes in time reports `partial: false` and `ranked: true`. `elapsed_s` is the time the search used, so two identical calls return responses that differ in that field (and a response is not byte-stable across calls). Offsets continue in index order for a partial page, which is not the order of the ranked pages; run a narrower query (quote a phrase, add terms) or raise the budget to get ranked results.
 
 **Capped count.** Counting every match of a huge set is itself costly, so `total` is exact only up to `count_cap` (1000 by default in the Python API, fixed at 1000 for the command line and the MCP tool). When more records match, `total` is the cap, `total_exact` is false and `total_label` is `"1000+"` (compact mode carries `n` and `nx`). The cap changes neither which hits are returned nor their order, and `next_offset` keeps advancing past the cap until the last page. `count_cap=None` counts exactly. A count that the time budget interrupts cannot say how many records match: the page that replaces it reports `total` as the offset plus the hits it found, with `total_exact` false and a label of the form `N+` (`0+` when nothing was found before time ran out), so `total_label` can read `0+`, `5+` or `1000+`; it is always a lower bound, never an exact count.
+
+**Excerpts of very long records.** A ranked page is read in two steps (rank on row numbers, then read the excerpts of just that page). SQLite's `snippet()` cost grows with a record's length times how often the query words occur in it, and the progress handler cannot interrupt it while it runs, so one multi-megabyte record could take minutes for a stop-word query and overrun any budget (a one-word stop-word query over a large library took 9 to 14 s against an 8 s budget, and its excerpt statement alone about 100 s unbounded). A hit whose text is longer than 150,000 characters therefore gets its excerpt from the first place a query word occurs (about one line, matches marked with `[ ]` as `snippet()` marks them), or from the start of the text when no word occurs as written (a stemmed match, for instance). Such a hit carries `excerpt_plain: true`; the response carries `plain_excerpts` (the count on the page) and a `notice`. Ranking, totals and paging do not change; shorter records keep the stem-aware `snippet()` highlight.
 
 | field | compact key | meaning |
 |---|---|---|

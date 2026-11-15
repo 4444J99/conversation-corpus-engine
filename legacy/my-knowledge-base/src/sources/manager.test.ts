@@ -7,6 +7,10 @@ vi.mock('./claude.js', () => ({ ClaudeSource: class { async exportAll() { return
 vi.mock('./chatgpt.js', () => ({ ChatGPTSource: class { async exportAll() { return []; } } }));
 vi.mock('./gemini.js', () => ({ GeminiSource: class { async exportAll() { return []; } } }));
 vi.mock('./local.js', () => ({ LocalFileSource: class { async exportAll() { return []; } } }));
+// SourceManager registers AppleNotesSource on darwin; unmocked it shells out to
+// `osascript` against the real Notes library (up to a 120s child timeout), which
+// hangs this unit test on macOS hosts and reads private data.
+vi.mock('./apple-notes.js', () => ({ AppleNotesSource: class { async exportAll() { return []; } } }));
 vi.mock('./bookmarks.js', () => ({ BookmarkSource: class { async exportAll() { return []; } } }));
 vi.mock('./claude-export.js', () => ({ ClaudeExportSource: class { async exportAll() { return []; } } }));
 vi.mock('./chatgpt-export.js', () => ({ ChatGPTExportSource: class { async exportAll() { return []; } } }));

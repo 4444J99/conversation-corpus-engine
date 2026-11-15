@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Import a document-style provider export into a corpus."
     )
-    parser.add_argument("provider", choices=["gemini", "grok", "perplexity", "copilot"])
+    parser.add_argument("provider")
     parser.add_argument("input_path", type=Path)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--name")

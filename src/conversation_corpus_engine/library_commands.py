@@ -12,6 +12,9 @@ from typing import Any
 
 from .archive_database import PHRASE_RE, WORD_RE
 from .attributed_knowledge import ZETTEL_SCHEMA, export_zettels, zettel_atoms
+from .browser_links import DEFAULT_KINDS as DEFAULT_LINK_KINDS
+from .browser_links import KINDS as LINK_KINDS
+from .browser_links import export_browser_links
 from .corpus_store import CorpusStoreError, require_git_private
 from .library_analysis import AnalysisLimits, export_analysis
 from .library_build import (
@@ -23,6 +26,7 @@ from .library_build import (
 )
 from .library_cards import export_cards, is_card_folder, verify_cards
 from .library_export import EXPORT_PROFILES, LEGACY_PROFILE, export_library, verify_export
+from .library_inventory import DEFAULT_MAX_SECONDS, InventorySources, build_inventory
 from .library_passages import PASSAGE_LIMIT
 from .library_read_metadata import MAX_ATTACHMENTS, message_metadata, sequence_attachment_count
 from .library_store import (
@@ -257,6 +261,7 @@ def read_record(
     limit: int = 12000,
     around_query: str | None = None,
     message_end: int | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Read one message span; with `around_query` centre it on the first match; with
     `message_end` read the messages [message, message_end) within a total character budget."""
@@ -272,7 +277,8 @@ def read_record(
         isinstance(message_end, bool) or not isinstance(message_end, int) or message_end <= message
     ):
         raise ValueError("message_end must be an integer greater than message")
-    payload = library.record(uid, version=version, digest=digest)
+    if payload is None:
+        payload = library.record(uid, version=version, digest=digest)
     main, alternates = _sequences(payload, uid)
     messages = main if sequence == "main" else alternates
     result = _record_header(
@@ -587,6 +593,7 @@ def record_toc(
     mode: str = "auto",
     toc_offset: int = 0,
     toc_limit: int = 50,
+    payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Table of contents of one record: markdown headings (with message and character offsets)
     or, without headings, a per-message index. Entries are paged and the total is exact."""
@@ -601,7 +608,8 @@ def record_toc(
         or not 1 <= toc_limit <= MAX_TOC_ENTRIES
     ):
         raise ValueError(f"toc_limit must be an integer from 1 to {MAX_TOC_ENTRIES}")
-    payload = library.record(uid, version=version, digest=digest)
+    if payload is None:
+        payload = library.record(uid, version=version, digest=digest)
     main, alternates = _sequences(payload, uid)
     messages = main if sequence == "main" else alternates
     result = _record_header(
@@ -670,6 +678,90 @@ def add_library_parser(subparsers: Any) -> Any:
         default=DEFAULT_VAULT_PROFILE,
         help="Reading vault written into the generation: none (default, no vault), cards "
         "(one capped card per record) or full (whole records in capped linked parts)",
+    )
+    links = sub.add_parser(
+        "browser-links",
+        help="Export the browser-state canonical links as one note per URL for a documents root",
+        description=(
+            "Read the browser-state canonical set (bookmarks, reading list, tabs, Wikipedia "
+            "visits, optionally history) and write one note per normalized URL under a private "
+            "directory, plus a receipt holding the `documents` manifest entry that reads it. "
+            "Nothing is fetched and nothing already exported is deleted."
+        ),
+    )
+    links.add_argument("--json", action="store_true", help="JSON is the default output")
+    links.add_argument("--canonical", type=Path, required=True, help="browser-state canonical/")
+    links.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="Private directory, outside every Git work tree or ignored by it; new, or an "
+        "earlier browser-links export",
+    )
+    links.add_argument(
+        "--kind",
+        action="append",
+        choices=sorted(LINK_KINDS),
+        help="List to export (repeatable). Default: bookmarks, reading-list, tabs, wikipedia; "
+        "history is opt in",
+    )
+    links.add_argument(
+        "--min-visits", type=int, default=1, help="History rows below this visit count are skipped"
+    )
+    links.add_argument(
+        "--exclude-host",
+        action="append",
+        default=[],
+        help="Skip a host and its subdomains (repeatable)",
+    )
+    inventory = sub.add_parser(
+        "inventory",
+        help="Inventory native coding-agent sessions into the database a manifest names under "
+        "estate_databases",
+        description=(
+            "Read explicitly declared native session roots (never written) and write a new "
+            "session-corpus.db plus inventory-receipt.json. Every source flag may repeat, so one "
+            "run can list a live root and archived copies of the same family; byte-identical "
+            "copies are observed once. Exits 0 when complete, 3 when --max-seconds ran out."
+        ),
+    )
+    inventory.add_argument("--json", action="store_true", help="JSON is the default output")
+    inventory.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="New private directory (it must not exist, and must be outside every Git work tree "
+        "or ignored by it); receives session-corpus.db and inventory-receipt.json",
+    )
+    for flag, help_text in (
+        ("--claude-projects", "Claude Code projects directory (holds <project>/<session>.jsonl)"),
+        (
+            "--codex-root",
+            "Codex home holding sessions/, archived_sessions/ and optionally state_5.sqlite",
+        ),
+        ("--codex-census", "Optional Codex census JSON (sessions[].relative_path)"),
+        ("--gemini-source", "Gemini census JSON (sessions[] with session_id)"),
+        (
+            "--antigravity-source",
+            "Antigravity CLI directory, native .db file or census JSON",
+        ),
+        ("--copilot-state-dir", "Copilot session-state directory (one folder per session)"),
+        ("--copilot-database", "Copilot session-store SQLite database"),
+        ("--opencode-database", "OpenCode SQLite database"),
+    ):
+        inventory.add_argument(
+            flag,
+            action="append",
+            type=Path,
+            default=[],
+            metavar="PATH",
+            help=f"{help_text}; repeatable, visited in the order given",
+        )
+    inventory.add_argument(
+        "--max-seconds",
+        type=float,
+        default=DEFAULT_MAX_SECONDS,
+        help="Wall-clock budget; a run that exceeds it writes an incomplete receipt and exits 3",
     )
     publish = sub.add_parser("publish", help="Verify and atomically publish an existing candidate")
     common(publish)
@@ -759,6 +851,18 @@ def add_library_parser(subparsers: Any) -> Any:
     )
     for name in ("status", "verify"):
         common(sub.add_parser(name))
+    serve = sub.add_parser(
+        "serve",
+        help="Browse the library as a local read-only wiki (loopback only)",
+        description=(
+            "Serve the current published generation as linked pages on a loopback address: "
+            "home, ranked search, one page per record with contents, paged messages, related "
+            "records and revision history. Nothing is exported or written."
+        ),
+    )
+    common(serve)
+    serve.add_argument("--host", default="127.0.0.1", help="loopback address only")
+    serve.add_argument("--port", type=int, default=8766)
     search = sub.add_parser(
         "search",
         help="Paged full-text retrieval; the match count is exact up to 1000",
@@ -938,7 +1042,12 @@ def read_cursor(arguments: dict[str, Any]) -> tuple[int, int]:
 
 
 def read_arguments(
-    library: Library, arguments: dict[str, Any], offset: int, limit: int
+    library: Library,
+    arguments: dict[str, Any],
+    offset: int,
+    limit: int,
+    *,
+    payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The read the MCP tool and `cce library read` share: a passage, a message range
     (`message_end`) or a table of contents (`toc`), from the arguments the caller gave.
@@ -968,6 +1077,7 @@ def read_arguments(
             mode=arguments.get("toc_mode", "auto"),
             toc_offset=integer_argument(arguments, "toc_offset", 0, 1000000000),
             toc_limit=integer_argument(arguments, "toc_limit", 50, MAX_TOC_ENTRIES),
+            payload=payload,
         )
     return read_record(
         library,
@@ -984,6 +1094,7 @@ def read_arguments(
             if "message_end" in arguments
             else None
         ),
+        payload=payload,
     )
 
 
@@ -1032,10 +1143,54 @@ def _verify_export_command(args: argparse.Namespace) -> int:
     return 1 if problems else 0
 
 
+def _browser_links_command(args: argparse.Namespace) -> int:
+    receipt = export_browser_links(
+        args.canonical,
+        args.out,
+        kinds=args.kind or DEFAULT_LINK_KINDS,
+        min_visits=args.min_visits,
+        exclude_hosts=args.exclude_host,
+    )
+    print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _inventory_command(args: argparse.Namespace) -> int:
+    # The inventory holds session titles, snippets and project paths: authorise where it lands
+    # before any source is read.
+    require_git_private(args.out)
+    receipt = build_inventory(
+        InventorySources(
+            claude_projects=args.claude_projects,
+            codex_roots=args.codex_root,
+            codex_censuses=args.codex_census,
+            gemini_sources=args.gemini_source,
+            antigravity_sources=args.antigravity_source,
+            copilot_state_dirs=args.copilot_state_dir,
+            copilot_databases=args.copilot_database,
+            opencode_databases=args.opencode_database,
+        ),
+        args.out,
+        max_seconds=args.max_seconds,
+    )
+    print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if receipt["status"] == "complete" else 3
+
+
 def handle_library(args: argparse.Namespace) -> int:
     try:
+        if args.action == "inventory":
+            return _inventory_command(args)
+        if args.action == "browser-links":
+            return _browser_links_command(args)
         if args.action == "verify-export":
             return _verify_export_command(args)
+        if args.action == "serve":
+            # library_serve imports this module, so the import waits until the command runs.
+            from .library_serve import serve as serve_library  # noqa: PLC0415
+
+            serve_library(configured_store(args.store_root), host=args.host, port=args.port)
+            return 0
         if args.action in {"export", "export-cards"}:
             # The export is the library's text as plaintext (all of it, or a card per record):
             # authorise where it lands before the library or the reviewed envelope is read.
