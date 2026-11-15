@@ -44,19 +44,32 @@ _WHOLE: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("anthropic-key", re.compile(_LEFT + r"sk-ant-[A-Za-z0-9_\-]{20,}")),
     (
         "openai-key",
-        # Needs a digit in the body so words such as ``sk-learn-pipeline-...`` stay readable.
+        # Needs a digit and a 16-character unbroken run so ``sk-learn-pipeline-2-stage-...`` stays readable.
         re.compile(
-            _LEFT + r"sk-(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_\-]*\d)[A-Za-z0-9_\-]{20,}"
+            _LEFT
+            + r"sk-(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_\-]*\d)(?=[A-Za-z0-9_\-]*[A-Za-z0-9_]{16})"
+            r"[A-Za-z0-9_\-]{20,}"
         ),
     ),
     ("stripe-key", re.compile(_LEFT + r"(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}")),
     ("stripe-webhook", re.compile(_LEFT + r"whsec_[A-Za-z0-9]{16,}")),
     ("slack-token", re.compile(_LEFT + r"xox[abeprs]-[A-Za-z0-9\-]{10,}")),
     ("slack-app-token", re.compile(_LEFT + r"xapp-\d-[A-Za-z0-9\-]{10,}")),
+    ("npm-token", re.compile(_LEFT + r"npm_[A-Za-z0-9]{36}" + _RIGHT)),
+    ("gitlab-pat", re.compile(_LEFT + r"glpat-[A-Za-z0-9_\-]{20,}")),
+    ("huggingface-token", re.compile(_LEFT + r"hf_[A-Za-z0-9]{30,}")),
+    (
+        "sendgrid-key",
+        re.compile(_LEFT + r"SG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}"),
+    ),
+    ("twilio-key", re.compile(_LEFT + r"SK[0-9a-f]{32}" + _RIGHT)),
+    ("azure-account-key", re.compile(r"(?<=AccountKey=)[A-Za-z0-9+/]{40,}={0,2}")),
 )
 
-_PEM_BEGIN = re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----")
-_PEM_END = re.compile(r"-----END (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----")
+_PEM_BEGIN = re.compile(
+    r"-----BEGIN\s+(?:[A-Z0-9]+\s+)*PRIVATE\s+KEY(?:\s+BLOCK)?-----", re.IGNORECASE
+)
+_PEM_END = re.compile(r"-----END\s+(?:[A-Z0-9]+\s+)*PRIVATE\s+KEY(?:\s+BLOCK)?-----", re.IGNORECASE)
 # Key-like body after the BEGIN line. Encrypted blocks put ``Name: value`` header lines first.
 _PEM_BODY = re.compile(r"(?:\s*[A-Za-z][A-Za-z0-9\-]*:[^\n]*\n)*\s*[A-Za-z0-9+/]{16}")
 
@@ -107,8 +120,18 @@ _URL_PASSWORD = re.compile(
 _URL_PLACEHOLDER = re.compile(r"^(?:\$|<|\{|%[A-Za-z_][A-Za-z0-9_]*%|\[REDACTED)")
 _NAME = (
     r"[A-Za-z0-9_.\-]{0,40}(?:api[\s_\-]?key|secret[\s_\-]key|secret|token|passwd|password|passphrase"
-    r"|access[\s_\-]?key|private[\s_\-]?key|auth[\s_\-]?key|credential)"
+    r"|pwd|(?<![A-Za-z0-9])pass|access[\s_\-]?key|private[\s_\-]?key|auth[\s_\-]?key|credential)"
     r"[A-Za-z0-9_.\-]{0,40}"
+)
+# A name that ends in one of these words labels metadata about a credential, not the credential.
+_META_SUFFIX = re.compile(
+    r"[_.\-](?:hash|id|name|file|path|dir|url|uri|type|count|length|len|version|ttl|expiry|expires"
+    r"|expiration|endpoint)$",
+    re.IGNORECASE,
+)
+_PATH_VALUE = re.compile(r"^(?:/|\./|\.\./|~/)")
+_IDENT_VALUE = re.compile(
+    r"^(?:[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+|[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+)$"
 )
 _GENERIC = re.compile(
     r"(?P<head>(?<![A-Za-z0-9_])" + _NAME + r"[\"'`]?\s*[:=]\s*[\"'`]?)"
@@ -178,9 +201,17 @@ def _entropy(value: str) -> float:
 def _generic_value_is_secret(value: str) -> bool:
     if _PLACEHOLDER.match(value) or MARKER in value:
         return False
+    if _PATH_VALUE.match(value) or _IDENT_VALUE.match(value):
+        return False
     if not (re.search(r"\d", value) and re.search(r"[A-Za-z]", value)):
         return False
     return _entropy(value) >= 3.0
+
+
+def _head_names_metadata(head: str) -> bool:
+    """Whether a matched ``name: `` head names metadata (``token_hash``, ``secret_name``)."""
+    name = re.sub(r"[\s\"'`:=]+$", "", head)
+    return _META_SUFFIX.search(name) is not None
 
 
 def _quoted_value_is_secret(value: str) -> bool:
@@ -211,7 +242,7 @@ def _auth_value_is_secret(scheme: str, value: str) -> bool:
 # Cheap necessary condition for every rule above: most text carries none of these and returns early.
 _TRIGGER = re.compile(
     r"AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA|gh[pousr]_|github_pat_|AIza|ya29\.|AQ\.|sk-|sk_|rk_"
-    r"|whsec_|xox|xapp-|eyJ|-----BEGIN|bearer|authorization|://|api|key|secret|token|pass|credential",
+    r"|whsec_|xox|xapp-|npm_|glpat-|hf_|SG\.|sk[0-9a-f]{32}|eyJ|-----BEGIN|bearer|authorization|://|api|key|secret|token|pass|pwd|credential",
     re.IGNORECASE,
 )
 
@@ -326,7 +357,7 @@ def _view(text: str) -> tuple[str, list[tuple[int, int]] | None]:
 def _credential_spans(text: str) -> list[tuple[int, int]]:
     """Every credential span of the detection view, as half-open (start, end) offsets."""
     spans: list[tuple[int, int]] = []
-    if "-----BEGIN" in text:
+    if "-----begin" in text.lower():
         spans.extend(_pem_spans(text))
     for _name, pattern in _WHOLE:
         spans.extend(match.span() for match in pattern.finditer(text))
@@ -339,10 +370,14 @@ def _credential_spans(text: str) -> list[tuple[int, int]]:
         if not _URL_PLACEHOLDER.match(value) and MARKER not in value:
             spans.append(match.span("value"))
     for match in _GENERIC_QUOTED.finditer(text):
-        if _quoted_value_is_secret(match.group("value")):
+        if _quoted_value_is_secret(match.group("value")) and not _head_names_metadata(
+            match.group("head")
+        ):
             spans.append(match.span("value"))
     for match in _GENERIC.finditer(text):
-        if _generic_value_is_secret(match.group("value")):
+        if _generic_value_is_secret(match.group("value")) and not _head_names_metadata(
+            match.group("head")
+        ):
             spans.append(match.span("value"))
     return spans
 
@@ -422,7 +457,8 @@ def mask_conversation(conversation: object) -> int:
             else:
                 holder = {key: extra[key]}
                 changed += _mask_json(holder)
-                extra[key] = holder[key]
+                extra[key] = next(iter(holder.values()))
+        changed += _mask_keys(extra)
     changed += _mask_json(getattr(conversation, "provenance", None))
     return changed
 
@@ -493,6 +529,28 @@ def _mask_keyed_string(key: object, item: str) -> str:
     return mask_credentials(item)
 
 
+def _mask_keys(container: dict) -> int:
+    """Rename dictionary keys that hold a credential; keep order, never drop a colliding value."""
+    renames = {
+        key: masked
+        for key in container
+        if isinstance(key, str) and (masked := mask_credentials(key)) != key
+    }
+    if not renames:
+        return 0
+    rebuilt: dict = {}
+    for key, item in container.items():
+        new = renames.get(key, key)
+        base, n = new, 1
+        while new in rebuilt:
+            n += 1
+            new = f"{base}#{n}"
+        rebuilt[new] = item
+    container.clear()
+    container.update(rebuilt)
+    return len(renames)
+
+
 def _mask_json(value: object) -> int:
     """Mask every string inside a JSON-like container in place; return how many changed.
 
@@ -509,6 +567,7 @@ def _mask_json(value: object) -> int:
                     changed += 1
             else:
                 changed += _mask_json(item)
+        changed += _mask_keys(value)
     elif isinstance(value, list):
         for index, item in enumerate(value):
             if isinstance(item, str):
