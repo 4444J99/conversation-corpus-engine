@@ -66,6 +66,41 @@
         }
       }
     },
+    "commercial_bridge": {
+      "type": "object",
+      "required": [
+        "horizon",
+        "source_organ",
+        "target_organ",
+        "target_repo",
+        "consumes",
+        "expected_output_signal",
+        "readiness_command"
+      ],
+      "properties": {
+        "horizon": {
+          "type": "string"
+        },
+        "source_organ": {
+          "type": "string"
+        },
+        "target_organ": {
+          "type": "string"
+        },
+        "target_repo": {
+          "type": "string"
+        },
+        "consumes": {
+          "type": "array"
+        },
+        "expected_output_signal": {
+          "type": "string"
+        },
+        "readiness_command": {
+          "type": "string"
+        }
+      }
+    },
     "schemas": {
       "type": "array",
       "items": {

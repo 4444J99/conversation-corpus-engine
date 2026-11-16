@@ -349,6 +349,85 @@ def test_main_surface_bundle_prints_json_payload(
     assert payload["source_drop_root"] == str(tmp_path / "drop")
 
 
+def test_main_commercial_h1_writes_contract_and_prints_json(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    calls: dict[str, object] = {}
+
+    def fake_build_commercial_h1_readiness(
+        project_root: Path, source_drop_root: Path | None = None
+    ) -> dict[str, object]:
+        calls["build"] = (project_root, source_drop_root)
+        return {
+            "contract_name": "conversation-corpus-engine-commercial-h1-readiness-v1",
+            "summary": {"commercial_h1_repo_ready": True},
+        }
+
+    def fake_write_commercial_h1_artifacts(
+        project_root: Path, payload: dict[str, object]
+    ) -> dict[str, str]:
+        calls["write"] = (project_root, payload)
+        return {"json_path": str(project_root / "reports" / "commercial.json")}
+
+    monkeypatch.setattr(
+        MODULE,
+        "build_commercial_h1_readiness",
+        fake_build_commercial_h1_readiness,
+    )
+    monkeypatch.setattr(
+        MODULE,
+        "write_commercial_h1_artifacts",
+        fake_write_commercial_h1_artifacts,
+    )
+
+    _run_main(
+        monkeypatch,
+        [
+            "commercial",
+            "h1",
+            "--project-root",
+            str(tmp_path / "project"),
+            "--source-drop-root",
+            str(tmp_path / "drop"),
+            "--write",
+            "--json",
+        ],
+    )
+    payload = json.loads(capsys.readouterr().out)
+
+    assert calls["build"] == (tmp_path / "project", tmp_path / "drop")
+    assert calls["write"] == (
+        tmp_path / "project",
+        {
+            "contract_name": "conversation-corpus-engine-commercial-h1-readiness-v1",
+            "summary": {"commercial_h1_repo_ready": True},
+        },
+    )
+    assert payload["artifacts_written"]["json_path"].endswith("commercial.json")
+
+
+def test_main_mcp_serve_delegates_to_stdio_server(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: dict[str, object] = {}
+
+    class FakeServer:
+        def __init__(self, *, default_project_root: Path) -> None:
+            calls["serve"] = default_project_root
+
+        def serve_stdio(self) -> None:
+            calls["served"] = True
+
+    # main's mcp_server exposes the stdio loop as CceMcpServer.serve_stdio;
+    # the branch's module-level serve_stdio was replaced by that class.
+    monkeypatch.setattr(MODULE, "CceMcpServer", FakeServer)
+
+    _run_main(monkeypatch, ["mcp", "serve", "--project-root", str(tmp_path)])
+
+    assert calls["serve"] == tmp_path
+    assert calls["served"] is True
+
+
 def test_main_policy_replay_passes_threshold_overrides_and_writes_artifacts(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:

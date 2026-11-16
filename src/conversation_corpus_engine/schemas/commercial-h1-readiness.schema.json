@@ -1,0 +1,235 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CCE Commercial H1 Readiness",
+  "type": "object",
+  "required": [
+    "contract_name",
+    "contract_version",
+    "generated_at",
+    "project_root",
+    "source_drop_root",
+    "summary",
+    "package",
+    "mcp_distribution",
+    "interface_contract",
+    "signal_chain",
+    "h1_actions",
+    "audience_offer",
+    "gate_evidence"
+  ],
+  "properties": {
+    "contract_name": {
+      "const": "conversation-corpus-engine-commercial-h1-readiness-v1"
+    },
+    "contract_version": {
+      "type": "integer"
+    },
+    "generated_at": {
+      "type": "string"
+    },
+    "project_root": {
+      "type": "string"
+    },
+    "source_drop_root": {
+      "type": "string"
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "horizon",
+        "repo_action_count",
+        "repo_ready_action_count",
+        "external_action_count",
+        "commercial_h1_repo_ready",
+        "external_actions_remaining"
+      ],
+      "properties": {
+        "horizon": {
+          "type": "string"
+        },
+        "repo_action_count": {
+          "type": "integer"
+        },
+        "repo_ready_action_count": {
+          "type": "integer"
+        },
+        "external_action_count": {
+          "type": "integer"
+        },
+        "commercial_h1_repo_ready": {
+          "type": "boolean"
+        },
+        "external_actions_remaining": {
+          "type": "integer"
+        }
+      }
+    },
+    "package": {
+      "type": "object",
+      "required": [
+        "metadata",
+        "readiness"
+      ],
+      "properties": {
+        "metadata": {
+          "type": "object"
+        },
+        "readiness": {
+          "type": "object",
+          "required": [
+            "checks",
+            "pypi_ready",
+            "mcp_distribution_ready"
+          ],
+          "properties": {
+            "checks": {
+              "type": "object"
+            },
+            "pypi_ready": {
+              "type": "boolean"
+            },
+            "mcp_distribution_ready": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "mcp_distribution": {
+      "type": "object",
+      "required": [
+        "extra",
+        "pipx_install",
+        "scripts",
+        "serve_command",
+        "tools"
+      ],
+      "properties": {
+        "extra": {
+          "type": "string"
+        },
+        "pipx_install": {
+          "type": "string"
+        },
+        "scripts": {
+          "type": "array"
+        },
+        "serve_command": {
+          "type": "string"
+        },
+        "tools": {
+          "type": "array"
+        }
+      }
+    },
+    "interface_contract": {
+      "type": "object",
+      "required": [
+        "source_organ",
+        "source_repo",
+        "target_organ",
+        "target_repo",
+        "formation_type",
+        "consumes",
+        "expected_output_signal",
+        "unidirectional_flow",
+        "engine_artifacts"
+      ],
+      "properties": {
+        "source_organ": {
+          "type": "string"
+        },
+        "source_repo": {
+          "type": "string"
+        },
+        "target_organ": {
+          "type": "string"
+        },
+        "target_repo": {
+          "type": "string"
+        },
+        "formation_type": {
+          "type": "string"
+        },
+        "consumes": {
+          "type": "array"
+        },
+        "expected_output_signal": {
+          "type": "string"
+        },
+        "unidirectional_flow": {
+          "type": "array"
+        },
+        "engine_artifacts": {
+          "type": "object"
+        }
+      }
+    },
+    "signal_chain": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "from",
+          "signal",
+          "to",
+          "artifact"
+        ],
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "signal": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          },
+          "artifact": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "h1_actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "status",
+          "repo_owned",
+          "evidence",
+          "next_action"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "repo_owned": {
+            "type": "boolean"
+          },
+          "evidence": {
+            "type": "array"
+          },
+          "next_action": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "audience_offer": {
+      "type": "object"
+    },
+    "gate_evidence": {
+      "type": "object"
+    }
+  }
+}

@@ -55,6 +55,10 @@ SCHEMA_CATALOG = {
         "filename": "surface-bundle.schema.json",
         "description": "Bundle of exported surface artifacts plus validation results.",
     },
+    "commercial-h1-readiness": {
+        "filename": "commercial-h1-readiness.schema.json",
+        "description": "Commercial architecture H1 readiness contract and external action ledger.",
+    },
 }
 
 

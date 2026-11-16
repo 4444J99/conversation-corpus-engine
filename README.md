@@ -20,6 +20,8 @@ It owns:
 - provider refresh orchestration across import, evaluation, candidate staging, and optional promotion
 - publishable JSON schemas and repo-native artifact validation
 - Meta/MCP-facing surface manifests and export bundles
+- read-only MCP stdio tools for corpus search and provider readiness
+- commercial H1 readiness contracts for the ORGAN-II surface bridge
 - commercial-awareness metadata for pipeline and surface consumers
 
 It does not own raw intake routing or system-wide discovery contracts. Those belong in Meta integrations such as `alchemia-ingestvm`, `schema-definitions`, `organvm-engine`, and `organvm-mcp-server`.
@@ -31,6 +33,8 @@ CCE is the institutional memory and product-scale side of the ORGANVM income sur
 The personal-capacity counterpart is [`4444J99/application-pipeline`](https://github.com/4444J99/application-pipeline), whose jobs, grants/residencies, and consulting tracks supply near-term income, market feedback, and enterprise-service leads for CCE Ring 4. This backlink closes `IRF-CCE-038` on the CCE side: the two repos should stay commercially aware of one another rather than treating pipeline revenue and CCE product revenue as separate strategies.
 
 ## Install
+
+For local development:
 
 ```bash
 pip install -e ".[dev]"
@@ -57,7 +61,6 @@ the command:
   }
 }
 ```
-
 ## License
 
 MIT
@@ -85,6 +88,8 @@ cce schema validate corpus-contract --path /path/to/corpus/contract.json
 cce surface manifest --project-root /path/to/project --source-drop-root /path/to/source-drop
 cce surface context --project-root /path/to/project --source-drop-root /path/to/source-drop
 cce surface bundle --project-root /path/to/project --source-drop-root /path/to/source-drop
+cce mcp serve --project-root /path/to/project
+cce commercial h1 --project-root /path/to/project --source-drop-root /path/to/source-drop --write
 cce source-policy set --project-root /path/to/project --provider claude --primary-root /path/to/corpus --primary-corpus-id claude-local-session-memory
 cce policy replay --project-root /path/to/project --set-threshold max_stale_corpora=1 --write
 cce policy stage --project-root /path/to/project --set-threshold max_stale_corpora=1 --note "allow one stale corpus during migration"
@@ -302,6 +307,8 @@ When started with `--library-store-root` (or `CCE_LIBRARY_STORE_ROOT`), it also 
 - `src/conversation_corpus_engine/provider_readiness.py` — provider lane readiness and report writing
 - `src/conversation_corpus_engine/schema_validation.py` — published schema catalog and lightweight JSON validation
 - `src/conversation_corpus_engine/surface_exports.py` — Meta/MCP-facing manifest and context export layer
+- `src/conversation_corpus_engine/mcp_server.py` — read-only MCP stdio server for federated search and readiness tools
+- `src/conversation_corpus_engine/commercial_architecture.py` — commercial H1 readiness and bridge-contract artifacts
 - `src/conversation_corpus_engine/schemas/` — installable JSON-schema contracts for canonical artifacts
 - `src/conversation_corpus_engine/evaluation.py` — seeded/manual evaluation, scorecards, and regression gates
 - `src/conversation_corpus_engine/evaluation_bootstrap.py` — provider-aware evaluation bootstrap and report generation
@@ -324,6 +331,8 @@ When started with `--library-store-root` (or `CCE_LIBRARY_STORE_ROOT`), it also 
 
 Runtime state is written to `state/`, `federation/`, and `reports/`. Those directories are intentionally ignored so the repo stays focused on canonical code, contracts, tests, and public documentation.
 
+Commercial H1 readiness is written under `reports/commercial/` when `cce commercial h1 --write` is used. The generated contract separates repo-owned readiness from external actions such as PyPI upload, Hacker News posting, ORGAN-II repo creation, landing-page publishing, and paid-tier enablement.
+
 ## Status
 
-This repo now serves as the canonical Organ I home of the conversation corpus system. The adjacent Meta consumer path is also live: `schema-definitions` canonizes the outward contracts, `organvm-engine` discovers and validates emitted surface bundles, and `organvm-mcp-server` exposes them to agent sessions. Operational hardening is underway: CI gates all pushes, ChatGPT is a first-class provider alongside Claude/Gemini/Grok/Perplexity/Copilot, and sanitized test fixtures document the expected export formats. Archive provider readers (including Copilot SingleFile research pages) are complete and CI-green on main. The unified private knowledge library (PR #86) adds versioned records, bounded retrieval, and portable exports over the existing archive and selected documents; see docs/knowledge-library.md. Library builds emit per-phase progress events with elapsed times and numbered byte-limit diagnostics. The next frontier is downstream dashboard consumption and additional provider adapters.
+This repo now serves as the canonical Organ I home of the conversation corpus system. The adjacent Meta consumer path is also live: `schema-definitions` canonizes the outward contracts, `organvm-engine` discovers and validates emitted surface bundles, and `organvm-mcp-server` exposes them to agent sessions. CCE also exposes its own read-only MCP stdio server and an H1 commercial readiness contract for the `conversation-corpus--surfaces` bridge. Operational hardening is underway: CI gates all pushes, ChatGPT is a first-class provider alongside Claude/Gemini/Grok/Perplexity/Copilot, and sanitized test fixtures document the expected export formats. Archive provider readers (including Copilot SingleFile research pages) are complete and CI-green on main. The unified private knowledge library (PR #86) adds versioned records, bounded retrieval, and portable exports over the existing archive and selected documents; see docs/knowledge-library.md. Library builds emit per-phase progress events with elapsed times and numbered byte-limit diagnostics. The next frontier is downstream dashboard consumption and additional provider adapters.

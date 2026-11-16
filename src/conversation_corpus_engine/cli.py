@@ -25,6 +25,11 @@ from .chatgpt_local_session import (
     set_project_route,
     sync_chatgpt_projects,
 )
+from .commercial_architecture import (
+    build_commercial_h1_readiness,
+    render_commercial_h1_readiness,
+    write_commercial_h1_artifacts,
+)
 from .corpus_candidates import (
     corpus_candidate_history_path,
     load_corpus_candidate_manifest,
@@ -52,6 +57,7 @@ from .governance_candidates import (
 from .governance_policy import load_or_create_promotion_policy
 from .governance_replay import build_policy_replay_payload, write_policy_replay_artifacts
 from .library_commands import add_library_parser, handle_library
+from .mcp_server import CceMcpServer
 from .migration import migrate_corpus_v2, seed_registry_from_staging
 from .paths import default_project_root
 from .persona_extract import extract_persona_lexicon, write_persona_extract_artifacts
@@ -411,6 +417,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     surface_bundle.add_argument("--project-root", type=Path, default=default_project_root())
     surface_bundle.add_argument("--source-drop-root", type=Path)
+
+    mcp = subparsers.add_parser("mcp", help="Serve read-only CCE tools over MCP")
+    mcp_sub = mcp.add_subparsers(dest="action", required=True)
+    mcp_serve = mcp_sub.add_parser("serve", help="Run the stdio MCP server")
+    mcp_serve.add_argument("--project-root", type=Path, default=default_project_root())
+
+    commercial = subparsers.add_parser("commercial", help="Commercial architecture readiness")
+    commercial_sub = commercial.add_subparsers(dest="action", required=True)
+    commercial_h1 = commercial_sub.add_parser(
+        "h1",
+        help="Build the commercial H1 readiness contract and external action ledger",
+    )
+    commercial_h1.add_argument("--project-root", type=Path, default=default_project_root())
+    commercial_h1.add_argument("--source-drop-root", type=Path)
+    commercial_h1.add_argument("--write", action="store_true")
+    commercial_h1.add_argument("--json", action="store_true")
 
     source_policy = subparsers.add_parser(
         "source-policy", help="Manage provider source authority policies"
@@ -1140,6 +1162,32 @@ def main() -> None:
             source_drop_root=args.source_drop_root,
         )
         print(json.dumps(payload, indent=2))
+        return
+
+    if args.group == "mcp" and args.action == "serve":
+        # main's mcp_server exposes the stdio loop as CceMcpServer.serve_stdio;
+        # the branch's module-level serve_stdio was replaced by that class.
+        CceMcpServer(default_project_root=args.project_root).serve_stdio()
+        return
+
+    if args.group == "commercial" and args.action == "h1":
+        payload = build_commercial_h1_readiness(
+            args.project_root,
+            source_drop_root=args.source_drop_root,
+        )
+        artifacts: dict[str, str] = {}
+        if args.write:
+            artifacts = write_commercial_h1_artifacts(args.project_root, payload)
+            payload = {**payload, "artifacts_written": artifacts}
+        if args.json:
+            print(json.dumps(payload, indent=2))
+            return
+        print(render_commercial_h1_readiness(payload))
+        if artifacts:
+            print("")
+            print("Artifacts:")
+            for path in artifacts.values():
+                print(f"- {path}")
         return
 
     if args.group == "source-policy" and args.action == "show":
