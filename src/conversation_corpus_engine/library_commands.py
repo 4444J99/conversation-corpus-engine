@@ -760,6 +760,13 @@ def add_library_parser(subparsers: Any) -> Any:
         help="Folder of Google Docs already exported as Markdown or text (repeatable), for "
         "example `rclone copy REMOTE: DIR --drive-export-formats md`",
     )
+    capture.add_argument(
+        "--google-docs-ids",
+        type=Path,
+        help="JSON list printed by `rclone lsjson -R --files-only --drive-export-formats md "
+        "REMOTE:`; gives each exported Doc its Drive file id, so a Doc the library already holds "
+        "from Drive becomes a new revision of that record instead of a second record",
+    )
     inventory = sub.add_parser(
         "inventory",
         help="Inventory native coding-agent sessions into the database a manifest names under "
@@ -1207,6 +1214,7 @@ def _capture_notes_docs_command(args: argparse.Namespace) -> int:
         notes_store=None if args.no_notes else args.notes_store,
         drive_roots=args.drive_root,
         google_docs_exports=args.google_docs_export,
+        google_docs_ids=args.google_docs_ids,
     )
     print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
