@@ -631,3 +631,58 @@ def test_two_sources_cannot_claim_the_same_identity(tmp_path):
     records = list(iter_documents([first, second], report=report))
     assert [r.provider for r in records] == ["applenotes", "documents"]
     assert [f["code"] for f in report["findings"]] == ["identity_claimed_twice"]
+
+
+def test_a_retained_note_keeps_its_identity_after_it_leaves_the_source(store, tmp_path):
+    out = tmp_path / "out"
+    notes_capture.capture_notes_and_docs(out, notes_store=store)
+    connection = sqlite3.connect(store)
+    connection.execute("UPDATE ZICCLOUDSYNCINGOBJECT SET ZMARKEDFORDELETION = 1 WHERE Z_PK = 10")
+    connection.commit()
+    connection.close()
+    receipt = notes_capture.capture_notes_and_docs(out, notes_store=store)
+    assert receipt["counts"]["notes_retained_not_in_source"] == 1
+    entry = next(e for e in receipt["manifest_entries"] if e["id"] == "apple-notes")
+    records = {r.title: r for r in iter_documents([entry], report={})}
+    assert set(records) == {"Tide", "Pasted", "Attach"}  # the retained note keeps its title
+    assert records["Tide"].provider == "applenotes"  # and its identity
+
+
+def test_an_id_list_cannot_label_the_text_of_a_path_two_roots_share(tmp_path):
+    first, second = tmp_path / "one", tmp_path / "two"
+    for root, body in ((first, "from one\n"), (second, "from two\n")):
+        root.mkdir()
+        (root / "Plan.md").write_text(body)
+    (first / "Solo.md").write_text("solo\n")
+    ids = _ids(
+        tmp_path,
+        [
+            {"Path": "Plan.md", "ID": "1AbCdEfGhIjKlMnOp", "IsDir": False},
+            {"Path": "Solo.md", "ID": "2ZyXwVuTsRqPoNmLk", "IsDir": False},
+        ],
+    )
+    receipt = notes_capture.capture_notes_and_docs(
+        tmp_path / "out", google_docs_exports=[first, second], google_docs_ids=ids
+    )
+    assert receipt["counts"]["gdocs_with_drive_id"] == 1  # only the unambiguous Solo.md
+    entry = next(e for e in receipt["manifest_entries"] if e["id"] == "google-docs")
+    providers = {r.title: r.provider for r in iter_documents([entry], report={})}
+    assert providers == {"Plan": "documents", "Solo": "googledrive"}
+
+
+def test_an_identity_is_reserved_only_when_a_file_uses_it(tmp_path):
+    root = tmp_path / "shared"
+    root.mkdir()
+    (root / "a.md").write_text("text a\n")
+    (root / "b.md").write_text("text b\n")
+    rows = [
+        {"path": "a.md", "title": "A", "provider": "applenotes", "source_id": "ID-AAAAAAA"},
+        {"path": "b.md", "title": "B", "provider": "applenotes", "source_id": "ID-BBBBBBB"},
+    ]
+    (root / "idx.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    first = {"id": "one", "root": str(root), "include": ["a.md"], "identities": "idx.jsonl"}
+    second = {"id": "two", "root": str(root), "include": ["b.md"], "identities": "idx.jsonl"}
+    report: dict = {}
+    records = list(iter_documents([first, second], report=report))
+    assert [(r.title, r.provider) for r in records] == [("A", "applenotes"), ("B", "applenotes")]
+    assert report["findings"] == []

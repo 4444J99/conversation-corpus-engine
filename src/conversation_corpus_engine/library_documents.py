@@ -229,9 +229,7 @@ _IDENTITY_TIME = re.compile(r"\d{4}-\d{2}-\d{2}(?:T[0-9:.+\-Z]+)?")
 _IDENTITY_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
-def _load_identities(
-    root: Path, name: str, report: dict, source_id: str, claimed: set[tuple[str, str]]
-) -> dict[str, dict]:
+def _load_identities(root: Path, name: str, report: dict, source_id: str) -> dict[str, dict]:
     """The identity rows of one source: relative path -> {provider, source_id, title, ...}.
 
     The index is a JSON Lines file inside the root, opened without following links and read
@@ -240,6 +238,7 @@ def _load_identities(
     """
     path = root / name
     rows: dict[str, dict] = {}
+    claimed: set[tuple[str, str]] = set()  # within this one index; across sources see `_record`
     try:
         # O_NOFOLLOW covers only the last component: every folder on the way must be a real one.
         walked = root
@@ -292,7 +291,10 @@ def _load_identities(
         except (ValueError, KeyError, TypeError, RecursionError):
             _finding(report, source_id, f"{name}:{number}", "identity_row_refused")
             continue
-        if (provider is not None and (provider, identity) in claimed) or relative in rows:
+        if provider is not None and (provider, identity) in claimed:
+            _finding(report, source_id, f"{name}:{number}", "identity_claimed_twice")
+            continue
+        if relative in rows:
             _finding(report, source_id, f"{name}:{number}", "identity_claimed_twice")
             continue
         if provider is not None:
@@ -340,7 +342,7 @@ def _validate_sources(sources: list[dict]) -> None:
         maximum = source.get("max_bytes", DEFAULT_MAX_BYTES)
         if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
             raise ValueError(f"source {source['id']} max_bytes must be a positive integer")
-        if "_identities" in source:
+        if "_identities" in source or "_claimed" in source:
             raise ValueError(f"source {source['id']} may not carry a reserved key")
         identities = source.get("identities")
         if identities is not None and (
@@ -837,6 +839,16 @@ def _record(path: Path, root: Path, source: dict, report: dict) -> Conversation 
         "reader_version": READER_VERSION,
     }
     named = source.get("_identities", {}).get(relative)
+    if named and "provider" in named:
+        # An identity is reserved when a file actually uses it, so an index row no file selects
+        # never blocks another source; a second user falls back to its default identity.
+        key = (named["provider"], named["source_id"])
+        claimed = source["_claimed"]
+        if key in claimed:
+            _finding(report, source["id"], relative, "identity_claimed_twice")
+            named = {"title": named["title"]}
+        else:
+            claimed.add(key)
     return Conversation(
         provider=named.get("provider", "documents") if named else "documents",
         source_id=named.get("source_id", f"file-{identity}") if named else f"file-{identity}",
@@ -898,9 +910,8 @@ def iter_documents(sources: list[dict], *, report: dict | None = None) -> Iterat
         if source.get("identities"):
             source = {  # noqa: PLW2901
                 **source,
-                "_identities": _load_identities(
-                    root, source["identities"], report, source["id"], claimed_identities
-                ),
+                "_identities": _load_identities(root, source["identities"], report, source["id"]),
+                "_claimed": claimed_identities,
             }
 
         def walk_error(

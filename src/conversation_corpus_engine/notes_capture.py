@@ -65,6 +65,7 @@ GDOCS_INDEX_NAME = "gdocs-index.jsonl"
 MAX_GDOCS = 200_000
 GDOC_SUFFIXES = (".md", ".txt")
 MAX_ID_LIST_BYTES = 64 * 1024 * 1024
+MAX_INDEX_BYTES = 64 * 1024 * 1024
 _DRIVE_ID = re.compile(r"[A-Za-z0-9_-]{10,200}")
 NOTES_FOLDER = "notes"
 DOCS_FOLDER = "docs"
@@ -692,7 +693,12 @@ def refuse_overlap(destination: Path, *source_groups: list[Path]) -> None:
                 raise ValueError("destination overlaps a source folder; choose a separate one")
 
 
-def collect_google_docs(roots: list[Path], counts: Counter[str], findings: list[dict[str, Any]]):
+def collect_google_docs(
+    roots: list[Path],
+    counts: Counter[str],
+    findings: list[dict[str, Any]],
+    ambiguous: set[str] | None = None,
+):
     """The text of every exported Google Doc under ``roots``: (relative path, cleaned text).
 
     The folders hold Docs exported as Markdown or plain text by a Drive export tool (such as
@@ -751,6 +757,9 @@ def collect_google_docs(roots: list[Path], counts: Counter[str], findings: list[
                     # Two export folders hold the same relative path: the first one is kept, the
                     # second is counted and named by code, never dropped without a trace.
                     counts["gdocs_skipped_duplicate_path"] += 1
+                    if ambiguous is not None:
+                        # The kept text is one root's, an id list may be another's: no id.
+                        ambiguous.add(relative)
                     _find(findings, "google_doc_duplicate_path")
                     continue
                 found[relative] = (Path(entry.name).stem, text)
@@ -946,6 +955,39 @@ def _write_stubs(stubs: dict[str, _Stub], destination: Path, counts: Counter[str
     return current
 
 
+def _merged_index(path: Path, rows: list[dict[str, Any]]) -> bytes:
+    """The sidecar index: the current rows, plus the earlier row of every file that is retained.
+
+    A retained file stays selected by the manifest, so it must keep the title and identity it
+    had; an earlier row is kept only for a path no current row names.
+    """
+    current = {row["path"] for row in rows}
+    merged = list(rows)
+    try:
+        previous = _existing(path)
+    except (OSError, ValueError):
+        previous = None
+    if previous is not None and len(previous) <= MAX_INDEX_BYTES:
+        for line in previous.splitlines():
+            try:
+                row = json.loads(line)
+            except (ValueError, RecursionError):
+                continue
+            name = row.get("path") if isinstance(row, dict) else None
+            if (
+                isinstance(name, str)
+                and not name.startswith("/")
+                and ".." not in name.split("/")
+                and name not in current
+                and (path.parent / name).is_file()
+            ):
+                merged.append(row)
+    return "".join(
+        json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+        for row in sorted(merged, key=lambda item: str(item.get("identifier", "")))
+    ).encode("utf-8")
+
+
 def _retained(destination: Path, folder: str, current: set[str]) -> int:
     root = destination / folder
     _no_symlinks(root)
@@ -1030,9 +1072,12 @@ def capture_notes_and_docs(
     gdoc_index: list[dict[str, Any]] = []
     if exports:
         counts.update(dict.fromkeys(_GDOC_COUNTS, 0))
-        found = collect_google_docs(exports, counts, findings)
+        ambiguous_paths: set[str] = set()
+        found = collect_google_docs(exports, counts, findings, ambiguous_paths)
         sources.append({"source": "google-docs-export", "roots": len(exports)})
         ids = read_drive_ids(google_docs_ids, counts, findings) if google_docs_ids else None
+        if ids:
+            ids = {name: value for name, value in ids.items() if name not in ambiguous_paths}
         current_gdocs, gdoc_index = _write_google_docs(found, destination, counts, ids)
         entries.append(google_docs_entry(destination))
 
@@ -1040,19 +1085,13 @@ def capture_notes_and_docs(
     if exports:
         _write_atomic(
             destination / GDOCS_INDEX_NAME,
-            "".join(
-                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
-                for row in sorted(gdoc_index, key=lambda item: item["identifier"])
-            ).encode("utf-8"),
+            _merged_index(destination / GDOCS_INDEX_NAME, gdoc_index),
         )
         counts["gdocs_retained_not_in_source"] = _retained(destination, GDOCS_FOLDER, current_gdocs)
     if notes_store is not None:
         _write_atomic(
             destination / INDEX_NAME,
-            "".join(
-                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
-                for row in sorted(index, key=lambda item: item["identifier"])
-            ).encode("utf-8"),
+            _merged_index(destination / INDEX_NAME, index),
         )
         counts["notes_retained_not_in_source"] = _retained(destination, NOTES_FOLDER, current_notes)
     if roots:
