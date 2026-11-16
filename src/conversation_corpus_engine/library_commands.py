@@ -43,6 +43,7 @@ from .library_vault import VAULT_PROFILES
 from .library_vault_gate import describe_findings, measure_vault
 from .library_zettel_files import authorize_destination as authorize_zettel_destination
 from .library_zettel_notes import export_zettel_notes
+from .notes_capture import DEFAULT_NOTES_STORE, capture_notes_and_docs
 from .origin_hints import load_origin_hints
 from .paths import default_project_root
 from .persona_extract import extract_persona_lexicon
@@ -714,6 +715,43 @@ def add_library_parser(subparsers: Any) -> Any:
         default=[],
         help="Skip a host and its subdomains (repeatable)",
     )
+    capture = sub.add_parser(
+        "capture-notes-docs",
+        help="Capture Apple Notes and Google Drive documents read-only into notes a documents "
+        "root reads",
+        description=(
+            "Copy the Apple Notes database (read only, into a private temporary directory that is "
+            "deleted afterwards), decode each note's text and write one file per note under a "
+            "private directory, plus a sidecar index. Google Drive for desktop shortcuts become "
+            "metadata-only notes. The receipt holds the `documents` manifest entries that read "
+            "the result. No application is opened and no source is written to."
+        ),
+    )
+    capture.add_argument("--json", action="store_true", help="JSON is the default output")
+    capture.add_argument(
+        "--out",
+        type=Path,
+        required=True,
+        help="Private directory, outside every Git work tree or ignored by it; new, or an "
+        "earlier capture",
+    )
+    capture.add_argument(
+        "--notes-store",
+        type=Path,
+        default=DEFAULT_NOTES_STORE,
+        help="Apple Notes database (NoteStore.sqlite); default: the current user's",
+    )
+    capture.add_argument(
+        "--no-notes", action="store_true", help="Skip Apple Notes (Drive documents only)"
+    )
+    capture.add_argument(
+        "--drive-root",
+        action="append",
+        type=Path,
+        default=[],
+        help="Google Drive for desktop folder, such as ~/Library/CloudStorage/GoogleDrive-NAME/"
+        "My Drive (repeatable). Without one, Drive is skipped",
+    )
     inventory = sub.add_parser(
         "inventory",
         help="Inventory native coding-agent sessions into the database a manifest names under "
@@ -1155,6 +1193,16 @@ def _browser_links_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def _capture_notes_docs_command(args: argparse.Namespace) -> int:
+    receipt = capture_notes_and_docs(
+        args.out,
+        notes_store=None if args.no_notes else args.notes_store,
+        drive_roots=args.drive_root,
+    )
+    print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
 def _inventory_command(args: argparse.Namespace) -> int:
     # The inventory holds session titles, snippets and project paths: authorise where it lands
     # before any source is read.
@@ -1183,6 +1231,8 @@ def handle_library(args: argparse.Namespace) -> int:
             return _inventory_command(args)
         if args.action == "browser-links":
             return _browser_links_command(args)
+        if args.action == "capture-notes-docs":
+            return _capture_notes_docs_command(args)
         if args.action == "verify-export":
             return _verify_export_command(args)
         if args.action == "serve":
