@@ -1,0 +1,1369 @@
+"""`cce library zettels --format obsidian-md`: one small Wiki Standard note per idea.
+
+Synthetic conversations and invented text only.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import unicodedata
+from pathlib import Path
+from typing import Any
+
+import pytest
+from test_web_capture import manifest_for, page_rows, setup, write_shard
+
+from conversation_corpus_engine import library_commands, library_zettel_files
+from conversation_corpus_engine.archive_model import Conversation, Message
+from conversation_corpus_engine.attributed_knowledge import (
+    ZETTEL_SCHEMA,
+    export_zettels,
+    zettel_atoms,
+)
+from conversation_corpus_engine.attribution_rules import attribute_message, record_info
+from conversation_corpus_engine.cli import build_parser
+from conversation_corpus_engine.corpus_store import CorpusStoreError
+from conversation_corpus_engine.library_build import build_library
+from conversation_corpus_engine.library_commands import handle_library, read_record
+from conversation_corpus_engine.library_store import Library
+from conversation_corpus_engine.library_zettel_notes import (
+    FRONTMATTER_KEYS,
+    build_notes,
+    export_zettel_notes,
+    lint_note,
+    note_id,
+    recover_quote,
+)
+
+REQUIRED = (
+    "id",
+    "type",
+    "title",
+    "summary",
+    "created",
+    "updated",
+    "author",
+    "authorship",
+    "status",
+)
+TUPLE = re.compile(
+    r"cce:(?P<library>library-[0-9a-f]{64})/(?P<uid>[a-z0-9-]+)@(?P<version>[0-9.]+)"
+    r"#(?P<mark>[ma])(?P<message>\d+):"
+    r"(?P<start>\d+)-(?P<end>\d+) sha256:(?P<digest>[0-9a-f]{64})"
+)
+TEXTS = {
+    "lantern": [
+        "How should a lantern keeper log the nightly oil level?",
+        "Write the level on the slate before dusk, then compare it with the dawn reading.",
+        "A drop of more than two fingers overnight means a leak. Check the seal first.",
+        "Thanks, the slate habit worked for the whole harbour season.",
+    ],
+    "orchard": [
+        "Which pear tree should be pruned first in winter?",
+        "Start with the oldest tree [the one by the gate](http://example.invalid/x) & its crossing limbs.",
+        "Cut crossing limbs; ``` never leave a stub. ---",
+        "Tidy the cuttings into a heap away from the roots.",
+    ],
+    "kiln": [
+        "What cone should the first test firing reach?",
+        "Cone 06 is safe for a first bisque firing of small test tiles.",
+        "Hold the peak for ten minutes and let the kiln cool for a full day.",
+        "Label every tile before it goes in.",
+    ],
+}
+
+
+def sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def annotation(text: str, author: str, author_id: str | None = None, **changes: Any) -> dict:
+    span = {
+        "start": 0,
+        "end": len(text),
+        "author": author,
+        "author_id": author_id,
+        "evidence": ["synthetic receipt"],
+        "assertion_status": "asserted",
+        "profile_eligible": author == "owner",
+        **changes,
+    }
+    return {"schema": "cce.span-attribution.v1", "text_digest": sha(text), "spans": [span]}
+
+
+def make_library(tmp_path: Path) -> Library:
+    library = Library.create(tmp_path / "library.sqlite")
+    for name, texts in TEXTS.items():
+        library.put(
+            Conversation(
+                provider="chatgpt",
+                source_id=name,
+                title=f"Talk about {name}",
+                created="2026-02-01",
+                messages=[
+                    Message(role="user" if i % 2 == 0 else "assistant", text=t, id=f"{name}{i}")
+                    for i, t in enumerate(texts)
+                ],
+            )
+        )
+    return library
+
+
+def ref(library: Library, name: str, message: int, start: int = 0, end: int = 60) -> dict:
+    uid = f"chatgpt-{name}"
+    row = library.history(uid)[-1]
+    item = library.record(uid, version=row["version"])["messages"][message]
+    return {
+        "uid": uid,
+        "version": row["version"],
+        "revision_digest": row["digest"],
+        "sequence": "main",
+        "message": message,
+        "message_id": item["id"],
+        "text_digest": sha(item["text"]),
+        "start": start,
+        "end": min(end, len(item["text"])),
+    }
+
+
+def source(library: Library, reference: dict, author: str = "agent", **extra: Any) -> dict:
+    item = library.record(reference["uid"], version=reference["version"])["messages"][
+        reference["message"]
+    ]
+    who = {"agent": "model", "owner": "rob"}.get(author)
+    return {"source": reference, "attribution": annotation(item["text"], author, who), **extra}
+
+
+def zettel(library: Library, number: int, sources: list[dict], **changes: Any) -> dict:
+    body = f"Invented idea number {number} about keeping a careful record."
+    title = changes.get("title", f"Careful records beat memory {number}")
+    return {
+        "id": f"idea-{number:03d}",
+        "title": title,
+        "body": body,
+        "created": "2026-03-04",
+        "review": {"status": "reviewed", "reviewer": "rev", "evidence": ["synthetic check"]},
+        "relationships": [],
+        "attribution": annotation(body, "agent", "model"),
+        "title_attribution": annotation(title, "agent", "model"),
+        "sources": sources,
+        **changes,
+    }
+
+
+def envelope(library: Library, count: int = 5) -> dict:
+    names = list(TEXTS)
+    items = []
+    for number in range(count):
+        name = names[number % 3]
+        found = [source(library, ref(library, name, 1 + number % 3))]
+        relationships = (
+            [{"type": "supports", "target": f"idea-{number - 1:03d}"}] if number % 2 else []
+        )
+        items.append(zettel(library, number, found, relationships=relationships))
+    return {"schema": ZETTEL_SCHEMA, "zettels": items}
+
+
+def parse(path: Path) -> tuple[dict[str, Any], str]:
+    text = path.read_text(encoding="utf-8")
+    lines = text.split("\n")
+    assert lines[0] == "---"
+    close = lines.index("---", 1)
+    meta: dict[str, Any] = {}
+    key = ""
+    for line in lines[1:close]:
+        if line.startswith("  - "):
+            meta[key].append(json.loads(line[4:]))
+        else:
+            assert re.fullmatch(r"[a-z_]+:( .*)?", line), f"nested or odd frontmatter: {line!r}"
+            key, _, rest = line.partition(":")
+            meta[key] = [] if rest.strip() in ("", "[]") else json.loads(rest)
+    return meta, "\n".join(lines[close + 1 :])
+
+
+def quotes(body: str) -> list[str]:
+    blocks = re.findall(r"(?m)(?:^> .*\n?)+", body)
+    return [recover_quote(block.rstrip("\n")) for block in blocks]
+
+
+def command(out: Path, store: Path, source_file: Path, *extra: str):
+    return build_parser().parse_args(
+        [
+            "library",
+            "zettels",
+            "--store-root",
+            str(store),
+            "--input",
+            str(source_file),
+            "--format",
+            "obsidian-md",
+            "--out",
+            str(out),
+            *extra,
+        ]
+    )
+
+
+@pytest.fixture
+def world(tmp_path, monkeypatch):
+    library = make_library(tmp_path)
+    store = tmp_path / "store"
+    store.mkdir()
+    database = tmp_path / "library.sqlite"
+    monkeypatch.setattr(library_commands, "open_library", lambda root: (store, Library(database)))
+    payload = envelope(library)
+    path = tmp_path / "ideas.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    yield library, payload, path, store, tmp_path / "wiki"
+    library.close()
+
+
+def run(out, store, path, capsys, *extra):
+    code = handle_library(command(out, store, path, *extra))
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def snapshot(root: Path) -> dict[str, tuple[bytes, int]]:
+    return {
+        str(p.relative_to(root)): (p.read_bytes(), p.stat().st_mtime_ns)
+        for p in sorted(root.rglob("*"))
+        if p.is_file()
+    }
+
+
+def test_command_writes_one_note_per_idea(world, capsys):
+    library, payload, path, store, out = world
+    code, stdout, _ = run(out, store, path, capsys)
+    assert code == 0
+    report = json.loads(stdout)
+    names = sorted(p.name for p in (out / "notes" / "zettel").glob("*.md"))
+    assert names == sorted(f"{z['title']}.md" for z in payload["zettels"])
+    assert report["written"] == len(payload["zettels"]) == 5 and report["unchanged"] == 0
+    assert not list((out / "notes" / "zettel").glob(".*"))
+
+
+def test_every_quote_matches_its_source_and_the_tuple_reopens_it(world, capsys):
+    library, payload, path, store, out = world
+    run(out, store, path, capsys)
+    for item in payload["zettels"]:
+        meta, body = parse(out / "notes" / "zettel" / f"{item['title']}.md")
+        found = quotes(body)
+        assert len(found) == len(meta["sources"]) == len(item["sources"])
+        for entry, quote, tup in zip(item["sources"], found, meta["sources"], strict=True):
+            r = entry["source"]
+            text = library.record(r["uid"], version=r["version"])["messages"][r["message"]]["text"]
+            assert quote.encode("utf-8") == text[r["start"] : r["end"]].encode("utf-8")
+            parts = TUPLE.fullmatch(tup)
+            assert parts and parts["digest"] == sha(text)
+            assert parts["library"] == "library-" + library.evidence_fingerprint()
+            reopened = read_record(
+                library,
+                parts["uid"],
+                version=parts["version"],
+                message=int(parts["message"]),
+                offset=int(parts["start"]),
+                limit=int(parts["end"]) - int(parts["start"]),
+            )
+            assert reopened["text"] == quote
+            assert (
+                f"cce library read {parts['uid']} --version {parts['version']} "
+                f"--message {parts['message']} --offset {parts['start']} --limit "
+                f"{int(parts['end']) - int(parts['start'])}"
+            ) in body
+
+
+def test_each_note_passes_the_wiki_caps_and_has_flat_required_frontmatter(world, capsys):
+    library, payload, path, store, out = world
+    run(out, store, path, capsys)
+    for note in (out / "notes" / "zettel").glob("*.md"):
+        meta, body = parse(note)
+        assert note.stat().st_size <= 4 * 1024
+        assert list(meta) == list(FRONTMATTER_KEYS)
+        assert all(meta[key] for key in REQUIRED)
+        assert re.fullmatch(r"20260304-[0-9a-f]{6}", meta["id"])
+        assert meta["type"] == "zettel" and meta["status"] == "draft"
+        assert meta["authorship"] == "agent" and meta["author"] == "agent"
+        assert len(meta["summary"]) <= 200 and len(meta["title"]) <= 100
+        assert meta["created"] == meta["updated"] == "2026-03-04"
+        assert meta["sources"] and "\r" not in note.read_text(encoding="utf-8")
+        assert all(len(q) <= 400 for q in quotes(body))
+        assert lint_note(note.read_text(encoding="utf-8")) == {"errors": [], "warnings": []}
+    linked, _ = parse(out / "notes" / "zettel" / "Careful records beat memory 1.md")
+    assert linked["links"] == ["[[Careful records beat memory 0]]"]
+
+
+def test_rerun_is_byte_identical_and_touches_nothing(world, capsys):
+    library, payload, path, store, out = world
+    run(out, store, path, capsys)
+    first = snapshot(out)
+    code, stdout, _ = run(out, store, path, capsys)
+    assert code == 0
+    assert json.loads(stdout)["written"] == 0 and json.loads(stdout)["unchanged"] == 5
+    assert snapshot(out) == first
+    shuffled = dict(payload, zettels=list(reversed(payload["zettels"])))
+    path.write_text(json.dumps(shuffled), encoding="utf-8")
+    run(out, store, path, capsys)
+    assert snapshot(out) == first
+
+
+def test_a_quote_that_does_not_match_is_refused_and_nothing_is_written(world, capsys):
+    library, payload, path, store, out = world
+    entry = payload["zettels"][2]["sources"][0]
+    r = entry["source"]
+    text = library.record(r["uid"], version=r["version"])["messages"][r["message"]]["text"]
+    entry["quote"] = text[r["start"] : r["end"] - 1] + "?"
+    assert entry["quote"] != text[r["start"] : r["end"]]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    code, stdout, err = run(out, store, path, capsys)
+    assert code == 2 and stdout == ""
+    assert "idea-002" in err and "byte for byte" in err
+    assert not out.exists()
+    entry["quote"] = text[r["start"] : r["end"]]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    assert run(out, store, path, capsys)[0] == 0
+
+
+def test_a_span_over_400_characters_or_with_control_characters_is_refused(tmp_path):
+    with Library.create(tmp_path / "l.sqlite") as library:
+        library.put(
+            Conversation(
+                provider="chatgpt",
+                source_id="long",
+                title="Long",
+                messages=[
+                    Message(role="user", text="word " * 200, id="a"),
+                    Message(role="user", text="line one\r\nline two", id="b"),
+                    Message(role="user", text="tab\tis fine\nand so is a newline", id="c"),
+                ],
+            )
+        )
+        long_one = zettel(library, 1, [source(library, ref(library, "long", 0, 0, 401))])
+        crlf = zettel(library, 2, [source(library, ref(library, "long", 1, 0, 30))])
+        fine = zettel(library, 3, [source(library, ref(library, "long", 2, 0, 40))])
+        with pytest.raises(ValueError, match="at most 400"):
+            build_notes(library, [long_one])
+        with pytest.raises(ValueError, match="control or line-separator"):
+            build_notes(library, [crlf])
+        (note,) = build_notes(library, [fine])
+        assert quotes(note.text) == ["tab\tis fine\nand so is a newline"]
+        ok = zettel(library, 4, [source(library, ref(library, "long", 0, 0, 400))])
+        assert len(quotes(build_notes(library, [ok])[0].text)[0]) == 400
+
+
+def test_awkward_quote_characters_round_trip_exactly(tmp_path):
+    with make_library(tmp_path) as library:
+        reference = ref(library, "orchard", 1, 0, 200)
+        reference2 = ref(library, "orchard", 2, 0, 200)
+        note = build_notes(
+            library, [zettel(library, 1, [source(library, reference), source(library, reference2)])]
+        )[0]
+        original = [library.record("chatgpt-orchard")["messages"][m]["text"] for m in (1, 2)]
+        assert quotes(note.text) == original
+        assert "](http" not in note.text.split("### Source 1", 1)[1]
+
+
+def test_agent_written_drafts_are_accepted_by_the_intake_and_emitted_as_agent_draft(world, capsys):
+    library, payload, path, store, out = world
+    exported = export_zettels(library, payload["zettels"])
+    assert {s["author"] for z in exported["zettels"] for s in z["body_attribution"]} == {"agent"}
+    run(out, store, path, capsys)
+    for note in (out / "notes" / "zettel").glob("*.md"):
+        meta, _ = parse(note)
+        assert (meta["authorship"], meta["status"]) == ("agent", "draft")
+    # Explicit agent drafts are accepted by this format without pretending they are reviewed.
+    payload["zettels"][0]["review"] = {"status": "draft", "reviewer": "rev", "evidence": ["x"]}
+    assert all(note.authorship == "agent" for note in build_notes(library, payload["zettels"]))
+    # Existing JSON/atoms callers keep the reviewed-only intake contract.
+    with pytest.raises(ValueError, match="explicitly reviewed"):
+        export_zettels(library, payload["zettels"])
+    with pytest.raises(ValueError, match="explicitly reviewed"):
+        zettel_atoms(library, payload["zettels"])
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "owner_not_eligible",
+        "owner_no_evidence",
+        "owner_disputed",
+        "no_attribution",
+        "reviewer_is_someone_else",
+        "owner_text_agent_quote",
+        "owner_text_unattributed_quote",
+        "third_party",
+    ],
+)
+def test_unreviewed_or_unproven_text_is_never_labelled_owner_authored(tmp_path, case):
+    with make_library(tmp_path) as library:
+        reference = ref(library, "kiln", 1)
+        owner_source = source(library, reference, "owner")
+        entry = zettel(library, 1, [owner_source])
+        entry["review"]["reviewer"] = "rob"
+        if case == "owner_not_eligible":
+            entry["attribution"] = annotation(entry["body"], "owner", "rob", profile_eligible=False)
+        elif case == "owner_no_evidence":
+            entry["attribution"] = annotation(entry["body"], "owner", "rob", evidence=[])
+        elif case == "owner_disputed":
+            entry["attribution"] = annotation(
+                entry["body"], "owner", "rob", assertion_status="disputed"
+            )
+        elif case == "no_attribution":
+            entry["attribution"] = None
+        elif case == "reviewer_is_someone_else":
+            entry["attribution"] = annotation(entry["body"], "owner", "rob")
+            entry["review"]["reviewer"] = "someone-else"
+        elif case == "owner_text_agent_quote":
+            entry["attribution"] = annotation(entry["body"], "owner", "rob")
+            entry["sources"] = [source(library, reference, "agent")]
+        elif case == "owner_text_unattributed_quote":
+            entry["attribution"] = annotation(entry["body"], "owner", "rob")
+            entry["sources"] = [{"source": reference}]
+        elif case == "third_party":
+            entry["attribution"] = annotation(entry["body"], "third_party", "someone")
+        if case == "no_attribution":
+            with pytest.raises(ValueError, match="explicit digest-bound attribution"):
+                build_notes(library, [entry])
+            return
+        (note,) = build_notes(library, [entry])
+        meta, _ = parse_text(note.text)
+        assert meta["authorship"] != "human" and note.authorship != "human"
+        assert meta["status"] == "draft"
+
+
+def parse_text(text: str) -> tuple[dict[str, Any], str]:
+    lines = text.split("\n")
+    close = lines.index("---", 1)
+    meta: dict[str, Any] = {}
+    key = ""
+    for line in lines[1:close]:
+        if line.startswith("  - "):
+            meta[key].append(json.loads(line[4:]))
+        else:
+            key, _, rest = line.partition(":")
+            meta[key] = [] if rest.strip() in ("", "[]") else json.loads(rest)
+    return meta, "\n".join(lines[close + 1 :])
+
+
+def test_typed_owner_claims_and_reviewer_strings_never_establish_owner_authorship(tmp_path):
+    with make_library(tmp_path) as library:
+        entry = zettel(library, 1, [source(library, ref(library, "kiln", 1), "owner")])
+        entry["review"]["reviewer"] = "rob"
+        entry["attribution"] = annotation(entry["body"], "owner", "rob")
+        entry["title_attribution"] = annotation(entry["title"], "owner", "rob")
+        (note,) = build_notes(library, [entry])
+        meta, _ = parse_text(note.text)
+        assert (meta["authorship"], meta["author"], meta["status"]) == (
+            "generated",
+            "unknown",
+            "draft",
+        )
+        assert "Owner authorship: not established" in note.text
+        assert "supplied assertion, not verification" in note.text
+
+
+def test_ids_are_stable_and_come_from_the_created_date_and_a_hash(tmp_path):
+    with make_library(tmp_path) as library:
+        base = zettel(library, 1, [source(library, ref(library, "kiln", 1))])
+        edited = dict(base, body="A rewritten body that must not change the id.")
+        edited["attribution"] = annotation(edited["body"], "agent", "model")
+        first = build_notes(library, [base])[0]
+        second = build_notes(library, [edited])[0]
+        assert first.id == second.id == note_id("2026-03-04", "idea-001")
+        assert re.fullmatch(r"20260304-[0-9a-f]{6}", first.id)
+        assert note_id("2026-03-04", "idea-002") != first.id
+        assert note_id("2026-03-05", "idea-001") != first.id
+
+
+@pytest.mark.parametrize(
+    ("changes", "reason"),
+    [
+        ({"created": ""}, "created"),
+        ({"created": "2026-13-45"}, "calendar"),
+        ({"title": "Why: a colon"}, "file-safe"),
+        ({"title": "x" * 101}, "1 to 100"),
+        ({"title": "Has [brackets]"}, "file-safe"),
+    ],
+)
+def test_unusable_created_or_title_is_refused_with_a_reason(tmp_path, changes, reason):
+    with make_library(tmp_path) as library:
+        entry = zettel(library, 1, [source(library, ref(library, "kiln", 1))], **changes)
+        with pytest.raises(ValueError, match=reason):
+            build_notes(library, [entry])
+
+
+def test_duplicate_titles_ignoring_case_are_refused(tmp_path):
+    with make_library(tmp_path) as library:
+        a = zettel(library, 1, [source(library, ref(library, "kiln", 1))], title="Same title")
+        b = zettel(library, 2, [source(library, ref(library, "kiln", 2))], title="same TITLE")
+        with pytest.raises(ValueError, match="duplicate title"):
+            build_notes(library, [a, b])
+
+
+def test_size_rules_warn_at_16_kib_and_refuse_at_64_kib(tmp_path):
+    with make_library(tmp_path) as library:
+        reference = ref(library, "kiln", 1)
+
+        def sized(words: int) -> dict:
+            body = "word " * words
+            return zettel(
+                library,
+                1,
+                [source(library, reference)],
+                body=body.strip(),
+                attribution=annotation(body.strip(), "agent", "model"),
+            )
+
+        (big,) = build_notes(library, [sized(4000)])
+        assert any("over 16384" in w for w in big.warnings)
+        with pytest.raises(ValueError, match="hard cap"):
+            build_notes(library, [sized(14000)])
+
+
+def test_an_existing_note_for_another_idea_is_never_overwritten(world, capsys):
+    library, payload, path, store, out = world
+    folder = out / "notes" / "zettel"
+    folder.mkdir(parents=True)
+    other = folder / "Careful records beat memory 0.md"
+    other.write_text('---\nid: "20200101-aaaaaa"\n---\nMine.\n', encoding="utf-8")
+    code, _, err = run(out, store, path, capsys)
+    assert code == 2 and "already holds a different note" in err
+    assert other.read_text(encoding="utf-8").endswith("Mine.\n")
+    assert sorted(p.name for p in folder.iterdir()) == [other.name]
+
+
+def test_a_changed_envelope_updates_only_the_changed_note(world, capsys):
+    library, payload, path, store, out = world
+    run(out, store, path, capsys)
+    before = snapshot(out)
+    payload["zettels"][0]["body"] = "A reviewed rewrite of the first invented idea."
+    payload["zettels"][0]["attribution"] = annotation(
+        payload["zettels"][0]["body"], "agent", "model"
+    )
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    report = json.loads(run(out, store, path, capsys)[1])
+    after = snapshot(out)
+    assert report["written"] == 1 and report["unchanged"] == 4
+    changed = [name for name in before if after[name] != before[name]]
+    assert changed == [
+        library_zettel_files.MANIFEST_NAME,
+        "notes/zettel/Careful records beat memory 0.md",
+    ]
+    new_paths = set(after) - set(before)
+    assert len(new_paths) == 2 and all(
+        name.startswith(".cce-zettel-recovery/") for name in new_paths
+    )
+    assert len(report["recovery"]["created"]) == report["recovery"]["retained"] == 1
+
+
+def test_git_visible_directory_is_refused_before_the_library_is_opened(
+    tmp_path, monkeypatch, capsys
+):
+    work_tree = tmp_path / "work"
+    work_tree.mkdir()
+    subprocess.run(["git", "-C", str(work_tree), "init", "-q"], check=True, capture_output=True)
+
+    def opened(root):
+        raise AssertionError("the library was opened before the destination was authorised")
+
+    def loaded(path):
+        raise AssertionError("the envelope was read before the destination was authorised")
+
+    monkeypatch.setattr(library_commands, "open_library", opened)
+    monkeypatch.setattr(library_commands, "_load_zettel_envelope", loaded)
+    code = handle_library(command(work_tree / "visible", tmp_path, tmp_path / "x.json"))
+    assert code == 2 and "Git-visible" in capsys.readouterr().err
+    assert sorted(p.name for p in work_tree.iterdir()) == [".git"]
+
+
+def test_the_api_refuses_a_git_visible_directory_and_writes_nothing(tmp_path):
+    work_tree = tmp_path / "work"
+    work_tree.mkdir()
+    subprocess.run(["git", "-C", str(work_tree), "init", "-q"], check=True, capture_output=True)
+    with make_library(tmp_path) as library:
+        payload = envelope(library)
+        with pytest.raises(CorpusStoreError, match="Git-visible"):
+            export_zettel_notes(
+                library, payload["zettels"], work_tree / "visible", store_root=tmp_path / "store"
+            )
+    assert sorted(p.name for p in work_tree.iterdir()) == [".git"]
+
+
+def test_top_level_authorship_and_status_in_the_envelope_are_ignored(tmp_path):
+    with make_library(tmp_path) as library:
+        entry = zettel(
+            library,
+            1,
+            [source(library, ref(library, "kiln", 1))],
+            authorship="human",
+            status="stable",
+            author="rob",
+        )
+        (note,) = build_notes(library, [entry])
+        meta, _ = parse_text(note.text)
+        assert (meta["authorship"], meta["status"], meta["author"]) == ("agent", "draft", "agent")
+
+
+def test_a_directory_inside_the_library_store_is_refused(world, capsys):
+    library, payload, path, store, out = world
+    inside = store / "wiki"
+    code, _, err = run(inside, store, path, capsys)
+    assert code == 2 and "outside the library store" in err
+    assert not inside.exists()
+    code, _, err = run(store.parent, store, path, capsys)
+    assert code == 2 and "outside the library store" in err
+
+
+def test_out_goes_with_the_obsidian_format_only(world, capsys):
+    library, payload, path, store, out = world
+    plain = build_parser().parse_args(
+        ["library", "zettels", "--store-root", str(store), "--input", str(path), "--out", str(out)]
+    )
+    assert handle_library(plain) == 2
+    assert "--out goes with --format obsidian-md" in capsys.readouterr().err
+    bare = build_parser().parse_args(
+        [
+            "library",
+            "zettels",
+            "--store-root",
+            str(store),
+            "--input",
+            str(path),
+            "--format",
+            "obsidian-md",
+        ]
+    )
+    assert handle_library(bare) == 2
+    assert not out.exists()
+
+
+def test_the_library_is_not_modified(world, capsys):
+    library, payload, path, store, out = world
+    database = store.parent / "library.sqlite"
+    before = database.read_bytes()
+    assert run(out, store, path, capsys)[0] == 0
+    assert database.read_bytes() == before
+    assert not list(store.iterdir())
+    with Library(database) as reopened:
+        assert reopened.verify() == []
+
+
+def test_nested_git_worktree_is_refused_before_reading_sources(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "wiki"
+    folder = out / "notes" / "zettel"
+    folder.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(folder), "init", "-q"], check=True, capture_output=True)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("private text was read before authorising the actual note folder")
+
+    monkeypatch.setattr(library_commands, "open_library", forbidden)
+    monkeypatch.setattr(library_commands, "_load_zettel_envelope", forbidden)
+    assert handle_library(command(out, tmp_path / "store", tmp_path / "ideas.json")) == 2
+    assert "Git-visible" in capsys.readouterr().err
+    with make_library(tmp_path) as library, pytest.raises(CorpusStoreError, match="Git-visible"):
+        export_zettel_notes(
+            library, envelope(library)["zettels"], out, store_root=tmp_path / "store"
+        )
+    assert sorted(path.name for path in folder.iterdir()) == [".git"]
+
+
+def test_case_only_title_rename_refuses_without_duplicate_id(world, capsys):
+    _library, payload, path, store, out = world
+    assert run(out, store, path, capsys)[0] == 0
+    before = snapshot(out)
+    payload["zettels"][0]["title"] = payload["zettels"][0]["title"].lower()
+    payload["zettels"][0]["title_attribution"] = annotation(
+        payload["zettels"][0]["title"], "agent", "model"
+    )
+    path.write_text(json.dumps(payload))
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "keep its title" in error
+    assert snapshot(out) == before
+
+
+def test_utf8_filename_limit_is_checked_before_any_output(world, capsys):
+    _library, payload, path, store, out = world
+    payload["zettels"][-1]["title"] = "界" * 90
+    payload["zettels"][-1]["title_attribution"] = annotation(
+        payload["zettels"][-1]["title"], "agent", "model"
+    )
+    path.write_text(json.dumps(payload))
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "filename" in error
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("existing", [198, 995, 996])
+def test_folder_caps_include_retained_entries(world, capsys, existing):
+    _library, _payload, path, store, out = world
+    folder = out / "notes" / "zettel"
+    folder.mkdir(parents=True)
+    for number in range(existing):
+        (folder / f"Retained {number}.md").write_text("Unrelated retained note.\n")
+    before = snapshot(out)
+    code, stdout, error = run(out, store, path, capsys)
+    if existing + 5 > 1000:
+        assert code == 2 and "folder cap" in error
+        assert snapshot(out) == before
+    else:
+        assert code == 0
+        assert any("one folder" in warning for warning in json.loads(stdout)["warnings"])
+        assert len(list(folder.iterdir())) == existing + 5
+
+
+@pytest.mark.parametrize("shape", ["review_draft", "top_level_draft"])
+def test_explicit_agent_drafts_need_no_fabricated_reviewer_or_review_evidence(world, capsys, shape):
+    _library, payload, path, store, out = world
+    for item in payload["zettels"]:
+        if shape == "review_draft":
+            item["review"] = {"status": "draft"}
+        else:
+            del item["review"]
+            item.update(authorship="agent", status="draft")
+    path.write_text(json.dumps(payload))
+    code, stdout, _ = run(out, store, path, capsys)
+    assert code == 0 and json.loads(stdout)["written"] == 5
+    for note in (out / "notes/zettel").glob("*.md"):
+        metadata, body = parse(note)
+        assert (metadata["authorship"], metadata["status"]) == ("agent", "draft")
+        assert "Review status: draft" in body and "- Reviewer:" not in body
+        assert "- Review evidence:" not in body
+
+
+@pytest.mark.parametrize("invalid", ["owner", "partial", "disputed", "missing", "stale"])
+def test_draft_labels_never_replace_digest_bound_agent_attribution(world, capsys, invalid):
+    _library, payload, path, store, out = world
+    item = payload["zettels"][0]
+    item.pop("review")
+    item.update(authorship="agent", status="draft")
+    if invalid == "owner":
+        item["attribution"] = annotation(item["body"], "owner", "rob")
+    elif invalid == "partial":
+        item["attribution"]["spans"][0]["start"] = 1
+    elif invalid == "disputed":
+        item["attribution"]["spans"][0]["assertion_status"] = "disputed"
+    elif invalid == "missing":
+        item.pop("attribution")
+    else:
+        item["attribution"]["text_digest"] = "0" * 64
+    path.write_text(json.dumps(payload))
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "attribution" in error
+    assert not out.exists()
+
+
+def test_agent_note_does_not_promote_unknown_quote_authorship(tmp_path):
+    with make_library(tmp_path) as library:
+        item = zettel(library, 1, [{"source": ref(library, "kiln", 1)}])
+        item["review"] = {"status": "draft"}
+        (note,) = build_notes(library, [item])
+        assert note.authorship == "agent"
+        attribution = [line for line in note.text.splitlines() if "Quote attribution:" in line]
+        assert len(attribution) == 1 and "unknown" in attribution[0]
+        assert "unattributed" in attribution[0]
+
+
+def test_unicode_title_forms_have_one_canonical_filename_and_cannot_collide(tmp_path):
+    composed = "Café notes"
+    decomposed = unicodedata.normalize("NFD", composed)
+    with make_library(tmp_path) as library:
+        first = zettel(library, 1, [source(library, ref(library, "kiln", 1))], title=composed)
+        second = zettel(library, 2, [source(library, ref(library, "kiln", 2))], title=decomposed)
+        assert build_notes(library, [second])[0].filename == composed + ".md"
+        with pytest.raises(ValueError, match="duplicate title"):
+            build_notes(library, [first, second])
+
+
+@pytest.mark.parametrize("claimed", ["rob", "Some Person", "model"])
+def test_agent_note_author_is_a_fixed_label_not_an_envelope_identity(tmp_path, claimed):
+    with make_library(tmp_path) as library:
+        entry = zettel(library, 1, [source(library, ref(library, "kiln", 1))])
+        entry["attribution"] = annotation(entry["body"], "agent", claimed)
+        entry["title_attribution"] = annotation(entry["title"], "agent", claimed)
+        metadata, _ = parse_text(build_notes(library, [entry])[0].text)
+        assert (metadata["authorship"], metadata["author"]) == ("agent", "agent")
+
+
+@pytest.mark.parametrize("kind", ["missing", "third_party", "owner", "disputed", "partial"])
+def test_nonagent_or_unattributed_title_keeps_the_note_generated(tmp_path, kind):
+    with make_library(tmp_path) as library:
+        entry = zettel(library, 1, [source(library, ref(library, "kiln", 1))])
+        entry["review"] = {"status": "draft"}
+        if kind == "missing":
+            entry.pop("title_attribution", None)
+        else:
+            entry["title_attribution"] = annotation(
+                entry["title"], kind if kind in ("owner", "third_party") else "agent", "model"
+            )
+            if kind == "disputed":
+                entry["title_attribution"]["spans"][0]["assertion_status"] = "disputed"
+            elif kind == "partial":
+                entry["title_attribution"]["spans"][0]["start"] = 1
+        metadata, _ = parse_text(build_notes(library, [entry])[0].text)
+        assert (metadata["authorship"], metadata["author"], metadata["status"]) == (
+            "generated",
+            "unknown",
+            "draft",
+        )
+
+
+def test_captured_third_party_page_becomes_an_exact_agent_draft_quote(tmp_path):
+    project, store, shards = setup(tmp_path)
+    row = page_rows()[0]
+    write_shard(shards / "synthetic.jsonl", [row])
+    built = build_library(manifest_for(shards), project_root=project, store_root=store)
+    assert built["coverage_complete"] and built["status"]["records"] == 1
+    with Library(Path(built["generation"]) / "library.sqlite") as library:
+        uid = next(library.rows())["uid"]
+        history = library.history(uid)[-1]
+        payload = library.record(uid, version=history["version"])
+        message = payload["messages"][0]
+        claims = attribute_message(
+            message["text"],
+            role=message["role"],
+            channel=message["channel"],
+            typed_chars=0,
+            record=record_info(payload),
+        )
+        assert {span.author for span in claims} == {"third_party"}
+        reference = {
+            "uid": uid,
+            "version": history["version"],
+            "revision_digest": history["digest"],
+            "sequence": "main",
+            "message": 0,
+            "message_id": message["id"],
+            "text_digest": sha(message["text"]),
+            "start": 4,
+            "end": len(message["text"]),
+        }
+        exact = message["text"][reference["start"] : reference["end"]]
+        entry = zettel(
+            library,
+            1,
+            [
+                {
+                    "source": reference,
+                    "quote": exact,
+                    "attribution": annotation(message["text"], "third_party", "example.com"),
+                }
+            ],
+        )
+        entry["title_attribution"] = annotation(entry["title"], "agent", "model")
+        entry["review"] = {"status": "draft"}
+        out = tmp_path / "wiki"
+        report = export_zettel_notes(library, [entry], out, store_root=store)
+        metadata, body = parse(out / report["notes"][0]["path"])
+        assert (metadata["authorship"], metadata["author"], metadata["status"]) == (
+            "agent",
+            "agent",
+            "draft",
+        )
+        assert quotes(body) == [exact]
+        assert metadata["sources"] == [
+            f"cce:library-{library.evidence_fingerprint()}/{uid}@{history['version']}"
+            f"#m0:4-{len(message['text'])} sha256:{sha(message['text'])}"
+        ]
+        assert "Quote attribution: third_party" in html.unescape(body)
+        assert "Owner authorship: not established" in body
+        assert len((out / report["notes"][0]["path"]).read_bytes()) < 16 * 1024
+        assert export_zettel_notes(library, [entry], out, store_root=store)["written"] == 0
+
+
+def test_library_identity_is_snapshot_bound_and_survives_copying(tmp_path):
+    with make_library(tmp_path) as library:
+        item = zettel(library, 1, [source(library, ref(library, "kiln", 1))])
+        first = build_notes(library, [item])[0]
+        with Library.create(tmp_path / "copy.sqlite", previous=library.path) as copied:
+            second = build_notes(copied, [item])[0]
+            assert second.library_id == first.library_id
+            assert second.text == first.text
+            copied.put(Conversation(provider="chatgpt", source_id="other", title="Other"))
+            changed = build_notes(copied, [item])[0]
+            assert changed.library_id != first.library_id
+            assert quotes(changed.text) == quotes(first.text)
+            item["sources"][0]["source"]["library_id"] = first.library_id
+            with pytest.raises(ValueError, match="library identity differs"):
+                build_notes(copied, [item])
+
+
+@pytest.mark.parametrize("characters", [84, 85])
+def test_utf8_filename_component_boundary(tmp_path, characters):
+    with make_library(tmp_path) as library:
+        item = zettel(
+            library, 1, [source(library, ref(library, "kiln", 1))], title="界" * characters
+        )
+        if characters == 84:
+            assert len(build_notes(library, [item])[0].filename.encode("utf-8")) == 255
+        else:
+            with pytest.raises(ValueError, match="UTF-8 filename"):
+                build_notes(library, [item])
+
+
+def test_manifest_owns_exact_bytes_and_retains_notes_absent_from_the_next_batch(world, capsys):
+    _library, payload, path, store, out = world
+    assert run(out, store, path, capsys)[0] == 0
+    manifest = json.loads((out / library_zettel_files.MANIFEST_NAME).read_text())
+    assert manifest["state"] == "complete" and len(manifest["files"]) == 5
+    for filename, entry in manifest["files"].items():
+        note = out / "notes/zettel" / filename
+        assert entry["sha256"] == hashlib.sha256(note.read_bytes()).hexdigest()
+        assert entry["id"] == parse(note)[0]["id"]
+    before = snapshot(out)
+    payload["zettels"] = payload["zettels"][:1]
+    path.write_text(json.dumps(payload))
+    assert run(out, store, path, capsys)[0] == 0
+    assert snapshot(out) == before
+
+
+def test_an_unowned_file_is_not_adopted_even_when_its_id_and_bytes_match(world, capsys):
+    library, payload, path, store, out = world
+    (first,) = build_notes(library, payload["zettels"][:1])
+    folder = out / "notes/zettel"
+    folder.mkdir(parents=True)
+    (folder / first.filename).write_text(first.text)
+    before = snapshot(out)
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "not owned by the manifest" in error
+    assert snapshot(out) == before
+
+
+def test_an_owned_note_edited_after_export_is_preserved(world, capsys):
+    _library, _payload, path, store, out = world
+    assert run(out, store, path, capsys)[0] == 0
+    note = next((out / "notes/zettel").glob("*.md"))
+    note.write_text(note.read_text() + "Human annotation to preserve.\n")
+    before = snapshot(out)
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "edited after export" in error
+    assert snapshot(out) == before
+
+
+def test_interrupted_writes_keep_ownership_and_resume_without_adopting_other_files(
+    world, capsys, monkeypatch
+):
+    _library, _payload, path, store, out = world
+    atomic = library_zettel_files._atomic_write
+    writes = 0
+
+    def interrupted(destination, data, **kwargs):
+        nonlocal writes
+        if destination.suffix == ".md":
+            writes += 1
+            if writes == 2:
+                raise OSError("synthetic interrupted write")
+        atomic(destination, data, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(library_zettel_files, "_atomic_write", interrupted)
+        code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "interrupted" in error
+    manifest = json.loads((out / library_zettel_files.MANIFEST_NAME).read_text())
+    assert manifest["state"] == "writing" and len(manifest["files"]) == 5
+    first = next((out / "notes/zettel").glob("*.md"))
+    before = first.stat().st_mtime_ns
+    code, stdout, _ = run(out, store, path, capsys)
+    assert code == 0
+    assert json.loads(stdout)["written"] == 4 and json.loads(stdout)["unchanged"] == 1
+    assert first.stat().st_mtime_ns == before
+    assert json.loads((out / library_zettel_files.MANIFEST_NAME).read_text())["state"] == "complete"
+    complete = snapshot(out)
+    assert run(out, store, path, capsys)[0] == 0
+    assert snapshot(out) == complete
+
+
+def test_different_batch_after_interruption_retains_the_previous_recorded_bytes(
+    world, capsys, monkeypatch
+):
+    _library, payload, path, store, out = world
+    assert run(out, store, path, capsys)[0] == 0
+    for item in payload["zettels"][:2]:
+        item["body"] += " Updated idea."
+        item["attribution"] = annotation(item["body"], "agent", "model")
+    path.write_text(json.dumps(payload))
+    atomic = library_zettel_files._atomic_write
+    writes = 0
+
+    def interrupted(destination, data, **kwargs):
+        nonlocal writes
+        if destination.suffix == ".md":
+            writes += 1
+            if writes == 2:
+                raise OSError("synthetic interrupted update")
+        atomic(destination, data, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(library_zettel_files, "_atomic_write", interrupted)
+        assert run(out, store, path, capsys)[0] == 2
+    path.write_text(json.dumps({**payload, "zettels": payload["zettels"][2:]}))
+    assert run(out, store, path, capsys)[0] == 0
+    manifest = json.loads((out / library_zettel_files.MANIFEST_NAME).read_text())
+    for name, entry in manifest["files"].items():
+        assert (
+            hashlib.sha256((out / "notes/zettel" / name).read_bytes()).hexdigest()
+            == entry["sha256"]
+        )
+    path.write_text(json.dumps(payload))
+    code, stdout, _ = run(out, store, path, capsys)
+    assert code == 0 and json.loads(stdout)["written"] == 1
+
+
+def test_concurrent_writer_refuses_without_touching_existing_output(world, capsys):
+    _library, _payload, path, store, out = world
+    assert run(out, store, path, capsys)[0] == 0
+    before = snapshot(out)
+    with (out / library_zettel_files.LOCK_NAME).open("rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "another Zettel export" in error
+    assert snapshot(out) == before
+
+
+@pytest.mark.parametrize("invalid", ["parent_path", "duplicate_id", "unknown_state", "list_state"])
+def test_invalid_ownership_manifest_never_authorizes_overwriting_notes(world, capsys, invalid):
+    _library, _payload, path, store, out = world
+    assert run(out, store, path, capsys)[0] == 0
+    receipt = out / library_zettel_files.MANIFEST_NAME
+    manifest = json.loads(receipt.read_text())
+    names = list(manifest["files"])
+    if invalid == "parent_path":
+        manifest["files"]["../elsewhere.md"] = manifest["files"].pop(names[0])
+    elif invalid == "duplicate_id":
+        manifest["files"][names[1]]["id"] = manifest["files"][names[0]]["id"]
+    elif invalid == "unknown_state":
+        manifest["state"] = "claimed"
+    else:
+        manifest["state"] = []
+    receipt.write_text(json.dumps(manifest))
+    before = snapshot(out)
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "ownership manifest" in error
+    assert snapshot(out) == before
+
+
+def test_file_created_by_an_editor_after_preflight_is_never_overwritten(world, capsys, monkeypatch):
+    _library, _payload, path, store, out = world
+    atomic = library_zettel_files._atomic_write
+    foreign = b"Independent editor text that the exporter does not own.\n"
+    raced = []
+
+    def editor_wins(destination, data, **kwargs):
+        if destination.suffix == ".md" and not raced:
+            destination.write_bytes(foreign)
+            raced.append(destination)
+        return atomic(destination, data, **kwargs)
+
+    monkeypatch.setattr(library_zettel_files, "_atomic_write", editor_wins)
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "appeared during export" in error
+    assert len(raced) == 1 and raced[0].read_bytes() == foreign
+    assert list((out / "notes/zettel").glob("*.md")) == raced
+
+
+def _updated_first_note(world, capsys):
+    _library, payload, path, store, out = world
+    assert run(out, store, path, capsys)[0] == 0
+    item = payload["zettels"][0]
+    note = out / "notes/zettel" / f"{item['title']}.md"
+    original = note.read_bytes()
+    item["body"] += " An intentional source update."
+    item["attribution"] = annotation(item["body"], "agent", "model")
+    path.write_text(json.dumps(payload))
+    return note, original
+
+
+def test_editor_file_appearing_during_owned_update_is_preserved(world, capsys, monkeypatch):
+    _library, _payload, path, store, out = world
+    note, original = _updated_first_note(world, capsys)
+    atomic = library_zettel_files._atomic_write
+    foreign = b"Editor bytes written after the owned-file preflight.\n"
+
+    def edit_before_publish(destination, data, **kwargs):
+        if destination == note:
+            destination.write_bytes(foreign)
+        return atomic(destination, data, **kwargs)
+
+    monkeypatch.setattr(library_zettel_files, "_atomic_write", edit_before_publish)
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "recovery" in error
+    assert note.read_bytes() == foreign
+    recovered = list((out / ".cce-zettel-recovery").glob("*/previous.bin"))
+    assert len(recovered) == 1 and recovered[0].read_bytes() == original
+
+
+def test_open_editor_descriptor_remains_reachable_after_successful_update(world, capsys):
+    _library, _payload, path, store, out = world
+    note, original = _updated_first_note(world, capsys)
+    late = b"Late bytes through the editor's previously open inode.\n"
+    with note.open("ab") as editor:
+        original_inode = os.fstat(editor.fileno()).st_ino
+        code, stdout, _ = run(out, store, path, capsys)
+        assert code == 0
+        editor.write(late)
+        editor.flush()
+    report = json.loads(stdout)
+    recovered = list((out / ".cce-zettel-recovery").glob("*/previous.bin"))
+    assert len(recovered) == 1
+    assert recovered[0].stat().st_ino == original_inode
+    assert recovered[0].read_bytes() == original + late
+    assert note.read_bytes() != original and late not in note.read_bytes()
+    assert report["recovery"]["created"] == [str(recovered[0].relative_to(out))]
+    assert report["recovery"]["retained"] == 1
+    receipt = json.loads((recovered[0].parent / "receipt.json").read_text())
+    assert receipt["captured_sha256"] == hashlib.sha256(original).hexdigest()
+    assert receipt["captured_sha256"] != hashlib.sha256(recovered[0].read_bytes()).hexdigest()
+    assert not list((out / ".cce-zettel-recovery").rglob("*.md"))
+
+
+def test_changed_bytes_captured_after_preflight_are_restored_and_retained(
+    world, capsys, monkeypatch
+):
+    _library, _payload, path, store, out = world
+    note, _original = _updated_first_note(world, capsys)
+    rename = Path.rename
+    foreign = b"Editor changed the owned inode immediately before capture.\n"
+
+    def edit_then_capture(source_path, target):
+        if source_path == note:
+            source_path.write_bytes(foreign)
+        return rename(source_path, target)
+
+    monkeypatch.setattr(Path, "rename", edit_then_capture)
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "captured note changed" in error and "restored" in error
+    retained = next((out / ".cce-zettel-recovery").glob("*/previous.bin"))
+    assert retained.read_bytes() == note.read_bytes() == foreign
+    assert retained.stat().st_ino == note.stat().st_ino
+
+
+@pytest.mark.parametrize("conflicting_editor", [False, True])
+def test_owned_update_interruption_restores_only_a_free_name(
+    world, capsys, monkeypatch, conflicting_editor
+):
+    _library, _payload, path, store, out = world
+    note, original = _updated_first_note(world, capsys)
+    atomic = library_zettel_files._atomic_write
+    foreign = b"A separate editor replacement must stay at the note path.\n"
+
+    def interrupted(destination, data, **kwargs):
+        if destination == note:
+            if conflicting_editor:
+                destination.write_bytes(foreign)
+            raise OSError("synthetic interruption after capture")
+        return atomic(destination, data, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(library_zettel_files, "_atomic_write", interrupted)
+        code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "recovery" in error and "synthetic interruption" in error
+    retained = next((out / ".cce-zettel-recovery").glob("*/previous.bin"))
+    assert retained.read_bytes() == original
+    assert note.read_bytes() == (foreign if conflicting_editor else original)
+    if not conflicting_editor:
+        assert run(out, store, path, capsys)[0] == 0
+        before = snapshot(out)
+        code, stdout, _ = run(out, store, path, capsys)
+        assert code == 0 and json.loads(stdout)["written"] == 0
+        assert snapshot(out) == before
+
+
+def test_failure_after_capture_rename_lands_still_restores_the_retained_inode(
+    world, capsys, monkeypatch
+):
+    _library, _payload, path, store, out = world
+    note, original = _updated_first_note(world, capsys)
+    rename = Path.rename
+
+    def late_failure(source_path, target):
+        result = rename(source_path, target)
+        if source_path == note:
+            raise OSError("synthetic failure after rename landed")
+        return result
+
+    monkeypatch.setattr(Path, "rename", late_failure)
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "recovery" in error and "restored" in error
+    retained = next((out / ".cce-zettel-recovery").glob("*/previous.bin"))
+    assert retained.read_bytes() == note.read_bytes() == original
+    assert retained.stat().st_ino == note.stat().st_ino
+
+
+@pytest.mark.parametrize("limit", ["slots", "bytes"])
+def test_recovery_capacity_is_reserved_for_the_whole_batch_before_mutation(
+    world, capsys, monkeypatch, limit
+):
+    _library, payload, path, store, out = world
+    _updated_first_note(world, capsys)
+    second = payload["zettels"][1]
+    second["body"] += " A second source update in the same batch."
+    second["attribution"] = annotation(second["body"], "agent", "model")
+    path.write_text(json.dumps(payload))
+    before = snapshot(out)
+    if limit == "slots":
+        monkeypatch.setattr(library_zettel_files, "RECOVERY_SLOTS", 1)
+    else:
+        one_payload = max(
+            (out / "notes/zettel" / f"{z['title']}.md").stat().st_size
+            for z in payload["zettels"][:2]
+        )
+        monkeypatch.setattr(
+            library_zettel_files,
+            "RECOVERY_BYTES",
+            one_payload + library_zettel_files.RECOVERY_RECEIPT_BYTES,
+        )
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "recovery capacity" in error
+    assert snapshot(out) == before
+    assert not (out / ".cce-zettel-recovery").exists()
+
+
+def test_retained_recovery_slots_are_never_pruned_to_make_room(world, capsys, monkeypatch):
+    _library, payload, path, store, out = world
+    _updated_first_note(world, capsys)
+    monkeypatch.setattr(library_zettel_files, "RECOVERY_SLOTS", 1)
+    assert run(out, store, path, capsys)[0] == 0
+    before = snapshot(out)
+    assert run(out, store, path, capsys)[0] == 0
+    assert snapshot(out) == before
+    payload["zettels"][0]["body"] += " A further source update."
+    payload["zettels"][0]["attribution"] = annotation(
+        payload["zettels"][0]["body"], "agent", "model"
+    )
+    path.write_text(json.dumps(payload))
+    code, _, error = run(out, store, path, capsys)
+    assert code == 2 and "recovery capacity" in error
+    assert snapshot(out) == before
+
+
+def test_actual_recovery_git_worktree_is_refused_before_source_reads(tmp_path, monkeypatch, capsys):
+    out = tmp_path / "wiki"
+    recovery = out / ".cce-zettel-recovery"
+    recovery.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(recovery), "init", "-q"], check=True, capture_output=True)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("sources were read before the actual recovery folder was authorized")
+
+    monkeypatch.setattr(library_commands, "open_library", forbidden)
+    monkeypatch.setattr(library_commands, "_load_zettel_envelope", forbidden)
+    code, _, error = run(out, tmp_path / "store", tmp_path / "input.json", capsys)
+    assert code == 2 and "Git-visible" in error
+    with make_library(tmp_path) as library, pytest.raises(CorpusStoreError, match="Git-visible"):
+        export_zettel_notes(
+            library, envelope(library)["zettels"], out, store_root=tmp_path / "store"
+        )
+    assert sorted(p.name for p in out.iterdir()) == [".cce-zettel-recovery"]
+
+
+def test_hard_interruption_keeps_recovery_reachable_and_a_retry_can_complete(tmp_path):
+    root = tmp_path / "wiki"
+    name = "Synthetic.md"
+    old = {
+        "id": "20260304-aaaaaa",
+        "caller_digest": sha("synthetic-1"),
+        "data": b"old note",
+        "sha256": sha("old note"),
+    }
+    new = {**old, "data": b"new note", "sha256": sha("new note")}
+    library_zettel_files.write_owned_notes(root, {name: old}, max_entries=1000)
+    script = """
+import json, os, sys
+from pathlib import Path
+from conversation_corpus_engine import library_zettel_files as files
+root = Path(sys.argv[1])
+name, entry = json.loads(sys.stdin.read())
+entry['data'] = entry['data'].encode()
+atomic = files._atomic_write
+def stopped(destination, data, **kwargs):
+    if destination == root / files.NOTES_FOLDER / name:
+        os._exit(17)
+    return atomic(destination, data, **kwargs)
+files._atomic_write = stopped
+files.write_owned_notes(root, {name: entry}, max_entries=1000)
+"""
+    done = subprocess.run(
+        [sys.executable, "-c", script, str(root)],
+        input=json.dumps([name, {**new, "data": new["data"].decode()}]),
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    assert done.returncode == 17
+    retained = next((root / ".cce-zettel-recovery").glob("*/previous.bin"))
+    assert retained.read_bytes() == old["data"]
+    assert not (root / "notes/zettel" / name).exists()
+    report = library_zettel_files.write_owned_notes(root, {name: new}, max_entries=1000)
+    assert report["written"] == 1 and report["recovery"]["retained"] == 1
+    assert (root / "notes/zettel" / name).read_bytes() == new["data"]
+    assert retained.read_bytes() == old["data"]
+
+
+@pytest.mark.parametrize("original_title,new_title", [("Test", "test"), ("Café", "Cafe\u0301")])
+def test_deleted_owned_name_remains_reserved_in_the_manifest(tmp_path, original_title, new_title):
+    root = tmp_path / "wiki"
+    old_name, new_name = original_title + ".md", new_title + ".md"
+    old = {
+        "id": "20260304-aaaaaa",
+        "caller_digest": sha("synthetic-1"),
+        "data": b"old note",
+        "sha256": sha("old note"),
+    }
+    new = {
+        "id": "20260304-bbbbbb",
+        "caller_digest": sha("synthetic-2"),
+        "data": b"new note",
+        "sha256": sha("new note"),
+    }
+    library_zettel_files.write_owned_notes(root, {old_name: old}, max_entries=1000)
+    (root / "notes/zettel" / old_name).unlink()
+    before = snapshot(root)
+    with pytest.raises(ValueError, match="filename conflicts"):
+        library_zettel_files.write_owned_notes(root, {new_name: new}, max_entries=1000)
+    assert snapshot(root) == before
+    # A refusal leaves the original manifest valid and its exact spelling usable.
+    assert (
+        library_zettel_files.write_owned_notes(root, {old_name: old}, max_entries=1000)["written"]
+        == 1
+    )
+
+
+@pytest.mark.parametrize("with_reader", [False, True])
+def test_fifo_at_the_export_lock_path_is_refused_without_blocking(tmp_path, with_reader):
+    root = tmp_path / "wiki"
+    root.mkdir()
+    lock_path = root / library_zettel_files.LOCK_NAME
+    os.mkfifo(lock_path, 0o600)
+    reader = os.open(lock_path, os.O_RDONLY | os.O_NONBLOCK) if with_reader else None
+    script = (
+        "from pathlib import Path\n"
+        "import sys\n"
+        "from conversation_corpus_engine.library_zettel_files import write_owned_notes\n"
+        "try:\n"
+        "    write_owned_notes(Path(sys.argv[1]), {}, max_entries=1000)\n"
+        "except ValueError as error:\n"
+        "    print(error)\n"
+        "else:\n"
+        "    raise SystemExit('FIFO was accepted as an export lock')\n"
+    )
+    try:
+        done = subprocess.run(
+            [sys.executable, "-c", script, str(root)],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    finally:
+        if reader is not None:
+            os.close(reader)
+    assert done.returncode == 0 and "lock" in done.stdout
+    assert list(root.iterdir()) == [lock_path]

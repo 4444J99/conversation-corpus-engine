@@ -20,6 +20,7 @@ from claude_code_to_bundle import (  # noqa: E402
 from conversation_corpus_engine.import_chatgpt_export_corpus import (  # noqa: E402
     import_chatgpt_export_corpus,
 )
+from conversation_corpus_engine.sharded_collection import collection_storage_path  # noqa: E402
 
 SESSION_A = "aaaaaaaa-1111-2222-3333-444444444444"
 SESSION_B = "bbbbbbbb-5555-6666-7777-888888888888"
@@ -390,8 +391,12 @@ class EndToEndIntegrationTests(unittest.TestCase):
             self.assertEqual(result["thread_count"], 1)
             self.assertGreaterEqual(result["pair_count"], 1)
             # Federation artifacts produced
-            self.assertTrue((output / "corpus" / "threads-index.json").exists())
-            self.assertTrue((output / "corpus" / "pairs-index.json").exists())
+            self.assertTrue(
+                collection_storage_path(output / "corpus" / "threads-index.json").exists()
+            )
+            self.assertTrue(
+                collection_storage_path(output / "corpus" / "pairs-index.json").exists()
+            )
             self.assertTrue((output / "corpus" / "contract.json").exists())
 
 

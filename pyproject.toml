@@ -19,11 +19,11 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Topic :: Text Processing :: Indexing",
 ]
-dependencies = []
+dependencies = ["rfc8785==0.1.4"]
 
 [project.urls]
-Repository = "https://github.com/organvm-i-theoria/conversation-corpus-engine"
-Issues = "https://github.com/organvm-i-theoria/conversation-corpus-engine/issues"
+Repository = "https://github.com/4444J99/conversation-corpus-engine"
+Issues = "https://github.com/4444J99/conversation-corpus-engine/issues"
 
 [project.optional-dependencies]
 # Pin CI-executed dev tooling to the known-good versions recorded in uv.lock. CI installs
@@ -32,12 +32,16 @@ Issues = "https://github.com/organvm-i-theoria/conversation-corpus-engine/issues
 # formatter or lint-rule changes silently breaks `ruff check` / `ruff format --check`
 # on every PR even though no source changed. Pinning keeps CI reproducible; bump
 # these deliberately.
-dev = ["pytest==9.0.3", "ruff==0.15.8", "mypy>=1.10.0"]
+dev = ["pytest==9.0.3", "ruff==0.15.8", "mypy>=1.10.0", "markdown-it-py==4.2.0"]
 mcp = []
+obsidian = ["markdown-it-py==4.2.0"]
+sealed = ["cryptography>=46,<51"]
 
 [project.scripts]
 cce = "conversation_corpus_engine.cli:main"
 cce-mcp = "conversation_corpus_engine.mcp_server:main"
+cce-knovv = "conversation_corpus_engine.knovv_cli:main"
+cce-knovv-cloudflare = "conversation_corpus_engine.knovv_cloudflare:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -61,6 +65,7 @@ ignore = [
     "PLR0912",
     "PLR0913",
     "PLR0915",
+    "PLR0917",
     "PLR2004",
 ]
 

@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .sharded_collection import collection_storage_path, load_corpus_collection
+
 SCHEMA_CATALOG = {
     "commercial-awareness": {
         "filename": "commercial-awareness.schema.json",
@@ -24,6 +26,10 @@ SCHEMA_CATALOG = {
     "source-policy": {
         "filename": "source-policy.schema.json",
         "description": "Per-provider source authority policy under state/source-policies/<provider>.json.",
+    },
+    "sharded-collection": {
+        "filename": "sharded-collection.schema.json",
+        "description": "Immutable generation manifest for a cce.sharded_collection.v1 collection.",
     },
     "promotion-policy": {
         "filename": "promotion-policy.schema.json",
@@ -188,8 +194,11 @@ def validate_payload(schema_name: str, payload: Any) -> dict[str, Any]:
 
 
 def validate_json_file(schema_name: str, path: Path) -> dict[str, Any]:
-    resolved_path = path.resolve()
-    payload = json.loads(resolved_path.read_text(encoding="utf-8"))
+    resolved_path = path.resolve(strict=False)
+    if collection_storage_path(resolved_path).exists():
+        payload = load_corpus_collection(resolved_path, default=[])
+    else:
+        payload = json.loads(resolved_path.read_text(encoding="utf-8"))
     result = validate_payload(schema_name, payload)
     result["path"] = str(resolved_path)
     return result

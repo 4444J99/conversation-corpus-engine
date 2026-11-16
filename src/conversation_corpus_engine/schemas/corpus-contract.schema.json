@@ -12,7 +12,10 @@
   ],
   "properties": {
     "contract_name": {
-      "const": "conversation-corpus-engine-v1"
+      "enum": [
+        "conversation-corpus-engine-v1",
+        "conversation-corpus-engine.v2"
+      ]
     },
     "contract_version": {
       "type": "integer"

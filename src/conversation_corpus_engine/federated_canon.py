@@ -1,4 +1,14 @@
 #!/usr/bin/env python3
+"""Federated canon: review queue, decisions and the materialized canonical groups.
+
+Federated group ids. A group a human named keeps that name (`canonical_subject`). Any other
+group, a singleton included, is `<prefix>-<slug of its member ids>`. The slug is cut at
+`GROUP_SLUG_LIMIT` characters, and a cut slug no longer tells two long member ids apart (archive
+members share a long `corpus-<provider>-archive:family-<provider>-` stem), so whenever the cut
+removes anything the id gets a stable 16 hex digest of the full, sorted member ids appended. A slug
+that fits is left exactly as it was, and the same members always give the same id.
+"""
+
 from __future__ import annotations
 
 from collections import Counter, defaultdict
@@ -8,9 +18,13 @@ from pathlib import Path
 from typing import Any
 
 from .answering import load_json, slugify, tokenize, write_json, write_markdown
+from .archive_naming import hash_identity
+from .schema_validation import validate_json_file
+from .sharded_collection import collection_storage_path, write_corpus_collection
 
-FEDERATION_CONTRACT = "conversation-corpus-engine-v1"
-FEDERATION_CONTRACT_VERSION = 1
+GROUP_SLUG_LIMIT = 72
+FEDERATION_CONTRACT = "conversation-corpus-engine.v2"
+FEDERATION_CONTRACT_VERSION = 2
 FEDERATED_REVIEW_TYPES = {
     "entity-alias": ("accepted_entity_aliases", "rejected_entity_aliases"),
     "family-merge": ("accepted_family_merges", "rejected_family_merges"),
@@ -31,6 +45,13 @@ DEFAULT_FEDERATED_DECISIONS = {
     "rejected_contradictions": [],
 }
 CORE_CONTRACT_FILES = (
+    "corpus/threads-index.collection",
+    "corpus/semantic-v3-index.collection",
+    "corpus/pairs-index.collection",
+    "corpus/doctrine-briefs.collection",
+    "corpus/family-dossiers.collection",
+)
+LEGACY_CORE_CONTRACT_FILES = (
     "corpus/threads-index.json",
     "corpus/semantic-v3-index.json",
     "corpus/pairs-index.json",
@@ -245,9 +266,30 @@ def resolve_federated_review_item(
     raise KeyError(f"Federated review item not found: {review_id}")
 
 
+class DuplicateFederatedId(ValueError):
+    """Two different groups of members were given the same federated id."""
+
+
+class FederatedGroupingError(ValueError):
+    """The grouping lost or repeated a member, so the federation would be wrong."""
+
+
+class ContractInvalid(ValueError):
+    """A corpus contract.json does not satisfy corpus-contract.schema.json."""
+
+
 class UnionFind:
-    def __init__(self, items: list[str]) -> None:
+    """Disjoint sets over string items.
+
+    With `labels` (item -> label, here the corpus id), a union is refused when the two sets
+    already share a label, so no set ever holds two items with the same label.
+    """
+
+    def __init__(self, items: list[str], labels: dict[str, str] | None = None) -> None:
         self.parent = {item: item for item in items}
+        self.labels: dict[str, set[str]] | None = (
+            {item: {labels[item]} for item in items} if labels is not None else None
+        )
 
     def find(self, item: str) -> str:
         root = self.parent[item]
@@ -255,14 +297,19 @@ class UnionFind:
             self.parent[item] = self.find(root)
         return self.parent[item]
 
-    def union(self, left: str, right: str) -> None:
+    def union(self, left: str, right: str) -> bool:
+        """Join the sets of `left` and `right`; False when the labels forbid it."""
         left_root = self.find(left)
         right_root = self.find(right)
-        if left_root != right_root:
-            if left_root < right_root:
-                self.parent[right_root] = left_root
-            else:
-                self.parent[left_root] = right_root
+        if left_root == right_root:
+            return True
+        if self.labels is not None and self.labels[left_root] & self.labels[right_root]:
+            return False
+        keep, drop = (left_root, right_root) if left_root < right_root else (right_root, left_root)
+        self.parent[drop] = keep
+        if self.labels is not None:
+            self.labels[keep] = self.labels[keep] | self.labels.pop(drop)
+        return True
 
     def groups(self) -> dict[str, list[str]]:
         grouped: dict[str, list[str]] = defaultdict(list)
@@ -552,15 +599,63 @@ def build_pair_suggestions(
     return suggestions
 
 
+def _group_canonical_subject(accepted: list[dict[str, Any]], member_ids: list[str]) -> str:
+    """The canonical subject a human gave to (part of) this group.
+
+    Accepted decisions are pairwise as often as not, so a group of three or more is covered by
+    several decisions and no single one lists every member. Every decision whose subjects all lie
+    inside the group competes; the one covering the most members wins, then the latest recorded,
+    then the one stored last.
+    """
+    members = set(member_ids)
+    best: tuple[int, str, int] | None = None
+    chosen = ""
+    for position, decision in enumerate(accepted):
+        subject = decision.get("canonical_subject")
+        subject_ids = set(decision.get("subject_ids") or [])
+        if not subject or len(subject_ids) < 2 or not subject_ids <= members:
+            continue
+        rank = (len(subject_ids), str(decision.get("recorded_at") or ""), position)
+        if best is None or rank > best:
+            best, chosen = rank, str(subject)
+    return chosen
+
+
+def default_group_id(prefix: str, member_ids: list[str]) -> str:
+    """`<prefix>-<slug>` for a group no human named; the full-member digest is appended when the
+    slug had to be cut, so two groups whose ids share their first characters cannot collide."""
+    joined = " ".join(member_ids)
+    slug = slugify(joined, limit=GROUP_SLUG_LIMIT)
+    if slug != slugify(joined, limit=len(joined) + 1):
+        return f"{prefix}-{slug}-{hash_identity(decision_subject_key(member_ids))}"
+    return f"{prefix}-{slug}"
+
+
 def apply_decision_groups(
     records: list[dict[str, Any]],
     decisions: dict[str, Any],
     accepted_key: str,
     canonical_subject_prefix: str,
+    *,
+    skipped: list[dict[str, Any]] | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
+    repeated = sorted(
+        member_id
+        for member_id, count in Counter(record["member_id"] for record in records).items()
+        if count > 1
+    )
+    if repeated:
+        raise FederatedGroupingError(
+            f"{len(repeated)} member id(s) appear more than once in the {accepted_key} records, "
+            f"so a record would be silently lost: {', '.join(repeated[:5])}"
+        )
     record_map = {record["member_id"]: record for record in records}
-    union = UnionFind(list(record_map.keys()))
-    for decision in decisions.get(accepted_key, []):
+    union = UnionFind(
+        list(record_map.keys()),
+        labels={member_id: str(record["corpus_id"]) for member_id, record in record_map.items()},
+    )
+    accepted = list(decisions.get(accepted_key, []))
+    for decision in accepted:
         subject_ids = [
             subject_id for subject_id in decision.get("subject_ids", []) if subject_id in record_map
         ]
@@ -568,25 +663,33 @@ def apply_decision_groups(
             continue
         base = subject_ids[0]
         for subject_id in subject_ids[1:]:
-            union.union(base, subject_id)
+            if not union.union(base, subject_id) and skipped is not None:
+                skipped.append(
+                    {
+                        "decision": accepted_key,
+                        "review_id": decision.get("review_id"),
+                        "members": sorted([base, subject_id]),
+                        "reason": "both sides already hold a member from the same corpus",
+                    }
+                )
     groups: dict[str, list[dict[str, Any]]] = {}
     for _root, member_ids in union.groups().items():
         members = [record_map[member_id] for member_id in member_ids]
-        canonical_subject = next(
-            (
-                decision.get("canonical_subject")
-                for decision in decisions.get(accepted_key, [])
-                if decision_subject_key(decision.get("subject_ids") or [])
-                == decision_subject_key(member_ids)
-                and decision.get("canonical_subject")
-            ),
-            "",
-        )
-        group_id = (
-            canonical_subject
-            or f"{canonical_subject_prefix}-{slugify(' '.join(member_ids), limit=72)}"
-        )
+        canonical_subject = _group_canonical_subject(accepted, member_ids)
+        group_id = canonical_subject or default_group_id(canonical_subject_prefix, member_ids)
+        if group_id in groups:
+            clash = sorted({record["member_id"] for record in groups[group_id]} | set(member_ids))
+            raise DuplicateFederatedId(
+                f"federated id {group_id!r} would be given to two different groups "
+                f"({', '.join(clash)})"
+            )
         groups[group_id] = members
+    placed = [member["member_id"] for members in groups.values() for member in members]
+    if sorted(placed) != sorted(record["member_id"] for record in records):
+        raise FederatedGroupingError(
+            f"grouping for {accepted_key} placed {len(placed)} members "
+            f"of {len(records)}: every member must appear exactly once"
+        )
     return groups
 
 
@@ -839,6 +942,7 @@ def materialize_lineage_map(canonical_families: list[dict[str, Any]]) -> list[di
 def materialize_conflict_report(
     contradiction_suggestions: list[dict[str, Any]],
     canonical_families: list[dict[str, Any]],
+    skipped_merges: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     multi_corpus = [item for item in canonical_families if len(item.get("corpus_ids") or []) > 1]
     return {
@@ -846,6 +950,7 @@ def materialize_conflict_report(
         "potential_conflict_count": len(contradiction_suggestions),
         "multi_corpus_family_count": len(multi_corpus),
         "potential_conflicts": contradiction_suggestions,
+        "skipped_merges": list(skipped_merges or []),
         "multi_corpus_families": [
             {
                 "federated_family_id": item["federated_family_id"],
@@ -903,15 +1008,21 @@ def ensure_corpus_contract_manifest(
 ) -> dict[str, Any]:
     path = corpus_root / "corpus" / "contract.json"
     payload = load_json(path, default={}) or {}
+    existing_contract_name = payload.get("contract_name")
+    default_required_files = (
+        LEGACY_CORE_CONTRACT_FILES
+        if existing_contract_name == "conversation-corpus-engine-v1"
+        else CORE_CONTRACT_FILES
+    )
     payload.update(
         {
-            "contract_name": FEDERATION_CONTRACT,
-            "contract_version": FEDERATION_CONTRACT_VERSION,
+            "contract_name": existing_contract_name or FEDERATION_CONTRACT,
+            "contract_version": payload.get("contract_version") or FEDERATION_CONTRACT_VERSION,
             "adapter_type": payload.get("adapter_type") or adapter_type,
             "corpus_id": payload.get("corpus_id") or corpus_id,
             "name": payload.get("name") or name,
             "generated_at": now_iso(),
-            "required_files": list(CORE_CONTRACT_FILES),
+            "required_files": payload.get("required_files") or list(default_required_files),
             "counts": {
                 "threads": summary.get("thread_count", 0),
                 "families": summary.get("family_count", 0),
@@ -925,16 +1036,25 @@ def ensure_corpus_contract_manifest(
     return payload
 
 
-def build_federated_canon(project_root: Path, surfaces: list[dict[str, Any]]) -> dict[str, str]:
+def validate_corpus_contracts(surfaces: list[dict[str, Any]]) -> None:
+    """Check every corpus contract.json against its schema; raise on any miss."""
+    problems: list[str] = []
     for surface in surfaces:
         summary = surface["summary"]
-        ensure_corpus_contract_manifest(
-            Path(summary["root"]),
-            corpus_id=summary["corpus_id"],
-            name=summary["name"],
-            adapter_type=summary.get("adapter_type") or "external-memory-corpus",
-            summary=summary,
+        path = Path(summary["root"]) / "corpus" / "contract.json"
+        if not path.is_file():
+            continue
+        verdict = validate_json_file("corpus-contract", path)
+        if not verdict["valid"]:
+            problems.append(f"{summary['corpus_id']}: {'; '.join(map(str, verdict['errors']))}")
+    if problems:
+        raise ContractInvalid(
+            "contract.json fails corpus-contract.schema.json: " + " | ".join(problems)
         )
+
+
+def build_federated_canon(project_root: Path, surfaces: list[dict[str, Any]]) -> dict[str, str]:
+    validate_corpus_contracts(surfaces)
 
     decisions = load_federated_decisions(project_root)
     family_records = collect_family_records(surfaces)
@@ -1010,17 +1130,34 @@ def build_federated_canon(project_root: Path, surfaces: list[dict[str, Any]]) ->
     save_federated_review_queue(project_root, queue_payload)
     save_federated_decisions(project_root, decisions)
 
+    skipped_merges: list[dict[str, Any]] = []
     entity_groups = apply_decision_groups(
-        entity_records, decisions, "accepted_entity_aliases", "federated-entity"
+        entity_records,
+        decisions,
+        "accepted_entity_aliases",
+        "federated-entity",
+        skipped=skipped_merges,
     )
     family_groups = apply_decision_groups(
-        family_records, decisions, "accepted_family_merges", "federated-family"
+        family_records,
+        decisions,
+        "accepted_family_merges",
+        "federated-family",
+        skipped=skipped_merges,
     )
     action_groups = apply_decision_groups(
-        action_records, decisions, "accepted_action_merges", "federated-action"
+        action_records,
+        decisions,
+        "accepted_action_merges",
+        "federated-action",
+        skipped=skipped_merges,
     )
     unresolved_groups = apply_decision_groups(
-        unresolved_records, decisions, "accepted_unresolved_merges", "federated-question"
+        unresolved_records,
+        decisions,
+        "accepted_unresolved_merges",
+        "federated-question",
+        skipped=skipped_merges,
     )
 
     canonical_entities = materialize_canonical_entities(entity_groups)
@@ -1031,7 +1168,9 @@ def build_federated_canon(project_root: Path, surfaces: list[dict[str, Any]]) ->
     entity_dossiers = materialize_entity_dossiers(canonical_entities)
     project_dossiers = materialize_project_dossiers(canonical_families)
     lineage_map = materialize_lineage_map(canonical_families)
-    conflict_report = materialize_conflict_report(contradiction_suggestions, canonical_families)
+    conflict_report = materialize_conflict_report(
+        contradiction_suggestions, canonical_families, skipped_merges
+    )
 
     overlap_report = render_overlap_report(
         canonical_entities,
@@ -1044,14 +1183,18 @@ def build_federated_canon(project_root: Path, surfaces: list[dict[str, Any]]) ->
 
     fed_dir = project_root / "federation"
     fed_dir.mkdir(parents=True, exist_ok=True)
-    write_json(fed_dir / "canonical-entities.json", canonical_entities)
-    write_json(fed_dir / "canonical-families.json", canonical_families)
-    write_json(fed_dir / "canonical-actions.json", canonical_actions)
-    write_json(fed_dir / "canonical-unresolved.json", canonical_unresolved)
-    write_json(fed_dir / "doctrine-briefs.json", doctrine_briefs)
-    write_json(fed_dir / "entity-dossiers.json", entity_dossiers)
-    write_json(fed_dir / "project-dossiers.json", project_dossiers)
-    write_json(fed_dir / "lineage-map.json", lineage_map)
+    collections = {
+        "canonical-entities.json": canonical_entities,
+        "canonical-families.json": canonical_families,
+        "canonical-actions.json": canonical_actions,
+        "canonical-unresolved.json": canonical_unresolved,
+        "doctrine-briefs.json": doctrine_briefs,
+        "entity-dossiers.json": entity_dossiers,
+        "project-dossiers.json": project_dossiers,
+        "lineage-map.json": lineage_map,
+    }
+    for filename, records in collections.items():
+        write_corpus_collection(fed_dir / filename, records)
     write_json(fed_dir / "conflict-report.json", conflict_report)
     write_markdown(fed_dir / "overlap-report.md", overlap_report)
     write_markdown(
@@ -1067,14 +1210,20 @@ def build_federated_canon(project_root: Path, surfaces: list[dict[str, Any]]) ->
         ),
     )
     return {
-        "canonical_entities_path": str(fed_dir / "canonical-entities.json"),
-        "canonical_families_path": str(fed_dir / "canonical-families.json"),
-        "canonical_actions_path": str(fed_dir / "canonical-actions.json"),
-        "canonical_unresolved_path": str(fed_dir / "canonical-unresolved.json"),
-        "doctrine_briefs_path": str(fed_dir / "doctrine-briefs.json"),
-        "entity_dossiers_path": str(fed_dir / "entity-dossiers.json"),
-        "project_dossiers_path": str(fed_dir / "project-dossiers.json"),
-        "lineage_map_path": str(fed_dir / "lineage-map.json"),
+        "canonical_entities_path": str(
+            collection_storage_path(fed_dir / "canonical-entities.json")
+        ),
+        "canonical_families_path": str(
+            collection_storage_path(fed_dir / "canonical-families.json")
+        ),
+        "canonical_actions_path": str(collection_storage_path(fed_dir / "canonical-actions.json")),
+        "canonical_unresolved_path": str(
+            collection_storage_path(fed_dir / "canonical-unresolved.json")
+        ),
+        "doctrine_briefs_path": str(collection_storage_path(fed_dir / "doctrine-briefs.json")),
+        "entity_dossiers_path": str(collection_storage_path(fed_dir / "entity-dossiers.json")),
+        "project_dossiers_path": str(collection_storage_path(fed_dir / "project-dossiers.json")),
+        "lineage_map_path": str(collection_storage_path(fed_dir / "lineage-map.json")),
         "conflict_report_path": str(fed_dir / "conflict-report.json"),
         "overlap_report_path": str(fed_dir / "overlap-report.md"),
         "review_queue_path": str(fed_dir / "review-queue.json"),

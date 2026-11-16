@@ -5,17 +5,28 @@ import argparse
 import json
 import re
 import shutil
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .answering import slugify, tokenize, write_json, write_markdown
+from .corpus_store import git_visible_refusal
+from .sharded_collection import (
+    collection_storage_path,
+    merge_entity_records,
+    merge_ledger_records,
+    write_corpus_collection,
+)
 from .source_lifecycle import build_source_snapshot
 
+if TYPE_CHECKING:
+    from .corpus_store import CorpusWriteAuthorization
+
 DEFAULT_OUTPUT_ROOT = Path.cwd() / "markdown-document-memory"
-CONTRACT_NAME = "conversation-corpus-engine-v1"
-CONTRACT_VERSION = 1
+CONTRACT_NAME = "conversation-corpus-engine.v2"
+CONTRACT_VERSION = 2
 H1_RE = re.compile(r"^\s*#\s+(.+?)\s*$", re.MULTILINE)
 LIST_PREFIX_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
 FOOTNOTE_RE = re.compile(r"\[\^[^\]]+\]")
@@ -352,6 +363,7 @@ def import_markdown_document_corpus(
     corpus_id: str | None = None,
     name: str | None = None,
     max_depth: int | None = None,
+    authorization: CorpusWriteAuthorization | None = None,
 ) -> dict[str, Any]:
     markdown_files = collect_markdown_files(input_path, max_depth=max_depth)
     if not markdown_files:
@@ -548,17 +560,44 @@ def import_markdown_document_corpus(
     corpus_dir = output_root / "corpus"
     collection_scope = "top-level" if max_depth == 1 and input_path.is_dir() else "recursive"
     source_snapshot = build_source_snapshot(input_path, "markdown-document", collection_scope)
-    write_json(corpus_dir / "threads-index.json", threads)
-    write_json(corpus_dir / "semantic-v3-index.json", {"threads": semantic_threads})
-    write_json(corpus_dir / "pairs-index.json", pairs)
-    write_json(corpus_dir / "doctrine-briefs.json", doctrine_briefs)
-    write_json(corpus_dir / "family-dossiers.json", family_dossiers)
-    write_json(corpus_dir / "canonical-families.json", canonical_families)
-    write_json(corpus_dir / "action-ledger.json", actions)
-    write_json(corpus_dir / "unresolved-ledger.json", unresolved)
-    write_json(corpus_dir / "canonical-entities.json", entities)
-    write_json(corpus_dir / "entity-aliases.json", entity_aliases)
-    write_json(corpus_dir / "doctrine-timeline.json", [])
+    actions = merge_ledger_records(
+        actions,
+        key_field="action_key",
+        text_field="canonical_action",
+    )
+    unresolved = merge_ledger_records(
+        unresolved,
+        key_field="question_key",
+        text_field="canonical_question",
+    )
+    entities = merge_entity_records(entities)
+    entity_aliases = [
+        {
+            "canonical_label": entity["canonical_label"],
+            "labels": entity.get("aliases") or [],
+        }
+        for entity in entities
+        if entity.get("aliases")
+    ]
+    collections = {
+        "threads-index.json": threads,
+        "semantic-v3-index.json": semantic_threads,
+        "pairs-index.json": pairs,
+        "doctrine-briefs.json": doctrine_briefs,
+        "family-dossiers.json": family_dossiers,
+        "canonical-families.json": canonical_families,
+        "action-ledger.json": actions,
+        "unresolved-ledger.json": unresolved,
+        "canonical-entities.json": entities,
+        "entity-aliases.json": entity_aliases,
+        "doctrine-timeline.json": [],
+    }
+    for filename, records in collections.items():
+        write_corpus_collection(
+            corpus_dir / filename,
+            records,
+            authorization=authorization,
+        )
     write_json(corpus_dir / "source-snapshot.json", source_snapshot)
     write_json(
         corpus_dir / "contract.json",
@@ -570,11 +609,11 @@ def import_markdown_document_corpus(
             "name": name or output_root.name,
             "generated_at": now_iso(),
             "required_files": [
-                "corpus/threads-index.json",
-                "corpus/semantic-v3-index.json",
-                "corpus/pairs-index.json",
-                "corpus/doctrine-briefs.json",
-                "corpus/family-dossiers.json",
+                "corpus/threads-index.collection",
+                "corpus/semantic-v3-index.collection",
+                "corpus/pairs-index.collection",
+                "corpus/doctrine-briefs.collection",
+                "corpus/family-dossiers.collection",
             ],
             "counts": {
                 "threads": len(threads),
@@ -612,7 +651,11 @@ def import_markdown_document_corpus(
             "gates": [],
         },
     )
-    write_json(output_root / "import-manifest.json", import_manifest)
+    write_corpus_collection(
+        output_root / "import-manifest.json",
+        import_manifest,
+        authorization=authorization,
+    )
     write_markdown(
         output_root / "README.md",
         "\n".join(
@@ -641,13 +684,18 @@ def import_markdown_document_corpus(
         "thread_count": len(threads),
         "action_count": len(actions),
         "unresolved_count": len(unresolved),
-        "manifest_path": str(output_root / "import-manifest.json"),
+        "manifest_path": str(collection_storage_path(output_root / "import-manifest.json")),
         "readme_path": str(output_root / "README.md"),
     }
 
 
 def main() -> int:
     args = parse_args()
+    # The corpus is the documents' text as plaintext, and --output-root defaults to the working
+    # directory: refuse a folder Git can see before anything is read.
+    if (refusal := git_visible_refusal(args.output_root)) is not None:
+        print(f"output refused: {refusal}", file=sys.stderr)
+        return 2
     result = import_markdown_document_corpus(
         args.input_path,
         args.output_root,

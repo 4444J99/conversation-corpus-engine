@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
 
-from . import __version__
+from . import __version__, archive_search, library_mcp
 from .answering import build_answer, render_answer_text, search_documents_v4
+from .archive_ingest import ArchivePaths
 from .federation import list_registered_corpora, validate_corpus_root
+from .library_commands import STORE_ENV
 from .paths import default_project_root as default_project_root_path
 from .paths import resolve_workspace_path
 from .surface_exports import build_mcp_context_payload
@@ -22,6 +25,16 @@ JSONRPC_INVALID_REQUEST = -32600
 JSONRPC_METHOD_NOT_FOUND = -32601
 JSONRPC_INVALID_PARAMS = -32602
 JSONRPC_INTERNAL_ERROR = -32603
+
+ARCHIVE_ROOT_ENV = "CCE_ARCHIVE_ROOT"
+ARCHIVE_TOOL = "cce_archive_search"
+
+
+class NoSearchableCorpusError(ValueError):
+    """No registered or direct federation corpus could be resolved for cce_search."""
+
+
+ARCHIVE_LIMIT_MAX = 25
 
 
 def compact_json(payload: Any) -> str:
@@ -107,11 +120,68 @@ class CceMcpServer:
         *,
         default_project_root: Path | None = None,
         default_source_drop_root: Path | None = None,
+        archive_root: Path | None = None,
+        library_store_root: Path | None = None,
     ) -> None:
         self.default_project_root = (default_project_root or default_project_root_path()).resolve()
         self.default_source_drop_root = default_source_drop_root
+        self.archive_root = archive_root.resolve() if archive_root else None
+        self.library_store_root = library_store_root.absolute() if library_store_root else None
+
+    def archive_tool_definition(self) -> dict[str, Any]:
+        return {
+            "name": ARCHIVE_TOOL,
+            "title": "Search the AI Archive",
+            "description": (
+                "Full-text search the private AI-conversation archive (ChatGPT, Claude, Gemini, "
+                "NotebookLM, Grok, Perplexity, Copilot). Returns the best matching message per "
+                "conversation. Results are the user's private conversation text and record "
+                "speech acts, not verified events."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Words or a quoted phrase."},
+                    "provider": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict to providers, e.g. ['claude', 'grok'].",
+                    },
+                    "kind": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict to kinds: chat, search, activity, notebook, memory.",
+                    },
+                    "author": {
+                        "type": "array",
+                        "items": {"type": "string", "enum": ["human", "machine"]},
+                        "description": (
+                            "Restrict to turns by an author: human (typed by the person) or "
+                            "machine (replies, reasoning, tool output, memories)."
+                        ),
+                    },
+                    "month": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict to months, e.g. ['202506'], or 'undated'.",
+                    },
+                    "titles_only": {"type": "boolean", "description": "Search titles only."},
+                    "limit": {"type": "integer", "description": "Maximum conversations (25)."},
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        }
 
     def tool_definitions(self) -> list[dict[str, Any]]:
+        tools = self._core_tool_definitions()
+        if self.archive_root is not None:
+            tools.append(self.archive_tool_definition())
+        if self.library_store_root is not None:
+            tools.extend(library_mcp.tool_definitions())
+        return tools
+
+    def _core_tool_definitions(self) -> list[dict[str, Any]]:
         return [
             {
                 "name": "cce_search",
@@ -205,7 +275,15 @@ class CceMcpServer:
                 return self.list_corpora(args)
             if name == "cce_surface_context":
                 return self.surface_context(args)
-        except ValueError as exc:
+            if name == ARCHIVE_TOOL and self.archive_root is not None:
+                return self.archive_search(args)
+            if name in library_mcp.LIBRARY_TOOLS and self.library_store_root is not None:
+                try:
+                    result = library_mcp.call_tool(self.library_store_root, name, args)
+                except KeyError as exc:
+                    raise ValueError("library record, version or digest not found") from exc
+                return text_result(library_mcp.render_text(name, args, result), result)
+        except (ValueError, FileNotFoundError) as exc:
             return text_result(str(exc), {"error": str(exc)}, is_error=True)
         raise KeyError(name)
 
@@ -249,7 +327,7 @@ class CceMcpServer:
         if validation["valid"]:
             return project_root
         missing = ", ".join(validation["missing_files"]) or "registry entries"
-        raise ValueError(
+        raise NoSearchableCorpusError(
             "No searchable corpus found. Provide corpus_root or register a corpus; "
             f"missing {missing}."
         )
@@ -260,7 +338,19 @@ class CceMcpServer:
         if mode not in {None, "action", "unresolved", "timeline", "family_brief"}:
             raise ValueError("mode must be one of action, unresolved, timeline, or family_brief")
         limit = optional_limit(arguments)
-        corpus_root = self.corpus_root_from_args(arguments)
+        try:
+            corpus_root = self.corpus_root_from_args(arguments)
+        except NoSearchableCorpusError:
+            explicit = any(
+                optional_string(arguments, key)
+                for key in ("corpus_root", "corpus_id", "project_root")
+            )
+            # The default configuration of this server is an archive (and optionally a
+            # library), not a federation registry. Without an explicit federation target,
+            # answer from the configured archive instead of failing.
+            if explicit or self.archive_root is None or mode is not None:
+                raise
+            return self.archive_search({"query": query, "limit": limit})
         validation = validate_corpus_root(corpus_root)
         if not validation["valid"]:
             missing = ", ".join(validation["missing_files"])
@@ -277,6 +367,53 @@ class CceMcpServer:
             "family_focus": retrieval.get("family_focus", []),
         }
         return text_result(render_answer_text(answer), structured)
+
+    def archive_search(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if self.archive_root is None:
+            raise ValueError("archive search is not configured; set --archive-root")
+        query = required_string(arguments, "query")
+        limit = optional_limit(arguments, default=10, maximum=ARCHIVE_LIMIT_MAX)
+        titles_only = optional_bool(arguments, "titles_only", default=False)
+        filters: dict[str, list[str] | None] = {}
+        for key in ("provider", "kind", "author", "month"):
+            value = arguments.get(key)
+            if value is None:
+                filters[key] = None
+            elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+                filters[key] = value or None
+            else:
+                raise ValueError(f"{key} must be an array of strings")
+        archive_paths = ArchivePaths(self.archive_root)
+        try:
+            if titles_only:
+                results = archive_search.search_titles(
+                    archive_paths,
+                    query,
+                    providers=filters["provider"],
+                    months=filters["month"],
+                    limit=limit,
+                )
+            else:
+                results = archive_search.search(
+                    archive_paths,
+                    query,
+                    providers=filters["provider"],
+                    kinds=filters["kind"],
+                    authors=filters["author"],
+                    months=filters["month"],
+                    limit=limit,
+                )
+        except FileNotFoundError as exc:
+            raise ValueError(f"The archive search database is not built: {exc}") from exc
+        except archive_search.FilterNotSupported as exc:
+            raise ValueError(str(exc)) from exc
+        structured = {"query": query, "count": len(results), "results": results}
+        lines = [
+            f"{hit['provider']} · {hit['created'][:10]} · {hit['title']} ({hit['uid']})"
+            + (f"\n    {hit['excerpt']}" if hit.get("excerpt") else "")
+            for hit in results
+        ]
+        return text_result("\n".join(lines) or "No matching conversations.", structured)
 
     def list_corpora(self, arguments: dict[str, Any]) -> dict[str, Any]:
         project_root = self.project_root_from_args(arguments)
@@ -401,7 +538,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the CCE MCP stdio server")
     parser.add_argument("--project-root", type=Path, default=default_project_root_path())
     parser.add_argument("--source-drop-root", type=Path)
+    parser.add_argument(
+        "--archive-root",
+        type=Path,
+        default=Path(os.environ[ARCHIVE_ROOT_ENV]) if os.environ.get(ARCHIVE_ROOT_ENV) else None,
+        help=f"enable {ARCHIVE_TOOL} over this archive root (or set {ARCHIVE_ROOT_ENV})",
+    )
     parser.add_argument("--version", action="store_true")
+    parser.add_argument(
+        "--library-store-root",
+        type=Path,
+        default=Path(os.environ[STORE_ENV]) if os.environ.get(STORE_ENV) else None,
+        help="enable bounded unified-library search/read/history over this registered private store",
+    )
     return parser
 
 
@@ -414,6 +563,8 @@ def main() -> None:
     server = CceMcpServer(
         default_project_root=args.project_root,
         default_source_drop_root=args.source_drop_root,
+        archive_root=args.archive_root,
+        library_store_root=args.library_store_root,
     )
     server.serve_stdio()
 

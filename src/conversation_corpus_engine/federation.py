@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
+import json
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from . import archive_layout
 from .answering import (
     STOP_WORDS,
     build_answer,
@@ -21,11 +24,17 @@ from .answering import (
 )
 from .federated_canon import build_federated_canon
 from .paths import default_project_root, resolve_workspace_path
+from .sharded_collection import (
+    collection_exists,
+    collection_storage_path,
+    load_corpus_collection,
+    write_corpus_collection,
+)
 from .source_lifecycle import compute_source_freshness
 
 DEFAULT_PROJECT_ROOT = default_project_root()
-FEDERATION_CONTRACT = "conversation-corpus-engine-v1"
-REGISTRY_VERSION = 1
+FEDERATION_CONTRACT = "conversation-corpus-engine.v2"
+REGISTRY_VERSION = 2
 REQUIRED_CONTRACT_FILES = (
     "corpus/threads-index.json",
     "corpus/semantic-v3-index.json",
@@ -58,7 +67,9 @@ def answers_dir(root: Path) -> Path:
 def validate_corpus_root(corpus_root: Path) -> dict[str, Any]:
     corpus_root = resolve_workspace_path(corpus_root)
     missing = [
-        relative for relative in REQUIRED_CONTRACT_FILES if not (corpus_root / relative).exists()
+        relative
+        for relative in REQUIRED_CONTRACT_FILES
+        if not collection_exists(corpus_root / relative)
     ]
     contract_manifest = load_json(corpus_root / "corpus" / "contract.json", default={}) or {}
     return {
@@ -71,11 +82,12 @@ def validate_corpus_root(corpus_root: Path) -> dict[str, Any]:
 
 
 def default_registry_entry(project_root: Path) -> dict[str, Any]:
+    validation = validate_corpus_root(project_root)
     return {
         "corpus_id": "primary-corpus",
         "name": "Primary Corpus",
         "root": str(project_root),
-        "contract": FEDERATION_CONTRACT,
+        "contract": validation.get("contract_name") or FEDERATION_CONTRACT,
         "status": "active",
         "default": True,
         "registered_at": now_iso(),
@@ -111,6 +123,7 @@ def load_registry(project_root: Path) -> dict[str, Any]:
 
 
 def save_registry(project_root: Path, registry: dict[str, Any]) -> dict[str, Any]:
+    registry["registry_version"] = REGISTRY_VERSION
     registry["generated_at"] = now_iso()
     active = [
         entry for entry in registry.get("corpora", []) if entry.get("status", "active") == "active"
@@ -148,7 +161,7 @@ def upsert_corpus(
     *,
     corpus_id: str | None = None,
     name: str | None = None,
-    contract: str = FEDERATION_CONTRACT,
+    contract: str | None = None,
     status: str = "active",
     make_default: bool = False,
 ) -> dict[str, Any]:
@@ -159,6 +172,7 @@ def upsert_corpus(
         raise ValueError(f"Corpus root {corpus_root} is missing required contract files: {missing}")
 
     registry = load_registry(project_root)
+    resolved_contract = contract or validation.get("contract_name") or FEDERATION_CONTRACT
     resolved_id = normalize_corpus_id(corpus_id or corpus_root.name)
     existing = next(
         (entry for entry in registry["corpora"] if entry["corpus_id"] == resolved_id), None
@@ -167,14 +181,14 @@ def upsert_corpus(
         entry = existing
         entry["name"] = name or entry.get("name") or corpus_root.name
         entry["root"] = str(corpus_root)
-        entry["contract"] = contract
+        entry["contract"] = resolved_contract
         entry["status"] = status
     else:
         entry = {
             "corpus_id": resolved_id,
             "name": name or corpus_root.name,
             "root": str(corpus_root),
-            "contract": contract,
+            "contract": resolved_contract,
             "status": status,
             "default": False,
             "registered_at": now_iso(),
@@ -203,13 +217,14 @@ def remove_corpus(project_root: Path, corpus_id: str) -> dict[str, Any]:
 
 def load_corpus_surface(entry: dict[str, Any]) -> dict[str, Any]:
     root = resolve_workspace_path(Path(entry["root"]))
-    threads = load_json(root / "corpus" / "threads-index.json", default=[]) or []
-    doctrine_briefs = load_json(root / "corpus" / "doctrine-briefs.json", default=[]) or []
-    family_dossiers = load_json(root / "corpus" / "family-dossiers.json", default=[]) or []
-    families = load_json(root / "corpus" / "canonical-families.json", default=[]) or []
-    actions = load_json(root / "corpus" / "action-ledger.json", default=[]) or []
-    unresolved = load_json(root / "corpus" / "unresolved-ledger.json", default=[]) or []
-    entities = load_json(root / "corpus" / "canonical-entities.json", default=[]) or []
+    corpus_dir = root / "corpus"
+    threads = load_corpus_collection(corpus_dir / "threads-index.json", default=[]) or []
+    doctrine_briefs = load_corpus_collection(corpus_dir / "doctrine-briefs.json", default=[]) or []
+    family_dossiers = load_corpus_collection(corpus_dir / "family-dossiers.json", default=[]) or []
+    families = load_corpus_collection(corpus_dir / "canonical-families.json", default=[]) or []
+    actions = load_corpus_collection(corpus_dir / "action-ledger.json", default=[]) or []
+    unresolved = load_corpus_collection(corpus_dir / "unresolved-ledger.json", default=[]) or []
+    entities = load_corpus_collection(corpus_dir / "canonical-entities.json", default=[]) or []
     contract_manifest = load_json(root / "corpus" / "contract.json", default={}) or {}
     evaluation = load_json(root / "corpus" / "evaluation-summary.json", default={}) or {}
     gates = load_json(root / "corpus" / "regression-gates.json", default={}) or {}
@@ -258,7 +273,40 @@ def load_corpus_surface(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def build_federation(project_root: Path) -> dict[str, Any]:
+class ArchiveManifestChanged(RuntimeError):
+    """A federation build changed the archive manifest, which it must only ever read around."""
+
+
+def archive_manifest_fingerprint(archive_root: Path) -> dict[str, str | None]:
+    """The archive manifest's recorded source fingerprint and the sha256 of the whole file."""
+    path = archive_root / archive_layout.MANIFEST_FILENAME
+    if not path.is_file():
+        raise FileNotFoundError(f"No archive manifest at {path}")
+    raw = path.read_bytes()
+    recorded = json.loads(raw.decode("utf-8")).get("source_fingerprint")
+    return {"source_fingerprint": recorded, "file_sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def build_federation(project_root: Path, *, archive_root: Path | None = None) -> dict[str, Any]:
+    """Materialize the federation.
+
+    With `archive_root`, the archive manifest fingerprint is recorded before and after the build
+    and the build fails if it moved: federation reads the projected corpora and must never touch
+    the archive they came from.
+    """
+    before = archive_manifest_fingerprint(archive_root) if archive_root is not None else None
+    result = _build_federation(project_root)
+    if archive_root is not None:
+        after = archive_manifest_fingerprint(archive_root)
+        if after != before:
+            raise ArchiveManifestChanged(
+                f"the archive manifest changed during the federation build ({before} -> {after})"
+            )
+        result["archive_manifest_fingerprint"] = after
+    return result
+
+
+def _build_federation(project_root: Path) -> dict[str, Any]:
     registry = load_registry(project_root)
     active_entries = [
         entry for entry in registry.get("corpora", []) if entry.get("status", "active") == "active"
@@ -384,11 +432,15 @@ def build_federation(project_root: Path) -> dict[str, Any]:
     fed_dir = federation_dir(project_root)
     fed_dir.mkdir(parents=True, exist_ok=True)
     write_json(fed_dir / "registry.json", registry)
-    write_json(fed_dir / "corpora-summary.json", corpora_summary)
-    write_json(fed_dir / "families-index.json", families_index)
-    write_json(fed_dir / "actions-index.json", actions_index)
-    write_json(fed_dir / "unresolved-index.json", unresolved_index)
-    write_json(fed_dir / "entities-index.json", entities_index)
+    collections = {
+        "corpora-summary.json": corpora_summary,
+        "families-index.json": families_index,
+        "actions-index.json": actions_index,
+        "unresolved-index.json": unresolved_index,
+        "entities-index.json": entities_index,
+    }
+    for filename, records in collections.items():
+        write_corpus_collection(fed_dir / filename, records)
     write_json(fed_dir / "evaluation-summary.json", evaluation_summary)
     write_markdown(
         federation_report_path(project_root),
@@ -396,11 +448,11 @@ def build_federation(project_root: Path) -> dict[str, Any]:
     )
     return {
         "registry_path": str(fed_dir / "registry.json"),
-        "corpora_summary_path": str(fed_dir / "corpora-summary.json"),
-        "families_index_path": str(fed_dir / "families-index.json"),
-        "actions_index_path": str(fed_dir / "actions-index.json"),
-        "unresolved_index_path": str(fed_dir / "unresolved-index.json"),
-        "entities_index_path": str(fed_dir / "entities-index.json"),
+        "corpora_summary_path": str(collection_storage_path(fed_dir / "corpora-summary.json")),
+        "families_index_path": str(collection_storage_path(fed_dir / "families-index.json")),
+        "actions_index_path": str(collection_storage_path(fed_dir / "actions-index.json")),
+        "unresolved_index_path": str(collection_storage_path(fed_dir / "unresolved-index.json")),
+        "entities_index_path": str(collection_storage_path(fed_dir / "entities-index.json")),
         "evaluation_summary_path": str(fed_dir / "evaluation-summary.json"),
         "summary_markdown_path": str(federation_report_path(project_root)),
         **canon_outputs,
@@ -459,15 +511,17 @@ def render_federation_summary(
 
 def ensure_federation(project_root: Path) -> None:
     fed_dir = federation_dir(project_root)
-    required = (
-        fed_dir / "corpora-summary.json",
-        fed_dir / "families-index.json",
-        fed_dir / "actions-index.json",
-        fed_dir / "unresolved-index.json",
-        fed_dir / "entities-index.json",
-        fed_dir / "evaluation-summary.json",
+    collection_names = (
+        "corpora-summary.json",
+        "families-index.json",
+        "actions-index.json",
+        "unresolved-index.json",
+        "entities-index.json",
     )
-    if not all(path.exists() for path in required):
+    if (
+        not all(collection_exists(fed_dir / name) for name in collection_names)
+        or not (fed_dir / "evaluation-summary.json").exists()
+    ):
         build_federation(project_root)
 
 
@@ -503,7 +557,10 @@ def load_federation_index(project_root: Path, ledger: str) -> Any:
         "evaluation-scorecard",
     }
     default = {} if ledger in dict_ledgers else []
-    return load_json(federation_dir(project_root) / mapping[ledger], default=default) or default
+    logical_path = federation_dir(project_root) / mapping[ledger]
+    if ledger not in dict_ledgers:
+        return load_corpus_collection(logical_path, default=default) or default
+    return load_json(logical_path, default=default) or default
 
 
 def query_federation_index(

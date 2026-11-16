@@ -18,11 +18,12 @@ def candidate_entry_for_root(
     target_corpus_id: str,
     target_name: str,
 ) -> dict[str, Any]:
+    validation = validate_corpus_root(candidate_root)
     return {
         "corpus_id": f"{target_corpus_id}-candidate",
         "name": f"{target_name} Candidate",
         "root": str(candidate_root.resolve()),
-        "contract": FEDERATION_CONTRACT,
+        "contract": validation.get("contract_name") or FEDERATION_CONTRACT,
         "status": "candidate",
         "default": False,
     }

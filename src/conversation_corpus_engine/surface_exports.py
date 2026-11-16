@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from .corpus_candidates import (
     corpus_live_pointer_path,
     corpus_promotion_latest_json_path,
 )
+from .corpus_store import CORPUS_STORE_ROOT_ENV
 from .federated_canon import load_federated_review_queue
 from .federation import (
     federation_report_path,
@@ -41,6 +43,22 @@ SURFACE_MANIFEST_CONTRACT = "conversation-corpus-engine-surface-manifest-v1"
 MCP_CONTEXT_CONTRACT = "conversation-corpus-engine-mcp-context-v1"
 SURFACE_BUNDLE_CONTRACT = "conversation-corpus-engine-surface-bundle-v1"
 SURFACE_CONTRACT_VERSION = 1
+CORPUS_STORE_ROOT_PLACEHOLDER = f"${{{CORPUS_STORE_ROOT_ENV}}}"
+HISTORICAL_CORPUS_ROOT_PLACEHOLDER = "<historical-corpus-root>"
+
+_CORPUS_EVENT_ROOT_FIELDS = {
+    "candidate_root",
+    "live_root",
+    "output_root",
+    "previous_root",
+    "promoted_root",
+    "restored_root",
+    "target_root",
+}
+_REFRESH_RECEIPT_FIELDS = {
+    "refresh_json_path",
+    "refresh_markdown_path",
+}
 
 CLI_SURFACES = [
     {
@@ -264,6 +282,178 @@ def surface_bundle_markdown_path(project_root: Path) -> Path:
 
 def optional_json(path: Path) -> Any:
     return load_json(path, default=None)
+
+
+def _replace_path_prefix(value: str, path_prefix: str, replacement: str) -> str:
+    normalized_prefix = path_prefix.rstrip("/") or "/"
+    pattern = re.compile(
+        rf"(?<![A-Za-z0-9._~/-]){re.escape(normalized_prefix)}"
+        r"(?=$|/|[\s'\"`,:;)\]}])"
+    )
+    return pattern.sub(lambda _match: replacement, value)
+
+
+def _redact_path_prefix(payload: Any, path_prefix: str, replacement: str) -> Any:
+    if isinstance(payload, str):
+        return _replace_path_prefix(payload, path_prefix, replacement)
+    if isinstance(payload, list):
+        return [_redact_path_prefix(item, path_prefix, replacement) for item in payload]
+    if isinstance(payload, dict):
+        return {
+            key: _redact_path_prefix(value, path_prefix, replacement)
+            for key, value in payload.items()
+        }
+    return payload
+
+
+def _absolute_path_string(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        return None
+    return str(path.resolve(strict=False))
+
+
+def _collect_named_paths(
+    payload: Any,
+    *,
+    field_names: set[str],
+    receipt_fields: set[str] | None = None,
+) -> set[str]:
+    paths: set[str] = set()
+    if isinstance(payload, list):
+        for item in payload:
+            paths.update(
+                _collect_named_paths(
+                    item,
+                    field_names=field_names,
+                    receipt_fields=receipt_fields,
+                )
+            )
+        return paths
+    if not isinstance(payload, dict):
+        return paths
+    for key, value in payload.items():
+        if key in field_names:
+            resolved = _absolute_path_string(value)
+            if resolved is not None:
+                paths.add(resolved)
+        if receipt_fields and key in receipt_fields:
+            resolved = _absolute_path_string(value)
+            if resolved is not None:
+                paths.add(str(Path(resolved).parent))
+        paths.update(
+            _collect_named_paths(
+                value,
+                field_names=field_names,
+                receipt_fields=receipt_fields,
+            )
+        )
+    return paths
+
+
+def _classified_corpus_roots(payload: Any) -> set[str]:
+    if not isinstance(payload, dict):
+        return set()
+    roots: set[str] = set()
+
+    registry = payload.get("registry")
+    if isinstance(registry, dict):
+        for entry in registry.get("corpora") or []:
+            if isinstance(entry, dict):
+                resolved = _absolute_path_string(entry.get("root"))
+                if resolved is not None:
+                    roots.add(resolved)
+
+    for provider in payload.get("providers") or []:
+        if not isinstance(provider, dict):
+            continue
+        for field in ("selected_target",):
+            target = provider.get(field)
+            if isinstance(target, dict):
+                resolved = _absolute_path_string(target.get("root"))
+                if resolved is not None:
+                    roots.add(resolved)
+        for field in ("selected_targets", "targets"):
+            for target in provider.get(field) or []:
+                if isinstance(target, dict):
+                    resolved = _absolute_path_string(target.get("root"))
+                    if resolved is not None:
+                        roots.add(resolved)
+        policy = provider.get("source_policy")
+        if isinstance(policy, dict):
+            for field in ("primary_root", "fallback_root"):
+                resolved = _absolute_path_string(policy.get(field))
+                if resolved is not None:
+                    roots.add(resolved)
+
+    governance = payload.get("governance")
+    if isinstance(governance, dict):
+        for field in ("latest_corpus_candidate", "latest_corpus_promotion"):
+            roots.update(
+                _collect_named_paths(
+                    governance.get(field),
+                    field_names=_CORPUS_EVENT_ROOT_FIELDS,
+                )
+            )
+
+    latest_events = payload.get("latest_events")
+    if isinstance(latest_events, dict):
+        roots.update(
+            _collect_named_paths(
+                latest_events.get("latest_corpus_live_pointer"),
+                field_names=_CORPUS_EVENT_ROOT_FIELDS,
+            )
+        )
+        roots.update(
+            _collect_named_paths(
+                latest_events.get("latest_provider_refreshes"),
+                field_names=_CORPUS_EVENT_ROOT_FIELDS,
+                receipt_fields=_REFRESH_RECEIPT_FIELDS,
+            )
+        )
+    return roots
+
+
+def redact_corpus_store_paths(payload: Any, registry: dict[str, Any]) -> Any:
+    registration = registry.get("corpus_store")
+    active_store_root = (
+        str(Path(registration["root"]).resolve())
+        if (
+            isinstance(registration, dict)
+            and registration.get("status") == "active"
+            and isinstance(registration.get("root"), str)
+        )
+        else None
+    )
+    redacted = payload
+    if active_store_root is not None:
+        redacted = _redact_path_prefix(
+            redacted,
+            active_store_root,
+            CORPUS_STORE_ROOT_PLACEHOLDER,
+        )
+
+    classified_roots = _classified_corpus_roots(payload)
+    historical_roots = {
+        root
+        for root in classified_roots
+        if not (
+            active_store_root
+            and (
+                Path(root) == Path(active_store_root)
+                or Path(root).is_relative_to(Path(active_store_root))
+            )
+        )
+    }
+    for historical_root in sorted(historical_roots, key=len):
+        redacted = _redact_path_prefix(
+            redacted,
+            historical_root,
+            HISTORICAL_CORPUS_ROOT_PLACEHOLDER,
+        )
+    return redacted
 
 
 def build_commercial_awareness_payload() -> dict[str, Any]:
@@ -558,7 +748,7 @@ def build_surface_manifest(
         resolved_source_drop_root,
     )
     registry = snapshot["registry"]
-    return {
+    payload = {
         "contract_name": SURFACE_MANIFEST_CONTRACT,
         "contract_version": SURFACE_CONTRACT_VERSION,
         "generated_at": now_iso(),
@@ -619,6 +809,7 @@ def build_surface_manifest(
         },
         "commercial_awareness": build_commercial_awareness_payload(),
     }
+    return redact_corpus_store_paths(payload, registry)
 
 
 def build_mcp_context_payload(
@@ -647,7 +838,7 @@ def build_mcp_context_payload(
     refresh_recommended_count = sum(
         1 for item in providers if "cce provider refresh" in (item.get("next_command") or "")
     )
-    return {
+    payload = {
         "contract_name": MCP_CONTEXT_CONTRACT,
         "contract_version": SURFACE_CONTRACT_VERSION,
         "generated_at": now_iso(),
@@ -700,6 +891,7 @@ def build_mcp_context_payload(
         "schema_catalog": list_schemas(),
         "commercial_awareness": build_commercial_awareness_payload(),
     }
+    return redact_corpus_store_paths(payload, snapshot["registry"])
 
 
 def write_surface_manifest_artifacts(
