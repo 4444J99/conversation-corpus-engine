@@ -60,6 +60,10 @@ from .library_paths import _absolute, _no_symlinks
 SCHEMA = "cce.notes-docs-capture.v1"
 RECEIPT_NAME = "notes-docs-capture-receipt.json"
 INDEX_NAME = "notes-index.jsonl"
+GDOCS_FOLDER = "gdocs"
+GDOCS_INDEX_NAME = "gdocs-index.jsonl"
+MAX_GDOCS = 200_000
+GDOC_SUFFIXES = (".md", ".txt")
 NOTES_FOLDER = "notes"
 DOCS_FOLDER = "docs"
 DEFAULT_NOTES_STORE = (
@@ -112,6 +116,17 @@ _NOTE_COUNTS = (
     "skipped_no_body",
     "skipped_empty",
     "skipped_undecodable",
+)
+_GDOC_COUNTS = (
+    "gdocs_seen",
+    "gdocs_written",
+    "gdocs_unchanged",
+    "gdocs_skipped_empty",
+    "gdocs_skipped_too_large",
+    "gdocs_skipped_not_utf8",
+    "gdocs_skipped_symlink",
+    "gdocs_skipped_duplicate_path",
+    "gdocs_characters",
 )
 _DRIVE_COUNTS = (
     "drive_roots_read",
@@ -667,6 +682,121 @@ def refuse_overlap(destination: Path, *source_groups: list[Path]) -> None:
                 raise ValueError("destination overlaps a source folder; choose a separate one")
 
 
+def collect_google_docs(roots: list[Path], counts: Counter[str], findings: list[dict[str, Any]]):
+    """The text of every exported Google Doc under ``roots``: (relative path, cleaned text).
+
+    The folders hold Docs exported as Markdown or plain text by a Drive export tool (such as
+    `rclone copy REMOTE: DIR --drive-export-formats md`). Only regular `.md` and `.txt` files are
+    opened, each through a no-follow descriptor, and each is read at most ``MAX_NOTE_BYTES``.
+    """
+    found: dict[str, tuple[str, str]] = {}
+    for root in roots:
+        if root.is_symlink() or not root.is_dir():
+            _find(findings, "google_docs_root_missing")
+            continue
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            try:
+                entries = sorted(os.scandir(directory), key=lambda item: item.name)
+            except OSError:
+                _find(findings, "google_docs_folder_unreadable")
+                continue
+            for entry in entries:
+                if entry.is_symlink():
+                    counts["gdocs_skipped_symlink"] += 1
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                    continue
+                if not entry.is_file(follow_symlinks=False) or not entry.name.lower().endswith(
+                    GDOC_SUFFIXES
+                ):
+                    continue
+                counts["gdocs_seen"] += 1
+                if counts["gdocs_seen"] > MAX_GDOCS:
+                    raise CaptureRefused("more exported documents than the bound")
+                relative = str(Path(entry.path).relative_to(root))
+                try:
+                    descriptor = os.open(entry.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    with os.fdopen(descriptor, "rb") as source:
+                        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                            continue
+                        raw = source.read(MAX_NOTE_BYTES + 1)
+                except OSError:
+                    _find(findings, "google_doc_unreadable")
+                    continue
+                if len(raw) > MAX_NOTE_BYTES:
+                    counts["gdocs_skipped_too_large"] += 1
+                    continue
+                try:
+                    text, _ = clean_note_text(raw.decode("utf-8-sig"))
+                except UnicodeDecodeError:
+                    counts["gdocs_skipped_not_utf8"] += 1
+                    continue
+                if not text:
+                    counts["gdocs_skipped_empty"] += 1
+                    continue
+                if relative in found:
+                    # Two export folders hold the same relative path: the first one is kept, the
+                    # second is counted and named by code, never dropped without a trace.
+                    counts["gdocs_skipped_duplicate_path"] += 1
+                    _find(findings, "google_doc_duplicate_path")
+                    continue
+                found[relative] = (Path(entry.name).stem, text)
+    return found
+
+
+def _write_google_docs(
+    found: dict[str, tuple[str, str]], destination: Path, counts: Counter[str]
+) -> tuple[set[str], list[dict[str, Any]]]:
+    current: set[str] = set()
+    index: list[dict[str, Any]] = []
+    checked: set[Path] = set()
+    for relative in sorted(found):
+        title, text = found[relative]
+        name = hashlib.sha256(relative.encode("utf-8")).hexdigest()[:24]
+        path = destination / GDOCS_FOLDER / name[:2] / f"gdoc_{name}.md"
+        if path.parent not in checked:
+            _no_symlinks(path.parent)
+            require_git_private(path.parent)
+            checked.add(path.parent)
+        data = text.encode("utf-8")
+        current.add(str(path.relative_to(destination)))
+        if _existing(path) == data:
+            counts["gdocs_unchanged"] += 1
+        else:
+            _write_atomic(path, data)
+            counts["gdocs_written"] += 1
+        counts["gdocs_characters"] += len(text)
+        index.append(
+            {
+                "identifier": name,
+                "path": str(path.relative_to(destination)),
+                "title": _clean_label(title, 300),
+                "folder": _clean_label(
+                    "" if Path(relative).parent == Path() else str(Path(relative).parent), 500
+                ),
+                "characters": len(text),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+        )
+    return current, index
+
+
+def google_docs_entry(destination: Path) -> dict[str, Any]:
+    return {
+        "id": "google-docs",
+        "root": str(destination),
+        "include": [f"{GDOCS_FOLDER}/**/*.md"],
+        # The owner's Google Docs are mostly their own writing, as Notes are; the authorship
+        # rules still withhold credit from text that carries an AI mark.
+        "wing": "authored",
+        "lane": "writing",
+        "kind": "document",
+    }
+
+
 def _prepare_destination(destination: Path) -> Path:
     _no_symlinks(destination)
     require_git_private(destination)
@@ -754,18 +884,26 @@ def capture_notes_and_docs(
     *,
     notes_store: Path | None = None,
     drive_roots: list[Path] | None = None,
+    google_docs_exports: list[Path] | None = None,
 ) -> dict[str, Any]:
-    """Capture Apple Notes and Google Drive documents under ``destination``; return the receipt.
+    """Capture Apple Notes and Google documents under ``destination``; return the receipt.
 
     ``notes_store`` is the Notes database (None skips Notes); ``drive_roots`` are Drive for
-    desktop folders (empty skips Drive). The destination is private (outside every Git work tree,
+    desktop folders (empty skips Drive); ``google_docs_exports`` are folders of Google Docs
+    already exported as Markdown or text (empty skips them). The destination is private (outside every Git work tree,
     or ignored by it), has no symlink in its path, and is new or an earlier capture. Nothing
     already there is deleted, and no source is written to.
     """
     destination = _absolute(destination)
-    if notes_store is None and not drive_roots:
-        raise ValueError("choose at least one source: a Notes database or a Drive folder")
-    refuse_overlap(destination, [_absolute(root) for root in drive_roots or []])
+    if notes_store is None and not drive_roots and not google_docs_exports:
+        raise ValueError(
+            "choose at least one source: a Notes database, a Drive folder or an exported Docs folder"
+        )
+    refuse_overlap(
+        destination,
+        [_absolute(root) for root in drive_roots or []],
+        [_absolute(root) for root in google_docs_exports or []],
+    )
     if notes_store is not None:
         # Not inside the Notes application's own container, and not holding the database it reads.
         container = _absolute(DEFAULT_NOTES_STORE.parent)
@@ -809,7 +947,26 @@ def capture_notes_and_docs(
         entries.append(stubs_entry(destination))
         entries.extend(drive_files_entry(root, number) for number, root in enumerate(roots, 1))
 
+    exports = [_absolute(root) for root in google_docs_exports or []]
+    current_gdocs: set[str] = set()
+    gdoc_index: list[dict[str, Any]] = []
+    if exports:
+        counts.update(dict.fromkeys(_GDOC_COUNTS, 0))
+        found = collect_google_docs(exports, counts, findings)
+        sources.append({"source": "google-docs-export", "roots": len(exports)})
+        current_gdocs, gdoc_index = _write_google_docs(found, destination, counts)
+        entries.append(google_docs_entry(destination))
+
     destination.mkdir(parents=True, exist_ok=True)
+    if exports:
+        _write_atomic(
+            destination / GDOCS_INDEX_NAME,
+            "".join(
+                json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
+                for row in sorted(gdoc_index, key=lambda item: item["identifier"])
+            ).encode("utf-8"),
+        )
+        counts["gdocs_retained_not_in_source"] = _retained(destination, GDOCS_FOLDER, current_gdocs)
     if notes_store is not None:
         _write_atomic(
             destination / INDEX_NAME,

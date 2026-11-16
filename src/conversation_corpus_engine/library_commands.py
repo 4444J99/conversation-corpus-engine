@@ -752,6 +752,14 @@ def add_library_parser(subparsers: Any) -> Any:
         help="Google Drive for desktop folder, such as ~/Library/CloudStorage/GoogleDrive-NAME/"
         "My Drive (repeatable). Without one, Drive is skipped",
     )
+    capture.add_argument(
+        "--google-docs-export",
+        action="append",
+        type=Path,
+        default=[],
+        help="Folder of Google Docs already exported as Markdown or text (repeatable), for "
+        "example `rclone copy REMOTE: DIR --drive-export-formats md`",
+    )
     inventory = sub.add_parser(
         "inventory",
         help="Inventory native coding-agent sessions into the database a manifest names under "
@@ -1198,6 +1206,7 @@ def _capture_notes_docs_command(args: argparse.Namespace) -> int:
         args.out,
         notes_store=None if args.no_notes else args.notes_store,
         drive_roots=args.drive_root,
+        google_docs_exports=args.google_docs_export,
     )
     print(json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
