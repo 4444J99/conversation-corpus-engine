@@ -962,9 +962,14 @@ def _merged_index(path: Path, rows: list[dict[str, Any]]) -> bytes:
     had; an earlier row is kept only for a path no current row names.
     """
     current = {row["path"] for row in rows}
+    held = {(row["provider"], row["source_id"]) for row in rows if "provider" in row}
     merged = list(rows)
     try:
-        previous = _existing(path)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError("an index path is not a regular file")
+            previous: bytes | None = source.read(MAX_INDEX_BYTES + 1)
     except (OSError, ValueError):
         previous = None
     if previous is not None and len(previous) <= MAX_INDEX_BYTES:
@@ -974,6 +979,12 @@ def _merged_index(path: Path, rows: list[dict[str, Any]]) -> bytes:
             except (ValueError, RecursionError):
                 continue
             name = row.get("path") if isinstance(row, dict) else None
+            # A moved or renamed Doc keeps its Drive id: the current row holds that identity, so
+            # the earlier row keeps only its title, never the identity a second time.
+            if isinstance(row, dict) and (row.get("provider"), row.get("source_id")) in held:
+                row = {k: v for k, v in row.items() if k not in ("provider", "source_id")}
+            elif isinstance(row, dict) and "provider" in row:
+                held.add((row["provider"], row.get("source_id")))
             if (
                 isinstance(name, str)
                 and not name.startswith("/")

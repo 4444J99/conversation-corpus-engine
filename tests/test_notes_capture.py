@@ -686,3 +686,24 @@ def test_an_identity_is_reserved_only_when_a_file_uses_it(tmp_path):
     records = list(iter_documents([first, second], report=report))
     assert [(r.title, r.provider) for r in records] == [("A", "applenotes"), ("B", "applenotes")]
     assert report["findings"] == []
+
+
+def test_a_moved_doc_keeps_its_identity_on_the_current_file_only(tmp_path):
+    root, out = tmp_path / "export", tmp_path / "out"
+    (root / "old").mkdir(parents=True)
+    (root / "old" / "Doc.md").write_text("the text\n")
+    first = _ids(tmp_path, [{"Path": "old/Doc.md", "ID": "1AbCdEfGhIjKlMnOp", "IsDir": False}])
+    notes_capture.capture_notes_and_docs(out, google_docs_exports=[root], google_docs_ids=first)
+    (root / "old" / "Doc.md").rename(root / "Moved.md")
+    second = _ids(tmp_path, [{"Path": "Moved.md", "ID": "1AbCdEfGhIjKlMnOp", "IsDir": False}])
+    receipt = notes_capture.capture_notes_and_docs(
+        out, google_docs_exports=[root], google_docs_ids=second
+    )
+    assert receipt["counts"]["gdocs_retained_not_in_source"] == 1
+    entry = next(e for e in receipt["manifest_entries"] if e["id"] == "google-docs")
+    report: dict = {}
+    records = list(iter_documents([entry], report=report))
+    assert len(records) == 2 and report["findings"] == []
+    googledrive = [r for r in records if r.provider == "googledrive"]
+    assert len(googledrive) == 1 and googledrive[0].title == "Moved"
+    assert {r.title for r in records} == {"Moved", "Doc"}  # the retained copy keeps its title
