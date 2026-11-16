@@ -57,5 +57,4 @@ generation were not touched.
 Document records do not carry `chatgpt-<id>` or Perplexity uids, so `cce app-cache gap` still
 counts those conversations as missing from the provider archive; once the library generation is published, search finds them.
 
-
-Update: the 8 files are now in the published library; see [library resume attempt](library-resume-attempt-20261115.md).
+Update: the 8 files are now in the published library; see [library resume attempt](library-resume-attempt-20261115.md). That note corrects the failed candidate to phase `indexing` (per its build-state.json) and 13.3 GB.

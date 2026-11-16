@@ -3,6 +3,8 @@
 Counts, hashes and timestamps only. Follows [history-export coverage](history-export-coverage-20261115.md).
 Owner registry row: IRF-CCE-043 (organvm-corpvs-testamentvm PR 642).
 
+Times without a zone below are the host's local time, five hours behind UTC (11:25Z is 06:25 local).
+
 ## Attempt 1: `resume_generation` on the failed candidate (refused)
 
 - Candidate: `generation-20261115T112506Z-6a27693ffcf7`, state `failed`, phase `indexing`, 8 accepted
@@ -22,7 +24,7 @@ Owner registry row: IRF-CCE-043 (organvm-corpvs-testamentvm PR 642).
 |---|---|---|
 | `record_fingerprint` | `078458e2...` | `baf1153b...` |
 | `evidence_fingerprint` | `46602d14...` | `12f1f564...` |
-| `report_sha256` | `aa429f79...` | `4663047...` |
+| `report_sha256` | `aa429f79...` | `46630475...` |
 
   Published generation files were rewritten in place that morning: `library.sqlite` 08:22,
   `build-state.json` 08:31, `report.json` and `current.json` 08:32. The writer is not attributed
@@ -81,7 +83,9 @@ Result (2026-11-15, one run, no second attempt needed):
   file SHA-256 `3524767fa3ec8d01d888ed322504942432579da3e4715336696625cfe58d68e3`). The previous
   generation was not modified by this work: its `library.sqlite` mtime is still 08:22:04 (written
   before this run started) and it has no `-wal`, `-shm` or `-journal` file. Rollback is a manual
-  copy of that JSON over `library-all/current.json` (respect `publication.lock`), not
+  restore of that file over `library-all/current.json` (take `publication.lock`; write a temporary file in the
+  same directory, then rename it so readers never see a partial file; restore from the staged copy and check
+  its SHA-256, using the inline JSON above, which is a key-sorted rendering, only as the fallback), not
   `cce library publish`: publish verifies the generation first, and the previous generation fails
   `verify_candidate` (see the diagnosis above), so the tool would refuse it.
 - Searchability: `cce library search` against the new generation returns the 8 staged exports
