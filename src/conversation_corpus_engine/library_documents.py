@@ -11,6 +11,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import io
+import json
 import mimetypes
 import os
 import posixpath
@@ -30,7 +31,7 @@ from urllib.parse import unquote
 
 from .archive_model import Conversation, Message, to_iso
 
-READER_VERSION = "library-documents@1.3.0"
+READER_VERSION = "library-documents@1.4.0"
 DEFAULT_MAX_BYTES = 20 * 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 4096
 # Directory packages recorded as one document and never descended into when selected.
@@ -216,6 +217,104 @@ def _matches(relative: str, pattern: str) -> bool:
     return walk(0, 0)
 
 
+# A capture tool may name each file's own identity (see `notes_capture`): the provider word and
+# source id a record would have had if it had been read from the application, so a note or a Drive
+# document read again from a captured file joins its existing record as a new revision instead of
+# becoming a second record. Only these providers may be named, and only with these kinds.
+IDENTITY_PROVIDERS = {"applenotes": "note", "googledrive": "document"}
+MAX_IDENTITY_BYTES = 64 * 1024 * 1024
+MAX_IDENTITY_ROWS = 2_000_000
+_IDENTITY_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
+_IDENTITY_TIME = re.compile(r"\d{4}-\d{2}-\d{2}(?:T[0-9:.+\-Z]+)?")
+_IDENTITY_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _load_identities(root: Path, name: str, report: dict, source_id: str) -> dict[str, dict]:
+    """The identity rows of one source: relative path -> {provider, source_id, title, ...}.
+
+    The index is a JSON Lines file inside the root, opened without following links and read
+    within a size bound. A row of the wrong shape, a provider not allowed here, an unsafe id or a
+    second claim on an identity is a finding and the file keeps its default identity.
+    """
+    path = root / name
+    rows: dict[str, dict] = {}
+    claimed: set[tuple[str, str]] = set()  # within this one index; across sources see `_record`
+    try:
+        # O_NOFOLLOW covers only the last component: every folder on the way must be a real one.
+        walked = root
+        for part in Path(name).parts[:-1]:
+            walked = walked / part
+            if walked.is_symlink():
+                raise OSError("symlink in identities path")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (OSError, ValueError):
+        _finding(report, source_id, name, "identities_unreadable")
+        return rows
+    with os.fdopen(descriptor, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            _finding(report, source_id, name, "identities_not_regular")
+            return rows
+        data = handle.read(MAX_IDENTITY_BYTES + 1)
+    if len(data) > MAX_IDENTITY_BYTES:
+        _finding(report, source_id, name, "identities_too_large")
+        return rows
+    lines = data.splitlines()
+    if len(lines) > MAX_IDENTITY_ROWS:
+        _finding(report, source_id, name, "identities_rows_truncated")
+    for number, line in enumerate(lines[:MAX_IDENTITY_ROWS], start=1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+            relative = row["path"]
+            provider = row.get("provider")
+            identity = row.get("source_id")
+            title = row["title"]
+            # A row without a provider names only a title; with one it names a full identity.
+            if (
+                not isinstance(relative, str)
+                or not isinstance(title, str)
+                or (provider is None) != (identity is None)
+                or (
+                    provider is not None
+                    and (
+                        provider not in IDENTITY_PROVIDERS
+                        or not isinstance(identity, str)
+                        or not _IDENTITY_ID.fullmatch(identity)
+                    )
+                )
+            ):
+                raise ValueError("shape")
+            # Text the library cannot store (a lone surrogate) refuses the row, not the ingest.
+            title.encode("utf-8")
+            relative.encode("utf-8")
+        except (ValueError, KeyError, TypeError, RecursionError):
+            _finding(report, source_id, f"{name}:{number}", "identity_row_refused")
+            continue
+        if provider is not None and (provider, identity) in claimed:
+            _finding(report, source_id, f"{name}:{number}", "identity_claimed_twice")
+            continue
+        if relative in rows:
+            _finding(report, source_id, f"{name}:{number}", "identity_claimed_twice")
+            continue
+        if provider is not None:
+            claimed.add((provider, identity))
+        stamps = {
+            key: row[key]
+            for key in ("created", "updated")
+            if isinstance(row.get(key), str) and _IDENTITY_TIME.fullmatch(row[key])
+        }
+        rows[relative] = {
+            "title": _IDENTITY_CONTROL.sub(" ", title).strip()[:300],
+            **stamps,
+        }
+        if provider is not None:
+            rows[relative].update(
+                provider=provider, source_id=identity, kind=IDENTITY_PROVIDERS[provider]
+            )
+    return rows
+
+
 def _validate_sources(sources: list[dict]) -> None:
     seen: set[str] = set()
     for source in sources:
@@ -243,9 +342,19 @@ def _validate_sources(sources: list[dict]) -> None:
         maximum = source.get("max_bytes", DEFAULT_MAX_BYTES)
         if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
             raise ValueError(f"source {source['id']} max_bytes must be a positive integer")
+        if "_identities" in source or "_claimed" in source:
+            raise ValueError(f"source {source['id']} may not carry a reserved key")
+        identities = source.get("identities")
+        if identities is not None and (
+            not isinstance(identities, str)
+            or not identities.strip()
+            or identities.startswith("/")
+            or ".." in identities.split("/")
+        ):
+            raise ValueError(f"source {source['id']} has an invalid identities path")
         for key, allowed, default in (
             ("wing", {"authored", "ai"}, "authored"),
-            ("lane", {"research", "creative", "writing", "support"}, "writing"),
+            ("lane", {"research", "creative", "writing", "support", "notes"}, "writing"),
             ("kind", {"document", "plan", "memory", "artifact"}, "document"),
         ):
             if source.get(key, default) not in allowed:
@@ -729,13 +838,26 @@ def _record(path: Path, root: Path, source: dict, report: dict) -> Conversation 
         "original_refs": [path.as_uri()],
         "reader_version": READER_VERSION,
     }
+    named = source.get("_identities", {}).get(relative)
+    if named and "provider" in named:
+        # An identity is reserved when a file actually uses it, so an index row no file selects
+        # never blocks another source; a second user falls back to its default identity.
+        key = (named["provider"], named["source_id"])
+        claimed = source["_claimed"]
+        if key in claimed:
+            _finding(report, source["id"], relative, "identity_claimed_twice")
+            named = {"title": named["title"]}
+        else:
+            claimed.add(key)
     return Conversation(
-        provider="documents",
-        source_id=f"file-{identity}",
-        title=path.stem,
-        created=created,
-        updated=to_iso(info.st_mtime),
-        kind=source.get("kind", "document"),
+        provider=named.get("provider", "documents") if named else "documents",
+        source_id=named.get("source_id", f"file-{identity}") if named else f"file-{identity}",
+        title=named["title"] if named and named["title"] else path.stem,
+        created=named.get("created", created) if named else created,
+        updated=named.get("updated", to_iso(info.st_mtime)) if named else to_iso(info.st_mtime),
+        kind=named.get("kind", source.get("kind", "document"))
+        if named
+        else source.get("kind", "document"),
         collection=source["id"],
         provenance=provenance,
         extra=extra,
@@ -769,6 +891,7 @@ def iter_documents(sources: list[dict], *, report: dict | None = None) -> Iterat
     counts = report.setdefault("counts", {})
     for key in ("matched", "ingested", "partial", "metadata_only", "excluded", "errors"):
         counts.setdefault(key, 0)
+    claimed_identities: set[tuple[str, str]] = set()
     for source in sources:
         root = Path(source["root"]).expanduser().absolute()
         entry = {"id": source["id"], "root": str(root), "status": "scanned"}
@@ -784,6 +907,12 @@ def iter_documents(sources: list[dict], *, report: dict | None = None) -> Iterat
             counts["errors"] += 1
             continue
         include, exclude = source.get("include", ["**/*"]), source.get("exclude", [])
+        if source.get("identities"):
+            source = {  # noqa: PLW2901
+                **source,
+                "_identities": _load_identities(root, source["identities"], report, source["id"]),
+                "_claimed": claimed_identities,
+            }
 
         def walk_error(
             error: OSError, source_id: str = source["id"], source_root: Path = root

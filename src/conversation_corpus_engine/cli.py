@@ -123,6 +123,7 @@ from .triage import (
     write_entity_alias_review_sample_summary_artifacts,
     write_entity_alias_review_scoreboard_artifacts,
 )
+from .wiki_zettels_cli import add_wiki_parser, handle_wiki
 
 PROVIDER_CHOICES = sorted(PROVIDER_CONFIG)
 
@@ -751,6 +752,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_attribute_parser(add_library_parser(subparsers))
     add_sealed_parser(subparsers)
     add_app_cache_parser(subparsers)
+    add_wiki_parser(subparsers)
 
     return parser
 
@@ -764,6 +766,9 @@ def main() -> None:
 
     if args.group == "app-cache":
         raise SystemExit(handle_app_cache(args))
+
+    if args.group == "wiki":
+        raise SystemExit(handle_wiki(args))
 
     if args.group == "archive":
         raise SystemExit(handle_archive(args))

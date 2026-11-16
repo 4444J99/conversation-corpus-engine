@@ -8,6 +8,8 @@ const integer = (
   max = Number.MAX_SAFE_INTEGER,
 ): n is number =>
   typeof n === "number" && Number.isSafeInteger(n) && n >= min && n <= max;
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
 const reply = (value: unknown, status = 200) =>
   Response.json(value, {
     status,
@@ -106,6 +108,8 @@ export async function control(
     } catch {
       return reply({ error: "invalid-control-parameters" }, 400);
     }
+    if (!isRecord(grant))
+      return reply({ error: "invalid-control-parameters" }, 400);
     if (
       canonical([
         grant.id,
@@ -128,7 +132,7 @@ export async function control(
       return reply({ error: "invalid-control-parameters" }, 400);
     }
     const digest = sha256(encoder.encode(raw));
-    if (canonical(pub) !== raw)
+    if (!isRecord(pub) || canonical(pub) !== raw)
       return reply({ error: "invalid-control-parameters" }, 400);
     if (operation === "publication-first") {
       if (

@@ -51,6 +51,16 @@ describe("original CCE archive format compatibility", () => {
         },
       );
       await expect(corrupt.file("note")).rejects.toThrow();
+      // Names that exist only on Object.prototype are not files of the vault.
+      for (const name of [
+        "__proto__",
+        "constructor",
+        "toString",
+        "hasOwnProperty",
+      ])
+        await expect(reader.file(name)).rejects.toThrow(
+          "sealed-file-unavailable",
+        );
       reader.lock();
       await expect(reader.file("note")).rejects.toThrow();
     },
