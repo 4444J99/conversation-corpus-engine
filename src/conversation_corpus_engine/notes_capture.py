@@ -47,6 +47,7 @@ import stat
 import tempfile
 import zlib
 from collections import Counter
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -146,10 +147,9 @@ def _varint(data: bytes, index: int) -> tuple[int, int]:
         shift += 7
 
 
-def _fields(data: bytes) -> list[tuple[int, int, Any]]:
-    """(field number, wire type, value) of every field of one message."""
+def _fields(data: bytes) -> Iterator[tuple[int, int, Any]]:
+    """(field number, wire type, value) of each field of one message, one at a time."""
     index = 0
-    found: list[tuple[int, int, Any]] = []
     while index < len(data):
         key, index = _varint(data, index)
         number, wire = key >> 3, key & 7
@@ -168,8 +168,7 @@ def _fields(data: bytes) -> list[tuple[int, int, Any]]:
             value, index = data[index : index + 4], index + 4
         else:
             raise CaptureRefused("protocol buffer has an unsupported wire type")
-        found.append((number, wire, value))
-    return found
+        yield number, wire, value
 
 
 def _first_bytes(data: bytes, number: int) -> bytes | None:
@@ -194,6 +193,8 @@ def decode_note_text(blob: bytes) -> str:
         raise CaptureRefused("note body is not gzip data") from None
     if len(raw) > MAX_NOTE_BYTES:
         raise CaptureRefused("note text is larger than the size bound")
+    if not inflater.eof:
+        raise CaptureRefused("note body is a truncated gzip stream")
     document = _first_bytes(raw, 2)
     note = _first_bytes(document, 3) if document is not None else None
     text = _first_bytes(note, 2) if note is not None else None
@@ -267,9 +268,15 @@ def copy_notes_store(store: Path, directory: Path) -> dict[str, Any]:
         for name in names:
             (directory / (store.name + name)).unlink(missing_ok=True)
         digests: dict[str, str] = {}
-        for name, path in sources.items():
-            if before[name] is not None:
-                digests[name or "database"] = _copy_regular(path, directory / path.name)
+        try:
+            for name, path in sources.items():
+                if before[name] is not None:
+                    digests[name or "database"] = _copy_regular(path, directory / path.name)
+        except FileNotFoundError:
+            # A journal file was folded into the database (a checkpoint) while it was copied: the
+            # set of files changed under the copy, so this attempt is unsettled and repeats.
+            last = {"attempts": attempt, "settled": False, "sha256": digests, "bytes": {}}
+            continue
         after = {name: _signature(path) for name, path in sources.items()}
         last = {
             "attempts": attempt,
@@ -279,6 +286,8 @@ def copy_notes_store(store: Path, directory: Path) -> dict[str, Any]:
         }
         if before == after:
             break
+    if "database" not in last.get("sha256", {}):
+        raise CaptureRefused("Notes database could not be copied")
     return last
 
 
@@ -329,6 +338,13 @@ def _find(findings: list[dict[str, Any]], code: str, **detail: Any) -> None:
 def read_notes(database: Path) -> _NotesRead:
     """Every readable note of a copied Notes database. The copy is opened read only."""
     result = _NotesRead()
+    try:
+        return _read_notes(database, result)
+    except sqlite3.Error:
+        raise CaptureRefused("Notes database copy could not be read") from None
+
+
+def _read_notes(database: Path, result: _NotesRead) -> _NotesRead:
     uri = f"file:{quote(str(database))}?mode=ro"
     connection = sqlite3.connect(uri, uri=True)
     try:
@@ -641,6 +657,16 @@ def drive_files_entry(root: Path, index: int) -> dict[str, Any]:
     }
 
 
+def refuse_overlap(destination: Path, *source_groups: list[Path]) -> None:
+    """Refuse a destination that contains a source or sits inside one: the capture would read
+    its own output or write into an application's data."""
+    for group in source_groups:
+        for entry in group:
+            source = _absolute(entry)
+            if destination.is_relative_to(source) or source.is_relative_to(destination):
+                raise ValueError("destination overlaps a source folder; choose a separate one")
+
+
 def _prepare_destination(destination: Path) -> Path:
     _no_symlinks(destination)
     require_git_private(destination)
@@ -737,9 +763,17 @@ def capture_notes_and_docs(
     already there is deleted, and no source is written to.
     """
     destination = _absolute(destination)
-    receipt_path = _prepare_destination(destination)
     if notes_store is None and not drive_roots:
         raise ValueError("choose at least one source: a Notes database or a Drive folder")
+    refuse_overlap(destination, [_absolute(root) for root in drive_roots or []])
+    if notes_store is not None:
+        # Not inside the Notes application's own container, and not holding the database it reads.
+        container = _absolute(DEFAULT_NOTES_STORE.parent)
+        if destination.is_relative_to(container) or _absolute(notes_store).is_relative_to(
+            destination
+        ):
+            raise ValueError("destination overlaps the Notes data; choose a separate folder")
+    receipt_path = _prepare_destination(destination)
     counts: Counter[str] = Counter()
     findings: list[dict[str, Any]] = []
     sources: list[dict[str, Any]] = []

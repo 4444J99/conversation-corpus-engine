@@ -214,18 +214,18 @@ def test_note_files_carry_no_agent_credit_and_stay_in_the_authored_wing(store, t
     assert (entry["wing"], entry["lane"]) == ("authored", "writing")
     records = list(iter_documents([entry], report={}))
     assert len(records) == 3, "the documents reader reads the exported notes"
-    pasted = next(r for r in records if "ChatGPT said" in json.dumps(r.to_dict()))
-    plain = next(r for r in records if "Went out at dawn" in json.dumps(r.to_dict()))
-    for record, owner_text in ((plain, True), (pasted, False)):
+
+    def authors(fragment: str) -> set[str]:
+        record = next(r for r in records if fragment in json.dumps(r.to_dict()))
         info = record_info(record.to_dict())
-        authors = {
+        return {
             span.author
             for message in record.messages
             for span in attribute_message(message.text, role=message.role, record=info)
         }
-        assert authors, "every note is attributed"
-        if not owner_text:
-            assert "owner" not in authors or len(authors) > 1
+
+    assert "owner" in authors("Went out at dawn")
+    assert "owner" not in authors("ChatGPT said")  # a pasted chat turn gets no owner credit
 
 
 def _drive(tmp_path: Path) -> Path:
@@ -302,3 +302,85 @@ def test_the_command_writes_the_receipt(store, tmp_path):
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["counts"]["notes_written"] == 3
     assert (out / notes_capture.RECEIPT_NAME).is_file()
+
+
+def test_truncated_gzip_is_refused_not_partially_captured():
+    blob = note_blob("a long enough note body to cut " * 20)
+    with pytest.raises(notes_capture.CaptureRefused, match="truncated"):
+        notes_capture.decode_note_text(blob[:-8])  # CRC and length trailer cut off
+    with pytest.raises(notes_capture.CaptureRefused):
+        notes_capture.decode_note_text(blob[: len(blob) // 2])
+
+
+def test_many_tiny_fields_are_read_lazily():
+    body = (
+        _field(2, _varint((1 << 3) | 0) + _varint(0) + _field(3, _field(2, b"x")))
+        + b"\x08\x01" * 1000
+    )
+    assert notes_capture.decode_note_text(gzip.compress(body)) == "x"
+
+
+def test_a_corrupt_database_copy_is_a_refusal_not_a_traceback(tmp_path):
+    bad = tmp_path / "NoteStore.sqlite"
+    bad.write_bytes(b"this is not a sqlite database" * 100)
+    with pytest.raises(ValueError, match="could not be read"):
+        notes_capture.capture_notes_and_docs(tmp_path / "out", notes_store=bad)
+
+
+def test_a_journal_file_vanishing_mid_copy_repeats_the_copy(store, tmp_path, monkeypatch):
+    (tmp_path / "NoteStore.sqlite-wal").write_bytes(b"")
+    real = notes_capture._copy_regular
+    calls = {"count": 0}
+
+    def flaky(source, target):
+        calls["count"] += 1
+        if calls["count"] == 2:  # the journal, on the first attempt only
+            raise FileNotFoundError(source)
+        return real(source, target)
+
+    monkeypatch.setattr(notes_capture, "_copy_regular", flaky)
+    receipt = notes_capture.capture_notes_and_docs(tmp_path / "out", notes_store=store)
+    assert receipt["sources"][0]["attempts"] == 2 and receipt["sources"][0]["settled"] is True
+    assert receipt["counts"]["notes_written"] == 3
+
+
+def test_a_store_that_never_settles_is_reported(store, tmp_path, monkeypatch):
+    sizes = iter(range(1, 100))
+    real = notes_capture._signature
+    monkeypatch.setattr(
+        notes_capture,
+        "_signature",
+        lambda path: (next(sizes), 0) if path.name == store.name else real(path),
+    )
+    receipt = notes_capture.capture_notes_and_docs(tmp_path / "out", notes_store=store)
+    assert receipt["sources"][0]["settled"] is False and receipt["sources"][0]["attempts"] == 3
+    assert {"code": "notes_store_changed_during_copy"} in receipt["findings"]
+
+
+def test_the_temporary_copy_is_removed_even_when_reading_fails(tmp_path, monkeypatch):
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    monkeypatch.setattr("tempfile.tempdir", None)
+    bad = tmp_path / "NoteStore.sqlite"
+    bad.write_bytes(b"junk" * 1000)
+    with pytest.raises(ValueError):
+        notes_capture.capture_notes_and_docs(tmp_path / "out", notes_store=bad)
+    assert list(scratch.iterdir()) == []
+
+
+def test_the_destination_may_not_overlap_a_source(store, tmp_path, monkeypatch):
+    container = tmp_path / "fake-notes-container"
+    container.mkdir()
+    monkeypatch.setattr(notes_capture, "DEFAULT_NOTES_STORE", container / "NoteStore.sqlite")
+    drive = _drive(tmp_path)
+    with pytest.raises(ValueError, match="overlaps"):
+        notes_capture.capture_notes_and_docs(drive / "capture", drive_roots=[drive])
+    with pytest.raises(ValueError, match="overlaps"):
+        notes_capture.capture_notes_and_docs(tmp_path, drive_roots=[drive])
+    with pytest.raises(ValueError, match="overlaps"):  # the destination would hold the database
+        notes_capture.capture_notes_and_docs(tmp_path, notes_store=store)
+    inside_notes = container / "capture-dest"
+    with pytest.raises(ValueError, match="overlaps"):
+        notes_capture.capture_notes_and_docs(inside_notes, notes_store=store)
+    assert not inside_notes.exists()
