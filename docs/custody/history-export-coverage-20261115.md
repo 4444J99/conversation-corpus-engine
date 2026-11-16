@@ -45,8 +45,8 @@ generation were not touched.
   exceeded`, observed at 1320 s of its own stage clock when the last progress line printed; the run
   was stopped by the library's deadline, not by `timeout`). The candidate generation
   (`generation-20261115T112506Z-6a27693ffcf7`, about 10 GiB, phase `ingested`) is a failed
-  candidate (as of the first entry; the 8 files were later published through a fresh build, see the update below): it was not verified, not published, and `library-all/current.json` still points at
-  generation `20261031T162115Z`. Nothing in v1 was modified.
+  candidate: it was not verified and not published, and when this entry was written `library-all/current.json` still
+  pointed at generation `20261031T162115Z` (it now names `20261115T151135Z-fc76b8f1bdb1`, the fresh build). Nothing in v1 was modified.
 - Why: a build over the 27,382-record base re-indexes the block graph (1.6 million blocks), which
   took 6,875 s on the last full build. A supplemental build with 8 small documents does not escape
   that cost. The 8 files are therefore **not yet searchable** (as of this entry; now searchable, see the update below) in the published library.
@@ -56,6 +56,6 @@ generation were not touched.
 
 
 Document records do not carry `chatgpt-<id>` or Perplexity uids, so `cce app-cache gap` still
-counts those conversations as missing from the provider archive; once the library generation is published, search finds them.
+counts those conversations as missing from the provider archive; the library generation containing them has since been published (2026-11-15) and search finds them now.
 
 Update: the 8 files are now in the published library; see [library resume attempt](library-resume-attempt-20261115.md). That note corrects the failed candidate to phase `indexing` (per its build-state.json) and 13.3 GB.
