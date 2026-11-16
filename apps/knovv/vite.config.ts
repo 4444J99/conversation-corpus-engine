@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import { cloudflare } from "@cloudflare/vite-plugin";
 const target = process.env.KNOVV_DEV_API;
