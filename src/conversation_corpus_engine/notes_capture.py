@@ -323,6 +323,8 @@ def _core_data_time(value: Any) -> str:
 def _clean_label(value: Any, limit: int) -> str:
     if not isinstance(value, str):
         return ""
+    # A lone surrogate cannot be stored: it becomes "?".
+    value = value.encode("utf-8", "replace").decode("utf-8")
     return _SPACE.sub(" ", _CONTROL.sub(" ", value)).strip()[:limit]
 
 

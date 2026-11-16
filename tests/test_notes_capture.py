@@ -540,7 +540,9 @@ def test_a_captured_file_becomes_a_new_revision_not_a_second_record(store, tmp_p
         assert len(rows) == 3  # one existing record joined, two new: never a duplicate of Tide
         tide = next(r for r in rows if r["uid"] == stable_uid("applenotes", old_id))
         assert tide["title"] == "Tide" and tide["provider"] == "applenotes"
-        assert len(library.history(tide["uid"])) == 2
+        history = library.history(tide["uid"])
+        assert len(history) == 2
+        assert history[-1]["change_kind"] == "minor"  # the lane matches, so no major bump
 
 
 def test_identity_rows_are_validated(tmp_path):
@@ -572,3 +574,60 @@ def test_identity_rows_are_validated(tmp_path):
     assert {"b", "c", "d"} == {r.title for r in records.values() if r.provider == "documents"}
     with pytest.raises(ValueError, match="identities path"):
         list(iter_documents([{**entry, "identities": "../outside.jsonl"}], report={}))
+
+
+def _source(root: Path, rows: list[dict], **extra) -> dict:
+    root.mkdir(exist_ok=True)
+    (root / "a.md").write_text("text a\n")
+    (root / "idx.jsonl").write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    return {"id": "t", "root": str(root), "include": ["*.md"], "identities": "idx.jsonl", **extra}
+
+
+def test_a_title_the_library_cannot_store_refuses_the_row_not_the_ingest(tmp_path):
+    row = {"path": "a.md", "title": "bad\ud800x"}
+    report: dict = {}
+    entry = _source(tmp_path / "r", [])
+    (tmp_path / "r" / "idx.jsonl").write_text(json.dumps(row) + "\n")  # ensure_ascii escapes it
+    records = list(iter_documents([entry], report=report))
+    assert [f["code"] for f in report["findings"]] == ["identity_row_refused"]
+    assert records[0].title == "a"
+    assert notes_capture._clean_label("bad\ud800x", 50) == "bad?x"
+
+
+def test_the_reserved_identities_key_cannot_be_smuggled_in(tmp_path):
+    entry = _source(tmp_path / "r", [])
+    entry["_identities"] = {"a.md": {"provider": "chatgpt", "source_id": "../x", "title": "x"}}
+    with pytest.raises(ValueError, match="reserved key"):
+        list(iter_documents([entry], report={}))
+
+
+def test_identities_path_may_not_pass_through_a_symlinked_folder(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x.jsonl").write_text(
+        json.dumps(
+            {"path": "a.md", "title": "Stolen", "provider": "applenotes", "source_id": "ID1234567"}
+        )
+        + "\n"
+    )
+    entry = _source(tmp_path / "r", [])
+    (tmp_path / "r" / "lnk").symlink_to(outside)
+    entry["identities"] = "lnk/x.jsonl"
+    report: dict = {}
+    records = list(iter_documents([entry], report=report))
+    assert records[0].title == "a" and records[0].provider == "documents"
+    assert "identities_unreadable" in [f["code"] for f in report["findings"]]
+    entry["identities"] = "nul\x00.jsonl"
+    report = {}
+    list(iter_documents([entry], report=report))
+    assert "identities_unreadable" in [f["code"] for f in report["findings"]]
+
+
+def test_two_sources_cannot_claim_the_same_identity(tmp_path):
+    row = {"path": "a.md", "title": "A", "provider": "applenotes", "source_id": "SAME-ID-1"}
+    first = _source(tmp_path / "one", [row])
+    second = {**_source(tmp_path / "two", [row]), "id": "u"}
+    report: dict = {}
+    records = list(iter_documents([first, second], report=report))
+    assert [r.provider for r in records] == ["applenotes", "documents"]
+    assert [f["code"] for f in report["findings"]] == ["identity_claimed_twice"]

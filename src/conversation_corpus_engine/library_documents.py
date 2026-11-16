@@ -229,7 +229,9 @@ _IDENTITY_TIME = re.compile(r"\d{4}-\d{2}-\d{2}(?:T[0-9:.+\-Z]+)?")
 _IDENTITY_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
-def _load_identities(root: Path, name: str, report: dict, source_id: str) -> dict[str, dict]:
+def _load_identities(
+    root: Path, name: str, report: dict, source_id: str, claimed: set[tuple[str, str]]
+) -> dict[str, dict]:
     """The identity rows of one source: relative path -> {provider, source_id, title, ...}.
 
     The index is a JSON Lines file inside the root, opened without following links and read
@@ -239,11 +241,16 @@ def _load_identities(root: Path, name: str, report: dict, source_id: str) -> dic
     path = root / name
     rows: dict[str, dict] = {}
     try:
+        # O_NOFOLLOW covers only the last component: every folder on the way must be a real one.
+        walked = root
+        for part in Path(name).parts[:-1]:
+            walked = walked / part
+            if walked.is_symlink():
+                raise OSError("symlink in identities path")
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
+    except (OSError, ValueError):
         _finding(report, source_id, name, "identities_unreadable")
         return rows
-    claimed: set[tuple[str, str]] = set()
     with os.fdopen(descriptor, "rb") as handle:
         if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
             _finding(report, source_id, name, "identities_not_regular")
@@ -252,7 +259,10 @@ def _load_identities(root: Path, name: str, report: dict, source_id: str) -> dic
     if len(data) > MAX_IDENTITY_BYTES:
         _finding(report, source_id, name, "identities_too_large")
         return rows
-    for number, line in enumerate(data.splitlines()[:MAX_IDENTITY_ROWS], start=1):
+    lines = data.splitlines()
+    if len(lines) > MAX_IDENTITY_ROWS:
+        _finding(report, source_id, name, "identities_rows_truncated")
+    for number, line in enumerate(lines[:MAX_IDENTITY_ROWS], start=1):
         if not line.strip():
             continue
         try:
@@ -276,6 +286,9 @@ def _load_identities(root: Path, name: str, report: dict, source_id: str) -> dic
                 )
             ):
                 raise ValueError("shape")
+            # Text the library cannot store (a lone surrogate) refuses the row, not the ingest.
+            title.encode("utf-8")
+            relative.encode("utf-8")
         except (ValueError, KeyError, TypeError, RecursionError):
             _finding(report, source_id, f"{name}:{number}", "identity_row_refused")
             continue
@@ -327,6 +340,8 @@ def _validate_sources(sources: list[dict]) -> None:
         maximum = source.get("max_bytes", DEFAULT_MAX_BYTES)
         if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum <= 0:
             raise ValueError(f"source {source['id']} max_bytes must be a positive integer")
+        if "_identities" in source:
+            raise ValueError(f"source {source['id']} may not carry a reserved key")
         identities = source.get("identities")
         if identities is not None and (
             not isinstance(identities, str)
@@ -864,6 +879,7 @@ def iter_documents(sources: list[dict], *, report: dict | None = None) -> Iterat
     counts = report.setdefault("counts", {})
     for key in ("matched", "ingested", "partial", "metadata_only", "excluded", "errors"):
         counts.setdefault(key, 0)
+    claimed_identities: set[tuple[str, str]] = set()
     for source in sources:
         root = Path(source["root"]).expanduser().absolute()
         entry = {"id": source["id"], "root": str(root), "status": "scanned"}
@@ -882,7 +898,9 @@ def iter_documents(sources: list[dict], *, report: dict | None = None) -> Iterat
         if source.get("identities"):
             source = {  # noqa: PLW2901
                 **source,
-                "_identities": _load_identities(root, source["identities"], report, source["id"]),
+                "_identities": _load_identities(
+                    root, source["identities"], report, source["id"], claimed_identities
+                ),
             }
 
         def walk_error(
