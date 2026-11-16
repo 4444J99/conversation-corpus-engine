@@ -21,8 +21,8 @@ No extracted Takeout (`MyActivity.json`, a `Gemini Apps` folder) exists outside 
 
 | Source | Archive (cce archive-all) | Found after the archive | Ingested now | Still missing |
 |---|---|---|---|---|
-| ChatGPT | through 2026-10-16/17 (full export plus 2026-10-17 delta); the app cache adds 8 full bodies up to 2026-11-02 (staged, not yet in a published generation) | 1 conversation, created 2026-10-24, updated 2026-11-08 (Markdown). The other 3 Markdown exports are older conversations already in the archive. | the 1 conversation, as a document record | 2026-10-17 to 2026-11-15, except that one conversation. Needs a new ChatGPT data export. |
-| Perplexity | through 2026-10-16 (official export) | 7 threads from the same Space, exported 2026-11-09 (the thread's title line is the owner's typed prompt; the answers are Perplexity's) | the 7 threads, as document records | 2026-10-17 to 2026-11-15, except those 7 threads. The Nov 10-11 typed prompts are not in any found file. Needs a new Perplexity export. |
+| ChatGPT | through 2026-10-16/17 (full export plus 2026-10-17 delta); the app cache adds 8 full bodies up to 2026-11-02 (staged, not yet in a published generation) | 1 conversation, created 2026-10-24, updated 2026-11-08 (Markdown). The other 3 Markdown exports are older conversations already in the archive. | the 1 conversation, as a document record (published in generation `20261115T151135Z-fc76b8f1bdb1` and searchable) | 2026-10-17 to 2026-11-15, except that one conversation. Needs a new ChatGPT data export. |
+| Perplexity | through 2026-10-16 (official export) | 7 threads from the same Space, exported 2026-11-09 (the thread's title line is the owner's typed prompt; the answers are Perplexity's) | the 7 threads, as document records (published in generation `20261115T151135Z-fc76b8f1bdb1` and searchable) | 2026-10-17 to 2026-11-15, except those 7 threads. The Nov 10-11 typed prompts are not in any found file. Needs a new Perplexity export. |
 | Gemini | through 2026-10-16 (Takeout, My Activity > Gemini Apps) | none. The app store lists 36 chats after 2026-10-16 (metadata only, bodies encrypted and not opened). | nothing | 2026-10-17 to 2026-11-15. Needs a new Google Takeout (My Activity > Gemini Apps, JSON). |
 
 The Google Takeout zips from 2025 (Drive and Dropbox) predate the archived 2026-10-16 Takeout,
@@ -45,8 +45,8 @@ generation were not touched.
   exceeded`, observed at 1320 s of its own stage clock when the last progress line printed; the run
   was stopped by the library's deadline, not by `timeout`). The candidate generation
   (`generation-20261115T112506Z-6a27693ffcf7`, about 10 GiB, phase `ingested`) is a failed
-  candidate: it was not verified, not published, and `library-all/current.json` still points at
-  generation `20261031T162115Z`. Nothing in v1 was modified.
+  candidate: it was not verified and not published, and when this entry was written `library-all/current.json` still
+  pointed at generation `20261031T162115Z` (it now names `20261115T151135Z-fc76b8f1bdb1`, the fresh build). Nothing in v1 was modified.
 - Why: a build over the 27,382-record base re-indexes the block graph (1.6 million blocks), which
   took 6,875 s on the last full build. A supplemental build with 8 small documents does not escape
   that cost. The 8 files are therefore **not yet searchable** (as of this entry; now searchable, see the update below) in the published library.
@@ -56,6 +56,6 @@ generation were not touched.
 
 
 Document records do not carry `chatgpt-<id>` or Perplexity uids, so `cce app-cache gap` still
-counts those conversations as missing from the provider archive; once the library generation is published, search finds them.
+counts those conversations as missing from the provider archive; the library generation containing them has since been published (2026-11-15) and search finds them now.
 
 Update: the 8 files are now in the published library; see [library resume attempt](library-resume-attempt-20261115.md). That note corrects the failed candidate to phase `indexing` (per its build-state.json) and 13.3 GB.
