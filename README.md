@@ -1,12 +1,13 @@
 # Conversation Corpus Engine
 
-[![CI](https://github.com/organvm-i-theoria/conversation-corpus-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/organvm-i-theoria/conversation-corpus-engine/actions/workflows/ci.yml)
+[![CI](https://github.com/4444J99/conversation-corpus-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/4444J99/conversation-corpus-engine/actions/workflows/ci.yml)
 
 `conversation-corpus-engine` is the canonical Organ I implementation of the AI conversation corpus system extracted from the staging workspace at `Workspace/intake/ai-exports`.
 
 It owns:
 
 - provider/source registration
+- provider-neutral redacted-bundle normalization and authority projection
 - provider inbox discovery and readiness reporting
 - corpus validation
 - source freshness and snapshot logic
@@ -21,8 +22,15 @@ It owns:
 - Meta/MCP-facing surface manifests and export bundles
 - read-only MCP stdio tools for corpus search and provider readiness
 - commercial H1 readiness contracts for the ORGAN-II surface bridge
+- commercial-awareness metadata for pipeline and surface consumers
 
 It does not own raw intake routing or system-wide discovery contracts. Those belong in Meta integrations such as `alchemia-ingestvm`, `schema-definitions`, `organvm-engine`, and `organvm-mcp-server`.
+
+## Commercial Strategy Linkage
+
+CCE is the institutional memory and product-scale side of the ORGANVM income surface. Its commercial architecture is tracked in [`docs/superpowers/specs/2026-03-31-cce-commercial-architecture-design.md`](docs/superpowers/specs/2026-03-31-cce-commercial-architecture-design.md) and [`docs/superpowers/specs/2026-03-31-cce-commercial-architecture-expansion.md`](docs/superpowers/specs/2026-03-31-cce-commercial-architecture-expansion.md).
+
+The personal-capacity counterpart is [`4444J99/application-pipeline`](https://github.com/4444J99/application-pipeline), whose jobs, grants/residencies, and consulting tracks supply near-term income, market feedback, and enterprise-service leads for CCE Ring 4. This backlink closes `IRF-CCE-038` on the CCE side: the two repos should stay commercially aware of one another rather than treating pipeline revenue and CCE product revenue as separate strategies.
 
 ## Install
 
@@ -32,13 +40,27 @@ For local development:
 pip install -e ".[dev]"
 ```
 
-For MCP clients:
+For tool-host integration:
 
 ```bash
 pipx install "conversation-corpus-engine[mcp]"
 cce-mcp --project-root /path/to/project
 ```
 
+The `mcp` extra is dependency-free today; it enables the install target and exposes
+the stdio MCP entry point. A Claude Desktop-style server entry can point directly at
+the command:
+
+```json
+{
+  "mcpServers": {
+    "conversation-corpus-engine": {
+      "command": "cce-mcp",
+      "args": ["--project-root", "/path/to/project"]
+    }
+  }
+}
+```
 ## License
 
 MIT
@@ -48,16 +70,18 @@ MIT
 ```bash
 cce corpus list --project-root /path/to/project
 cce corpus register /path/to/corpus --project-root /path/to/project --name "Notes Memory"
+cce corpus-store register --project-root /path/to/project --root /path/to/private-corpus-store
 cce federation build --project-root /path/to/project
 cce provider discover --project-root /path/to/project --source-drop-root /path/to/source-drop
-cce provider import --provider chatgpt --source-drop-root /path/to/source-drop --register --build
-cce provider import --provider gemini --source-drop-root /path/to/source-drop --register --build
-cce provider import --provider claude --mode local-session --local-root "/Users/you/Library/Application Support/Claude"
-cce provider bootstrap-eval --provider claude --project-root /path/to/project --full-eval
+cce provider authority-ingest --source-root /path/to/redacted-bundle --source-census /path/to/source-census.v1.json --provider-manifest /path/to/provider-manifest.json --output-root /path/to/output --snapshot-id frozen-snapshot --captured-at 2026-07-16T16:00:00Z --custody-pointer custody:frozen-snapshot
+cce provider import --provider chatgpt --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store --source-drop-root /path/to/source-drop --register --build
+cce provider import --provider gemini --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store --source-drop-root /path/to/source-drop --register --build
+cce provider import --provider claude --mode local-session --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store --local-root "/Users/you/Library/Application Support/Claude"
+cce provider bootstrap-eval --provider claude --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store --full-eval
 cce provider readiness --project-root /path/to/project --source-drop-root /path/to/source-drop --write
-cce provider refresh --provider chatgpt --project-root /path/to/project --source-drop-root /path/to/source-drop
-cce provider refresh --provider perplexity --project-root /path/to/project --source-drop-root /path/to/source-drop
-cce provider refresh --provider claude --project-root /path/to/project --promote --note "refresh and replace live corpus"
+cce provider refresh --provider chatgpt --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store --source-drop-root /path/to/source-drop
+cce provider refresh --provider perplexity --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store --source-drop-root /path/to/source-drop
+cce provider refresh --provider claude --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store --promote --note "refresh and replace live corpus"
 cce schema list
 cce schema show corpus-contract
 cce schema validate corpus-contract --path /path/to/corpus/contract.json
@@ -74,11 +98,188 @@ cce candidate stage --project-root /path/to/project --candidate-root /path/to/ca
 cce candidate review --project-root /path/to/project --candidate-id latest --decision approve --note "promote candidate"
 cce candidate promote --project-root /path/to/project --candidate-id latest --note "replace live corpus"
 cce candidate rollback --project-root /path/to/project --target previous --note "restore previous live corpus"
-cce evaluation run --root /path/to/corpus --seed --json
+cce migration corpus-v2 --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store --source-root /path/to/legacy-corpus --destination-root /path/to/private-corpus-store/migrated-corpus
+cce migration corpus-v2 --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store --source-root /path/to/legacy-corpus --destination-root /path/to/private-corpus-store/migrated-corpus --write
+cce evaluation run --root /path/to/corpus --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store --seed --json
 cce review queue --project-root /path/to/project
 cce review resolve federated-family-merge-... --decision accepted --note "same family"
 cce source freshness /path/to/corpus
+cce archive build --export-root /path/to/ai-exports --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
+cce archive verify --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
+cce archive search "kubernetes ingress" --provider claude --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
+cce archive serve --project-root /path/to/project --corpus-store-root /path/to/private-corpus-store
+cce-mcp --project-root /path/to/project --archive-root /path/to/private-corpus-store/archive-all
 ```
+
+### Provider-neutral authority ingest
+
+`provider authority-ingest` is the default path for new source acquisition. It reads only a
+frozen, redacted `session-meta` atom bundle. It never opens browser profiles, cookies, tokens,
+OAuth material, or provider application stores. The runtime provider manifest separates source
+families, aliases, adapter IDs, custody root environment keys, authority policy, and owner
+blockers. Adding or renaming a provider is a manifest-only change when an existing format adapter
+applies.
+
+The bundled `provider-manifest.organvm.v1.json` is explicitly instance configuration. The
+`provider-manifest.example.v1.json` reusable template contains only generic placeholders. Set
+`CCE_PROVIDER_MANIFEST` or pass `--provider-manifest` to select another runtime manifest.
+Supplying `--source-census` binds normalization to session-meta's exact frozen denominator;
+the census is rejected on schema-shape, snapshot, or RFC 8785 digest mismatch. Contract digests
+use the pinned `rfc8785` dependency and exclude JSONL record delimiters. Exact ingest also
+requires each atom's `meta.raw_unit_content_hashes` to match the census. That immutable
+raw-unit content identity is promoted into every source envelope and normalized event and
+repeated in the complete parity crosswalk; a changed-and-resealed census fails before
+projection.
+
+Each frozen run writes deterministic, body-free public projections:
+
+- `source-envelope.v1.jsonl`
+- `normalized-events.v1.jsonl`
+- `quarantine.jsonl`
+- `owner-blockers.jsonl`
+- `coverage-receipt.v1.json`
+- `normalization-parity-receipt.v1.json`
+
+Malformed rows quarantine without stopping valid siblings. Unknown families and missing roots
+remain explicit owner blockers. `exact_all` means every discovered unit was classified exactly
+once; `ready` additionally requires every unit to be parsed with no residual debt. Per-record
+adapter failures remain explicit parity quarantine debt even when valid siblings from the same raw
+unit normalize. Existing export importers remain compatibility paths until a frozen run reports
+both exact parity and readiness.
+
+### Governance cadence parse/classify owners
+
+CCE exposes separate owner commands for Limen's bounded `parse` and `classify`
+stages. `authority-parse-cadence` performs the existing authority ingest exactly
+once. `authority-classify-cadence` does not reprocess the source: it independently
+checks the parse projection, copies the six governed artifacts byte-for-byte, and
+binds their digests in a typed classify projection.
+
+```bash
+cce provider authority-parse-cadence \
+  --source-root "$CCE_REDACTED_SNAPSHOT" \
+  --source-census "$CCE_SOURCE_CENSUS" \
+  --provider-manifest "$CCE_PROVIDER_MANIFEST" \
+  --output-root "$LIMEN_GOV_RUN_ROOT/parse" \
+  --snapshot-id "$LIMEN_GOV_SNAPSHOT_ID" \
+  --captured-at "$LIMEN_GOV_SNAPSHOT_AT" \
+  --custody-pointer "$CCE_CUSTODY_POINTER"
+
+cce provider authority-classify-cadence \
+  --input-root "$LIMEN_GOV_RUN_ROOT/parse" \
+  --output-root "$LIMEN_GOV_RUN_ROOT/classify" \
+  --snapshot-id "$LIMEN_GOV_SNAPSHOT_ID"
+```
+
+The commands consume Limen's injected `LIMEN_GOV_*` execution variables and
+write one bounded transaction child to `LIMEN_GOV_STAGE_METRICS_OUT`.
+`LIMEN_GOV_MAX_ITEMS` bounds the census raw-unit or promotion denominator.
+On proof traversals, the parse owner reruns the exact ingest in a temporary
+directory and requires every governed artifact and projection to be
+byte-identical; the classify owner revalidates its byte projection. Neither
+owner rewrites governed outputs. Both emit a `skipped_completed` child bound to
+the exact prior child receipt and report zero new events. The independent
+predicate commands are:
+
+```bash
+cce provider authority-parse-predicate \
+  --source-root "$CCE_REDACTED_SNAPSHOT" \
+  --source-census "$CCE_SOURCE_CENSUS" \
+  --provider-manifest "$CCE_PROVIDER_MANIFEST" \
+  --output-root "$LIMEN_GOV_RUN_ROOT/parse" \
+  --snapshot-id "$LIMEN_GOV_SNAPSHOT_ID" \
+  --captured-at "$LIMEN_GOV_SNAPSHOT_AT" \
+  --custody-pointer "$CCE_CUSTODY_POINTER"
+
+cce provider authority-classify-predicate \
+  --input-root "$LIMEN_GOV_RUN_ROOT/parse" \
+  --output-root "$LIMEN_GOV_RUN_ROOT/classify" \
+  --snapshot-id "$LIMEN_GOV_SNAPSHOT_ID" \
+  --captured-at "$LIMEN_GOV_SNAPSHOT_AT"
+```
+
+Both projections preserve the owner's distinction between classification and
+readiness: a complete parity crosswalk can remain `exact_all: true` while
+blockers or quarantines keep `ready: false`.
+
+`cce archive` turns raw provider exports (ChatGPT, Claude, Gemini Takeout + NotebookLM, Grok,
+Perplexity, Copilot) into an Obsidian vault/wiki, a static archive site, a SQLite FTS5 search
+database and a graph, all inside the private corpus store. See
+[docs/archive-surfaces.md](docs/archive-surfaces.md).
+
+The unified private knowledge library extends this with versioned records from web archives,
+native coding sessions, and selected authored documents. It provides bounded CLI/MCP search,
+revision history, graph/index contracts, Obsidian-compatible Markdown, and a verified Notion
+import ZIP. Library builds now emit a stable progress event at the start of every phase
+(including previously silent fingerprint, verify, and artifact stages) with elapsed_seconds,
+and byte-limit failures include measured numbers for sizing retries. See [docs/knowledge-library.md](docs/knowledge-library.md).
+
+`cce library attribute` labels who wrote each span of each message (owner, agent, third party or unknown) with deterministic rules, and nothing is profile-eligible until the owner has reviewed a sample and the precision gate is met; see [docs/attributed-knowledge.md](docs/attributed-knowledge.md).
+
+Documents that came out of software repositories can only be told apart by their git history.
+`scripts/git_origin_hints.py` (stdlib only) reads history-only clones (bare or blobless, one
+`git log` pass per repository) and writes one `cce.origin-hints.v1` row per file: `agent` when every
+commit touching it is agent-signed (a `Co-Authored-By: Claude`-style trailer, a bot or agent author,
+the agent footer), `human` when none is, `mixed` otherwise.
+
+```bash
+python scripts/git_origin_hints.py --repos-dir /path/to/clones --wanted wanted.jsonl --out hints.jsonl
+cce library attribute --report --origin-hints hints.jsonl --library /path/to/library
+```
+
+Git cannot see renames (not followed), a human squash that holds agent text, a human committing agent
+output, text from before git, or rewritten history; a `human` hint never grants owner credit and a
+`mixed` hint withholds it. See [docs/attributed-knowledge.md](docs/attributed-knowledge.md#git-history-hints).
+
+Example:
+
+```bash
+cce library status --store-root /path/to/private-corpus-store
+cce library search "lattice" --store-root /path/to/private-corpus-store --limit 10
+```
+
+The Copilot reader takes SingleFile captures of Copilot web research pages from a `copilot/` folder,
+or from any folder with `--source copilot=/path/to/copilot-captures`. Each recognized page becomes
+one search-kind conversation. It reads the `.html`/`.htm` pages that carry a Copilot SingleFile
+header; HTML that is not a Copilot page is skipped and counted, and every other file is counted by
+extension and never opened. The capture date is the only timestamp. The pages hold no user turn,
+and none is invented.
+
+Corpus-destination writers fail closed unless a store has first been registered and the
+configured root exactly matches that active registration. The
+`--corpus-store-root` option takes precedence over `CCE_CORPUS_STORE_ROOT`; there is no
+implicit fallback. A store must already exist, must not traverse symlinks or contain nested
+Git repositories, and must either live outside Git or be wholly ignored and untracked.
+Provider imports default to `<store>/<corpus-id>`, while refresh candidates default to
+`<store>/provider-refresh/<provider>/<run-id>/candidate-corpus`.
+
+Corpus writers publish `conversation-corpus-engine.v2` collections as immutable
+`cce.sharded_collection.v1` generations. A logical collection such as
+`corpus/threads-index.json` is stored under `corpus/threads-index.collection/`, with an
+atomically replaced `CURRENT` pointer, a verified manifest, and SHA-256-prefix JSONL
+shards capped at 8 MiB and 1,000 records. Readers prefer v2 and read legacy v1 JSON only
+when no v2 storage directory exists; malformed v2 state fails closed.
+
+`cce migration corpus-v2` is read-only unless `--write` is supplied. The write mode
+requires an authorized destination beneath the exactly registered store, preserves the
+v1 source, converts copied `source/conversations.json` data to a sharded collection, and
+is deterministic on rerun.
+
+## MCP Tools
+
+`cce-mcp` serves MCP over stdio and never writes non-protocol output to stdout. It
+currently exposes:
+
+- `cce_search`: search a registered or direct corpus root and return a grounded
+  answer, citations, and structured top-hit metadata.
+- `cce_list_corpora`: list registered project corpora.
+- `cce_surface_context`: build the MCP-facing project context payload.
+- `cce_archive_search`: full-text search the private AI archive search database. Only advertised
+  when the server is started with `--archive-root` (or `CCE_ARCHIVE_ROOT`); the root is server
+  configuration and is never a tool argument. Results are private conversation text.
+
+When started with `--library-store-root` (or `CCE_LIBRARY_STORE_ROOT`), it also exposes read-only
+`cce_library_search`, `cce_library_read`, and `cce_library_history`.
 
 ## Layout
 
@@ -86,12 +287,21 @@ cce source freshness /path/to/corpus
 - `src/conversation_corpus_engine/source_lifecycle.py` — source snapshot and freshness checks
 - `src/conversation_corpus_engine/federated_canon.py` — federated review state and canon builders
 - `src/conversation_corpus_engine/federation.py` — corpus registry and federation build/query logic
+- `src/conversation_corpus_engine/corpus_store.py` — private corpus-store registration and write authorization
+- `src/conversation_corpus_engine/sharded_collection.py` — immutable v2 collection publication, validation, and v1-compatible reads
+- `src/conversation_corpus_engine/migration.py` — read-only planning and authorized v1-to-v2 corpus migration
 - `src/conversation_corpus_engine/import_markdown_document_corpus.py` — generic markdown corpus materialization
 - `src/conversation_corpus_engine/import_document_export_corpus.py` — document-style provider export import
 - `src/conversation_corpus_engine/import_claude_export_corpus.py` — Claude bundle import
 - `src/conversation_corpus_engine/import_claude_local_session_corpus.py` — Claude local-session import
 - `src/conversation_corpus_engine/import_chatgpt_export_corpus.py` — ChatGPT conversations.json export import
+- `src/conversation_corpus_engine/export_projector.py` — shared rewire of legacy export importers through the archive corpus projector (see #78)
 - `src/conversation_corpus_engine/provider_discovery.py` — source-drop inbox discovery
+- `src/conversation_corpus_engine/source_adapter_registry.py` — provider-neutral redacted-bundle adapter registry
+- `src/conversation_corpus_engine/authority_projection.py` — role-aware authority and lane projection
+- `src/conversation_corpus_engine/authority_ingest.py` — deterministic envelope, event, quarantine, coverage, and parity generation
+- `src/conversation_corpus_engine/authority_cadence.py` — bounded parse/classify owner projections and proof metrics
+- `src/conversation_corpus_engine/authority_cadence_predicate.py` — independent parse/classify predicates
 - `src/conversation_corpus_engine/provider_import.py` — provider import/onboarding orchestration
 - `src/conversation_corpus_engine/provider_refresh.py` — provider refresh orchestration over import, evaluation, and corpus promotion
 - `src/conversation_corpus_engine/provider_readiness.py` — provider lane readiness and report writing
@@ -108,7 +318,14 @@ cce source freshness /path/to/corpus
 - `src/conversation_corpus_engine/governance_candidates.py` — candidate stage/review/apply/rollback workflow
 - `src/conversation_corpus_engine/corpus_diff.py` — live-vs-candidate structural and retrieval diffing
 - `src/conversation_corpus_engine/corpus_candidates.py` — corpus candidate stage/review/promote/rollback workflow
-- `tests/` — extraction-safe regression tests
+- `src/conversation_corpus_engine/archive_model.py` — provider-neutral conversation schema, ids, time, atomic JSONL
+- `src/conversation_corpus_engine/archive_read_*.py` — streaming readers (chatgpt, claude, gemini, notebooklm, grok, perplexity, copilot)
+- `src/conversation_corpus_engine/archive_ingest.py` — normalized store, manifest denominators, custody gate
+- `src/conversation_corpus_engine/archive_topics.py` — TF-IDF topic hubs and cross-provider neighbours
+- `src/conversation_corpus_engine/archive_vault.py` / `archive_database.py` / `archive_graph.py` / `archive_site.py` / `archive_serve.py` — vault, search database, graph, site and loopback server
+- `src/conversation_corpus_engine/archive_layout.py` — every archive file, folder and note name, and the one wikilink function, minted through `derive_name`
+- `src/conversation_corpus_engine/archive_commands.py` — `cce archive` command group and cross-surface verification
+- `tests/` — extraction-safe regression tests (archive tests use only synthetic fixtures)
 
 ## Runtime Outputs
 
@@ -118,4 +335,4 @@ Commercial H1 readiness is written under `reports/commercial/` when `cce commerc
 
 ## Status
 
-This repo now serves as the canonical Organ I home of the conversation corpus system. The adjacent Meta consumer path is also live: `schema-definitions` canonizes the outward contracts, `organvm-engine` discovers and validates emitted surface bundles, and `organvm-mcp-server` exposes them to agent sessions. CCE also exposes its own read-only MCP stdio server and an H1 commercial readiness contract for the `conversation-corpus--surfaces` bridge. Operational hardening is underway: CI gates all pushes, ChatGPT is a first-class provider alongside Claude/Gemini/Grok/Perplexity/Copilot, and sanitized test fixtures document the expected export formats. The next frontier is downstream dashboard consumption, ORGAN-II surface creation, and additional provider adapters.
+This repo now serves as the canonical Organ I home of the conversation corpus system. The adjacent Meta consumer path is also live: `schema-definitions` canonizes the outward contracts, `organvm-engine` discovers and validates emitted surface bundles, and `organvm-mcp-server` exposes them to agent sessions. CCE also exposes its own read-only MCP stdio server and an H1 commercial readiness contract for the `conversation-corpus--surfaces` bridge. Operational hardening is underway: CI gates all pushes, ChatGPT is a first-class provider alongside Claude/Gemini/Grok/Perplexity/Copilot, and sanitized test fixtures document the expected export formats. Archive provider readers (including Copilot SingleFile research pages) are complete and CI-green on main. The unified private knowledge library (PR #86) adds versioned records, bounded retrieval, and portable exports over the existing archive and selected documents; see docs/knowledge-library.md. Library builds emit per-phase progress events with elapsed times and numbered byte-limit diagnostics. The next frontier is downstream dashboard consumption and additional provider adapters.

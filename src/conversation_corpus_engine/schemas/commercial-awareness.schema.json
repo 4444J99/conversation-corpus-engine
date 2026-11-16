@@ -1,0 +1,281 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Conversation Corpus Engine Commercial Awareness",
+  "type": "object",
+  "required": [
+    "contract_name",
+    "contract_version",
+    "source_specs",
+    "relationship",
+    "commercial_position",
+    "consumer_contract",
+    "signal_chain",
+    "commercial_rings",
+    "pipeline_bridges",
+    "revenue_evolution",
+    "activation_gates"
+  ],
+  "properties": {
+    "contract_name": {
+      "const": "conversation-corpus-engine-commercial-awareness-v1"
+    },
+    "contract_version": {
+      "type": "integer"
+    },
+    "source_specs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "relative_path",
+          "path",
+          "sections"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "relative_path": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "sections": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "relationship": {
+      "type": "object",
+      "required": [
+        "cce_repo",
+        "pipeline_repo",
+        "relationship_type",
+        "same_income_equation",
+        "summary"
+      ],
+      "properties": {
+        "cce_repo": {
+          "type": "string"
+        },
+        "pipeline_repo": {
+          "type": "string"
+        },
+        "relationship_type": {
+          "type": "string"
+        },
+        "same_income_equation": {
+          "type": "boolean"
+        },
+        "summary": {
+          "type": "string"
+        }
+      }
+    },
+    "commercial_position": {
+      "type": "object",
+      "required": [
+        "organ",
+        "mechanism",
+        "system_role",
+        "revenue_model",
+        "revenue_status"
+      ],
+      "properties": {
+        "organ": {
+          "type": "string"
+        },
+        "mechanism": {
+          "type": "string"
+        },
+        "system_role": {
+          "type": "string"
+        },
+        "revenue_model": {
+          "type": "string"
+        },
+        "revenue_status": {
+          "type": "string"
+        }
+      }
+    },
+    "consumer_contract": {
+      "type": "object",
+      "required": [
+        "intended_consumers",
+        "pipeline_consumption",
+        "surface_signal",
+        "interface_signal",
+        "flow_constraint"
+      ],
+      "properties": {
+        "intended_consumers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "pipeline_consumption": {
+          "type": "string"
+        },
+        "surface_signal": {
+          "type": "string"
+        },
+        "interface_signal": {
+          "type": "string"
+        },
+        "flow_constraint": {
+          "type": "string"
+        }
+      }
+    },
+    "signal_chain": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "stage",
+          "organ",
+          "emits",
+          "consumed_by"
+        ],
+        "properties": {
+          "stage": {
+            "type": "string"
+          },
+          "organ": {
+            "type": "string"
+          },
+          "emits": {
+            "type": "string"
+          },
+          "consumed_by": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "commercial_rings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "ring",
+          "name",
+          "surface",
+          "revenue_model",
+          "horizon"
+        ],
+        "properties": {
+          "ring": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "surface": {
+            "type": "string"
+          },
+          "revenue_model": {
+            "type": "string"
+          },
+          "horizon": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "pipeline_bridges": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "pipeline_label",
+          "pipeline_surface",
+          "income_band",
+          "horizon",
+          "cce_surface",
+          "cce_commercial_effect"
+        ],
+        "properties": {
+          "pipeline_label": {
+            "type": "string"
+          },
+          "pipeline_surface": {
+            "type": "string"
+          },
+          "income_band": {
+            "type": "string"
+          },
+          "horizon": {
+            "type": "string"
+          },
+          "cce_surface": {
+            "type": "string"
+          },
+          "cce_commercial_effect": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "revenue_evolution": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "horizon",
+          "pipeline_role",
+          "cce_role",
+          "commercial_band"
+        ],
+        "properties": {
+          "horizon": {
+            "type": "string"
+          },
+          "pipeline_role": {
+            "type": "string"
+          },
+          "cce_role": {
+            "type": "string"
+          },
+          "commercial_band": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "activation_gates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "check",
+          "evidence"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "check": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

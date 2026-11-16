@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .answering import write_json, write_markdown
-from .federation import list_registered_corpora, load_corpus_surface
+from .federation import load_corpus_surface, load_registry
 from .provider_catalog import PROVIDER_CONFIG, get_provider_config, provider_corpus_targets
 from .provider_discovery import discover_provider_uploads
 
@@ -82,38 +82,101 @@ def target_register_command(target: dict[str, Any]) -> str:
     )
 
 
+def corpus_store_register_command(project_root: Path) -> str:
+    return (
+        "cce corpus-store register "
+        f"--project-root {shlex.quote(str(project_root.resolve()))} "
+        "--root /path/to/private-corpus-store"
+    )
+
+
+def corpus_writer_command(
+    command: str,
+    *,
+    project_root: Path,
+    corpus_store_root: Path | None,
+) -> str:
+    if corpus_store_root is None:
+        return corpus_store_register_command(project_root)
+    return f"{command} --corpus-store-root {shlex.quote(str(corpus_store_root.resolve()))}"
+
+
+def target_is_store_backed(target: dict[str, Any], corpus_store_root: Path | None) -> bool:
+    if corpus_store_root is None:
+        return False
+    return Path(target["root"]).resolve().is_relative_to(corpus_store_root.resolve())
+
+
+def legacy_target_guidance(
+    target: dict[str, Any],
+    corpus_store_root: Path,
+) -> str:
+    destination = corpus_store_root.resolve() / target["corpus_id"]
+    return (
+        f"Migrate or re-import {target['corpus_id']} into the active corpus store "
+        f"at {destination} before writing evaluation assets."
+    )
+
+
 def determine_next_command(
     provider: str,
     discovery: dict[str, Any],
     selected_target: dict[str, Any],
     *,
     project_root: Path,
+    corpus_store_root: Path | None,
 ) -> str:
     config = get_provider_config(provider)
     state = target_readiness_state(selected_target)
     source_drop_root = discovery["inbox_root"].rsplit(f"/{provider}/inbox", 1)[0]
     if state == "missing":
         if discovery.get("upload_state") == "ready":
-            return (
-                f"cce provider import --provider {provider} --source-drop-root {source_drop_root} "
-                "--register --build"
+            return corpus_writer_command(
+                f"cce provider import --provider {provider} "
+                f"--project-root {shlex.quote(str(project_root.resolve()))} "
+                f"--source-drop-root {shlex.quote(source_drop_root)} --register --build",
+                project_root=project_root,
+                corpus_store_root=corpus_store_root,
             )
         return f"Place a supported {config['display_name']} export in {discovery['inbox_root']}"
+    if (
+        state
+        in {
+            "missing-contract",
+            "imported-needs-bootstrap",
+            "manual-eval-pending",
+            "manual-eval-unrun",
+        }
+        and corpus_store_root is not None
+        and not target_is_store_backed(selected_target, corpus_store_root)
+    ):
+        return legacy_target_guidance(selected_target, corpus_store_root)
     if state == "missing-contract":
         return f"Create corpus contract and index files under {selected_target['root']}/corpus"
     if state == "imported-needs-bootstrap":
-        return (
+        return corpus_writer_command(
             f"cce provider bootstrap-eval --provider {provider} "
-            f"--project-root {project_root.resolve()} --target-root {selected_target['root']}"
+            f"--project-root {shlex.quote(str(project_root.resolve()))} "
+            f"--target-root {shlex.quote(selected_target['root'])}",
+            project_root=project_root,
+            corpus_store_root=corpus_store_root,
         )
     if state in {"manual-eval-pending", "manual-eval-unrun"}:
-        return f"Update manual fixtures under {selected_target['root']}/eval and run cce evaluation run --root {selected_target['root']}"
+        return corpus_writer_command(
+            f"cce evaluation run --root {shlex.quote(selected_target['root'])} "
+            f"--project-root {shlex.quote(str(project_root.resolve()))}",
+            project_root=project_root,
+            corpus_store_root=corpus_store_root,
+        )
     if state == "calibration-pass":
         return target_register_command(selected_target)
     if state == "healthy-federation" and discovery.get("upload_state") == "ready":
-        return (
+        return corpus_writer_command(
             f"cce provider refresh --provider {provider} "
-            f"--project-root {project_root.resolve()} --source-drop-root {source_drop_root}"
+            f"--project-root {shlex.quote(str(project_root.resolve()))} "
+            f"--source-drop-root {shlex.quote(source_drop_root)}",
+            project_root=project_root,
+            corpus_store_root=corpus_store_root,
         )
     return "ready"
 
@@ -125,6 +188,7 @@ def summarize_provider_readiness(
     registry_by_root: dict[str, dict[str, Any]],
     project_root: Path,
     source_drop_root: Path,
+    corpus_store_root: Path | None,
 ) -> dict[str, Any]:
     config = get_provider_config(provider)
     registry = list(registry_by_corpus_id.values())
@@ -155,6 +219,7 @@ def summarize_provider_readiness(
             discovery,
             selected_target,
             project_root=project_root,
+            corpus_store_root=corpus_store_root,
         ),
         "notes": config.get("notes", []),
         "policy": {
@@ -172,9 +237,18 @@ def build_provider_readiness(project_root: Path, source_drop_root: Path) -> dict
     source_drop_root = source_drop_root.resolve()
     discovery_payload = discover_provider_uploads(project_root, source_drop_root)
     discovery_by_provider = {item["provider"]: item for item in discovery_payload["providers"]}
-    registry = list_registered_corpora(project_root)
+    registry_payload = load_registry(project_root)
+    registry = registry_payload.get("corpora") or []
     registry_by_corpus_id = {item["corpus_id"]: item for item in registry}
     registry_by_root = {str(Path(item["root"]).resolve()): item for item in registry}
+    store_registration = registry_payload.get("corpus_store")
+    corpus_store_root = (
+        Path(store_registration["root"])
+        if isinstance(store_registration, dict)
+        and store_registration.get("status") == "active"
+        and isinstance(store_registration.get("root"), str)
+        else None
+    )
     providers = [
         summarize_provider_readiness(
             provider,
@@ -183,6 +257,7 @@ def build_provider_readiness(project_root: Path, source_drop_root: Path) -> dict
             registry_by_root,
             project_root,
             source_drop_root,
+            corpus_store_root,
         )
         for provider in PROVIDER_CONFIG
     ]

@@ -1,0 +1,28 @@
+{
+  "$schema": "testament-event-v1",
+  "session_id": "S38",
+  "session_date": "2026-03-26",
+  "repo": "conversation-corpus-engine",
+  "organ": "ORGAN-I",
+  "summary": "ChatGPT local-session adapter, Chrome cookie fallback",
+  "commits": {
+    "first": "",
+    "last": "",
+    "count": 0
+  },
+  "test_state": {
+    "before": 0,
+    "after": 0
+  },
+  "modules_added": [],
+  "modules_modified": [],
+  "capabilities_shipped": [
+    "ChatGPT local-session adapter",
+    "Chrome cookie fallback"
+  ],
+  "issues_closed": [],
+  "issues_opened": [],
+  "cross_repo_propagation": [],
+  "remaining_work": [],
+  "operational_findings": []
+}

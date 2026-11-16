@@ -9,6 +9,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from conversation_corpus_engine import import_chatgpt_local_session_corpus as module  # noqa: E402
+from conversation_corpus_engine.sharded_collection import (  # noqa: E402
+    collection_storage_path,
+    load_collection,
+)
 
 
 def test_write_local_session_bundle_writes_expected_files(tmp_path: Path) -> None:
@@ -62,10 +66,10 @@ def test_write_local_session_bundle_writes_expected_files(tmp_path: Path) -> Non
     )
 
     assert (bundle_root / "user.json").exists()
-    assert (bundle_root / "conversations.json").exists()
+    assert collection_storage_path(bundle_root / "conversations.json").exists()
     user = json.loads((bundle_root / "user.json").read_text(encoding="utf-8"))
     assert user["email"] == "user@example.com"
-    conversations = json.loads((bundle_root / "conversations.json").read_text(encoding="utf-8"))
+    conversations = load_collection(bundle_root / "conversations.json")
     assert len(conversations) == 1
     assert conversations[0]["conversation_id"] == "conv-1"
 

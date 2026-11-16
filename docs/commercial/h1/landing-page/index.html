@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Conversation Corpus Engine</title>
+    <meta
+      name="description"
+      content="Search and govern AI conversation archives across providers with cited retrieval and MCP access."
+    >
+    <style>
+      :root {
+        color-scheme: light;
+        --ink: #17202a;
+        --muted: #5d6773;
+        --line: #d9dee5;
+        --paper: #f7f8fa;
+        --panel: #ffffff;
+        --accent: #0f766e;
+        --accent-strong: #115e59;
+        --mark: #f2c94c;
+        --rose: #b42352;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        background: var(--paper);
+        color: var(--ink);
+        font-family:
+          Inter,
+          ui-sans-serif,
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        line-height: 1.5;
+      }
+
+      a {
+        color: var(--accent-strong);
+      }
+
+      .shell {
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+
+      header {
+        border-bottom: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.92);
+      }
+
+      .nav,
+      .section {
+        width: min(1120px, calc(100% - 32px));
+        margin: 0 auto;
+      }
+
+      .nav {
+        min-height: 64px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-weight: 750;
+      }
+
+      .brand-mark {
+        width: 28px;
+        height: 28px;
+        display: grid;
+        place-items: center;
+        border: 1px solid var(--ink);
+        background: var(--mark);
+        font-size: 13px;
+        font-weight: 800;
+      }
+
+      .nav a {
+        font-size: 14px;
+        font-weight: 650;
+        text-decoration: none;
+      }
+
+      main {
+        flex: 1;
+      }
+
+      .hero {
+        padding: 56px 0 34px;
+      }
+
+      .hero-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.02fr) minmax(320px, 0.72fr);
+        gap: 28px;
+        align-items: stretch;
+      }
+
+      .hero-copy {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        min-height: 470px;
+      }
+
+      .eyebrow {
+        margin: 0 0 14px;
+        color: var(--accent-strong);
+        font-size: 13px;
+        font-weight: 750;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 0;
+        max-width: 760px;
+        font-size: clamp(42px, 7vw, 76px);
+        line-height: 0.98;
+        letter-spacing: 0;
+      }
+
+      .lede {
+        max-width: 640px;
+        margin: 22px 0 0;
+        color: var(--muted);
+        font-size: 19px;
+      }
+
+      .terminal {
+        margin-top: 28px;
+        overflow: hidden;
+        border: 1px solid #202833;
+        background: #101820;
+        color: #e9eef4;
+        box-shadow: 0 18px 42px rgba(23, 32, 42, 0.16);
+      }
+
+      .terminal-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 11px 14px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+        color: #b8c3cf;
+        font-size: 13px;
+      }
+
+      .dots {
+        display: flex;
+        gap: 6px;
+      }
+
+      .dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 999px;
+        background: #c84b58;
+      }
+
+      .dot:nth-child(2) {
+        background: #d6a33d;
+      }
+
+      .dot:nth-child(3) {
+        background: #35a866;
+      }
+
+      pre {
+        margin: 0;
+        padding: 18px;
+        overflow-x: auto;
+        font: 14px/1.55 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      }
+
+      .capture {
+        border: 1px solid var(--line);
+        background: var(--panel);
+        padding: 24px;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        min-height: 470px;
+      }
+
+      .capture h2 {
+        margin: 0;
+        font-size: 25px;
+        line-height: 1.15;
+        letter-spacing: 0;
+      }
+
+      .capture p {
+        margin: 12px 0 0;
+        color: var(--muted);
+      }
+
+      form {
+        margin-top: 24px;
+        display: grid;
+        gap: 12px;
+      }
+
+      label {
+        display: grid;
+        gap: 7px;
+        color: #33404f;
+        font-size: 13px;
+        font-weight: 700;
+      }
+
+      input,
+      select {
+        width: 100%;
+        min-height: 44px;
+        border: 1px solid #b9c2cc;
+        background: #fff;
+        color: var(--ink);
+        padding: 10px 12px;
+        font: inherit;
+      }
+
+      button {
+        min-height: 46px;
+        border: 0;
+        background: var(--accent);
+        color: #fff;
+        padding: 11px 16px;
+        font: inherit;
+        font-weight: 750;
+        cursor: pointer;
+      }
+
+      button:hover {
+        background: var(--accent-strong);
+      }
+
+      .privacy {
+        font-size: 12px;
+      }
+
+      .metrics {
+        padding: 16px 0 42px;
+      }
+
+      .metric-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .metric {
+        border: 1px solid var(--line);
+        background: var(--panel);
+        padding: 18px;
+      }
+
+      .metric strong {
+        display: block;
+        font-size: 24px;
+        line-height: 1;
+      }
+
+      .metric span {
+        display: block;
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .flow {
+        border-top: 1px solid var(--line);
+        background: #fff;
+        padding: 38px 0 54px;
+      }
+
+      .flow h2 {
+        margin: 0 0 18px;
+        font-size: 28px;
+        letter-spacing: 0;
+      }
+
+      .flow-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .flow-item {
+        border-left: 4px solid var(--accent);
+        padding: 6px 0 6px 14px;
+      }
+
+      .flow-item strong {
+        display: block;
+      }
+
+      .flow-item span {
+        color: var(--muted);
+      }
+
+      .bot-field {
+        display: none;
+      }
+
+      footer {
+        border-top: 1px solid var(--line);
+        padding: 20px 0;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      @media (max-width: 860px) {
+        .hero-grid,
+        .metric-grid,
+        .flow-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .hero-copy,
+        .capture {
+          min-height: auto;
+        }
+
+        .hero {
+          padding-top: 34px;
+        }
+      }
+
+      @media (max-width: 520px) {
+        .nav {
+          align-items: flex-start;
+          flex-direction: column;
+          justify-content: center;
+          padding: 14px 0;
+        }
+
+        .lede {
+          font-size: 17px;
+        }
+
+        pre {
+          font-size: 12px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <header>
+        <nav class="nav" aria-label="Primary">
+          <div class="brand">
+            <span class="brand-mark">CCE</span>
+            <span>Conversation Corpus Engine</span>
+          </div>
+          <a href="https://github.com/organvm-i-theoria/conversation-corpus-engine">GitHub</a>
+        </nav>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div class="section hero-grid">
+            <div class="hero-copy">
+              <p class="eyebrow">Local AI memory infrastructure</p>
+              <h1>Search your AI conversations from one governed corpus.</h1>
+              <p class="lede">
+                CCE turns provider exports into validated, federated, cited retrieval
+                surfaces for builders, researchers, consultants, and small teams.
+              </p>
+              <div class="terminal" aria-label="CCE command preview">
+                <div class="terminal-head">
+                  <div class="dots" aria-hidden="true">
+                    <span class="dot"></span>
+                    <span class="dot"></span>
+                    <span class="dot"></span>
+                  </div>
+                  <span>cce-mcp</span>
+                </div>
+                <pre><code>$ pipx install "conversation-corpus-engine[mcp]"
+$ cce-mcp --project-root ~/work/memory
+
+tools/list
+  cce_search
+  cce_list_corpora
+  cce_surface_context</code></pre>
+              </div>
+            </div>
+
+            <aside class="capture" aria-label="Waitlist signup">
+              <div>
+                <h2>Join the early access list.</h2>
+                <p>
+                  Get release notes for the MCP server, hosted search prototype,
+                  and the first Ring 1 web app build.
+                </p>
+              </div>
+              <form
+                name="cce-waitlist"
+                method="POST"
+                action="/thanks.html"
+                data-netlify="true"
+                netlify-honeypot="bot-field"
+              >
+                <input type="hidden" name="form-name" value="cce-waitlist">
+                <p class="bot-field">
+                  <label>Do not fill this out <input name="bot-field"></label>
+                </p>
+                <label>
+                  Email
+                  <input name="email" type="email" autocomplete="email" required>
+                </label>
+                <label>
+                  Role
+                  <select name="role" required>
+                    <option value="">Select one</option>
+                    <option>Builder</option>
+                    <option>Researcher</option>
+                    <option>Consultant</option>
+                    <option>Team lead</option>
+                  </select>
+                </label>
+                <button type="submit">Request early access</button>
+                <p class="privacy">
+                  No raw conversation exports are collected by this form.
+                </p>
+              </form>
+            </aside>
+          </div>
+        </section>
+
+        <section class="metrics" aria-label="Product scope">
+          <div class="section metric-grid">
+            <div class="metric"><strong>8</strong><span>Provider lanes</span></div>
+            <div class="metric"><strong>3</strong><span>MCP tools</span></div>
+            <div class="metric"><strong>0</strong><span>Required runtime dependencies</span></div>
+            <div class="metric"><strong>$29</strong><span>Planned professional tier</span></div>
+          </div>
+        </section>
+
+        <section class="flow">
+          <div class="section">
+            <h2>From scattered chats to governed memory.</h2>
+            <div class="flow-grid">
+              <div class="flow-item">
+                <strong>Import</strong>
+                <span>Provider exports become canonical corpus artifacts.</span>
+              </div>
+              <div class="flow-item">
+                <strong>Govern</strong>
+                <span>Freshness, validation, policy replay, and candidate review.</span>
+              </div>
+              <div class="flow-item">
+                <strong>Retrieve</strong>
+                <span>Cited answers through CLI, surface bundle, or MCP host.</span>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer>
+        <div class="section">Conversation Corpus Engine - ORGAN-I memory surface</div>
+      </footer>
+    </div>
+  </body>
+</html>

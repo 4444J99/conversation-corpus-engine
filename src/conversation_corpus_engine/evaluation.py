@@ -15,6 +15,14 @@ from .answering import (
     write_json,
     write_markdown,
 )
+from .corpus_store import (
+    CorpusStoreError,
+    CorpusWriteAuthorization,
+    authorize_additional_corpus_path,
+    authorize_corpus_write,
+)
+from .paths import default_project_root
+from .sharded_collection import load_corpus_collection
 
 DEFAULT_ROOT = Path.cwd()
 DETECTOR_KEYS = (
@@ -52,6 +60,8 @@ def parse_args() -> argparse.Namespace:
         description="Evaluate a conversation corpus against local gold fixtures."
     )
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
+    parser.add_argument("--project-root", type=Path, default=default_project_root())
+    parser.add_argument("--corpus-store-root", type=Path)
     parser.add_argument(
         "--seed",
         action="store_true",
@@ -239,10 +249,13 @@ def seed_gold(root: Path) -> dict[str, Path]:
     fixtures_manual_dir.mkdir(parents=True, exist_ok=True)
 
     canonical_decisions = load_json(root / "state" / "canonical-decisions.json", default={}) or {}
-    canonical_families = load_json(root / "corpus" / "canonical-families.json", default=[]) or []
-    doctrine_briefs = load_json(root / "corpus" / "doctrine-briefs.json", default=[]) or []
-    family_dossiers = load_json(root / "corpus" / "family-dossiers.json", default=[]) or []
-    pairs_index = load_json(root / "corpus" / "pairs-index.json", default=[]) or []
+    corpus_dir = root / "corpus"
+    canonical_families = (
+        load_corpus_collection(corpus_dir / "canonical-families.json", default=[]) or []
+    )
+    doctrine_briefs = load_corpus_collection(corpus_dir / "doctrine-briefs.json", default=[]) or []
+    family_dossiers = load_corpus_collection(corpus_dir / "family-dossiers.json", default=[]) or []
+    pairs_index = load_corpus_collection(corpus_dir / "pairs-index.json", default=[]) or []
 
     detectors_payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -449,7 +462,9 @@ def evaluate_current_corpus(root: Path) -> dict[str, Any]:
     answer_payload, answer_source, answer_path = load_preferred_fixture(root, "answers")
 
     canonical_decisions = load_json(root / "state" / "canonical-decisions.json", default={}) or {}
-    canonical_families = load_json(root / "corpus" / "canonical-families.json", default=[]) or []
+    canonical_families = (
+        load_corpus_collection(root / "corpus" / "canonical-families.json", default=[]) or []
+    )
 
     # Pre-build the corpus document index once — avoids rebuilding from disk per fixture.
     corpus = build_documents(root)
@@ -821,8 +836,32 @@ def run_corpus_evaluation(
     seed: bool = False,
     markdown_output: Path | None = None,
     json_output: Path | None = None,
+    project_root: Path | None = None,
+    corpus_store_root: Path | None = None,
+    authorization: CorpusWriteAuthorization | None = None,
 ) -> tuple[dict[str, Any], dict[str, Path]]:
-    root = root.resolve()
+    requested_root = root
+    if authorization is None:
+        if project_root is None:
+            raise CorpusStoreError(
+                "Evaluation writes require project_root and registered corpus-store custody."
+            )
+        resolved_authorization = authorize_corpus_write(
+            project_root=project_root,
+            corpus_store_root=corpus_store_root,
+            destination=requested_root,
+        )
+    else:
+        resolved_authorization = authorize_corpus_write(
+            project_root=authorization.project_root,
+            corpus_store_root=authorization.store_root,
+            destination=requested_root,
+        )
+    root = resolved_authorization.destination
+    if markdown_output is not None:
+        authorize_additional_corpus_path(resolved_authorization, markdown_output)
+    if json_output is not None:
+        authorize_additional_corpus_path(resolved_authorization, json_output)
     if seed:
         seed_gold(root)
     scorecard = evaluate_current_corpus(root)
@@ -842,6 +881,8 @@ def main() -> int:
         seed=args.seed,
         markdown_output=args.markdown_output,
         json_output=args.json_output,
+        project_root=args.project_root,
+        corpus_store_root=args.corpus_store_root,
     )
 
     if args.json:

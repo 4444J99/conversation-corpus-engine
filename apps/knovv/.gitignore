@@ -1,0 +1,9 @@
+node_modules/
+dist/
+build/
+.cf/
+.cloudflare/
+.dev.vars
+.env*
+!.env.example
+.private/

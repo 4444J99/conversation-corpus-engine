@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from conversation_corpus_engine.corpus_candidates import stage_corpus_candidate
+from conversation_corpus_engine.corpus_store import register_corpus_store
 from conversation_corpus_engine.federation import upsert_corpus
 from conversation_corpus_engine.governance_policy import (
     load_or_create_promotion_policy,
@@ -43,6 +44,7 @@ class SchemaValidationTests(unittest.TestCase):
         self.assertEqual(
             names,
             [
+                "commercial-awareness",
                 "commercial-h1-readiness",
                 "corpus-candidate",
                 "corpus-contract",
@@ -51,6 +53,7 @@ class SchemaValidationTests(unittest.TestCase):
                 "near-duplicates",
                 "promotion-policy",
                 "provider-refresh",
+                "sharded-collection",
                 "source-policy",
                 "surface-bundle",
                 "surface-manifest",
@@ -82,7 +85,10 @@ class SchemaValidationTests(unittest.TestCase):
 
             self.assertTrue(result["valid"], result["errors"])
 
-    def test_validate_real_import_audit_and_near_duplicates_artifacts(self) -> None:
+    def test_validate_real_projector_contract_artifact(self) -> None:
+        # The rewire (#78) retired the importers' import-audit and
+        # near-duplicates files; the artifact a real import now validates is
+        # the projector's corpus contract.
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_root = Path(tmpdir)
             bundle_root = workspace_root / "claude-export"
@@ -166,22 +172,20 @@ class SchemaValidationTests(unittest.TestCase):
                 name="Claude History Memory",
             )
 
-            audit_result = validate_json_file(
-                "import-audit",
-                output_root / "corpus" / "import-audit.json",
-            )
-            near_duplicates_result = validate_json_file(
-                "near-duplicates",
-                output_root / "corpus" / "near-duplicates.json",
+            contract_result = validate_json_file(
+                "corpus-contract",
+                output_root / "corpus" / "contract.json",
             )
 
-            self.assertTrue(audit_result["valid"], audit_result["errors"])
-            self.assertTrue(near_duplicates_result["valid"], near_duplicates_result["errors"])
+            self.assertTrue(contract_result["valid"], contract_result["errors"])
+            self.assertFalse((output_root / "corpus" / "import-audit.json").exists())
+            self.assertFalse((output_root / "corpus" / "near-duplicates.json").exists())
 
     def test_validate_source_policy_and_promotion_policy_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_root = Path(tmpdir)
             project_root = workspace_root / "project"
+            project_root.mkdir()
             primary_root = workspace_root / "gemini-history-memory"
             fallback_root = workspace_root / "gemini-archive-memory"
             primary_root.mkdir(parents=True, exist_ok=True)
@@ -276,6 +280,9 @@ class SchemaValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace_root = Path(tmpdir)
             project_root = workspace_root / "project"
+            project_root.mkdir()
+            corpus_store_root = workspace_root / "corpus-store"
+            corpus_store_root.mkdir()
             live_source = workspace_root / "live-source"
             live_root = workspace_root / "perplexity-history-memory"
             source_drop_root = workspace_root / "source-drop"
@@ -306,6 +313,7 @@ class SchemaValidationTests(unittest.TestCase):
                 name="Perplexity History Memory",
                 make_default=True,
             )
+            register_corpus_store(project_root, corpus_store_root)
             set_source_policy(
                 project_root,
                 "perplexity",
@@ -319,6 +327,7 @@ class SchemaValidationTests(unittest.TestCase):
                 project_root=project_root,
                 provider="perplexity",
                 source_drop_root=source_drop_root,
+                corpus_store_root=corpus_store_root,
                 note="Stage a refreshed Perplexity corpus.",
             )
             result = validate_json_file("provider-refresh", Path(payload["refresh_json_path"]))

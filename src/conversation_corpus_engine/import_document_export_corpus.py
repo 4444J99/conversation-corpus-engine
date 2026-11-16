@@ -6,26 +6,32 @@ import csv
 import html
 import json
 import shutil
+import sys
 import tempfile
 import zipfile
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .answering import load_json, slugify, write_json, write_markdown
+from .corpus_store import git_visible_refusal
 from .import_markdown_document_corpus import import_markdown_document_corpus
 from .provider_catalog import get_provider_config
 from .provider_exports import collect_supported_export_files
+from .sharded_collection import collection_storage_path, write_corpus_collection
 from .source_lifecycle import build_source_snapshot
 
 DEFAULT_OUTPUT_ROOT = Path.cwd() / "document-export-memory"
-CONTRACT_NAME = "conversation-corpus-engine-v1"
-CONTRACT_VERSION = 1
+CONTRACT_NAME = "conversation-corpus-engine.v2"
+CONTRACT_VERSION = 2
 SUPPORTED_PLAINTEXT_SUFFIXES = {".md", ".markdown", ".txt"}
 SUPPORTED_HTML_SUFFIXES = {".html", ".htm"}
 SUPPORTED_JSON_SUFFIXES = {".json"}
 SUPPORTED_CSV_SUFFIXES = {".csv"}
+
+if TYPE_CHECKING:
+    from .corpus_store import CorpusWriteAuthorization
 
 
 def now_iso() -> str:
@@ -36,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Import a document-style provider export into a corpus."
     )
-    parser.add_argument("provider", choices=["gemini", "grok", "perplexity", "copilot"])
+    parser.add_argument("provider")
     parser.add_argument("input_path", type=Path)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--name")
@@ -295,6 +301,7 @@ def import_document_export_corpus(
     corpus_id: str | None = None,
     name: str | None = None,
     throttle: float = 0.0,
+    authorization: CorpusWriteAuthorization | None = None,
 ) -> dict[str, Any]:
     config = get_provider_config(provider_slug)
     provider_name = config["display_name"]
@@ -335,6 +342,7 @@ def import_document_export_corpus(
                 output_root,
                 corpus_id=corpus_id,
                 name=default_name,
+                authorization=authorization,
             )
             raw_copy_map = build_raw_source_copy_map(
                 input_path=input_path,
@@ -397,7 +405,11 @@ def import_document_export_corpus(
                 "gates": [],
             },
         )
-        write_json(output_root / "import-manifest.json", import_manifest)
+        write_corpus_collection(
+            output_root / "import-manifest.json",
+            import_manifest,
+            authorization=authorization,
+        )
         write_markdown(
             output_root / "README.md",
             "\n".join(
@@ -427,7 +439,7 @@ def import_document_export_corpus(
             "source_file_count": len(source_files),
             "format_counts": dict(format_counts),
             "archive_type": archive_type,
-            "manifest_path": str(output_root / "import-manifest.json"),
+            "manifest_path": str(collection_storage_path(output_root / "import-manifest.json")),
             "readme_path": str(output_root / "README.md"),
         }
     finally:
@@ -437,6 +449,11 @@ def import_document_export_corpus(
 
 def main() -> int:
     args = parse_args()
+    # The corpus is the export's text as plaintext, and --output-root defaults to the working
+    # directory: refuse a folder Git can see before the export is read.
+    if (refusal := git_visible_refusal(args.output_root)) is not None:
+        print(f"output refused: {refusal}", file=sys.stderr)
+        return 2
     result = import_document_export_corpus(
         args.input_path,
         args.output_root,

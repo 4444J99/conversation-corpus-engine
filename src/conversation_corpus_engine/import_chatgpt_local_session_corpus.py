@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .answering import load_json, write_json, write_markdown
 from .chatgpt_local_session import (
@@ -23,7 +23,11 @@ from .chatgpt_local_session import (
     scope_preflight_check,
 )
 from .import_chatgpt_export_corpus import import_chatgpt_export_corpus
+from .sharded_collection import content_hash_key, write_collection
 from .source_lifecycle import build_source_snapshot
+
+if TYPE_CHECKING:
+    from .corpus_store import CorpusWriteAuthorization
 
 DEFAULT_OUTPUT_ROOT = Path.cwd() / "chatgpt-local-session-memory"
 DEFAULT_CORPUS_ID = "chatgpt-local-session-memory"
@@ -34,7 +38,15 @@ def write_local_session_bundle(bundle_root: Path, bundle: dict[str, Any]) -> Non
     bundle_root.mkdir(parents=True, exist_ok=True)
     user_payload = bundle.get("user") or {}
     write_json(bundle_root / "user.json", user_payload)
-    write_json(bundle_root / "conversations.json", bundle.get("conversations") or [])
+    write_collection(
+        bundle_root / "conversations.json",
+        bundle.get("conversations") or [],
+        key=lambda record: (
+            str(record.get("conversation_id") or record.get("id"))
+            if isinstance(record, dict) and (record.get("conversation_id") or record.get("id"))
+            else content_hash_key(record)
+        ),
+    )
     write_json(
         bundle_root / "conversation-summaries.json",
         bundle.get("conversation_summaries") or [],
@@ -126,6 +138,7 @@ def import_chatgpt_local_session_corpus(
     limit: int = 100,
     offset: int = 0,
     throttle: float = 0.0,
+    authorization: CorpusWriteAuthorization | None = None,
 ) -> dict[str, Any]:
     cookie_jar = cookie_jar.resolve()
     output_root = output_root.resolve()
@@ -146,7 +159,12 @@ def import_chatgpt_local_session_corpus(
         bundle_root = Path(tmpdir) / "chatgpt-local-bundle"
         write_local_session_bundle(bundle_root, bundle)
         result = import_chatgpt_export_corpus(
-            bundle_root, output_root, corpus_id=corpus_id, name=name, throttle=throttle
+            bundle_root,
+            output_root,
+            corpus_id=corpus_id,
+            name=name,
+            throttle=throttle,
+            authorization=authorization,
         )
         source_root = output_root / "source"
         source_root.mkdir(parents=True, exist_ok=True)

@@ -11,6 +11,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from conversation_corpus_engine.import_markdown_document_corpus import (
     import_markdown_document_corpus,
 )
+from conversation_corpus_engine.sharded_collection import (
+    collection_storage_path,
+    load_corpus_collection,
+)
 
 
 class ImportMarkdownDocumentCorpusTests(unittest.TestCase):
@@ -36,11 +40,14 @@ class ImportMarkdownDocumentCorpusTests(unittest.TestCase):
             )
 
             self.assertEqual(result["thread_count"], 1)
-            self.assertTrue((output_root / "corpus" / "threads-index.json").exists())
-            self.assertTrue((output_root / "corpus" / "semantic-v3-index.json").exists())
-            self.assertTrue((output_root / "corpus" / "pairs-index.json").exists())
-            self.assertTrue((output_root / "corpus" / "doctrine-briefs.json").exists())
-            self.assertTrue((output_root / "corpus" / "family-dossiers.json").exists())
+            for filename in (
+                "threads-index.json",
+                "semantic-v3-index.json",
+                "pairs-index.json",
+                "doctrine-briefs.json",
+                "family-dossiers.json",
+            ):
+                self.assertTrue(collection_storage_path(output_root / "corpus" / filename).exists())
             self.assertTrue((output_root / "corpus" / "contract.json").exists())
             self.assertTrue((output_root / "corpus" / "source-snapshot.json").exists())
             self.assertTrue((output_root / "corpus" / "regression-gates.json").exists())
@@ -51,12 +58,8 @@ class ImportMarkdownDocumentCorpusTests(unittest.TestCase):
             self.assertEqual(contract["adapter_type"], "markdown-document")
             self.assertTrue(contract["source_signature_fingerprint"])
 
-            actions = json.loads(
-                (output_root / "corpus" / "action-ledger.json").read_text(encoding="utf-8")
-            )
-            unresolved = json.loads(
-                (output_root / "corpus" / "unresolved-ledger.json").read_text(encoding="utf-8")
-            )
+            actions = load_corpus_collection(output_root / "corpus" / "action-ledger.json")
+            unresolved = load_corpus_collection(output_root / "corpus" / "unresolved-ledger.json")
             self.assertGreaterEqual(len(actions), 1)
             self.assertGreaterEqual(len(unresolved), 1)
 
@@ -81,9 +84,7 @@ class ImportMarkdownDocumentCorpusTests(unittest.TestCase):
             )
 
             self.assertEqual(result["thread_count"], 1)
-            manifest = json.loads(
-                (output_root / "import-manifest.json").read_text(encoding="utf-8")
-            )
+            manifest = load_corpus_collection(output_root / "import-manifest.json")
             self.assertEqual(len(manifest), 1)
             self.assertIn("TopLevel.md", manifest[0]["source_markdown"])
 
@@ -118,15 +119,9 @@ class ImportMarkdownDocumentCorpusTests(unittest.TestCase):
 
             import_markdown_document_corpus(input_root, output_root, corpus_id="document-memory")
 
-            actions = json.loads(
-                (output_root / "corpus" / "action-ledger.json").read_text(encoding="utf-8")
-            )
-            unresolved = json.loads(
-                (output_root / "corpus" / "unresolved-ledger.json").read_text(encoding="utf-8")
-            )
-            threads = json.loads(
-                (output_root / "corpus" / "threads-index.json").read_text(encoding="utf-8")
-            )
+            actions = load_corpus_collection(output_root / "corpus" / "action-ledger.json")
+            unresolved = load_corpus_collection(output_root / "corpus" / "unresolved-ledger.json")
+            threads = load_corpus_collection(output_root / "corpus" / "threads-index.json")
 
             self.assertEqual(len(actions), 1)
             self.assertEqual(

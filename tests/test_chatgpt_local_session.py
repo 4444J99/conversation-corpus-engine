@@ -439,6 +439,105 @@ def test_merge_project_discovery_preserves_extraction_state() -> None:
     assert result["project_count"] == 2
 
 
+def _fake_project_session() -> module.ChatGPTHttpSession:
+    return module.ChatGPTHttpSession(
+        cookies=[],
+        session_payload={"account": {"id": "acct-1"}, "user": {"email": "u@example.com"}},
+        access_token="tok",  # allow-secret
+        account_id="acct-1",
+        device_id="dev-1",
+    )
+
+
+def test_project_display_name_prefers_flat_projects_shape() -> None:
+    assert module._project_display_name({"id": "g-p-a", "name": "My Project"}) == "My Project"
+    assert module._project_display_name({"title": "Titled"}) == "Titled"
+
+
+def test_project_display_name_falls_back_to_gizmo_wrapped() -> None:
+    item = {"gizmo": {"display": {"name": "Gizmo Display"}}}
+    assert module._project_display_name(item) == "Gizmo Display"
+    assert module._project_display_name({}) == ""
+
+
+def test_parse_project_item_reads_flat_projects_shape() -> None:
+    item = {
+        "id": "g-p-aaa",
+        "name": "Alpha",
+        "num_conversations": 7,
+        "files": [{"id": "f1"}, {"id": "f2"}],
+    }
+    parsed = module._parse_project_item(item)
+    assert parsed is not None
+    pid, info = parsed
+    assert pid == "g-p-aaa"
+    assert info == {"name": "Alpha", "interactions": 7, "file_count": 2}
+
+
+def test_parse_project_item_tolerates_legacy_gizmo_entry() -> None:
+    item = {
+        "gizmo": {"id": "g-p-bbb", "display": {"name": "Beta"}},
+        "vanity_metrics": {"num_conversations": 3},
+    }
+    parsed = module._parse_project_item(item)
+    assert parsed is not None
+    pid, info = parsed
+    assert pid == "g-p-bbb"
+    assert info["name"] == "Beta"
+    assert info["interactions"] == 3
+
+
+def test_parse_project_item_returns_none_without_id() -> None:
+    assert module._parse_project_item({"name": "no-id"}) is None
+
+
+def test_discover_chatgpt_projects_uses_projects_api(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    jar = tmp_path / "test.binarycookies"
+    jar.write_bytes(
+        build_binary_cookie_jar([{"domain": ".chatgpt.com", "name": "x", "value": "y"}])
+    )
+    monkeypatch.setattr(module, "build_chatgpt_session", lambda cookie_jar: _fake_project_session())
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+
+    seen_urls: list[str] = []
+
+    def fake_fetch_json(session: object, url: str) -> object:
+        seen_urls.append(url)
+        return {
+            "items": [
+                {"id": "g-p-aaa", "name": "Alpha", "num_conversations": 2},
+                {"id": "g-p-bbb", "name": "Beta", "files": [{"id": "f"}]},
+            ]
+        }
+
+    monkeypatch.setattr(module, "fetch_json", fake_fetch_json)
+
+    projects = module.discover_chatgpt_projects(jar)
+
+    # Hits the Projects API, NOT the gizmos discovery API.
+    assert seen_urls
+    assert "backend-api/projects?" in seen_urls[0]
+    assert all("gizmos" not in url for url in seen_urls)
+    assert projects["g-p-aaa"] == {"name": "Alpha", "interactions": 2, "file_count": 0}
+    assert projects["g-p-bbb"]["file_count"] == 1
+
+
+def test_discover_chatgpt_projects_stops_on_empty_page(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    jar = tmp_path / "test.binarycookies"
+    jar.write_bytes(
+        build_binary_cookie_jar([{"domain": ".chatgpt.com", "name": "x", "value": "y"}])
+    )
+    monkeypatch.setattr(module, "build_chatgpt_session", lambda cookie_jar: _fake_project_session())
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(module, "fetch_json", lambda session, url: {"items": []})
+
+    assert module.discover_chatgpt_projects(jar) == {}
+
+
 def test_set_project_route_updates_registry(tmp_path: Path) -> None:
     registry = module.load_project_registry(tmp_path)
     registry["projects"]["g-p-aaa"] = module._blank_project_entry("g-p-aaa", "test", 5, 2)

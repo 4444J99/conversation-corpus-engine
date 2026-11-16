@@ -4,6 +4,22 @@
 **Archetype:** THE ACQUISITOR | **IRF:** IRF-CCE-027
 **Blocked by:** GH#15 (ChatGPT API scope degradation)
 
+> **Resolution (2026-06-18, LIMEN-087):** `discover_chatgpt_projects()` and
+> `fetch_chatgpt_project()` now target the ChatGPT **Projects** API
+> (`backend-api/projects` / `backend-api/projects/{id}`) via the
+> `PROJECTS_LIST_PATH` / `PROJECT_DETAIL_PATH` constants, not the gizmos
+> discovery API. Listing items are parsed by `_parse_project_item()` /
+> `_project_display_name()`, which read the flat Projects shape
+> (`id`/`name`/`files`) first and fall back to legacy gizmo-wrapped entries for
+> safety. Parsing + endpoint selection are covered by mocked unit tests in
+> `tests/test_chatgpt_local_session.py`.
+>
+> **Still open — live verification:** the exact JSON shapes could not be observed
+> from this environment (no valid session — see GH#15). When a session is
+> available, confirm the Projects list/detail paths and response shapes via
+> browser DevTools and adjust the two path constants + parsing helpers if they
+> differ. The registry/routing/status machinery needs no changes either way.
+
 ## Current State
 
 `discover_chatgpt_projects()` uses the **GPT Store discovery endpoint**, not the
@@ -59,10 +75,10 @@ API discovery endpoint is wrong.
 - [x] `fetch_chatgpt_project()` — project detail extraction (S38)
 - [x] `sync_chatgpt_projects()` — batch extraction orchestrator (S39)
 - [x] CLI: `cce project discover`, `cce project extract`, `cce project sync` (S39)
-- [ ] Identify correct Projects API endpoint
-- [ ] Update `discover_chatgpt_projects()` with correct endpoint
-- [ ] Update `fetch_chatgpt_project()` if detail endpoint also differs
-- [ ] Test end-to-end project discovery + extraction
+- [x] Identify correct Projects API endpoint (`backend-api/projects[/{id}]`; live-verify shapes)
+- [x] Update `discover_chatgpt_projects()` with correct endpoint + Projects-shape parsing
+- [x] Update `fetch_chatgpt_project()` to the Projects detail endpoint
+- [x] Unit tests for discovery endpoint + parsing (mocked); live end-to-end still pending GH#15
 - [ ] GH#16 closed
 
 ## Key Decisions

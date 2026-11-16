@@ -4,6 +4,8 @@
 **Status:** APPROVED
 **Session:** S41
 **Scope:** Revenue architecture for conversation-corpus-engine and its position in the ORGANVM income surface
+**Cross-repo reference:** [`4444J99/application-pipeline`](https://github.com/4444J99/application-pipeline) is the personal-capacity income counterpart for jobs, grants/residencies, and consulting.
+**IRF:** IRF-CCE-038 DONE — CCE docs now backlink the pipeline revenue strategy.
 
 ---
 
@@ -208,6 +210,26 @@ income equation with different parameter weightings:
 - Pipeline Identity #9 (Founder/Operator) → IS the CCE commercial persona
 - Pipeline Identity #5 (Independent Engineer) → builds CCE engineering credibility
 - SGO research → papers on conversation federation = CCE marketing + omega #14
+
+### 8.1 Cross-Repo Commercial Awareness
+
+The canonical pipeline counterpart is
+[`4444J99/application-pipeline`](https://github.com/4444J99/application-pipeline).
+CCE owns the governed conversation corpus, provider federation, schemas, and
+surface exports that can become recurring product revenue. The pipeline owns the
+near-term application and relationship infrastructure that turns operator effort
+into jobs, grants/residencies, writing, and consulting income.
+
+Commercial planning must keep these docs linked in both directions:
+
+- CCE docs point to `application-pipeline` as the jobs/grants/consulting income
+  bridge that funds and validates CCE commercialization.
+- Pipeline docs should point back to this spec as the product-scale successor to
+  the same income surface, especially where consulting engagements become CCE
+  Ring 4 enterprise services.
+
+`IRF-CCE-038` is DONE for this repo: the CCE commercial architecture now carries
+an explicit pipeline backlink and names the shared revenue model.
 
 ### Revenue Evolution
 

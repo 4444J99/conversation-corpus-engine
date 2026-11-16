@@ -3,11 +3,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .answering import load_json, write_markdown
+from .corpus_store import (
+    CorpusWriteAuthorization,
+    authorize_corpus_write,
+    load_corpus_store_registry,
+    resolve_configured_corpus_store_root,
+)
 from .evaluation import run_corpus_evaluation, seed_gold
 from .paths import default_project_root
 from .provider_catalog import (
@@ -27,7 +34,8 @@ def parse_args() -> argparse.Namespace:
         description="Seed and scaffold manual evaluation for a provider corpus.",
     )
     parser.add_argument("--project-root", type=Path, default=DEFAULT_PROJECT_ROOT)
-    parser.add_argument("--provider", choices=["claude", "gemini", "grok", "perplexity", "copilot"])
+    parser.add_argument("--corpus-store-root", type=Path)
+    parser.add_argument("--provider")
     parser.add_argument("--target-root", type=Path)
     parser.add_argument("--policy-path", type=Path, default=DEFAULT_CLAUDE_POLICY_PATH)
     parser.add_argument(
@@ -45,9 +53,10 @@ def resolve_target_root(
     provider: str | None,
     explicit_target_root: Path | None,
     policy_path: Path | None = None,
+    registry: list[dict[str, Any]] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     if explicit_target_root is not None:
-        return explicit_target_root.resolve(), {
+        return explicit_target_root, {
             "provider": provider,
             "selection": "explicit",
             "policy_path": str(policy_path.resolve()) if policy_path else None,
@@ -58,9 +67,19 @@ def resolve_target_root(
         raise ValueError("Provide --provider or --target-root.")
 
     resolved_project_root = project_root.resolve()
+    if policy_path is not None and policy_path.is_file():
+        policy = load_json(policy_path, default={}) or {}
+        primary_root = policy.get("primary_root")
+        if primary_root:
+            return Path(primary_root), {
+                "provider": provider,
+                "selection": "primary",
+                "policy_path": str(policy_path.resolve()),
+                "policy": policy,
+            }
     source_drop_root = default_source_drop_root(resolved_project_root)
     targets = provider_corpus_targets(
-        resolved_project_root, provider, source_drop_root, registry=[]
+        resolved_project_root, provider, source_drop_root, registry=registry
     )
     target = next((item for item in targets if item.get("selected")), targets[0])
     return Path(target["root"]).resolve(), {
@@ -88,31 +107,48 @@ def corpus_metadata(target_root: Path) -> dict[str, Any]:
 
 def render_manual_guide(
     *,
-    provider_slug: str,
+    provider_slug: str | None,
     provider_name: str,
     target_root: Path,
+    project_root: Path,
+    corpus_store_root: Path,
     full_eval: bool,
 ) -> str:
-    rerun_command = f"cce evaluation run --root {target_root}"
-    refresh_command = f"cce provider bootstrap-eval --provider {provider_slug} --target-root {target_root} --full-eval"
-    return "\n".join(
-        [
-            f"# {provider_name} Manual Evaluation Guide",
-            "",
-            f"- Generated: {datetime.now(timezone.utc).isoformat()}",
-            f"- Target root: {target_root}",
-            f"- Full eval ran during bootstrap: {'yes' if full_eval else 'no'}",
-            "",
-            "## Next Manual Steps",
-            "",
-            "- Review `eval/gold/manual/detectors.json` and confirm or reject seeded detector truth.",
-            "- Review `eval/gold/manual/families.json` and confirm canonical family membership.",
-            "- Review `eval/fixtures/manual/retrieval.json` and replace seeded retrieval prompts with provider-specific cases.",
-            "- Review `eval/gold/manual/answers.json` and replace seeded answer fixtures with grounded expectations.",
-            f"- Re-run `{rerun_command}` after manual edits.",
-            f"- Use `{refresh_command}` only when you want the seeded baseline refreshed and re-scored.",
-        ],
+    quoted_target_root = shlex.quote(str(target_root))
+    quoted_project_root = shlex.quote(str(project_root))
+    quoted_store_root = shlex.quote(str(corpus_store_root))
+    rerun_command = (
+        f"cce evaluation run --root {quoted_target_root} "
+        f"--project-root {quoted_project_root} "
+        f"--corpus-store-root {quoted_store_root}"
     )
+    lines = [
+        f"# {provider_name} Manual Evaluation Guide",
+        "",
+        f"- Generated: {datetime.now(timezone.utc).isoformat()}",
+        f"- Target root: {target_root}",
+        f"- Full eval ran during bootstrap: {'yes' if full_eval else 'no'}",
+        "",
+        "## Next Manual Steps",
+        "",
+        "- Review `eval/gold/manual/detectors.json` and confirm or reject seeded detector truth.",
+        "- Review `eval/gold/manual/families.json` and confirm canonical family membership.",
+        "- Review `eval/fixtures/manual/retrieval.json` and replace seeded retrieval prompts with provider-specific cases.",
+        "- Review `eval/gold/manual/answers.json` and replace seeded answer fixtures with grounded expectations.",
+        f"- Re-run `{rerun_command}` after manual edits.",
+    ]
+    if provider_slug is not None:
+        refresh_command = (
+            "cce provider bootstrap-eval "
+            f"--provider {shlex.quote(provider_slug)} "
+            f"--project-root {quoted_project_root} "
+            f"--target-root {quoted_target_root} "
+            f"--corpus-store-root {quoted_store_root} --full-eval"
+        )
+        lines.append(
+            f"- Use `{refresh_command}` only when you want the seeded baseline refreshed and re-scored."
+        )
+    return "\n".join(lines)
 
 
 def bootstrap_provider_evaluation(
@@ -122,16 +158,33 @@ def bootstrap_provider_evaluation(
     target_root: Path | None = None,
     policy_path: Path | None = None,
     full_eval: bool = False,
+    corpus_store_root: Path | None = None,
+    authorization: CorpusWriteAuthorization | None = None,
 ) -> dict[str, Any]:
     resolved_project_root = project_root.resolve()
+    configured_store_root = (
+        authorization.store_root
+        if authorization is not None
+        else resolve_configured_corpus_store_root(corpus_store_root)
+    )
+    registry_entries = None
+    if target_root is None and provider is not None:
+        registry_entries = load_corpus_store_registry(resolved_project_root)["corpora"]
     resolved_target_root, resolution = resolve_target_root(
         project_root=resolved_project_root,
         provider=provider,
         explicit_target_root=target_root,
         policy_path=policy_path,
+        registry=registry_entries,
     )
     if not resolved_target_root.exists():
         raise FileNotFoundError(f"Target corpus root does not exist: {resolved_target_root}")
+    resolved_authorization = authorize_corpus_write(
+        project_root=resolved_project_root,
+        corpus_store_root=configured_store_root,
+        destination=resolved_target_root,
+    )
+    resolved_target_root = resolved_authorization.destination
 
     if provider is not None:
         provider_name = get_provider_config(provider)["display_name"]
@@ -146,7 +199,10 @@ def bootstrap_provider_evaluation(
     scorecard = None
     outputs: dict[str, str] = {}
     if full_eval:
-        scorecard, resolved_outputs = run_corpus_evaluation(resolved_target_root)
+        scorecard, resolved_outputs = run_corpus_evaluation(
+            resolved_target_root,
+            authorization=resolved_authorization,
+        )
         outputs = {key: str(value) for key, value in resolved_outputs.items()}
 
     metadata = corpus_metadata(resolved_target_root)
@@ -154,9 +210,11 @@ def bootstrap_provider_evaluation(
     write_markdown(
         guidance_path,
         render_manual_guide(
-            provider_slug=provider or "external",
+            provider_slug=provider,
             provider_name=provider_name,
             target_root=resolved_target_root,
+            project_root=resolved_project_root,
+            corpus_store_root=resolved_authorization.store_root,
             full_eval=full_eval,
         ),
     )
@@ -226,6 +284,7 @@ def bootstrap_claude_evaluation(
     policy_path: Path = DEFAULT_CLAUDE_POLICY_PATH,
     target_root: Path | None = None,
     full_eval: bool = False,
+    corpus_store_root: Path | None = None,
 ) -> dict[str, Any]:
     payload = bootstrap_provider_evaluation(
         project_root=project_root,
@@ -233,6 +292,7 @@ def bootstrap_claude_evaluation(
         target_root=target_root,
         policy_path=policy_path,
         full_eval=full_eval,
+        corpus_store_root=corpus_store_root,
     )
     return {
         "target_root": payload["target_root"],
@@ -256,6 +316,7 @@ def main() -> int:
         target_root=args.target_root,
         policy_path=args.policy_path,
         full_eval=args.full_eval,
+        corpus_store_root=args.corpus_store_root,
     )
     print(json.dumps(payload, indent=2))
     return 0

@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .sharded_collection import load_corpus_collection
+
 TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_-]+")
 STOP_WORDS = {
     "a",
@@ -135,18 +137,25 @@ def build_documents(root: Path) -> dict[str, Any]:
     pair_docs: list[dict[str, Any]] = []
     ledger_docs: list[dict[str, Any]] = []
 
-    threads_index = load_json(root / "corpus" / "threads-index.json", default=[]) or []
-    semantic_index = load_json(
-        root / "corpus" / "semantic-v3-index.json", default={"threads": []}
-    ) or {"threads": []}
-    pairs_index = load_json(root / "corpus" / "pairs-index.json", default=[]) or []
-    doctrine_briefs = load_json(root / "corpus" / "doctrine-briefs.json", default=[]) or []
-    family_dossiers = load_json(root / "corpus" / "family-dossiers.json", default=[]) or []
-    action_ledger = load_json(root / "corpus" / "action-ledger.json", default=[]) or []
-    unresolved_ledger = load_json(root / "corpus" / "unresolved-ledger.json", default=[]) or []
-    doctrine_timeline = load_json(root / "corpus" / "doctrine-timeline.json", default=[]) or []
-    canonical_entities = load_json(root / "corpus" / "canonical-entities.json", default=[]) or []
-    entity_aliases = load_json(root / "corpus" / "entity-aliases.json", default=[]) or []
+    corpus_dir = root / "corpus"
+    threads_index = load_corpus_collection(corpus_dir / "threads-index.json", default=[]) or []
+    semantic_index = {
+        "threads": load_corpus_collection(corpus_dir / "semantic-v3-index.json", default=[]) or []
+    }
+    pairs_index = load_corpus_collection(corpus_dir / "pairs-index.json", default=[]) or []
+    doctrine_briefs = load_corpus_collection(corpus_dir / "doctrine-briefs.json", default=[]) or []
+    family_dossiers = load_corpus_collection(corpus_dir / "family-dossiers.json", default=[]) or []
+    action_ledger = load_corpus_collection(corpus_dir / "action-ledger.json", default=[]) or []
+    unresolved_ledger = (
+        load_corpus_collection(corpus_dir / "unresolved-ledger.json", default=[]) or []
+    )
+    doctrine_timeline = (
+        load_corpus_collection(corpus_dir / "doctrine-timeline.json", default=[]) or []
+    )
+    canonical_entities = (
+        load_corpus_collection(corpus_dir / "canonical-entities.json", default=[]) or []
+    )
+    entity_aliases = load_corpus_collection(corpus_dir / "entity-aliases.json", default=[]) or []
 
     thread_family_map: dict[str, list[str]] = {}
     thread_title_map: dict[str, str] = {}

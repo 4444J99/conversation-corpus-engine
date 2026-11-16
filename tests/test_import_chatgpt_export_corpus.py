@@ -9,10 +9,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from conversation_corpus_engine.corpus_store import register_corpus_store  # noqa: E402
 from conversation_corpus_engine.import_chatgpt_export_corpus import (  # noqa: E402
     import_chatgpt_export_corpus,
 )
 from conversation_corpus_engine.provider_exports import looks_like_chatgpt_export  # noqa: E402
+from conversation_corpus_engine.sharded_collection import (  # noqa: E402
+    collection_storage_path,
+    load_corpus_collection,
+)
 
 FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures" / "chatgpt-export"
 
@@ -56,16 +61,18 @@ class ImportChatGPTExportCorpusTests(unittest.TestCase):
             contract = json.loads(
                 (output_root / "corpus" / "contract.json").read_text(encoding="utf-8"),
             )
-            self.assertEqual(contract["adapter_type"], "chatgpt-export")
-            self.assertEqual(contract["contract_name"], "conversation-corpus-engine-v1")
+            self.assertEqual(contract["adapter_type"], "archive-normalized")
+            self.assertEqual(contract["corpus_id"], "corpus-chatgpt-archive")
+            self.assertEqual(contract["contract_name"], "conversation-corpus-engine.v2")
+            self.assertEqual(result["projector_corpus_id"], "corpus-chatgpt-archive")
 
             # Verify federation-required files exist
             corpus_dir = output_root / "corpus"
             for required in (
-                "threads-index.json",
-                "pairs-index.json",
-                "doctrine-briefs.json",
-                "canonical-families.json",
+                "threads-index.collection",
+                "pairs-index.collection",
+                "doctrine-briefs.collection",
+                "canonical-families.collection",
                 "evaluation-summary.json",
                 "regression-gates.json",
             ):
@@ -83,9 +90,7 @@ class ImportChatGPTExportCorpusTests(unittest.TestCase):
                 corpus_id="chatgpt-memory",
                 name="ChatGPT Memory",
             )
-            threads = json.loads(
-                (output_root / "corpus" / "threads-index.json").read_text(encoding="utf-8"),
-            )
+            threads = load_corpus_collection(output_root / "corpus" / "threads-index.json")
             # At least one thread should exist even from the null-title conversation
             titles = [t["title_normalized"] for t in threads]
             # The null-title conversation should have an inferred title
@@ -123,22 +128,27 @@ class ChatGPTProviderIntegrationTests(unittest.TestCase):
     def test_import_provider_corpus_routes_chatgpt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             project_root = Path(tmpdir) / "project"
+            project_root.mkdir()
+            corpus_store_root = Path(tmpdir) / "corpus-store"
+            corpus_store_root.mkdir()
+            register_corpus_store(project_root, corpus_store_root)
             source_path = FIXTURE_ROOT
-            output_root = Path(tmpdir) / "chatgpt-history-memory"
+            output_root = corpus_store_root / "chatgpt-history-memory"
             result = import_provider_corpus(
                 project_root=project_root,
                 provider="chatgpt",
                 source_path=source_path,
                 output_root=output_root,
+                corpus_store_root=corpus_store_root,
                 bootstrap_eval=False,
             )
             self.assertEqual(result["provider"], "chatgpt")
             self.assertGreaterEqual(result["import_result"]["thread_count"], 2)
 
 
+from conversation_corpus_engine.corpus_text import detect_near_duplicates  # noqa: E402
 from conversation_corpus_engine.import_chatgpt_export_corpus import (  # noqa: E402
     build_thread_audit,
-    detect_near_duplicates,
     extract_node_text,
 )
 
@@ -415,8 +425,16 @@ class ImportMultiPartCorpusTests(unittest.TestCase):
             self.assertEqual(result["thread_count"], 3, "Expected 3 unique threads after dedup")
 
             # Sources copied under prefixed subdirectories
-            self.assertTrue((output / "source" / "part-1" / "conversations.json").exists())
-            self.assertTrue((output / "source" / "part-2" / "conversations.json").exists())
+            self.assertTrue(
+                collection_storage_path(
+                    output / "source" / "part-1" / "conversations.json"
+                ).exists()
+            )
+            self.assertTrue(
+                collection_storage_path(
+                    output / "source" / "part-2" / "conversations.json"
+                ).exists()
+            )
 
             # README mentions multi-part
             readme_text = (output / "README.md").read_text(encoding="utf-8")
@@ -438,7 +456,9 @@ class ImportMultiPartCorpusTests(unittest.TestCase):
             self.assertEqual(result["bundle_part_count"], 1)
             self.assertEqual(result["duplicate_conversations_skipped"], 0)
             # Source files at top level of source/, NOT under source/<name>/
-            self.assertTrue((output / "source" / "conversations.json").exists())
+            self.assertTrue(
+                collection_storage_path(output / "source" / "conversations.json").exists()
+            )
             self.assertFalse((output / "source" / "export").exists())
 
 

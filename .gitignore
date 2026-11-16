@@ -14,3 +14,6 @@ dist/
 /state/*
 !/state/testaments/
 /source-drop/
+
+# Generated persona extracts may contain private owner text (cce corpus persona-extract --write)
+/docs/storefront/_generated/

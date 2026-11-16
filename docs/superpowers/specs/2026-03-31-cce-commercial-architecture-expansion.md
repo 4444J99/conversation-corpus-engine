@@ -346,6 +346,13 @@ organism translation) remains correct. This expansion adds:
 
 The expansion incorporates the second tribunal's findings:
 
+**Pipeline backlink demand (IRF-CCE-038):** The expansion depends on
+[`4444J99/application-pipeline`](https://github.com/4444J99/application-pipeline)
+for the near-term cash-flow bridge. Pipeline jobs, grants/residencies, writing,
+and consulting are not separate from CCE commercialization; they are the
+personal-capacity side of the same income surface, while CCE product tiers are
+the institutional-scale side. Status: `IRF-CCE-038` DONE for this repo.
+
 **Stranger's demand (product brief):** The one-page brief becomes: "Your AI
 conversations become an institution." One sentence per loop, not per feature.
 

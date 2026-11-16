@@ -652,10 +652,10 @@ def fetch_chatgpt_project(
     session = build_chatgpt_session(cookie_jar)
     output_root = output_root.resolve()
 
-    project = fetch_json(session, f"https://{CHATGPT_HOST}/backend-api/gizmos/{project_id}")
-    gizmo = project.get("gizmo") or {}
+    detail_path = PROJECT_DETAIL_PATH.format(project_id=project_id)
+    project = fetch_json(session, f"https://{CHATGPT_HOST}/{detail_path}")
     files = project.get("files") or []
-    project_name = gizmo.get("display", {}).get("name") or project_id
+    project_name = _project_display_name(project) or project_id
 
     meta_dir = output_root / "metadata"
     meta_dir.mkdir(parents=True, exist_ok=True)
@@ -771,6 +771,20 @@ def render_discovery_text(payload: dict[str, Any]) -> str:
 # Project registry (The Post Office)
 # ---------------------------------------------------------------------------
 
+# ChatGPT Projects API (distinct from the GPT Store "gizmos" API).
+#
+# ChatGPT Projects and custom GPTs ("gizmos") are separate features served by
+# different backend routes. The gizmos discovery API returns custom GPTs, NOT
+# Projects, so the Post Office must talk to the Projects API instead
+# (GH#16 / IRF-CCE-027). Project IDs are prefixed "g-p-" (gizmo-project).
+#
+# The JSON shapes parsed below follow the Projects API (flat ``id``/``name`` per
+# item), while staying tolerant of legacy gizmo-wrapped entries for safety. When
+# a valid ChatGPT session is available, live-verify these paths/shapes via
+# browser DevTools (see playbooks/handoffs/gh-16-chatgpt-projects-endpoint.md).
+PROJECTS_LIST_PATH = "backend-api/projects"
+PROJECT_DETAIL_PATH = "backend-api/projects/{project_id}"
+
 EXTRACTION_STATES = (
     "discovered",
     "queued",
@@ -861,19 +875,60 @@ def merge_project_discovery(
     return result
 
 
+def _project_display_name(item: dict[str, Any]) -> str:
+    """Extract a project's display name from a Projects-API or legacy gizmo entry."""
+    name = item.get("name") or item.get("title")
+    if name:
+        return name
+    gizmo = item.get("gizmo") or item.get("resource") or {}
+    display = gizmo.get("display") or {}
+    return display.get("name") or gizmo.get("name") or gizmo.get("title") or ""
+
+
+def _parse_project_item(item: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """Normalize one Projects-API listing item to ``(project_id, info)``.
+
+    Reads the flat Projects shape (``id``/``name``) first and falls back to a
+    legacy gizmo-wrapped entry. Returns ``None`` when no project id is present.
+    """
+    pid = item.get("id") or ""
+    if not pid:
+        gizmo = item.get("gizmo") or item.get("resource") or {}
+        pid = gizmo.get("id") or ""
+    if not pid:
+        return None
+    interactions = (
+        item.get("num_conversations")
+        or item.get("conversation_count")
+        or (item.get("vanity_metrics") or {}).get("num_conversations")
+        or 0
+    )
+    info = {
+        "name": _project_display_name(item),
+        "interactions": interactions,
+        "file_count": len(item.get("files") or []),
+    }
+    return pid, info
+
+
 def discover_chatgpt_projects(
     cookie_jar: Path = DEFAULT_CHATGPT_COOKIE_JAR,
 ) -> dict[str, dict[str, Any]]:
-    """Fetch all ChatGPT project metadata from the API. Returns {project_id: info}."""
+    """Fetch all ChatGPT Project metadata from the Projects API.
+
+    Uses the ChatGPT Projects API (``backend-api/projects``), NOT the GPT Store
+    "gizmos" discovery API. Projects and custom GPTs are distinct ChatGPT
+    features served by different backend routes; the gizmos endpoint returns
+    custom GPTs, not Projects (GH#16 / IRF-CCE-027). Returns ``{project_id: info}``.
+    """
 
     session = build_chatgpt_session(cookie_jar)
-    # ChatGPT "gizmos" API returns projects as gizmo entries with resource_type "project"
     projects: dict[str, dict[str, Any]] = {}
     offset = 0
     limit = 100
     while True:
         url = (
-            f"https://{CHATGPT_HOST}/backend-api/projects?"
+            f"https://{CHATGPT_HOST}/{PROJECTS_LIST_PATH}?"
             f"{urlencode({'offset': offset, 'limit': limit})}"
         )
         try:
@@ -884,18 +939,10 @@ def discover_chatgpt_projects(
         if not items:
             break
         for item in items:
-            gizmo = item.get("gizmo") or item.get("resource") or item
-            gizmo_id = gizmo.get("id") or ""
-            display = gizmo.get("display") or {}
-            name = display.get("name") or gizmo.get("name") or gizmo.get("title") or ""
-            file_count = len(item.get("files") or [])
-            interaction_count = item.get("vanity_metrics", {}).get("num_conversations", 0)
-            if gizmo_id:
-                projects[gizmo_id] = {
-                    "name": name,
-                    "interactions": interaction_count,
-                    "file_count": file_count,
-                }
+            parsed = _parse_project_item(item)
+            if parsed is not None:
+                pid, info = parsed
+                projects[pid] = info
         if len(items) < limit:
             break
         offset += limit

@@ -10,6 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from conversation_corpus_engine.import_document_export_corpus import import_document_export_corpus
+from conversation_corpus_engine.sharded_collection import load_corpus_collection
 
 
 class ImportDocumentExportCorpusTests(unittest.TestCase):
@@ -47,9 +48,7 @@ class ImportDocumentExportCorpusTests(unittest.TestCase):
             snapshot = json.loads(
                 (output_root / "corpus" / "source-snapshot.json").read_text(encoding="utf-8")
             )
-            manifest = json.loads(
-                (output_root / "import-manifest.json").read_text(encoding="utf-8")
-            )
+            manifest = load_corpus_collection(output_root / "import-manifest.json")
 
             self.assertEqual(contract["adapter_type"], "perplexity-export")
             self.assertEqual(contract["corpus_id"], "perplexity-history-memory")

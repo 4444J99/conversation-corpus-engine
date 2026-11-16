@@ -5,6 +5,11 @@ from typing import Any
 
 from .chatgpt_local_session import DEFAULT_CHATGPT_COOKIE_JAR
 from .claude_local_session import DEFAULT_CLAUDE_LOCAL_ROOT
+from .corpus_store import (
+    CorpusWriteAuthorization,
+    authorize_corpus_write,
+    resolve_configured_corpus_store_root,
+)
 from .evaluation_bootstrap import bootstrap_provider_evaluation
 from .federation import build_federation, upsert_corpus
 from .import_chatgpt_export_corpus import import_chatgpt_export_corpus
@@ -12,8 +17,9 @@ from .import_chatgpt_local_session_corpus import import_chatgpt_local_session_co
 from .import_claude_export_corpus import import_claude_export_corpus
 from .import_claude_local_session_corpus import import_claude_local_session_corpus
 from .import_document_export_corpus import import_document_export_corpus
+from .import_perplexity_local_session_corpus import import_perplexity_local_session_corpus
+from .perplexity_local_session import DEFAULT_PERPLEXITY_COOKIE_JAR
 from .provider_catalog import (
-    conventional_corpus_root,
     default_source_drop_root,
     get_provider_config,
 )
@@ -30,13 +36,29 @@ def bootstrap_manual_review(
     *,
     project_root: Path,
     full_eval: bool = False,
+    authorization: CorpusWriteAuthorization,
 ) -> dict[str, Any]:
     return bootstrap_provider_evaluation(
         project_root=project_root,
         provider=provider_slug,
         target_root=target_root,
         full_eval=full_eval,
+        authorization=authorization,
     )
+
+
+def _resolve_perplexity_cookie_jar(local_root: Path | None) -> Path:
+    """Resolve the Perplexity cookie jar from ``local_root``.
+
+    ``local_root`` may be the cookie-jar file itself, the ``HTTPStorages``
+    directory that contains it, or unset (fall back to the catalog default).
+    """
+    if local_root is None:
+        return DEFAULT_PERPLEXITY_COOKIE_JAR.resolve()
+    resolved = local_root.resolve()
+    if resolved.is_dir():
+        return (resolved / DEFAULT_PERPLEXITY_COOKIE_JAR.name).resolve()
+    return resolved
 
 
 def resolve_provider_import_source(
@@ -57,6 +79,10 @@ def resolve_provider_import_source(
 
     if provider == "chatgpt" and mode == "local-session":
         resolved_cookie_jar = (local_root or DEFAULT_CHATGPT_COOKIE_JAR).resolve()
+        return resolved_cookie_jar, {"resolution": "local-session-cookie-jar"}
+
+    if provider == "perplexity" and mode == "local-session":
+        resolved_cookie_jar = _resolve_perplexity_cookie_jar(local_root)
         return resolved_cookie_jar, {"resolution": "local-session-cookie-jar"}
 
     resolved_source_drop_root = (
@@ -81,22 +107,10 @@ def resolve_provider_import_source(
 
 def default_output_root(
     *,
-    provider: str,
-    mode: str,
-    project_root: Path,
-    source_drop_root: Path | None,
+    corpus_store_root: Path,
+    corpus_id: str,
 ) -> Path:
-    config = get_provider_config(provider)
-    if mode == "local-session" and provider in {"claude", "chatgpt"}:
-        corpus_id = config["default_corpus_id"]
-    else:
-        corpus_id = (
-            config["default_corpus_id"] if provider != "claude" else config["fallback_corpus_id"]
-        )
-    resolved_source_drop_root = (
-        source_drop_root or default_source_drop_root(project_root)
-    ).resolve()
-    return conventional_corpus_root(resolved_source_drop_root, corpus_id)
+    return corpus_store_root / corpus_id
 
 
 def import_provider_corpus(
@@ -108,6 +122,7 @@ def import_provider_corpus(
     source_path: Path | None = None,
     local_root: Path | None = None,
     output_root: Path | None = None,
+    corpus_store_root: Path | None = None,
     corpus_id: str | None = None,
     name: str | None = None,
     register: bool = False,
@@ -116,6 +131,13 @@ def import_provider_corpus(
     throttle: float = 0.0,
 ) -> dict[str, Any]:
     config = get_provider_config(provider)
+    if provider == "claude" and mode != "local-session":
+        resolved_corpus_id = corpus_id or config["fallback_corpus_id"]
+        resolved_name = name or config["fallback_corpus_name"]
+    else:
+        resolved_corpus_id = corpus_id or config["default_corpus_id"]
+        resolved_name = name or config["default_corpus_name"]
+
     resolved_source_path, resolution = resolve_provider_import_source(
         provider=provider,
         mode=mode,
@@ -124,32 +146,41 @@ def import_provider_corpus(
         source_path=source_path,
         local_root=local_root,
     )
-    resolved_output_root = (
-        output_root
-        or default_output_root(
-            provider=provider,
-            mode=mode,
-            project_root=project_root,
-            source_drop_root=source_drop_root,
-        )
-    ).resolve()
-    resolved_corpus_id = corpus_id
-    resolved_name = name
+    configured_store_root = resolve_configured_corpus_store_root(corpus_store_root)
+    requested_output_root = output_root or default_output_root(
+        corpus_store_root=configured_store_root,
+        corpus_id=resolved_corpus_id,
+    )
+    authorization = authorize_corpus_write(
+        project_root=project_root,
+        corpus_store_root=configured_store_root,
+        destination=requested_output_root,
+        source_roots=(resolved_source_path,),
+    )
+    resolved_output_root = authorization.destination
 
     if provider == "claude" and mode == "local-session":
-        resolved_corpus_id = resolved_corpus_id or config["default_corpus_id"]
-        resolved_name = resolved_name or config["default_corpus_name"]
         import_result = import_claude_local_session_corpus(
             resolved_source_path,
             resolved_output_root,
             corpus_id=resolved_corpus_id,
             name=resolved_name,
             throttle=throttle,
+            authorization=authorization,
         )
     elif provider == "chatgpt" and mode == "local-session":
+        import_result = import_chatgpt_local_session_corpus(
+            resolved_source_path,
+            resolved_output_root,
+            corpus_id=resolved_corpus_id,
+            name=resolved_name,
+            throttle=throttle,
+            authorization=authorization,
+        )
+    elif provider == "perplexity" and mode == "local-session":
         resolved_corpus_id = resolved_corpus_id or config["default_corpus_id"]
         resolved_name = resolved_name or config["default_corpus_name"]
-        import_result = import_chatgpt_local_session_corpus(
+        import_result = import_perplexity_local_session_corpus(
             resolved_source_path,
             resolved_output_root,
             corpus_id=resolved_corpus_id,
@@ -157,28 +188,24 @@ def import_provider_corpus(
             throttle=throttle,
         )
     elif provider == "chatgpt":
-        resolved_corpus_id = resolved_corpus_id or config["default_corpus_id"]
-        resolved_name = resolved_name or config["default_corpus_name"]
         import_result = import_chatgpt_export_corpus(
             resolved_source_path,
             resolved_output_root,
             corpus_id=resolved_corpus_id,
             name=resolved_name,
             throttle=throttle,
+            authorization=authorization,
         )
     elif provider == "claude":
-        resolved_corpus_id = resolved_corpus_id or config["fallback_corpus_id"]
-        resolved_name = resolved_name or config["fallback_corpus_name"]
         import_result = import_claude_export_corpus(
             resolved_source_path,
             resolved_output_root,
             corpus_id=resolved_corpus_id,
             name=resolved_name,
             throttle=throttle,
+            authorization=authorization,
         )
     else:
-        resolved_corpus_id = resolved_corpus_id or config["default_corpus_id"]
-        resolved_name = resolved_name or config["default_corpus_name"]
         import_result = import_document_export_corpus(
             resolved_source_path,
             resolved_output_root,
@@ -186,6 +213,7 @@ def import_provider_corpus(
             corpus_id=resolved_corpus_id,
             name=resolved_name,
             throttle=throttle,
+            authorization=authorization,
         )
 
     bootstrap_result = (
@@ -194,6 +222,7 @@ def import_provider_corpus(
             resolved_output_root,
             project_root=project_root.resolve(),
             full_eval=False,
+            authorization=authorization,
         )
         if bootstrap_eval
         else None
