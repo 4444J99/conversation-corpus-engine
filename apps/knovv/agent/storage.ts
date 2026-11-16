@@ -47,6 +47,27 @@ export async function privateOutput(path: string, value: unknown) {
     await handle.close();
   }
 }
+// A guard is held for microseconds; one this old with no readable owner is a crash remnant.
+const STALE_GUARD_MS = 60_000;
+// Remove a reclaim guard only when it is provably abandoned: its owner is dead, or it is an
+// unreadable (for example empty, crashed between create and write) private file of ours that has
+// not changed for STALE_GUARD_MS. The identity is re-checked just before the unlink so a guard
+// another opener created in between is left alone; the remaining window is a stat-to-unlink gap.
+async function removeAbandonedGuard(guard: string): Promise<boolean> {
+  const before = await fs.lstat(guard).catch(() => undefined);
+  if (!before?.isFile() || before.uid !== process.getuid!()) return false;
+  const holder = await lockOwner(guard);
+  const abandoned =
+    holder === undefined
+      ? Date.now() - before.mtimeMs > STALE_GUARD_MS
+      : dead(holder);
+  if (!abandoned) return false;
+  const now = await fs.lstat(guard).catch(() => undefined);
+  if (!now || now.ino !== before.ino || now.mtimeMs !== before.mtimeMs)
+    return false;
+  await fs.unlink(guard).catch(() => undefined);
+  return true;
+}
 async function lockOwner(path: string): Promise<number | undefined> {
   let pid: unknown;
   try {
@@ -73,7 +94,7 @@ export class FileStorage implements StoragePort {
     private root: string,
     private token: string, // allow-secret: runtime-only lock owner id
   ) {}
-  static async open(root: string) {
+  static async open(root: string, retried = false): Promise<FileStorage> {
     await noLinks(root);
     try {
       await fs.mkdir(root, { mode: 0o700 });
@@ -109,13 +130,13 @@ export class FileStorage implements StoragePort {
       try {
         await privateOutput(guard, { pid: process.pid });
       } catch (guardError: any) {
-        const holder = await lockOwner(guard);
+        // Clear an abandoned guard, then try once more; a live or fresh guard fails closed.
         if (
           guardError.code === "EEXIST" &&
-          holder !== undefined &&
-          dead(holder)
+          (await removeAbandonedGuard(guard)) &&
+          !retried
         )
-          await fs.unlink(guard).catch(() => undefined);
+          return FileStorage.open(root, true);
         throw error;
       }
       try {

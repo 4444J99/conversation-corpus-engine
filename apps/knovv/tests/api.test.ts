@@ -2,7 +2,15 @@ import { beforeAll, afterAll, describe, it, expect } from "vitest";
 import { Miniflare } from "miniflare";
 import { build } from "esbuild";
 import { readFile } from "node:fs/promises";
-import { generateDevice, sign, sha256, hex } from "../src/crypto";
+import {
+  generateDevice,
+  sign,
+  sha256,
+  hex,
+  encrypt,
+  MAX_OBJECT,
+  MAX_CIPHERTEXT,
+} from "../src/crypto";
 
 const owner = generateDevice("knovv", "owner");
 const device = generateDevice("knovv", "phone");
@@ -176,4 +184,81 @@ describe("encrypted journal against real local D1 and R2", () => {
       409,
     );
   });
+});
+
+describe("maximum-size ciphertext through the API", () => {
+  it("accepts the largest ciphertext encrypt() can emit and refuses one byte more", async () => {
+    const compiled = await build({
+      stdin: {
+        contents: `import { api } from './server/api'; export default {fetch:(r,e)=>api(r,e,{email:'owner@example.test'})}`,
+        resolveDir: process.cwd(),
+      },
+      bundle: true,
+      write: false,
+      format: "esm",
+      platform: "browser",
+    });
+    const big = new Miniflare({
+      modules: true,
+      script: compiled.outputFiles[0].text,
+      compatibilityDate: "2026-08-01",
+      d1Databases: { DB: "knovv-max-test" },
+      r2Buckets: ["BUCKET"],
+      bindings: {
+        OWNER_PUBLIC_KEY: owner.signing_public,
+        OWNER_EMAIL: "owner@example.test",
+        MAX_CIPHER_BYTES: String(4 * MAX_CIPHERTEXT),
+      },
+    });
+    try {
+      const db = await big.getD1Database("DB");
+      await db.exec(
+        (await readFile("server/schema.sql", "utf8")).replace(/\n/g, " "),
+      );
+      const enroll = await big.dispatchFetch("http://localhost/api/devices", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          origin: "http://localhost",
+        },
+        body: JSON.stringify(grant()),
+      });
+      expect(enroll.status).toBe(201);
+      const put = (data: Uint8Array, size = data.length) => {
+        const object = sha256(data);
+        const auth = sign(
+          { schema: "knovv-upload.v1", object, size, device: device.id },
+          device.signing_key,
+        );
+        return big.dispatchFetch("http://localhost/api/objects/" + object, {
+          method: "PUT",
+          headers: {
+            origin: "http://localhost",
+            "x-knovv-authorization": btoa(JSON.stringify(auth)),
+          },
+          body: data,
+        });
+      };
+      const maximum = encrypt(
+        new Uint8Array(32).fill(3),
+        new Uint8Array(MAX_OBJECT),
+        "max",
+      );
+      expect(maximum.length).toBe(MAX_CIPHERTEXT);
+      const saved = await put(maximum);
+      expect(saved.status).toBe(201);
+      const object = sha256(maximum);
+      const back = new Uint8Array(
+        await (
+          await big.dispatchFetch("http://localhost/api/objects/" + object, {
+            headers: { origin: "http://localhost" },
+          })
+        ).arrayBuffer(),
+      );
+      expect(back.length).toBe(MAX_CIPHERTEXT);
+      expect((await put(new Uint8Array(MAX_CIPHERTEXT + 1))).status).toBe(400);
+    } finally {
+      await big.dispose();
+    }
+  }, 180000);
 });

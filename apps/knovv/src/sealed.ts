@@ -170,7 +170,9 @@ export class SealedReader {
   async object(id: string): Promise<Uint8Array> {
     if (!this.secret) throw new Error("vault-locked");
     validId(id);
-    const info = this.manifest.objects[id];
+    const info = Object.hasOwn(this.manifest.objects, id)
+      ? this.manifest.objects[id]
+      : undefined;
     if (!info) throw new Error("sealed-object-unavailable");
     let plain: Uint8Array;
     if (this.manifest.format === "cce-sealed.v1")
@@ -234,7 +236,9 @@ export class SealedReader {
   }
   async file(name: string): Promise<Uint8Array> {
     if (!this.secret) throw new Error("vault-locked");
-    const recipe = this.manifest.files[name];
+    const recipe = Object.hasOwn(this.manifest.files, name)
+      ? this.manifest.files[name]
+      : undefined;
     if (!recipe) throw new Error("sealed-file-unavailable");
     const chunks: Uint8Array[] = [];
     let size = 0;

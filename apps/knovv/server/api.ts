@@ -142,7 +142,8 @@ export async function api(
     )
       fail(403, "origin-refused");
     if (path === "/control" && method === "POST") {
-      return control(request, env, await body(request), (operation, value) =>
+      // Awaited so a throw inside control() reaches the catch below instead of escaping as a 500.
+      return await control(request, env, await body(request), (operation, value) =>
         api(
           new Request(new URL("/api/" + operation, url), {
             method: "POST",
