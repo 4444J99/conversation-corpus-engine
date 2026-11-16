@@ -7,6 +7,7 @@ import {
   writeFile,
   readFile,
   unlink,
+  utimes,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -122,3 +123,40 @@ it("lets exactly one of many racing openers reclaim a dead owner's lock", async 
     await rm(root, { recursive: true, force: true });
   }
 }, 60000);
+
+it("reclaims past a stale empty guard left by a crash but fails closed on a fresh one", async () => {
+  const root = await mkdtemp(join(tmpdir(), "knovv-agent-guard-"));
+  try {
+    const dir = join(root, "device");
+    await (await FileStorage.open(dir)).close();
+    const deadLock = JSON.stringify({ pid: 2 ** 22 + 1 });
+    await writeFile(join(dir, ".lock"), deadLock, { mode: 0o600 });
+    // A guard another opener has only just created is empty for an instant: leave it alone.
+    await writeFile(join(dir, ".lock.reclaim"), "", { mode: 0o600 });
+    await expect(FileStorage.open(dir)).rejects.toMatchObject({
+      code: "EEXIST",
+    });
+    expect(await readFile(join(dir, ".lock.reclaim"), "utf8")).toBe("");
+    // A guard left empty by a crash long ago is stale.
+    const old = new Date(Date.now() - 10 * 60 * 1000);
+    await utimes(join(dir, ".lock.reclaim"), old, old);
+    const store = await FileStorage.open(dir);
+    await expect(readFile(join(dir, ".lock.reclaim"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    await store.close();
+    // An old guard that names a live process is never stolen.
+    await writeFile(join(dir, ".lock"), deadLock, { mode: 0o600 });
+    await writeFile(
+      join(dir, ".lock.reclaim"),
+      JSON.stringify({ pid: process.pid }),
+      { mode: 0o600 },
+    );
+    await utimes(join(dir, ".lock.reclaim"), old, old);
+    await expect(FileStorage.open(dir)).rejects.toMatchObject({
+      code: "EEXIST",
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}, 30000);
