@@ -7,6 +7,14 @@ block store or an archive shard. The marker is fixed, so masking is idempotent: 
 re-masks to itself and a second ingest creates no new revision.
 
 Specific shapes (provider prefixes, JWTs, PEM blocks, Bearer tokens) are matched on their own.
+Masking runs more than once per conversation by design: `finalize_conversation` and
+`assign_message_fields` each call `mask_conversation` before ids and digests are derived, and
+`Library.put` calls it again before storage. Idempotence makes the repeats safe, and a cheap
+trigger pre-check makes a pass over clean text a single regex scan; the repeated passes are an
+accepted efficiency cost, not a correctness gap, and are not collapsed into one marked pass
+(a "already masked" flag on the object would be trusted by later mutators and could skip a
+secret added after the first pass).
+
 The generic rule is anchored on a credential-like *name* (api key, secret, token, password ...),
 never on shape alone, because a corpus is full of sha256 digests, git SHAs and UUIDs.
 """
@@ -49,6 +57,16 @@ _WHOLE: tuple[tuple[str, re.Pattern[str]], ...] = (
             _LEFT
             + r"sk-(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_\-]*\d)(?=[A-Za-z0-9_\-]*[A-Za-z0-9_]{16})"
             r"[A-Za-z0-9_\-]{20,}"
+        ),
+    ),
+    (
+        "openai-key-segmented",
+        # A dash-segmented key has no 16-character unbroken run. Require 32 or more characters in
+        # all, and a digit, an upper-case and a lower-case letter, so a lower-case slug such as
+        # ``sk-learn-pipeline-2-stage-processing`` still survives.
+        re.compile(
+            _LEFT + r"sk-(?=[A-Za-z0-9_\-]{29})(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_\-]*\d)"
+            r"(?=[A-Za-z0-9_\-]*[A-Z])(?=[A-Za-z0-9_\-]*[a-z])[A-Za-z0-9_\-]+"
         ),
     ),
     ("stripe-key", re.compile(_LEFT + r"(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}")),
@@ -115,6 +133,11 @@ _AUTH_HEADER = re.compile(
 # the last '@' of the authority, so a password that itself holds '@' is masked whole.
 _URL_PASSWORD = re.compile(
     r"(?P<head>\b[A-Za-z][A-Za-z0-9+.\-]{0,31}://[^\s/:@?#\"'<>]+:)(?P<value>[^\s/?#\"'<>]+)(?P<tail>@)"
+)
+# A Slack incoming-webhook URL is a bearer secret in its final path segment; the two team and
+# bot ids before it are routing identifiers and stay readable.
+_SLACK_WEBHOOK = re.compile(
+    r"(?P<head>hooks\.slack\.com/services/T[A-Z0-9]{6,}/B[A-Z0-9]{6,}/)(?P<value>[A-Za-z0-9]{16,})"
 )
 # Only template markers count as placeholders in a URL; "%40" is a percent-encoded character.
 _URL_PLACEHOLDER = re.compile(r"^(?:\$|<|\{|%[A-Za-z_][A-Za-z0-9_]*%|\[REDACTED)")
@@ -301,7 +324,7 @@ def _auth_value_is_secret(scheme: str, value: str) -> bool:
 
 # Cheap necessary condition for every rule above: most text carries none of these and returns early.
 _TRIGGER = re.compile(
-    r"AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA|gh[pousr]_|github_pat_|AIza|ya29\.|AQ\.|sk-|sk_|rk_"
+    r"AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|AIPA|gh[pousr]_|github_pat_|AIza|ya29\.|AQ\.|sk-|sk_|rk_|hooks\.slack"
     r"|whsec_|xox|xapp-|npm_|glpat-|hf_|SG\.|sk[0-9a-f]{32}|eyJ|-----BEGIN|bearer|authorization|://|api|key|secret|token|pass|pwd|credential",
     re.IGNORECASE,
 )
@@ -428,6 +451,9 @@ def _credential_spans(text: str) -> list[tuple[int, int]]:
     for match in _URL_PASSWORD.finditer(text):
         value = match.group("value")
         if not _URL_PLACEHOLDER.match(value) and MARKER not in value:
+            spans.append(match.span("value"))
+    for match in _SLACK_WEBHOOK.finditer(text):
+        if _generic_value_is_secret(match.group("value")):
             spans.append(match.span("value"))
     for match in _GENERIC_QUOTED.finditer(text):
         value = match.group("value")
