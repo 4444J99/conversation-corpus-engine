@@ -45,6 +45,7 @@ class SchemaValidationTests(unittest.TestCase):
             names,
             [
                 "commercial-awareness",
+                "commercial-h1-readiness",
                 "corpus-candidate",
                 "corpus-contract",
                 "import-audit",

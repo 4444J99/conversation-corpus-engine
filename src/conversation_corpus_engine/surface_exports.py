@@ -86,6 +86,16 @@ CLI_SURFACES = [
         "purpose": "Export Meta/MCP-facing manifests from the governed project state.",
         "audience": "mcp",
     },
+    {
+        "command": "cce mcp serve --project-root /path/to/project",
+        "purpose": "Serve read-only corpus search and readiness tools over MCP stdio.",
+        "audience": "mcp",
+    },
+    {
+        "command": "cce commercial h1 --project-root /path/to/project --write",
+        "purpose": "Write the commercial H1 readiness contract and external action ledger.",
+        "audience": "commercial",
+    },
 ]
 
 COMMERCIAL_SPEC_REFERENCES = [
@@ -762,6 +772,15 @@ def build_surface_manifest(
             "source_drop_root": str(resolved_source_drop_root),
             "organ": "ORGAN-I",
             "system_role": "conversation-corpus-engine",
+        },
+        "commercial_bridge": {
+            "horizon": "H1",
+            "source_organ": "ORGAN-I",
+            "target_organ": "ORGAN-II",
+            "target_repo": "conversation-corpus--surfaces",
+            "consumes": ["STATE_MODEL", "VALIDATION_RECORD"],
+            "expected_output_signal": "INTERFACE_CONTRACT",
+            "readiness_command": ("cce commercial h1 --project-root /path/to/project --write"),
         },
         "schemas": list_schemas(),
         "cli_surfaces": CLI_SURFACES,

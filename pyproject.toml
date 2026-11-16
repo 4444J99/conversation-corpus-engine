@@ -9,7 +9,8 @@ description = "Canonical corpus and federation engine for multi-provider AI conv
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-keywords = ["ai", "corpus", "federation", "mcp", "memory"]
+dependencies = ["rfc8785==0.1.4"]
+keywords = ["ai", "conversation", "corpus", "federation", "mcp", "memory"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",
@@ -17,9 +18,10 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Text Processing :: Indexing",
 ]
-dependencies = ["rfc8785==0.1.4"]
 
 [project.urls]
 Repository = "https://github.com/4444J99/conversation-corpus-engine"
