@@ -707,3 +707,25 @@ def test_a_moved_doc_keeps_its_identity_on_the_current_file_only(tmp_path):
     googledrive = [r for r in records if r.provider == "googledrive"]
     assert len(googledrive) == 1 and googledrive[0].title == "Moved"
     assert {r.title for r in records} == {"Moved", "Doc"}  # the retained copy keeps its title
+
+
+def test_a_corrupt_earlier_index_row_is_skipped_not_fatal(tmp_path):
+    root, out = tmp_path / "export", tmp_path / "out"
+    root.mkdir()
+    (root / "Doc.md").write_text("the text\n")
+    notes_capture.capture_notes_and_docs(out, google_docs_exports=[root])
+    index = out / "gdocs-index.jsonl"
+    keep = next(out.rglob("gdoc_*.md")).relative_to(out).as_posix()
+    index.write_text(
+        index.read_text()
+        + json.dumps({"path": keep, "provider": ["x"], "source_id": {}, "title": "T"})
+        + "\nnot json\n"
+        + json.dumps(
+            {"path": "../escape.md", "provider": "googledrive", "source_id": "1AbCdEfGhIjKlMnOp"}
+        )
+        + "\n"
+    )
+    receipt = notes_capture.capture_notes_and_docs(out, google_docs_exports=[root])
+    assert receipt["counts"]["gdocs_unchanged"] == 1
+    rows = [json.loads(x) for x in index.read_text().splitlines()]
+    assert all("../" not in row["path"] for row in rows) and len(rows) == 1

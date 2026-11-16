@@ -979,20 +979,26 @@ def _merged_index(path: Path, rows: list[dict[str, Any]]) -> bytes:
             except (ValueError, RecursionError):
                 continue
             name = row.get("path") if isinstance(row, dict) else None
-            # A moved or renamed Doc keeps its Drive id: the current row holds that identity, so
-            # the earlier row keeps only its title, never the identity a second time.
-            if isinstance(row, dict) and (row.get("provider"), row.get("source_id")) in held:
-                row = {k: v for k, v in row.items() if k not in ("provider", "source_id")}
-            elif isinstance(row, dict) and "provider" in row:
-                held.add((row["provider"], row.get("source_id")))
             if (
-                isinstance(name, str)
-                and not name.startswith("/")
-                and ".." not in name.split("/")
-                and name not in current
-                and (path.parent / name).is_file()
+                not isinstance(row, dict)
+                or not isinstance(name, str)
+                or name.startswith("/")
+                or ".." in name.split("/")
+                or name in current
+                or not (path.parent / name).is_file()
             ):
-                merged.append(row)
+                continue
+            provider, identity = row.get("provider"), row.get("source_id")
+            if isinstance(provider, str) and isinstance(identity, str):
+                # A moved or renamed Doc keeps its Drive id: a row that already holds the
+                # identity wins, and this earlier row keeps only its title.
+                if (provider, identity) in held:
+                    row = {k: v for k, v in row.items() if k not in ("provider", "source_id")}
+                else:
+                    held.add((provider, identity))
+            else:
+                row = {k: v for k, v in row.items() if k not in ("provider", "source_id")}
+            merged.append(row)
     return "".join(
         json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n"
         for row in sorted(merged, key=lambda item: str(item.get("identifier", "")))
