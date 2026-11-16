@@ -64,6 +64,8 @@ GDOCS_FOLDER = "gdocs"
 GDOCS_INDEX_NAME = "gdocs-index.jsonl"
 MAX_GDOCS = 200_000
 GDOC_SUFFIXES = (".md", ".txt")
+MAX_ID_LIST_BYTES = 64 * 1024 * 1024
+_DRIVE_ID = re.compile(r"[A-Za-z0-9_-]{10,200}")
 NOTES_FOLDER = "notes"
 DOCS_FOLDER = "docs"
 DEFAULT_NOTES_STORE = (
@@ -126,6 +128,9 @@ _GDOC_COUNTS = (
     "gdocs_skipped_not_utf8",
     "gdocs_skipped_symlink",
     "gdocs_skipped_duplicate_path",
+    "gdocs_with_drive_id",
+    "gdocs_ids_ambiguous",
+    "gdocs_ids_refused",
     "gdocs_characters",
 )
 _DRIVE_COUNTS = (
@@ -324,6 +329,7 @@ def _clean_label(value: Any, limit: int) -> str:
 @dataclass
 class _NoteRow:
     identifier: str
+    source_id: str
     title: str
     folder: str
     created: str
@@ -472,6 +478,7 @@ def _read_notes(database: Path, result: _NotesRead) -> _NotesRead:
             result.notes.append(
                 _NoteRow(
                     identifier=key,
+                    source_id=identifier,
                     title=_clean_label(title, 300),
                     folder=path,
                     created=_core_data_time(created),
@@ -640,10 +647,11 @@ def notes_entry(destination: Path) -> dict[str, Any]:
         "id": "apple-notes",
         "root": str(destination),
         "include": [f"{NOTES_FOLDER}/**/*.md"],
+        "identities": INDEX_NAME,
         # The owner's own writing is the default for a note; pasted text is flagged in the
         # sidecar and the authorship rules still withhold credit from marked AI text.
         "wing": "authored",
-        "lane": "writing",
+        "lane": "notes",
         "kind": "document",
     }
 
@@ -747,8 +755,55 @@ def collect_google_docs(roots: list[Path], counts: Counter[str], findings: list[
     return found
 
 
+def read_drive_ids(path: Path, counts: Counter[str], findings: list[dict[str, Any]]):
+    """Drive file ids by export-relative path, from the JSON list `rclone lsjson -R` prints.
+
+    The list is read through a no-follow descriptor within a size bound. A path that two Drive
+    files share is ambiguous, so it gets no id and is counted; the Doc still gets its title.
+    """
+    try:
+        descriptor = os.open(_absolute(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise CaptureRefused("Drive id list is not a regular file")
+            raw = source.read(MAX_ID_LIST_BYTES + 1)
+    except OSError:
+        raise CaptureRefused("Drive id list could not be read") from None
+    if len(raw) > MAX_ID_LIST_BYTES:
+        raise CaptureRefused("Drive id list is larger than the size bound")
+    try:
+        rows = json.loads(raw)
+    except (ValueError, RecursionError):
+        raise CaptureRefused("Drive id list is not valid JSON") from None
+    if not isinstance(rows, list):
+        raise CaptureRefused("Drive id list is not a JSON list")
+    ids: dict[str, str] = {}
+    ambiguous: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict) or row.get("IsDir"):
+            continue
+        name, identity = row.get("Path"), row.get("ID")
+        if (
+            not isinstance(name, str)
+            or not isinstance(identity, str)
+            or not _DRIVE_ID.fullmatch(identity)
+        ):
+            counts["gdocs_ids_refused"] += 1
+            continue
+        if name in ids or name in ambiguous:
+            ids.pop(name, None)
+            ambiguous.add(name)
+            continue
+        ids[name] = identity
+    counts["gdocs_ids_ambiguous"] += len(ambiguous)
+    return ids
+
+
 def _write_google_docs(
-    found: dict[str, tuple[str, str]], destination: Path, counts: Counter[str]
+    found: dict[str, tuple[str, str]],
+    destination: Path,
+    counts: Counter[str],
+    ids: dict[str, str] | None = None,
 ) -> tuple[set[str], list[dict[str, Any]]]:
     current: set[str] = set()
     index: list[dict[str, Any]] = []
@@ -769,9 +824,14 @@ def _write_google_docs(
             _write_atomic(path, data)
             counts["gdocs_written"] += 1
         counts["gdocs_characters"] += len(text)
+        identity = (ids or {}).get(relative)
+        counts["gdocs_with_drive_id"] += int(identity is not None)
         index.append(
             {
                 "identifier": name,
+                # The identity a Drive document has everywhere else in the library, so a Doc
+                # read again is a new revision of that record, never a second record.
+                **({"provider": "googledrive", "source_id": identity} if identity else {}),
                 "path": str(path.relative_to(destination)),
                 "title": _clean_label(title, 300),
                 "folder": _clean_label(
@@ -789,6 +849,7 @@ def google_docs_entry(destination: Path) -> dict[str, Any]:
         "id": "google-docs",
         "root": str(destination),
         "include": [f"{GDOCS_FOLDER}/**/*.md"],
+        "identities": GDOCS_INDEX_NAME,
         # The owner's Google Docs are mostly their own writing, as Notes are; the authorship
         # rules still withhold credit from text that carries an AI mark.
         "wing": "authored",
@@ -834,10 +895,15 @@ def _write_notes(
         index.append(
             {
                 "identifier": note.identifier,
+                # The identity an Apple Notes record has everywhere else in the library, so a
+                # re-read note is a new revision of that record, never a second record.
+                "provider": "applenotes",
+                "source_id": note.source_id,
                 "path": str(path.relative_to(destination)),
-                "title": note.title,
+                "title": note.title or _first_line(note.text),
                 "folder": note.folder,
                 "created": note.created,
+                "updated": note.modified,
                 "modified": note.modified,
                 "pinned": note.pinned,
                 "attachments": note.attachments,
@@ -846,6 +912,15 @@ def _write_notes(
             }
         )
     return current, index
+
+
+def _first_line(text: str) -> str:
+    """The first non-empty line, cleaned: the title Apple Notes itself shows for an untitled note."""
+    for line in text.splitlines():
+        label = _clean_label(line, 300)
+        if label:
+            return label
+    return ""
 
 
 def _write_stubs(stubs: dict[str, _Stub], destination: Path, counts: Counter[str]) -> set[str]:
@@ -885,6 +960,7 @@ def capture_notes_and_docs(
     notes_store: Path | None = None,
     drive_roots: list[Path] | None = None,
     google_docs_exports: list[Path] | None = None,
+    google_docs_ids: Path | None = None,
 ) -> dict[str, Any]:
     """Capture Apple Notes and Google documents under ``destination``; return the receipt.
 
@@ -954,7 +1030,8 @@ def capture_notes_and_docs(
         counts.update(dict.fromkeys(_GDOC_COUNTS, 0))
         found = collect_google_docs(exports, counts, findings)
         sources.append({"source": "google-docs-export", "roots": len(exports)})
-        current_gdocs, gdoc_index = _write_google_docs(found, destination, counts)
+        ids = read_drive_ids(google_docs_ids, counts, findings) if google_docs_ids else None
+        current_gdocs, gdoc_index = _write_google_docs(found, destination, counts, ids)
         entries.append(google_docs_entry(destination))
 
     destination.mkdir(parents=True, exist_ok=True)

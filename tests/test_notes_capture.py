@@ -13,8 +13,10 @@ from pathlib import Path
 import pytest
 
 from conversation_corpus_engine import notes_capture
+from conversation_corpus_engine.archive_model import Conversation, Message, stable_uid
 from conversation_corpus_engine.attribution_rules import attribute_message, record_info
 from conversation_corpus_engine.library_documents import iter_documents
+from conversation_corpus_engine.library_store import Library
 
 NOTE_ENTITY, FOLDER_ENTITY = 12, 15
 
@@ -211,7 +213,7 @@ def test_note_files_carry_no_agent_credit_and_stay_in_the_authored_wing(store, t
     out = tmp_path / "out"
     receipt = notes_capture.capture_notes_and_docs(out, notes_store=store)
     entry = next(e for e in receipt["manifest_entries"] if e["id"] == "apple-notes")
-    assert (entry["wing"], entry["lane"]) == ("authored", "writing")
+    assert (entry["wing"], entry["lane"]) == ("authored", "notes")
     records = list(iter_documents([entry], report={}))
     assert len(records) == 3, "the documents reader reads the exported notes"
 
@@ -455,3 +457,118 @@ def test_google_docs_source_is_untouched_and_oversize_is_skipped(tmp_path, monke
     assert before == after
     assert receipt["counts"]["gdocs_skipped_too_large"] == 1
     assert "x" * 50 not in json.dumps(receipt)
+
+
+def _ids(tmp_path: Path, rows: list[dict]) -> Path:
+    path = tmp_path / "ids.json"
+    path.write_text(json.dumps(rows))
+    return path
+
+
+def test_notes_carry_their_real_title_and_their_applenotes_identity(store, tmp_path):
+
+    receipt = notes_capture.capture_notes_and_docs(tmp_path / "out", notes_store=store)
+    entry = next(e for e in receipt["manifest_entries"] if e["id"] == "apple-notes")
+    records = {r.title: r for r in iter_documents([entry], report={})}
+    assert set(records) == {"Tide", "Pasted", "Attach"}  # the note's title, not its file name
+    tide = records["Tide"]
+    assert (tide.provider, tide.kind) == ("applenotes", "note")
+    assert tide.uid == stable_uid("applenotes", "AAAAAAAA-0000-0000-0000-000000000010")
+    assert tide.created.startswith("2023-") and tide.updated.startswith("2023-")
+
+
+def test_an_untitled_note_is_titled_by_its_first_line(tmp_path):
+    store = make_store(
+        tmp_path / "NoteStore.sqlite", [{"title": None, "text": "\nFirst words\nmore\n"}]
+    )
+    receipt = notes_capture.capture_notes_and_docs(tmp_path / "out", notes_store=store)
+    entry = next(e for e in receipt["manifest_entries"] if e["id"] == "apple-notes")
+    assert [r.title for r in iter_documents([entry], report={})] == ["First words"]
+
+
+def test_docs_with_a_drive_id_join_the_existing_google_drive_record(tmp_path):
+
+    root = _gdocs(tmp_path)
+    ids = _ids(
+        tmp_path,
+        [
+            {"Path": "Plan.md", "ID": "1AbCdEfGhIjKlMnOp", "IsDir": False},
+            {"Path": "Work/Plan.md", "ID": "2ZyXwVuTsRqPoNmLk", "IsDir": False},
+            {"Path": "Work/Notes.txt", "ID": "3AAAAAAAAAAAAAAAA", "IsDir": False},
+            {"Path": "Work/Notes.txt", "ID": "4BBBBBBBBBBBBBBBB", "IsDir": False},
+            {"Path": "Work", "ID": "5CCCCCCCCCCCCCCCC", "IsDir": True},
+            {"Path": "Bad.md", "ID": "no", "IsDir": False},
+        ],
+    )
+    out = tmp_path / "out"
+    receipt = notes_capture.capture_notes_and_docs(
+        out, google_docs_exports=[root], google_docs_ids=ids
+    )
+    counts = receipt["counts"]
+    assert counts["gdocs_with_drive_id"] == 2
+    assert counts["gdocs_ids_ambiguous"] == 1 and counts["gdocs_ids_refused"] == 1
+    entry = next(e for e in receipt["manifest_entries"] if e["id"] == "google-docs")
+    by_title = {}
+    for record in iter_documents([entry], report={}):
+        by_title.setdefault(record.title, []).append(record)
+    assert set(by_title) == {"Plan", "Notes"}
+    assert {r.uid for r in by_title["Plan"]} == {
+        stable_uid("googledrive", "1AbCdEfGhIjKlMnOp"),
+        stable_uid("googledrive", "2ZyXwVuTsRqPoNmLk"),
+    }
+    assert by_title["Notes"][0].provider == "documents"  # an ambiguous path keeps its title only
+
+
+def test_a_captured_file_becomes_a_new_revision_not_a_second_record(store, tmp_path):
+    receipt = notes_capture.capture_notes_and_docs(tmp_path / "out", notes_store=store)
+    entry = next(e for e in receipt["manifest_entries"] if e["id"] == "apple-notes")
+    old_id = "AAAAAAAA-0000-0000-0000-000000000010"
+    with Library.create(tmp_path / "library.sqlite") as library:
+        library.put(
+            Conversation(
+                provider="applenotes",
+                source_id=old_id,
+                title="Tide",
+                kind="note",
+                messages=[Message(role="user", text="old text", id="m1", channel="typed")],
+                extra={"wing": "authored", "lane": "notes", "body_status": "partial"},
+            )
+        )
+        for record in iter_documents([entry], report={}):
+            library.put(record)
+        rows = library.connection.execute("SELECT uid, title, provider FROM records").fetchall()
+        assert len(rows) == 3  # one existing record joined, two new: never a duplicate of Tide
+        tide = next(r for r in rows if r["uid"] == stable_uid("applenotes", old_id))
+        assert tide["title"] == "Tide" and tide["provider"] == "applenotes"
+        assert len(library.history(tide["uid"])) == 2
+
+
+def test_identity_rows_are_validated(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    for name in ("a", "b", "c", "d"):
+        (root / f"{name}.md").write_text(f"text {name}\n")
+    rows = [
+        {"path": "a.md", "title": "A", "provider": "applenotes", "source_id": "ID-A1234"},
+        {"path": "b.md", "title": "B", "provider": "applenotes", "source_id": "ID-A1234"},
+        {"path": "c.md", "title": "C", "provider": "chatgpt", "source_id": "ID-C1234"},
+        {"path": "d.md", "title": "D", "provider": "googledrive", "source_id": "../x"},
+        "not json",
+    ]
+    (root / "identities.jsonl").write_text(
+        "\n".join(r if isinstance(r, str) else json.dumps(r) for r in rows) + "\n"
+    )
+    report: dict = {}
+    entry = {"id": "t", "root": str(root), "include": ["*.md"], "identities": "identities.jsonl"}
+    records = {r.title or "": r for r in iter_documents([entry], report=report)}
+    codes = sorted(f["code"] for f in report["findings"])
+    assert codes == [
+        "identity_claimed_twice",
+        "identity_row_refused",
+        "identity_row_refused",
+        "identity_row_refused",
+    ]
+    assert records["A"].provider == "applenotes"
+    assert {"b", "c", "d"} == {r.title for r in records.values() if r.provider == "documents"}
+    with pytest.raises(ValueError, match="identities path"):
+        list(iter_documents([{**entry, "identities": "../outside.jsonl"}], report={}))
