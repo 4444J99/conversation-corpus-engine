@@ -95,6 +95,28 @@ async function boundedBody(
   }
   return bytes;
 }
+// Consume and discard a request body up to `limit` bytes so the client
+// receives the response instead of a connection reset. Bodies past the
+// limit are abandoned mid-stream; boundedBody stays the path for
+// oversized bodies that must be rejected as 413.
+async function drainBody(request: Request, limit: number): Promise<void> {
+  if (!request.body) return;
+  const reader = request.body.getReader();
+  try {
+    let size = 0;
+    while (true) {
+      const next = await reader.read();
+      if (next.done) break;
+      size += next.value.length;
+      if (size > limit) {
+        await reader.cancel();
+        break;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
 async function body(request: Request): Promise<any> {
   try {
     return JSON.parse(
@@ -229,8 +251,13 @@ export async function api(
         auth.schema !== "knovv-upload.v1" ||
         auth.object !== object ||
         !integer(auth.size, 1, MAX_CIPHERTEXT)
-      )
+      ) {
+        // Drain the body before answering: the client is still uploading,
+        // and responding while its stream is unread resets the connection
+        // (EPIPE in miniflare) instead of delivering the 400.
+        await drainBody(request, 64 * 1024);
         fail(400, "invalid-upload");
+      }
       const grant = await enrolled(env, auth.device);
       if (!verify(auth, grant.signing_public))
         fail(403, "invalid-upload-signature");
