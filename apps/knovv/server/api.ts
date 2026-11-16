@@ -254,8 +254,11 @@ export async function api(
       ) {
         // Drain the body before answering: the client is still uploading,
         // and responding while its stream is unread resets the connection
-        // (EPIPE in miniflare) instead of delivering the 400.
-        await drainBody(request, 64 * 1024);
+        // (EPIPE in miniflare) instead of delivering the 400. The drain
+        // must cover a full oversized object (MAX_CIPHERTEXT is ~48 MiB,
+        // so a 64 KiB cap still reset the connection mid-upload); cap it
+        // just above the largest plausible oversized upload.
+        await drainBody(request, MAX_CIPHERTEXT + 1024 * 1024);
         fail(400, "invalid-upload");
       }
       const grant = await enrolled(env, auth.device);
