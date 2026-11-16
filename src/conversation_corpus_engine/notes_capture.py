@@ -125,6 +125,7 @@ _GDOC_COUNTS = (
     "gdocs_skipped_too_large",
     "gdocs_skipped_not_utf8",
     "gdocs_skipped_symlink",
+    "gdocs_skipped_duplicate_path",
     "gdocs_characters",
 )
 _DRIVE_COUNTS = (
@@ -736,7 +737,13 @@ def collect_google_docs(roots: list[Path], counts: Counter[str], findings: list[
                 if not text:
                     counts["gdocs_skipped_empty"] += 1
                     continue
-                found.setdefault(relative, (Path(entry.name).stem, text))
+                if relative in found:
+                    # Two export folders hold the same relative path: the first one is kept, the
+                    # second is counted and named by code, never dropped without a trace.
+                    counts["gdocs_skipped_duplicate_path"] += 1
+                    _find(findings, "google_doc_duplicate_path")
+                    continue
+                found[relative] = (Path(entry.name).stem, text)
     return found
 
 
@@ -767,7 +774,9 @@ def _write_google_docs(
                 "identifier": name,
                 "path": str(path.relative_to(destination)),
                 "title": _clean_label(title, 300),
-                "folder": _clean_label(str(Path(relative).parent).removeprefix("."), 500),
+                "folder": _clean_label(
+                    "" if Path(relative).parent == Path() else str(Path(relative).parent), 500
+                ),
                 "characters": len(text),
                 "sha256": hashlib.sha256(data).hexdigest(),
             }
