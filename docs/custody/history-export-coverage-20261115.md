@@ -49,8 +49,9 @@ generation were not touched.
   generation `20261031T162115Z`. Nothing in v1 was modified.
 - Why: a build over the 27,382-record base re-indexes the block graph (1.6 million blocks), which
   took 6,875 s on the last full build. A supplemental build with 8 small documents does not escape
-  that cost. The 8 files are therefore **not yet searchable** in the published library.
-- To finish: run the documented resume (`resume_generation` pointing at the failed candidate, declaring only the supplemental documents source, with `limits.max_seconds` of at least 14400 and `limits.max_output_bytes` of 25769803776, because the omitted default of 8 GiB is below the 9.57 GiB base database) as a scheduled or owner-started job, then `cce library publish GENERATION_PATH` with the generation path the build prints (publish verifies the candidate before the pointer moves). The staged inputs and
+  that cost. The 8 files are therefore **not yet searchable** (as of this entry; now searchable, see the update below) in the published library.
+- Superseded: the 8 files are now published (see the update below). Do not run the resume step that follows; it was refused on a moved publication pointer and a fresh bounded build was published instead.
+- To finish (superseded, kept as history): run the documented resume (`resume_generation` pointing at the failed candidate, declaring only the supplemental documents source, with `limits.max_seconds` of at least 14400 and `limits.max_output_bytes` of 25769803776, because the omitted default of 8 GiB is below the 9.57 GiB base database) as a scheduled or owner-started job, then `cce library publish GENERATION_PATH` with the generation path the build prints (publish verifies the candidate before the pointer moves). The staged inputs and
   their SHA-256 sums are in the custody staging root under `history-exports-find-20261115/`.
 
 
