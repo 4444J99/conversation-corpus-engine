@@ -384,3 +384,44 @@ def test_the_destination_may_not_overlap_a_source(store, tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="overlaps"):
         notes_capture.capture_notes_and_docs(inside_notes, notes_store=store)
     assert not inside_notes.exists()
+
+
+def _gdocs(tmp_path: Path) -> Path:
+    root = tmp_path / "gdocs-export"
+    (root / "Work").mkdir(parents=True)
+    (root / "Plan.md").write_text("﻿# Plan\r\nfirst line\r\n", encoding="utf-8")
+    (root / "Work" / "Plan.md").write_text("same title, other folder\n")
+    (root / "Work" / "Notes.txt").write_text("plain text doc\n")
+    (root / "Empty.md").write_text("\n \n")
+    (root / "Binary.md").write_bytes(b"\xff\xfe\x00bad")
+    (root / "Skip.pdf").write_text("not a doc")
+    (root / "link.md").symlink_to(root / "Plan.md")
+    return root
+
+
+def test_exported_google_docs_become_one_note_each(tmp_path):
+    root = _gdocs(tmp_path)
+    out = tmp_path / "out"
+    receipt = notes_capture.capture_notes_and_docs(out, google_docs_exports=[root])
+    counts = receipt["counts"]
+    assert counts["gdocs_seen"] == 5 and counts["gdocs_written"] == 3
+    assert counts["gdocs_skipped_empty"] == 1 and counts["gdocs_skipped_not_utf8"] == 1
+    assert counts["gdocs_skipped_symlink"] == 1
+    files = sorted((out / "gdocs").rglob("*.md"))
+    assert len(files) == 3  # same title in two folders is two documents
+    assert "# Plan\nfirst line\n" in {f.read_text() for f in files}
+    rows = [json.loads(x) for x in (out / "gdocs-index.jsonl").read_text().splitlines()]
+    assert {row["folder"] for row in rows} == {"", "Work"}
+    assert "Plan" in {row["title"] for row in rows}
+    entry = next(e for e in receipt["manifest_entries"] if e["id"] == "google-docs")
+    assert (entry["wing"], entry["lane"]) == ("authored", "writing")
+    assert len(list(iter_documents([entry], report={}))) == 3
+    again = notes_capture.capture_notes_and_docs(out, google_docs_exports=[root])
+    assert again["counts"]["gdocs_written"] == 0 and again["counts"]["gdocs_unchanged"] == 3
+    assert "Plan" not in json.dumps(receipt)
+
+
+def test_google_docs_export_may_not_overlap_the_destination(tmp_path):
+    root = _gdocs(tmp_path)
+    with pytest.raises(ValueError, match="overlaps"):
+        notes_capture.capture_notes_and_docs(root / "capture", google_docs_exports=[root])
