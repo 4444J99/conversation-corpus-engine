@@ -888,6 +888,12 @@ def _ingest_provider(
             raise FileNotFoundError(f"published shard missing: {filename}")
         shard["sha256"] = sha256_file(target)
     basis = archive_read_library.counter_report(dict(tracker.counters))
+    # Coding-CLI families classify user turns by provenance; a plain-text harness template not
+    # recognized by the rules stays human:typed, so their human count is an upper bound. The
+    # manifest records the audit trail in author_basis and reader_counters (basis:*).
+    cli_provenance = any(
+        key.startswith("basis:") for key in tracker.counters
+    )
     # A captured identity remains protected after a newer account export absorbs it.
     # An explicit allow-loss merge releases only identities absent from the new store.
     live_capture_uids.update(
@@ -918,6 +924,17 @@ def _ingest_provider(
         "turn_channels": dict(sorted(turn_channels.items())),
         "authors": {author: authors[author] for author in AUTHORS},
         **({"author_basis": basis} if any(basis.values()) else {}),
+        **(
+            {
+                "authorship_caveats": [
+                    "human count is an upper bound: unrecognized plain-text harness "
+                    "templates remain human:typed (audit author_basis/reader_counters "
+                    "basis:* and add repeated templates to HARNESS_PREFIXES)"
+                ]
+            }
+            if cli_provenance
+            else {}
+        ),
         "created_min": min(created) if created else "",
         "last_activity_max": max(activity) if activity else "",
         "reader": spec.module.READER,
