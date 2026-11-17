@@ -1,0 +1,43 @@
+{
+ "repo": "conversation-corpus-engine",
+ "slug": "4444J99/conversation-corpus-engine",
+ "archived_upstream": false,
+ "prs": {
+  "prs_total": 140,
+  "prs_merged": 120,
+  "prs_open": 0,
+  "prs_closed_unmerged": 20
+ },
+ "closed_classes": {
+  "abandoned": 16,
+  "producer_retired": 1,
+  "series_superseded": 3
+ },
+ "supersession_links": [
+  {
+   "old": 69,
+   "new": 162,
+   "class": "series_superseded",
+   "title": "chore(deps): bump softprops/action-gh-release from 3.0.2 to 3.0.3 in the github-actions-deps group across 1 directory"
+  },
+  {
+   "old": 76,
+   "new": 79,
+   "class": "series_superseded",
+   "title": "feat: derived naming contract, normalized layer v2, prompt feed and corpus projections, federation repairs"
+  },
+  {
+   "old": 182,
+   "new": 183,
+   "class": "series_superseded",
+   "title": "build(knovv): single workerd binary via npm override"
+  }
+ ],
+ "open_pr_actions": [],
+ "issues": {
+  "total": 55,
+  "open": 23,
+  "stale": 13
+ },
+ "generated": "2026-11-17"
+}
