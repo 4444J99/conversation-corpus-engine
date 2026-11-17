@@ -8,14 +8,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+# Import the shared binary-cookie-jar builder from the ChatGPT adapter's tests.
+from test_chatgpt_local_session import build_binary_cookie_jar  # noqa: E402
+
 from conversation_corpus_engine import perplexity_local_session as module  # noqa: E402
 from conversation_corpus_engine.perplexity_local_session import (  # noqa: E402
     PerplexityHttpSession,
     PerplexityLocalSessionError,
 )
-
-# Import the shared binary-cookie-jar builder from the ChatGPT adapter's tests.
-from test_chatgpt_local_session import build_binary_cookie_jar  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Fixture: the real step-block shape (INITIAL_QUERY, SEARCH_WEB, FINAL).
