@@ -15,7 +15,7 @@ from conversation_corpus_engine.perplexity_local_session import (  # noqa: E402
 )
 
 # Import the shared binary-cookie-jar builder from the ChatGPT adapter's tests.
-from tests.test_chatgpt_local_session import build_binary_cookie_jar  # noqa: E402
+from test_chatgpt_local_session import build_binary_cookie_jar  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Fixture: the real step-block shape (INITIAL_QUERY, SEARCH_WEB, FINAL).
