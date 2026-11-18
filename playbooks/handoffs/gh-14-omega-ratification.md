@@ -6,7 +6,7 @@
 ## Current State
 
 OM-MEM-001 is **proposed but not ratified**. The criterion states: "the system must
-ingest its own session transcripts." A formal specification has been drafted in `docs/ratification/OM-MEM-001-specification.md`.
+ingest its own session transcripts." A formal specification has been drafted in `docs/ratification/OM-MEM-001-specification.md` and posted to [GH#14](https://github.com/organvm-i-theoria/conversation-corpus-engine/issues/14) (S40 issue comment). In-repo status receipt: `docs/ratification/irf-cce-015-status.md`. Formal acceptance, upstream amendment tooling, and live omega scorecard propagation remain pending.
 
 ### References
 
@@ -35,10 +35,13 @@ existing omega criteria in `meta-organvm/organvm-corpvs-testamentvm/`.
 - [x] IRF-CCE-015 created
 - [x] Evidence partially assembled: testament files, session review protocol
 - [x] Read existing omega criteria format from meta-organvm
-- [x] Draft OM-MEM-001 specification
-- [ ] Post specification as GH#14 comment
-- [ ] Ratification (formal acceptance)
-- [ ] Update omega state tracking
+- [x] Draft OM-MEM-001 specification in `docs/ratification/OM-MEM-001-specification.md`
+- [x] Post specification as GH#14 comment (S40)
+- [x] Record in-repo IRF-CCE-015 status/remaining work (`docs/ratification/irf-cce-015-status.md`)
+- [ ] Route amendment to canonical meta-organvm/engine owner and obtain criterion-authoring/amendment path
+- [ ] Ratification (formal acceptance / governance decision)
+- [ ] Propagate into live omega scorecard and update omega state tracking
+- [ ] Record upstream decision and exact scorecard/evidence commits back into IRF-CCE-015 tracking surfaces
 
 ## Key Decisions
 
@@ -87,12 +90,9 @@ The established format for an Omega Criterion is as follows, extracted from exis
 
 ## Next Actions
 
-1. Post the specification drafted in `docs/ratification/OM-MEM-001-specification.md` as a comment on GH#14.
-
-2. Initiate ratification per the omega governance process (likely requires
-   human approval in meta-organvm)
-
-3. Update IRF-CCE-015 and omega state tracking
+1. Route the prepared OM-MEM-001 specification and CCE evidence to the canonical `meta-organvm/organvm-engine` amendment owner with an explicit decision request (criterion-authoring/amendment path is external to this repo).
+2. After governance review, capture the accept/revise/reject decision and, if ratified, the live scorecard propagation details.
+3. Record the resulting scorecard/evidence impact and exact upstream commits/receipts back into IRF-CCE-015 tracking surfaces (GH#14, this handoff, `docs/ratification/irf-cce-015-status.md`, and `docs/ratification/omega-evidence-map.md` as applicable). Do not assert ratification until the upstream decision and scorecard update exist.
 
 ## Risks & Warnings
 

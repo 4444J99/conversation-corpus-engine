@@ -94,6 +94,8 @@ evidence map; they are not the subject of IRF-CCE-035.
   per-module test suite. Evidence is in-repo.
 - **#18 / OM-MEM-001 — Autopoietic Memory:** proposed, not ratified. Spec:
   [`docs/ratification/OM-MEM-001-specification.md`](OM-MEM-001-specification.md);
+  in-repo status/receipt:
+  [`docs/ratification/irf-cce-015-status.md`](irf-cce-015-status.md);
   tracking [Issue #14](https://github.com/organvm-i-theoria/conversation-corpus-engine/issues/14).
 
 ---
