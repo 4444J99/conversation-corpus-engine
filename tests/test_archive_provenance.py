@@ -53,6 +53,23 @@ def test_plain_text_templates_the_harness_writes_are_machine() -> None:
         "# AGENTS.md instructions for /repo",
         "A previous agent produced the plan below",
         "[3 prior /loop wakeups found nothing actionable]",
+        "[Workflow harness — computed task] The task text below was computed at runtime",
+        "[Workflow harness — user request] The harness relays, verbatim and indented below",
+        "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event",
+        "Another Claude session sent a message while you were working:\n<agent-message />",
+        "The coordinator sent a message while you were working:\nThe verifier passed",
+        "Background (from the session that started this one):\nThis is a one-shot probe.",
+        "A session-scoped Stop hook is now active with condition: \"get it all done\"",
+        "Goal check-in: «Complete everything in this work stream.» is still active",
+        "Your response above was cut off mid-stream. Resume directly from where it stops",
+        "Your response above was stopped by a safety classifier — this is not a tool or API error.",
+        "Skill /workflow-authoring is already loaded above; instructions unchanged.",
+        "The following is a <SYSTEM_MESSAGE> not actually sent by the user.",
+        "You are a subagent spawned by another session. Use model opencode/inkling-2-small-free.",
+        "You are a worker in the autonomous development team. Your mission: investigate",
+        "# FLAME — the Continuity Kernel\n\n> This file is the portable *self* of VLTIMA.",
+        "[Scheduled prompt #1]\nRun the next bounded slice of the github-universe mission",
+        "[PR COMMENT FIX REQUEST - BATCH]\nYou must use task subagents to perform this request.",
     ):
         assert classify_user_turn(text, "root") == (False, "harness-text")
 
