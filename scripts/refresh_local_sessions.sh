@@ -20,7 +20,7 @@ PROVIDER_TIMEOUT=1200  # 20 minutes per provider
 
 # ChatGPT local-session
 echo "--- ChatGPT local-session ---"
-if timeout "$PROVIDER_TIMEOUT" taskpolicy -b python3 -m conversation_corpus_engine.cli provider refresh \
+if timeout "$PROVIDER_TIMEOUT" nice -n 19 taskpolicy -b python3 -m conversation_corpus_engine.cli provider refresh \
   --provider chatgpt \
   --mode local-session \
   --project-root "$CCE_PROJECT_ROOT" \
@@ -38,7 +38,7 @@ fi
 
 # Claude local-session
 echo "--- Claude local-session ---"
-if timeout "$PROVIDER_TIMEOUT" taskpolicy -b python3 -m conversation_corpus_engine.cli provider refresh \
+if timeout "$PROVIDER_TIMEOUT" nice -n 19 taskpolicy -b python3 -m conversation_corpus_engine.cli provider refresh \
   --provider claude \
   --mode local-session \
   --project-root "$CCE_PROJECT_ROOT" \

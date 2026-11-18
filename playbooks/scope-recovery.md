@@ -53,8 +53,12 @@ If session recovery fails:
 
 The `scope_preflight_check()` function (added S40) automatically detects scope
 degradation before import operations. The LaunchAgent `com.4jp.cce-refresh`
-runs the refresh every 6 hours — if scope degrades, the refresh will fail fast
-rather than importing partial data.
+can run `scripts/refresh_local_sessions.sh` on a schedule; if scope degrades,
+the refresh should fail fast rather than importing partial data. The repo-owned
+script enforces timeout/throttle/nice defaults for background runs; LaunchAgent
+interval and host install details are operator-owned — see
+`docs/custody/cpu-throttling-layer4.md` for the Layer 4 template and
+verification notes.
 
 ## Related
 

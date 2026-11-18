@@ -74,7 +74,7 @@ cce archive     ingest | analyze | vault | database | graph | site | build | ver
 
 **`provider refresh`** is the primary operational workflow — orchestrates import → bootstrap eval → run eval → stage candidate → (optionally) review → promote in a single command. Use `--approve --promote` for end-to-end auto-promote.
 
-**`--throttle SECONDS`** (float, default 0.0) — CPU throttle for background operation. Injects `time.sleep(throttle)` every 50 iterations during near-duplicate detection. Combined with `taskpolicy -b` shell wrapping in `scripts/refresh_local_sessions.sh`, prevents corpus refresh from saturating performance cores. Recommended: `--throttle 0.001` for background runs.
+**`--throttle SECONDS`** (float, default 0.0) — CPU throttle for background operation. Injects `time.sleep(throttle)` every 50 iterations during near-duplicate detection. Combined with `nice -n 19` and `taskpolicy -b` wrapping in `scripts/refresh_local_sessions.sh`, prevents corpus refresh from saturating performance cores. Recommended: `--throttle 0.001` for background runs. See `docs/custody/cpu-throttling-layer4.md` for Layer 4 orchestration status and the operator-owned LaunchAgent template.
 
 Providers: `chatgpt`, `claude`, `gemini`, `grok`, `perplexity`, `copilot`, `deepseek`, `mistral`. Both ChatGPT and Claude support `--mode local-session` for live desktop-app extraction. ChatGPT reads from `~/Library/HTTPStorages/com.openai.chat.binarycookies` (Apple binary cookie jar). Claude reads from `~/Library/Application Support/Claude` (Chromium Cookies SQLite).
 
