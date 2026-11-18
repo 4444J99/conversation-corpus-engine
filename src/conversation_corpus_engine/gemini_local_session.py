@@ -21,7 +21,6 @@ The adapter mirrors the shipped ChatGPT/Claude/Perplexity local-session shape
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import struct
 import subprocess
@@ -30,10 +29,8 @@ from datetime import UTC, datetime, timedelta
 from hashlib import pbkdf2_hmac, sha256
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
-from .chatgpt_local_session import Cookie, build_cookie_header
+from .chatgpt_local_session import Cookie
 
 DEFAULT_GEMINI_STORE = Path.home() / (
     "Library/Caches/com.google.GeminiMacOS/Gemini/user1/ChatInfo2.store"
