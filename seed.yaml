@@ -108,3 +108,26 @@ subscriptions:
     source: META-ORGANVM
   - event: schema.registry.sync
     source: META-ORGANVM
+
+planned_produces:
+  - type: conversation-evidence
+    signal_class: VALIDATION_RECORD
+    consumers:
+      - organvm-iii-ergon/the-actual-news
+    status: planned
+    irf: IRF-CCE-036
+    rationale: "Evidence authority loop (planned future edge)"
+  - type: curated-conversations
+    signal_class: ANNOTATED_CORPUS
+    consumers:
+      - organvm-iii-ergon/classroom-rpg-aetheria
+    status: planned
+    irf: IRF-CCE-036
+    rationale: "Education / Knowledge Crystal loop (planned future edge)"
+  - type: corpus-deployment
+    signal_class: STATE_MODEL
+    consumers:
+      - organvm-iii-ergon/consult-consul--console
+    status: planned
+    irf: IRF-CCE-036
+    rationale: "Managed governance and services deployment (planned future edge)"
