@@ -24,8 +24,11 @@ classifiers = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/4444J99/conversation-corpus-engine"
 Repository = "https://github.com/4444J99/conversation-corpus-engine"
 Issues = "https://github.com/4444J99/conversation-corpus-engine/issues"
+Documentation = "https://github.com/4444J99/conversation-corpus-engine#readme"
+Changelog = "https://github.com/4444J99/conversation-corpus-engine/releases"
 
 [project.optional-dependencies]
 # Pin CI-executed dev tooling to the known-good versions recorded in uv.lock. CI installs

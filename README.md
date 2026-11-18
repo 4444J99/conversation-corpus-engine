@@ -40,12 +40,20 @@ For local development:
 pip install -e ".[dev]"
 ```
 
-For tool-host integration:
+For tool-host integration (when a package release is published to your index, e.g. PyPI):
 
 ```bash
 pipx install "conversation-corpus-engine[mcp]"
 cce-mcp --project-root /path/to/project
 ```
+
+To install a tagged release directly from GitHub without a package index:
+
+```bash
+pipx install "conversation-corpus-engine[mcp] @ git+https://github.com/4444J99/conversation-corpus-engine.git@v0.3.0"
+```
+
+Release artifacts (sdist/wheel) are attached to GitHub Releases for tagged versions when the release workflow runs. Publishing to PyPI requires repository/package owner credentials and is tracked separately.
 
 The `mcp` extra is dependency-free today; it enables the install target and exposes
 the stdio MCP entry point. A Claude Desktop-style server entry can point directly at
