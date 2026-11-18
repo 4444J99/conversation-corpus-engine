@@ -205,9 +205,9 @@ requires-dist = [
     { name = "markdown-it-py", marker = "extra == 'dev'", specifier = "==4.2.0" },
     { name = "markdown-it-py", marker = "extra == 'obsidian'", specifier = "==4.2.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.0.3" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = "==9.0.3" },
     { name = "rfc8785", specifier = "==0.1.4" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.15.8,<0.18" },
+    { name = "ruff", marker = "extra == 'dev'", specifier = "==0.15.8" },
 ]
 provides-extras = ["dev", "mcp", "obsidian", "sealed"]
 
