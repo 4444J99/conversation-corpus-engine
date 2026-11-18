@@ -1,2 +1,101 @@
-schema_version: "1.0"
-activities: []
+schema_version: "1.1"
+log: inquiry-log
+scope: conversation-corpus-engine
+updated: "2026-11-17"
+irf: IRF-CCE-031
+irf_status: done
+issue: 18
+notes:
+  - >-
+    Tracks CCE research-adjacent activities. Pattern aligned with
+    praxis-perpetua/commissions/inquiry-log.yaml where useful, while keeping a
+    CCE-local activities list for lightweight intake.
+  - "S27 noted SGO research relevance; log created to make that relevance explicit and trackable."
+
+activities:
+  - id: INQ-CCE-001
+    title: "Autopoietic loop and OM-MEM-001 (self-ingest / corpus self-maintenance)"
+    short_name: Autopoietic Memory Loop
+    status: proposed
+    commissioned: 2026-03-31
+    work_refs:
+      irf: IRF-CCE-031
+      om: OM-MEM-001
+      issues: [14, 18]
+    location:
+      - docs/ratification/OM-MEM-001-specification.md
+      - playbooks/handoffs/gh-14-omega-ratification.md
+      - .claude/plans/2026-03-24-cce-exhaustive-roadmap.md
+    description: >-
+      Research-adjacent activity around the corpus engine's autopoietic loop:
+      ingesting and governing its own session transcripts and creation history so
+      the system can evaluate and maintain its own completeness. OM-MEM-001
+      formalizes the "system must ingest its own session transcripts" criterion;
+      ratification and implementation remain tracked in their dedicated threads.
+    needs:
+      - Route OM-MEM-001 through formal amendment/ratification (see GH#14 handoff)
+      - Define evidence specimen and omega-state updates when ratified
+
+  - id: INQ-CCE-002
+    title: "Cross-provider linking and federated canon materialization"
+    short_name: Cross-Provider Linking
+    status: active
+    commissioned: 2026-03-31
+    work_refs:
+      irf: IRF-CCE-031
+      issues: [18]
+    location:
+      - docs/archive-surfaces.md
+      - src/conversation_corpus_engine/archive_topics.py
+      - README.md
+    description: >-
+      Research and engineering activity to relate conversations across providers
+      (ChatGPT, Claude, Gemini, etc.) through federation, companion indices,
+      topic hubs/neighbours, and canon materialization. The goal is coherent
+      cross-provider grounding and retrieval without collapsing provider/source
+      authority boundaries.
+    evidence:
+      - date: 2026-11-17
+        type: repo-state
+        description: >-
+          Archive topic/neighbor surfaces and cross-provider federation
+          capabilities are present in the codebase and documented surfaces; this
+          log records the activity as an explicit CCE research thread.
+
+  - id: INQ-CCE-003
+    title: "Narrative lens integration for conversation analysis surfaces"
+    short_name: Narrative Lens Integration
+    status: tracking
+    commissioned: 2026-03-31
+    work_refs:
+      irf: IRF-CCE-031
+      issues: [18]
+    location:
+      - docs/superpowers/specs/2026-03-31-cce-commercial-architecture-expansion.md
+      - docs/knowledge-analysis-bridge.md
+    description: >-
+      Research-adjacent integration of narrative/interpretive lenses over corpus
+      material (e.g. recurring story patterns, epistemic framing, and derived
+      analysis views) as part of CCE's knowledge and product surfaces.
+      Commercial architecture materials reference multi-lens narrative analysis;
+      implementation depth and scope remain an evolving research/product concern.
+    needs:
+      - Clarify canonical lens taxonomy and evaluation criteria as surfaces mature
+      - Keep lens outputs attributable to underlying corpus evidence
+
+  - id: INQ-CCE-004
+    title: "SGO research relevance and inquiry alignment"
+    short_name: SGO Research Relevance
+    status: noted
+    commissioned: 2026-03-31
+    work_refs:
+      irf: IRF-CCE-031
+      issues: [18]
+      sessions: [S27]
+    location:
+      - inquiry-log.yaml
+    description: >-
+      S27 noted SGO research relevance for CCE research-adjacent work. This
+      entry anchors that relevance in-repo so future inquiry, governance, and
+      corpus-evolution activities can be related to the broader research program
+      without requiring external context recovery.
