@@ -648,7 +648,17 @@ def fetch_chatgpt_project(
     *,
     cookie_jar: Path = DEFAULT_CHATGPT_COOKIE_JAR,
 ) -> dict[str, Any]:
-    """Extract a ChatGPT Project's files and conversations to a local directory."""
+    """Extract a ChatGPT Project's files and conversations to a local directory.
+
+    Notes (GH#16 / IRF-CCE-027): endpoint paths, response shapes, and source-file
+    download mechanics require live verification on an authorized session. Current
+    implementation derives conversation exports from saved-file metadata in the
+    project detail payload; issue discussion reports this may under-cover project
+    chats (missing conversations that produced no saved source files) and suggests
+    project-scoped conversation listing endpoints to confirm. Do not guess API
+    contracts; validate with observed network evidence and keep private data out of
+    the repo.
+    """
     session = build_chatgpt_session(cookie_jar)
     output_root = output_root.resolve()
 
@@ -775,13 +785,15 @@ def render_discovery_text(payload: dict[str, Any]) -> str:
 #
 # ChatGPT Projects and custom GPTs ("gizmos") are separate features served by
 # different backend routes. The gizmos discovery API returns custom GPTs, NOT
-# Projects, so the Post Office must talk to the Projects API instead
+# Projects, so the Post Office must not use ``backend-api/gizmos/discovery/mine``
 # (GH#16 / IRF-CCE-027). Project IDs are prefixed "g-p-" (gizmo-project).
 #
-# The JSON shapes parsed below follow the Projects API (flat ``id``/``name`` per
-# item), while staying tolerant of legacy gizmo-wrapped entries for safety. When
-# a valid ChatGPT session is available, live-verify these paths/shapes via
-# browser DevTools (see playbooks/handoffs/gh-16-chatgpt-projects-endpoint.md).
+# Current implementation targets the Projects-style paths below. Endpoint paths
+# and JSON shapes MUST be live-verified against an authorized session (browser
+# DevTools): issue discussion reports ``backend-api/gizmos/snorlax/sidebar`` and
+# project-scoped gizmo routes as alternatives. Parsing helpers are kept tolerant
+# of flat and legacy gizmo-wrapped entries; adjust path constants only with
+# observed evidence. See playbooks/handoffs/gh-16-chatgpt-projects-endpoint.md.
 PROJECTS_LIST_PATH = "backend-api/projects"
 PROJECT_DETAIL_PATH = "backend-api/projects/{project_id}"
 
@@ -920,17 +932,24 @@ def discover_chatgpt_projects(
     "gizmos" discovery API. Projects and custom GPTs are distinct ChatGPT
     features served by different backend routes; the gizmos endpoint returns
     custom GPTs, not Projects (GH#16 / IRF-CCE-027). Returns ``{project_id: info}``.
+
+    Endpoint paths and response shapes require live verification against an
+    authorized ChatGPT session (browser DevTools). Issue discussion has also
+    reported ``backend-api/gizmos/snorlax/sidebar`` as a candidate Projects
+    listing source; this implementation keeps the configured Projects path and
+    tolerates both offset-style pages and cursor-bearing responses for safety.
     """
 
     session = build_chatgpt_session(cookie_jar)
     projects: dict[str, dict[str, Any]] = {}
     offset = 0
     limit = 100
+    cursor: str | None = None
     while True:
-        url = (
-            f"https://{CHATGPT_HOST}/{PROJECTS_LIST_PATH}?"
-            f"{urlencode({'offset': offset, 'limit': limit})}"
-        )
+        params: dict[str, Any] = {"offset": offset, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        url = f"https://{CHATGPT_HOST}/{PROJECTS_LIST_PATH}?{urlencode(params)}"
         try:
             page = fetch_json(session, url)
         except ChatGPTLocalSessionError:
@@ -943,6 +962,14 @@ def discover_chatgpt_projects(
             if parsed is not None:
                 pid, info = parsed
                 projects[pid] = info
+
+        next_cursor = page.get("cursor")
+        if next_cursor:
+            if next_cursor == cursor:
+                break
+            cursor = str(next_cursor)
+            time.sleep(1)
+            continue
         if len(items) < limit:
             break
         offset += limit

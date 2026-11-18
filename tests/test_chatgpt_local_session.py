@@ -538,6 +538,93 @@ def test_discover_chatgpt_projects_stops_on_empty_page(
     assert module.discover_chatgpt_projects(jar) == {}
 
 
+def test_discover_chatgpt_projects_paginates_offset_pages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    jar = tmp_path / "test.binarycookies"
+    jar.write_bytes(
+        build_binary_cookie_jar([{"domain": ".chatgpt.com", "name": "x", "value": "y"}])
+    )
+    monkeypatch.setattr(module, "build_chatgpt_session", lambda cookie_jar: _fake_project_session())
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+
+    seen_urls: list[str] = []
+    full_page = [{"id": f"g-p-{i}", "name": f"Project {i}"} for i in range(100)]
+
+    def fake_fetch_json(session: object, url: str) -> object:
+        seen_urls.append(url)
+        if "offset=0" in url:
+            return {"items": full_page}
+        if "offset=100" in url:
+            return {"items": [{"id": "g-p-last", "name": "Last"}]}
+        return {"items": []}
+
+    monkeypatch.setattr(module, "fetch_json", fake_fetch_json)
+
+    projects = module.discover_chatgpt_projects(jar)
+
+    assert len(projects) == 101
+    assert "g-p-0" in projects and "g-p-last" in projects
+    assert any("offset=0" in u for u in seen_urls)
+    assert any("offset=100" in u for u in seen_urls)
+
+
+def test_discover_chatgpt_projects_follows_cursor_pagination(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    jar = tmp_path / "test.binarycookies"
+    jar.write_bytes(
+        build_binary_cookie_jar([{"domain": ".chatgpt.com", "name": "x", "value": "y"}])
+    )
+    monkeypatch.setattr(module, "build_chatgpt_session", lambda cookie_jar: _fake_project_session())
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+
+    seen_urls: list[str] = []
+
+    def fake_fetch_json(session: object, url: str) -> object:
+        seen_urls.append(url)
+        if "cursor=" not in url:
+            return {
+                "items": [{"id": "g-p-aaa", "name": "Alpha"}],
+                "cursor": "next-cursor",
+            }
+        if "cursor=next-cursor" in url:
+            return {"items": [{"id": "g-p-bbb", "name": "Beta"}], "cursor": None}
+        return {"items": []}
+
+    monkeypatch.setattr(module, "fetch_json", fake_fetch_json)
+
+    projects = module.discover_chatgpt_projects(jar)
+
+    assert set(projects) == {"g-p-aaa", "g-p-bbb"}
+    assert any("cursor=next-cursor" in u for u in seen_urls)
+
+
+def test_discover_chatgpt_projects_stops_on_fetch_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    jar = tmp_path / "test.binarycookies"
+    jar.write_bytes(
+        build_binary_cookie_jar([{"domain": ".chatgpt.com", "name": "x", "value": "y"}])
+    )
+    monkeypatch.setattr(module, "build_chatgpt_session", lambda cookie_jar: _fake_project_session())
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+
+    calls = {"n": 0}
+
+    def fake_fetch_json(session: object, url: str) -> object:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"items": [{"id": "g-p-aaa", "name": "Alpha"}], "cursor": "next"}
+        raise module.ChatGPTLocalSessionError("401 Unauthorized")
+
+    monkeypatch.setattr(module, "fetch_json", fake_fetch_json)
+
+    projects = module.discover_chatgpt_projects(jar)
+
+    assert projects == {"g-p-aaa": {"name": "Alpha", "interactions": 0, "file_count": 0}}
+
+
 def test_set_project_route_updates_registry(tmp_path: Path) -> None:
     registry = module.load_project_registry(tmp_path)
     registry["projects"]["g-p-aaa"] = module._blank_project_entry("g-p-aaa", "test", 5, 2)
