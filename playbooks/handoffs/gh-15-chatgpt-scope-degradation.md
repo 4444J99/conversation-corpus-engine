@@ -43,14 +43,20 @@ is external: the ChatGPT API session's scope is restricted.
 
 ## Completed Work
 
-- [x] Scope preflight check implemented (S38)
-- [x] 50% threshold enforcement with clear error message (S38)
-- [x] Chrome cookie fallback path (S38)
+- [x] Scope preflight check implemented (`chatgpt_local_session.scope_preflight_check`)
+- [x] 50% threshold enforcement with clear error message and recovery playbook path
+- [x] Chrome cookie fallback path for session establishment
+- [x] Pre-flight wired into `import_chatgpt_local_session_corpus` before detail fetch/import (guards direct import and refresh paths that import)
 - [x] Tests for scope degradation detection (boundary tests at 49%/50%)
-- [x] `playbooks/scope-recovery.md` referenced in error message (verify it exists)
-- [ ] Re-authenticate ChatGPT session
-- [ ] Verify conversation count recovery
-- [ ] Root-cause investigation of degradation trigger
+- [x] `playbooks/scope-recovery.md` present and referenced from failure guidance
+- [ ] Re-authenticate ChatGPT session (operator)
+- [ ] Verify conversation count recovery (operator)
+- [ ] Root-cause investigation of degradation trigger (external/OpenAI-side behavior)
+
+**Repo-side note (current head):** code now fails fast on degraded scope; it cannot
+restore missing server-side visibility. Remaining work to close GH#15 is primarily
+operational (fresh signed-in session or official export) followed by a full,
+idempotent import per the recovery playbook and issue execution plan.
 
 ## Key Decisions
 

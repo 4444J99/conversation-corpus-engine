@@ -52,13 +52,29 @@ If session recovery fails:
 ## Prevention
 
 The `scope_preflight_check()` function (added S40) automatically detects scope
-degradation before import operations. The LaunchAgent `com.4jp.cce-refresh`
-can run `scripts/refresh_local_sessions.sh` on a schedule; if scope degrades,
-the refresh should fail fast rather than importing partial data. The repo-owned
-script enforces timeout/throttle/nice defaults for background runs; LaunchAgent
-interval and host install details are operator-owned — see
-`docs/custody/cpu-throttling-layer4.md` for the Layer 4 template and
-verification notes.
+degradation before import operations. It runs during
+`cce provider import --provider chatgpt --mode local-session` (and therefore
+`cce provider refresh` paths that import a ChatGPT local-session candidate)
+before conversation detail fetches, raising `ChatGPTLocalSessionError` when the
+visible count falls below 50% of the prior acquisition baseline. This prevents
+silent partial imports and delta-state corruption.
+
+The LaunchAgent `com.4jp.cce-refresh` can run `scripts/refresh_local_sessions.sh`
+on a schedule; when scope is degraded, the import/refresh should fail fast rather
+than importing partial data. The repo-owned script enforces timeout/throttle/nice
+defaults for background runs; LaunchAgent interval and host install details are
+operator-owned — see `docs/custody/cpu-throttling-layer4.md` for the Layer 4
+template and verification notes.
+
+## Repo-side status (GH#15 / IRF-CCE-026)
+
+Implemented in-repo: `scope_preflight_check`, acquisition-state baseline
+comparison, fail-fast guard in the ChatGPT local-session import flow, recovery
+playbook, and tests for boundary behavior.
+
+Remaining (external/operator): restore a full-scope authorized session or obtain
+an official export, then run a successful full import. See issue #15 comments and
+the handoff for the current operational checklist.
 
 ## Related
 
