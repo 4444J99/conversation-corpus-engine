@@ -4,26 +4,39 @@
   "session_date": "2026-03-30",
   "repo": "conversation-corpus-engine",
   "organ": "ORGAN-I",
-  "summary": "Owner archetypes, scope pre-flight, review-ID migration",
+  "summary": "Owner archetypes, scope pre-flight guard, and review-ID migration shipped as part of bundled S40/S41 work.",
   "commits": {
-    "first": "",
-    "last": "",
-    "count": 0
+    "first": "593c60d",
+    "last": "593c60d",
+    "count": 1
   },
   "test_state": {
     "before": 0,
     "after": 0
   },
-  "modules_added": [],
-  "modules_modified": [],
+  "modules_added": [
+    "OWNERS.md"
+  ],
+  "modules_modified": [
+    "src/conversation_corpus_engine/chatgpt_local_session.py",
+    "src/conversation_corpus_engine/cli.py",
+    "src/conversation_corpus_engine/federated_canon.py",
+    "src/conversation_corpus_engine/import_chatgpt_local_session_corpus.py",
+    "tests/test_chatgpt_local_session.py",
+    "tests/test_federated_canon.py"
+  ],
   "capabilities_shipped": [
-    "Owner archetypes",
-    "Scope pre-flight",
-    "Review-ID migration"
+    "Owner archetypes / module ownership map (OWNERS.md)",
+    "Scope pre-flight degradation check for imports",
+    "Review-ID migration with fingerprint suffix",
+    "ChatGPT project extraction support (bundled code)"
   ],
   "issues_closed": [],
   "issues_opened": [],
   "cross_repo_propagation": [],
   "remaining_work": [],
-  "operational_findings": []
+  "operational_findings": [
+    "Commit evidence: 593c60d (2026-03-31) 'feat: S40 code + S41 handoff documents, testaments, playbooks, OWNERS' states S40 code was uncommitted across S38-S40 sessions and landed in this commit.",
+    "593c60d also includes S41 handoff documents, playbooks, templates, and earlier testament files; attribution across S40/S41 is shared at commit level per commit message."
+  ]
 }

@@ -4,26 +4,60 @@
   "session_date": "2026-03-31",
   "repo": "conversation-corpus-engine",
   "organ": "ORGAN-I",
-  "summary": "6 handoff docs, commercial architecture spec + expansion",
+  "summary": "Handoff documentation set, playbooks/templates, and commercial architecture specification + expansion.",
   "commits": {
-    "first": "",
-    "last": "",
-    "count": 0
+    "first": "593c60d",
+    "last": "439584e",
+    "count": 5
   },
   "test_state": {
     "before": 0,
     "after": 0
   },
-  "modules_added": [],
-  "modules_modified": [],
+  "modules_added": [
+    ".claude/plans/2026-03-30-s40-full-breath-session.md",
+    ".claude/plans/2026-03-31-s41-handoff-documents.md",
+    "docs/ratification/OM-MEM-001-specification.md",
+    "docs/superpowers/specs/2026-03-31-cce-commercial-architecture-design.md",
+    "docs/superpowers/specs/2026-03-31-cce-commercial-architecture-expansion.md",
+    "playbooks/handoffs/gh-11-s33-testament-recording.md",
+    "playbooks/handoffs/gh-12-s37-testament-recording.md",
+    "playbooks/handoffs/gh-13-review-id-migration.md",
+    "playbooks/handoffs/gh-14-omega-ratification.md",
+    "playbooks/handoffs/gh-15-chatgpt-scope-degradation.md",
+    "playbooks/handoffs/gh-16-chatgpt-projects-endpoint.md",
+    "playbooks/new-provider-onboarding.md",
+    "playbooks/review-campaign-workflow.md",
+    "playbooks/scope-recovery.md",
+    "state/testaments/s33-testament.json",
+    "state/testaments/s37-testament.json",
+    "templates/session-canon.md",
+    "templates/testament-event.json",
+    "uv.lock"
+  ],
+  "modules_modified": [
+    ".gitignore",
+    "CLAUDE.md",
+    "src/conversation_corpus_engine/chatgpt_local_session.py",
+    "src/conversation_corpus_engine/cli.py",
+    "src/conversation_corpus_engine/federated_canon.py",
+    "src/conversation_corpus_engine/import_chatgpt_local_session_corpus.py",
+    "tests/test_chatgpt_local_session.py",
+    "tests/test_federated_canon.py"
+  ],
   "capabilities_shipped": [
-    "6 handoff docs",
-    "Commercial architecture spec",
-    "Expansion"
+    "6 issue handoff documents (GH#11-#16 playbooks/handoffs)",
+    "Operational playbooks and session/testament templates",
+    "Commercial architecture spec (v1 with v2 organism translation)",
+    "Commercial architecture expansion (knowledge stack + compounding loops)",
+    "Session closure fixes and OM-MEM-001 ratification spec draft"
   ],
   "issues_closed": [],
   "issues_opened": [],
   "cross_repo_propagation": [],
   "remaining_work": [],
-  "operational_findings": []
+  "operational_findings": [
+    "Commit evidence: 593c60d (2026-03-31) bundled S41 handoff documents/playbooks/templates with S40 code; de33923 and b3fbda5 added commercial architecture spec and expansion; d2cd5a5 and 439584e recorded follow-up fixes/closure work on 2026-03-31.",
+    "S33/S37 testament files were added in 593c60d as part of S41 operational artifacts per commit message."
+  ]
 }

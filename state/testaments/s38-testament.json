@@ -4,25 +4,38 @@
   "session_date": "2026-03-26",
   "repo": "conversation-corpus-engine",
   "organ": "ORGAN-I",
-  "summary": "ChatGPT local-session adapter, Chrome cookie fallback",
+  "summary": "ChatGPT local-session adapter with Chrome cookie fallback for importing ChatGPT desktop/web session data when the native app session is unavailable.",
   "commits": {
-    "first": "",
-    "last": "",
-    "count": 0
+    "first": "cf97add",
+    "last": "cf97add",
+    "count": 1
   },
   "test_state": {
     "before": 0,
     "after": 0
   },
-  "modules_added": [],
-  "modules_modified": [],
+  "modules_added": [
+    "src/conversation_corpus_engine/chatgpt_local_session.py",
+    "src/conversation_corpus_engine/import_chatgpt_local_session_corpus.py",
+    "tests/test_chatgpt_local_session.py",
+    "tests/test_import_chatgpt_local_session_corpus.py"
+  ],
+  "modules_modified": [
+    "CLAUDE.md",
+    "GEMINI.md",
+    "seed.yaml",
+    "src/conversation_corpus_engine/provider_catalog.py",
+    "src/conversation_corpus_engine/provider_import.py"
+  ],
   "capabilities_shipped": [
-    "ChatGPT local-session adapter",
-    "Chrome cookie fallback"
+    "ChatGPT local-session import adapter",
+    "Chrome cookie fallback when native app session is stale"
   ],
   "issues_closed": [],
   "issues_opened": [],
   "cross_repo_propagation": [],
   "remaining_work": [],
-  "operational_findings": []
+  "operational_findings": [
+    "Commit evidence: cf97add (2026-03-26) adds chatgpt_local_session.py and import_chatgpt_local_session_corpus.py with tests; chatgpt_local_session.py reads native app binary cookies and falls back to Chrome's Chromium cookie store."
+  ]
 }
