@@ -11,7 +11,7 @@
 ## Acceptance
 
 - [x] At least 2 of 5 H1 deliverables completed.
-- [x] Implementation plan derived from IRF-CCE-039 and the approved commercial architecture specs.
+- [x] Implementation plan derived from IRF-CCE-039 and the approved commercial architecture specs (`.claude/plans/irf-cce-039-commercial-implementation-plan.md` is present and coverage-mapped; IRF-CCE-039 marked DONE in that plan).
 - [x] IRF-CCE-033 marked DONE in this completion record.
 
 ## Completed H1 Deliverables
