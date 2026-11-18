@@ -1154,6 +1154,20 @@ def inline_suffix(marker, *, at_line_start):
     return prefix + marker + b"\n"
 
 
+def _body_starts_at_column_zero(body: bytes) -> bool:
+    """True when the segment's first non-blank line begins at column zero.
+
+    A split part whose body begins at column zero is fence content (not a
+    list continuation): reopening the carried fence at column zero keeps the
+    part CommonMark-balanced, so the first body line does not close the fence
+    by leaving a synthetic list item the part header created.
+    """
+    for line in body.splitlines():
+        if line.strip():
+            return not line.startswith((b" ", b"\t"))
+    return True
+
+
 def render_part(body, relative, number, count, segment):
     filename = quote(Path(relative).name, safe="._-~")
     header = f"# Part {number} of {count}\n\n[Source note index]({filename})\n\n".encode()
@@ -1164,27 +1178,30 @@ def render_part(body, relative, number, count, segment):
         # the bare list prefix alone rebuilds only the outer item
         # ("> - ```"), whose shallow content indent leaves the
         # column-11 footer and the source's own closing lines unable
-        # to close it, so the part ends inside an open fence. A
-        # spaces-only prefix (a bare continuation-line fence) keeps
-        # the existing list-prefix behaviour, which recreates its
-        # list context instead.
+        # to close it, so the part ends inside an open fence.
         opener = segment["before"]
-        carried_prefix = segment.get("fence_opener_before") or ""
-        if carried_prefix and (">" in carried_prefix or _LIST_MARKER.match(carried_prefix)):
-            marker = opener
-            while marker.startswith("> "):
-                marker = marker[2:]
-            opener = carried_prefix + marker
+        if _body_starts_at_column_zero(body):
+            # The body begins at column zero: reopen the carried fence at
+            # column zero with no list prefix, so the body reads as fence
+            # content and the part stays balanced.
+            header += (opener + "\n").encode()
         else:
-            prefix = segment.get("fence_prefix_before") or ""
-            if prefix:
-                quote_prefix = ""
-                rest = opener
-                while rest.startswith("> "):
-                    quote_prefix += "> "
-                    rest = rest[2:]
-                opener = quote_prefix + prefix + rest
-        header += (opener + "\n").encode()
+            carried_prefix = segment.get("fence_opener_before") or ""
+            if carried_prefix and (">" in carried_prefix or _LIST_MARKER.match(carried_prefix)):
+                marker = opener
+                while marker.startswith("> "):
+                    marker = marker[2:]
+                opener = carried_prefix + marker
+            else:
+                prefix = segment.get("fence_prefix_before") or ""
+                if prefix:
+                    quote_prefix = ""
+                    rest = opener
+                    while rest.startswith("> "):
+                        quote_prefix += "> "
+                        rest = rest[2:]
+                    opener = quote_prefix + prefix + rest
+            header += (opener + "\n").encode()
     elif segment.get("inline_before"):
         header += ("Inline code continued: " + segment["inline_before"] + " ").encode()
     footer = b""
