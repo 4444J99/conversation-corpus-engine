@@ -564,6 +564,29 @@ def test_antigravity_protobuf_leaf_text_keeps_field_path_without_invented_role(t
     assert item.extra["body_status"] == "partial"
 
 
+def test_antigravity_user_prompt_chunk_keeps_nested_wire_path_without_inventing_role(tmp_path):
+    # The person's own prompt rides nested content leaves of the step payload; recovery keeps
+    # the full wire path but never invents an authorship it cannot prove (issue #98).
+    text = b"<USER_REQUEST>\nAdvance the VLTIMA kernel mapping.\n</USER_REQUEST>"
+    nested = bytes([26, len(text)]) + text
+    inner = bytes([10, len(nested)]) + nested
+    wire = bytes([42, len(inner)]) + inner
+    source = tmp_path / "ag.db"
+    with sqlite3.connect(source) as c:
+        c.executescript(
+            "CREATE TABLE trajectory_meta (trajectory_id TEXT,cascade_id TEXT); CREATE TABLE steps (idx INT, step_payload BLOB);"
+        )
+        c.execute("INSERT INTO trajectory_meta VALUES (?,?)", ("trajectory", "ag"))
+        c.execute("INSERT INTO steps VALUES (?,?)", (0, wire))
+    item = next(iter_estate(estate(tmp_path, [("antigravity", "ag", source)])))
+    assert [m.text for m in item.messages] == [text.decode()]
+    assert item.messages[0].role == "system"
+    assert item.messages[0].meta["protobuf_field_path"] == "5[0].1[0].3[0]"
+    assert item.messages[0].meta["semantic_role"] == "unknown"
+    assert item.messages[0].meta["source_encoding"] == "protobuf-wire"
+    assert item.extra["body_status"] == "partial"
+
+
 def test_protobuf_decoder_rejects_truncation_and_bounds_depth():
     assert list(_protobuf_strings(b"\x2a\xff")) == []
     nested = b"\x0a\x04text"

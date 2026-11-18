@@ -213,6 +213,17 @@ plain-text template the rules do not list stays human, so a CLI family's human c
 bound that the manifest's `author_basis` lets a reader audit. Antigravity's text is recovered from
 protobuf leaves with no role, so all of it is machine.
 
+**Antigravity wire findings (issue #98).** The native `steps.step_payload` blobs of an Antigravity
+conversation database are protobuf, not JSON, and the message type recovered from the wire reads
+`type.googleapis.com/gemini_coder.Step`. The content container is carried by top-level protobuf field
+`5` across the step kinds sampled in the estate (step-kind-specific companions — fields `19`, `20`,
+`24`, `31`, `114`, `140`, `147`, `148` — ride along beside it), and the person's own prompt text is
+present in the store as length-delimited string leaves nested under those fields (for example a
+`<USER_REQUEST>` body recovered at wire path `2[0].6[0].2[0].10[0].2[0].1[0].2[0].3[0].3[5].1[0]`).
+The generic leaf recovery therefore does reach the person's text; what it cannot do is attribute it:
+the step-payload fallback labels every recovered leaf `system` with `semantic_role: unknown`, so the
+human prompt and the model's text stay indistinguishable at read time.
+
 ```bash
 cce archive ingest --export-root "$EXPORTS" --library-root "$OLD_STORE" --provider claudecode --merge
 ```
