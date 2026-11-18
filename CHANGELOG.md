@@ -7,6 +7,7 @@ This project follows semantic versioning as reflected in git tags and GitHub Rel
 ## [Unreleased]
 
 - Release-readiness and packaging metadata improvements tracked under issue #35.
+- Document IRF-CCE-038 cross-repo commercial awareness status (CCE-side backlinks/metadata in place; reciprocal application-pipeline backlink and global issue closeout remain).
 
 ## [0.3.0] - 2026 (tagged)
 
