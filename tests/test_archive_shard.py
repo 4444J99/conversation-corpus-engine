@@ -92,6 +92,19 @@ def test_an_oversize_row_gets_a_shard_of_its_own(tmp_path: Path) -> None:
     assert writer.add("202506", b"a\n", b"{}\n") == "202506"
     assert writer.add("202506", big, b"{}\n") == "202506-002"
     assert writer.add("202506", b"b\n", b"{}\n") == "202506-003"
+    shards = writer.close()
+    by_subject = {shard["subject"]: shard for shard in shards}
+    # The lone oversize row is its own shard, flagged oversize_row; the others are not.
+    assert by_subject["202506-002"]["conversations"] == 1
+    assert by_subject["202506-002"]["bytes"] > 1000
+    assert by_subject["202506-002"]["oversize_row"] is True
+    assert by_subject["202506"].get("oversize_row") is not True
+    assert by_subject["202506-003"].get("oversize_row") is not True
+    # A row at exactly the shard size is not oversize; only past it is.
+    exact = b"y" * 999 + b"\n"  # 1000 bytes == shard_bytes, not past it
+    writer2 = ShardWriter(tmp_path / "build2", "grok", shard_bytes=1000)
+    writer2.add("202506", exact, b"{}\n")
+    assert writer2.close()[0].get("oversize_row") is not True
 
 
 def test_many_months_do_not_exhaust_open_files(tmp_path: Path) -> None:
