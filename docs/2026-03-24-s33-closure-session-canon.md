@@ -1,10 +1,8 @@
 # S33 Closure Session Canon
 
-This is the repo-tracked mirror of the deployment-site source artifact at:
+This is the repo-tracked mirror of a deployment-site session canon artifact maintained outside this public repository.
 
-`/Users/4jp/Workspace/organvm-i-theoria/conversation-corpus-site/2026-03-24-conversation-corpus-engine-s33-closure-session-canon.md`
-
-It exists to satisfy the persistence rule that important session memory must survive both locally and remotely. The deployment-site copy is the ingest-ready markdown source for `ai-exports-markdown-memory`; this repo copy is the Git-tracked soul that survives host loss.
+It exists to satisfy the persistence rule that important session memory must survive both locally and remotely. A deployment-site copy served as the ingest-ready markdown source for memory ingestion; this repo copy is the Git-tracked record that survives host loss.
 
 ## Verified Outcomes
 

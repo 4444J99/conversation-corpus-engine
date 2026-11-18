@@ -1,0 +1,5 @@
+{
+  "schema": "ai-exports-custody-receipt.v2",
+  "status": "redacted",
+  "note": "This public record previously contained real library figures, receipt hashes, private filesystem paths, device identifiers, and custody measurements. Those details are retained only in the owner's private notes. This stub preserves the existence of a dated custody receipt while removing sensitive operational data."
+}

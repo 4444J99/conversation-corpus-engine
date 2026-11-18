@@ -1,52 +1,22 @@
-# Derived-store custody and sealed publication: decisions (2026-11-10)
+# Derived-store custody and sealed publication: decisions (sanitized)
 
-Aggregates only; no keys, passphrases or hostnames. The owner delegated these decisions
-("everything has full approval"); each is derived from the registries and records cited.
+Aggregates only; no keys, passphrases, hostnames, private paths, receipt names, or real-library figures. Decisions are summarized at a method/policy level; detailed measurements and receipts are retained in the owner's private notes.
 
-## Derived stores and library generations (issue #107)
+## Derived stores and library generations
 
-Decision: **do not copy the regenerable derived stores offsite.** Adopt the recommendation in the
-2026-11-05 measured-scope note on #107.
+**Decision:** do not copy regenerable derived stores offsite by default.
 
-- Irreplaceable inputs already have independent copies: raw provider exports (internal disk plus
-  Time Machine, restore tested 2026-10-31) and the published library database (encrypted offsite
-  copy, 20 of 20 parts hash-identical, decryption proven end to end 2026-11-05).
-- The archive tree is derived: replaying the engine reader over the capture plus export reproduced
-  the previous store exactly (2,898 of 2,898 row digests). Library artifacts are exported from the
-  database. A from-scratch full rebuild was not performed; "regenerable" rests on replay evidence.
-- Spending roughly 70-110 GiB of bandwidth on a hotspot-constrained link for data that rebuilds in
-  hours is not justified. Retained previous trees (pre-restore rollback tree, older library
-  generations) are rollback holdings: keep on the working disk, reap per the headroom plan once the
-  published generation is verified; they are not custody obligations.
-- Reversal condition: if a source behind a retained revision is confirmed gone and not in the
-  database copy, copy that single generation with the same encrypted, quota-gated method.
+- Irreplaceable inputs (raw provider exports and the published library database) should have independent, verified copies using the approved custody method.
+- Archive and library derivative artifacts are generally regenerable from retained inputs and the database; copy decisions should weigh rebuild cost against bandwidth/storage constraints.
+- Retained previous trees/generations are rollback holdings on working storage and are reaped according to headroom policy once the published generation is verified; they are not custody obligations by default.
+- **Reversal condition:** if a source behind a retained revision is confirmed missing and not present in the database copy, copy that specific generation using the same encrypted, quota-aware method.
 
-## Sealed (encrypted) publication, issue #129
+## Sealed (encrypted) publication
 
-Status observed 2026-11-10 (not a claim of acceptance):
+**Status (dated observation, not acceptance):** sealed publication tooling and format work exist, but a completed real-data publication and independent-clone restore verification had not been demonstrated at the time of this record.
 
-- Format: cce-sealed.v2 packing merged (#150); synthetic-identity tests only in that change.
-- A real-data attempt exists in the KNOVV Cloudflare lane (staging directory of 2026-11-08): its
-  run receipt records `production_accepted: false`, `uploaded: false`; the export stage failed at
-  the 7,200 s migration limit. No completed real publication exists, so **no real-data restore in
-  an independent clone can be verified yet**. That verification stays open and is gated on a
-  completed export, not on a decision.
-- Enrollment decision: production enrollment uses the identities generated for that lane
-  (one publisher, desktop and phone recipients, plus an offline recovery recipient required by
-  `docs/encrypted-publication.md`). Their key files and unlock material stay outside Git and outside
-  any agent-readable shared path. Custody is split: each key file and its passphrase live in
-  separate locations with independent access controls (for example the key file on an encrypted
-  offline volume and the passphrase in the password manager), so compromise of one location does
-  not decrypt the corpus. No agent copies either into chat, CI secrets or a repository.
-- Key decision: new identities require a passphrase of at least 12 bytes, generated at random and
-  held apart from its key file. Losing all enrolled keys loses only the offsite copy, never
-  the originals.
-- Remote selection: the offsite remote for the library database is the existing encrypted Drive
-  overlay (shared rclone client, retiring this year, so it is not used for new bulk copies). For
-  sealed git publication the destination is a private repository or the Cloudflare account already
-  used by the KNOVV lane; the choice is made by the lane that owns the publication (PR #155) and is
-  verified for identity, policy and measured capacity before any push, per the sealed-publication
-  procedure.
-- Acceptance gate (unchanged): canary publish and unseal bit-identical with the right key, failure
-  with a wrong key or app identity, then real shards in bounded batches, then restore into a fresh
-  clone and compare against the manifest.
+- A real-data publication attempt in a separate lane did not complete within its execution limits and did not produce an accepted uploaded publication. Independent restore verification remains open and gated on a completed export/publication.
+- **Enrollment/custody principles:** production enrollment uses separately held publisher, device, and offline recovery identities/keys as required by procedure. Key material and unlock secrets stay outside Git and outside agent-readable shared paths, with split custody so compromise of one location does not decrypt the corpus.
+- **Key handling:** new identities require strong randomly generated secrets held apart from key files. Loss of all enrolled keys affects only the offsite copy, not the originals.
+- **Remote selection:** destination choice for encrypted publication is made by the owning lane, with identity, policy, and capacity verified before any push according to the sealed-publication procedure.
+- **Acceptance gate (unchanged):** canary publish/unseal verifies bit-identical restore with the correct key and failure with a wrong key or app identity; only then proceed with bounded real-data publication and an independent-clone restore compared against the manifest.

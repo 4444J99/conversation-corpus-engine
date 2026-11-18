@@ -1,23 +1,27 @@
-# Completed-index recovery verification - 2026-10-27
+# Completed-index recovery verification (sanitized)
+
+This page describes the library builder's recovery modes and the verification performed for them. It omits private paths, exact byte measurements, and host-specific receipt details.
+
+## Resume modes
 
 The library builder accepts explicit `resume_mode` values in the source manifest:
 
 | Mode | Required failed-seed evidence | New sources | Database work |
 | --- | --- | --- | --- |
 | `ingested` (default) | Completed source counts and full normalized-object verification | Allowed | Existing compact copy and full index rebuild |
-| `export` | Failed `exporting`/`verifying` phase, matching status and record/evidence fingerprints, full verification | Rejected | Clone/copy opened read-only; reuse index and regenerate exports |
-| `indexed` | Same completed-index proof as `export` | Allowed within normal record/byte/deadline limits | Clone/copy writable; reindex only UIDs whose current records changed |
+| `export` | Failed export/verification phase with matching fingerprints and verification evidence | Rejected | Open seed read-only; reuse index and regenerate exports |
+| `indexed` | Same completed-index proof as `export` | Allowed within normal limits | Clone/copy writable; reindex only changed current records |
 
-All modes require an absolute `resume_generation` under the configured library store. Resume never modifies the failed generation or publishes automatically. Every new generation retains its source manifest, qualified seed receipt, inherited findings, prior source report, baseline observation count and new observation count.
+All modes require an absolute `resume_generation` under the configured library store. Resume never modifies the failed generation or publishes automatically. Each new generation retains its source manifest, qualified seed receipt, inherited findings, prior source report, and observation counts.
 
-Example recovery manifest (replace explicit paths with registered paths):
+## Example recovery manifest
 
 ```json
 {
   "schema": "cce.library-sources.v1",
-  "resume_generation": "/registered/store/library-all/generations/generation-failed",
+  "resume_generation": "/path/to/registered/store/library-all/generations/<failed-generation>",
   "resume_mode": "indexed",
-  "archives": ["/registered/supplement"],
+  "archives": ["/path/to/registered/supplement"],
   "limits": {
     "max_records": 100000,
     "max_seconds": 3600,
@@ -26,12 +30,11 @@ Example recovery manifest (replace explicit paths with registered paths):
 }
 ```
 
-The normal `cce library build --manifest ...` command consumes this manifest. Publication still requires `cce library publish` after completed export verification.
+Use the normal `cce library build --manifest ...` command with a manifest like this. Publication still requires `cce library publish` after completed export verification.
 
-On macOS, recovery uses the exclusive native `clonefile` operation. COW admission requires `max_output_bytes - seed_database_bytes + mutation_reserve + 1 GiB`, with a 1 GiB mutation reserve for `indexed` mode and zero for read-only `export`. Actual free space is monitored through ingestion SQL, indexing and export callbacks. The full logical output cap remains unchanged. If the filesystem cannot clone, an ordinary bounded copy requires the entire output budget plus the 1 GiB floor. A failed clone never overwrites an existing destination.
+## Behavior and checks
 
-The receipt reports copy method, free bytes before/after cloning, filesystem-reported allocated bytes, admission reserve, source hashes before/after copying, and the copied database hash before any supplemental changes. Allocated blocks on APFS can include shared extents; that number is not a unique-physical-byte measurement.
-
-Incremental indexing retains unchanged occurrences, rebuilds changed UIDs in a savepoint, and removes only derived blocks with no current occurrences. Source objects, historical revisions and provenance remain intact. Its regression test compares the resulting blocks, occurrences and status with a full rebuild, and checks rollback after interruption.
-
-Validation: 61 targeted store/build/resume tests passed. Scoped Ruff lint and formatting checks passed. A synthetic 330,000-byte clone on the custody filesystem returned `copy_on_write`, with identical source-before/source-after/candidate SHA-256 and unchanged measured free space (15,688,122,368 bytes before and after). This validates the recovery mechanism and host clone capability; it does not itself establish production publication.
+- On supported filesystems, recovery uses copy-on-write cloning when available; otherwise it falls back to bounded copying with appropriate admission checks and free-space monitoring.
+- Output budgets and free-space floors remain enforced; logical output caps are unchanged.
+- Incremental indexing retains unchanged occurrences, rebuilds changed records in a savepoint, and removes derived blocks with no current occurrences while preserving source objects, historical revisions, and provenance.
+- Verification covered targeted store/build/resume tests, lint/format checks, and synthetic clone-capability validation on the custody filesystem. These results validate the recovery mechanism; they do not by themselves establish production publication.
