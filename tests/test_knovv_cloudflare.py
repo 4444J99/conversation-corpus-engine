@@ -329,7 +329,9 @@ def test_durable_control_transport_signs_only_allowlisted_operations(tmp_path, m
         Cloudflare(config)
 
 
-@pytest.mark.skip(reason="cloudflare CLI runner (cf-runner.mjs) requires the 'cf' npm package which is not installed in this environment")
+@pytest.mark.skip(
+    reason="cloudflare CLI runner (cf-runner.mjs) requires the 'cf' npm package which is not installed in this environment"
+)
 def test_cloudflare_cli_runner_reuses_one_process_and_rejects_other_commands(tmp_path):
     config, _, _, _ = setup(tmp_path)
     with Cloudflare(config, seconds=90) as transport:

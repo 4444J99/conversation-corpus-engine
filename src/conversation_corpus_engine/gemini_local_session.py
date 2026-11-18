@@ -159,10 +159,17 @@ def _decode_protobuf_fields(data: bytes, *, depth: int = 0) -> list[dict[str, An
                 pass
             sub = _decode_protobuf_fields(content, depth=depth + 1)
             if sub:
-                fields.append({"field": field_num, "type": "message", "value": sub, "length": length})
+                fields.append(
+                    {"field": field_num, "type": "message", "value": sub, "length": length}
+                )
             else:
                 fields.append(
-                    {"field": field_num, "type": "bytes", "value": content.hex()[:200], "length": length}
+                    {
+                        "field": field_num,
+                        "type": "bytes",
+                        "value": content.hex()[:200],
+                        "length": length,
+                    }
                 )
         elif wire_type == 5:
             if pos + 4 > len(data):
@@ -230,7 +237,10 @@ def extract_local_cache_content(store: Path = DEFAULT_GEMINI_STORE) -> dict[str,
     if not store.exists():
         raise GeminiLocalSessionError(f"Gemini app cache not found: {store}")
     try:
-        password = _find_safe_storage_password(GEMINI_SAFE_STORAGE_SERVICES, "Gemini Safe Storage")  # allow-secret
+        password = _find_safe_storage_password(
+            GEMINI_SAFE_STORAGE_SERVICES,
+            "Gemini Safe Storage",  # allow-secret
+        )
         key = _derive_key(password)  # allow-secret
     except GeminiLocalSessionError:
         try:
@@ -451,7 +461,9 @@ def discover_gemini_local_session(source: Path | None = None) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             note = f"cache extraction unavailable: {exc}"
     elif chrome_available:
-        note = "local cache missing; Chrome cookie session available but web endpoint mapping required"
+        note = (
+            "local cache missing; Chrome cookie session available but web endpoint mapping required"
+        )
     else:
         note = "no local cache or Chrome cookies found"
     return {

@@ -155,7 +155,9 @@ def import_provider_corpus(
         resolved_corpus_id = corpus_id or config["fallback_corpus_id"]
         resolved_name = name or config["fallback_corpus_name"]
     elif provider == "gemini" and mode != "local-session":
-        resolved_corpus_id = corpus_id or config.get("fallback_corpus_id") or config["default_corpus_id"]
+        resolved_corpus_id = (
+            corpus_id or config.get("fallback_corpus_id") or config["default_corpus_id"]
+        )
         resolved_name = name or config.get("fallback_corpus_name") or config["default_corpus_name"]
     else:
         resolved_corpus_id = corpus_id or config["default_corpus_id"]
