@@ -12,11 +12,13 @@ from .corpus_store import (
 )
 from .evaluation_bootstrap import bootstrap_provider_evaluation
 from .federation import build_federation, upsert_corpus
+from .gemini_local_session import DEFAULT_GEMINI_STORE
 from .import_chatgpt_export_corpus import import_chatgpt_export_corpus
 from .import_chatgpt_local_session_corpus import import_chatgpt_local_session_corpus
 from .import_claude_export_corpus import import_claude_export_corpus
 from .import_claude_local_session_corpus import import_claude_local_session_corpus
 from .import_document_export_corpus import import_document_export_corpus
+from .import_gemini_local_session_corpus import import_gemini_local_session_corpus
 from .import_perplexity_local_session_corpus import import_perplexity_local_session_corpus
 from .perplexity_local_session import DEFAULT_PERPLEXITY_COOKIE_JAR
 from .provider_catalog import (
@@ -61,6 +63,20 @@ def _resolve_perplexity_cookie_jar(local_root: Path | None) -> Path:
     return resolved
 
 
+def _resolve_gemini_local_source(local_root: Path | None) -> Path:
+    """Resolve the Gemini local-session source (ChatInfo2.store or containing dir)."""
+    if local_root is None:
+        return DEFAULT_GEMINI_STORE.resolve()
+    resolved = local_root.resolve()
+    if resolved.is_dir():
+        candidate = resolved / "Gemini" / "user1" / "ChatInfo2.store"
+        if candidate.exists():
+            return candidate.resolve()
+        if (resolved / "ChatInfo2.store").exists():
+            return (resolved / "ChatInfo2.store").resolve()
+    return resolved
+
+
 def resolve_provider_import_source(
     *,
     provider: str,
@@ -84,6 +100,10 @@ def resolve_provider_import_source(
     if provider == "perplexity" and mode == "local-session":
         resolved_cookie_jar = _resolve_perplexity_cookie_jar(local_root)
         return resolved_cookie_jar, {"resolution": "local-session-cookie-jar"}
+
+    if provider == "gemini" and mode == "local-session":
+        resolved_local_source = _resolve_gemini_local_source(local_root)
+        return resolved_local_source, {"resolution": "local-session-store"}
 
     resolved_source_drop_root = (
         source_drop_root or default_source_drop_root(project_root)
@@ -134,6 +154,9 @@ def import_provider_corpus(
     if provider == "claude" and mode != "local-session":
         resolved_corpus_id = corpus_id or config["fallback_corpus_id"]
         resolved_name = name or config["fallback_corpus_name"]
+    elif provider == "gemini" and mode != "local-session":
+        resolved_corpus_id = corpus_id or config.get("fallback_corpus_id") or config["default_corpus_id"]
+        resolved_name = name or config.get("fallback_corpus_name") or config["default_corpus_name"]
     else:
         resolved_corpus_id = corpus_id or config["default_corpus_id"]
         resolved_name = name or config["default_corpus_name"]
@@ -181,6 +204,16 @@ def import_provider_corpus(
         resolved_corpus_id = resolved_corpus_id or config["default_corpus_id"]
         resolved_name = resolved_name or config["default_corpus_name"]
         import_result = import_perplexity_local_session_corpus(
+            resolved_source_path,
+            resolved_output_root,
+            corpus_id=resolved_corpus_id,
+            name=resolved_name,
+            throttle=throttle,
+        )
+    elif provider == "gemini" and mode == "local-session":
+        resolved_corpus_id = resolved_corpus_id or config["default_corpus_id"]
+        resolved_name = resolved_name or config["default_corpus_name"]
+        import_result = import_gemini_local_session_corpus(
             resolved_source_path,
             resolved_output_root,
             corpus_id=resolved_corpus_id,

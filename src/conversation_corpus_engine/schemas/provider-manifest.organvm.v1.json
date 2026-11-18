@@ -127,14 +127,18 @@
       "adapter_type": "gemini-export",
       "discovery_mode": "document-export",
       "inbox_rel": "gemini/inbox",
-      "default_corpus_id": "gemini-history-memory",
-      "default_corpus_name": "Gemini History Memory",
+      "default_corpus_id": "gemini-local-session-memory",
+      "default_corpus_name": "Gemini Local Session Memory",
+      "fallback_corpus_id": "gemini-history-memory",
+      "fallback_corpus_name": "Gemini History Memory",
       "source_family_aliases": ["gemini"],
       "source_contract": {"kind": "session-meta-redacted-bundle", "root_env": "CCE_SESSION_META_BUNDLE_ROOT"},
       "authority_policy": "native-role",
       "owner_reference": "repo:organvm/session-meta",
       "blocker": {"owner_reference": "repo:organvm/session-meta", "failed_predicate": "redacted source bundle is readable", "next_action": "publish a frozen session-meta redacted bundle and rerun authority ingest"},
-      "calibration_only": true
+      "calibration_only": true,
+      "local_source_root": "/Users/4jp/Library/Caches/com.google.GeminiMacOS/Gemini/user1",
+      "local_session_supported": true
     },
     {
       "provider_id": "grok",

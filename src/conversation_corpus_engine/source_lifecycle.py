@@ -19,6 +19,7 @@ SUPPORTED_SOURCE_ADAPTERS = {
     "chatgpt-local-session",
     "copilot-export",
     "gemini-export",
+    "gemini-local-session",
     "grok-export",
     "perplexity-export",
 }
@@ -115,6 +116,23 @@ def collect_source_files(
         else:
             tracked_paths = [
                 source_input / "com.openai.chat.binarycookies",
+            ]
+            files = [p for p in tracked_paths if p.is_file()]
+    elif adapter_type == "gemini-local-session":
+        if source_input.is_file():
+            files = [source_input]
+            for suffix in ("-wal", "-shm"):
+                sidecar = Path(str(source_input) + suffix)
+                if sidecar.is_file():
+                    files.append(sidecar)
+        else:
+            tracked_paths = [
+                source_input / "ChatInfo2.store",
+                source_input / "ChatInfo2.store-wal",
+                source_input / "ChatInfo2.store-shm",
+                source_input / "Gemini" / "user1" / "ChatInfo2.store",
+                source_input / "Gemini" / "user1" / "ChatInfo2.store-wal",
+                source_input / "Gemini" / "user1" / "ChatInfo2.store-shm",
             ]
             files = [p for p in tracked_paths if p.is_file()]
     elif adapter_type == "chatgpt-export":
