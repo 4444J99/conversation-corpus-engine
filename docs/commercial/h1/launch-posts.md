@@ -19,7 +19,7 @@ pipx install "conversation-corpus-engine[mcp]"
 cce-mcp --project-root /path/to/project
 ```
 
-Repo: https://github.com/organvm-i-theoria/conversation-corpus-engine
+Repo: https://github.com/4444J99/conversation-corpus-engine
 
 I am especially looking for feedback from people who treat AI conversations as work product: researchers, engineers, consultants, and teams trying to preserve decision history across tools.
 

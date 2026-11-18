@@ -263,7 +263,7 @@ def build_commercial_h1_readiness(
             "pipx_install": 'pipx install "conversation-corpus-engine[mcp]"',
             "scripts": ["cce", "cce-mcp"],
             "serve_command": "cce mcp serve --project-root /path/to/project",
-            "tools": ["cce_search", "cce_list_corpora", "cce_provider_readiness"],
+            "tools": ["cce_search", "cce_list_corpora", "cce_surface_context"],
         },
         "interface_contract": build_interface_contract(resolved_project_root),
         "signal_chain": build_signal_chain(resolved_project_root),

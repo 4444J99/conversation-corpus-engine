@@ -1,6 +1,6 @@
 # IRF-CCE-033 H1 Completion Plan
 
-**Issue:** https://github.com/organvm-i-theoria/conversation-corpus-engine/issues/20  
+**Issue:** https://github.com/4444J99/conversation-corpus-engine/issues/20  
 **Status:** DONE in repository scope  
 **Completed:** 2026-06-18  
 **Primary specs:**
