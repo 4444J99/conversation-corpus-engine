@@ -59,7 +59,9 @@ def write_conversation_markdown_bundle(bundle_root: Path, bundle: dict[str, Any]
             base = f"{base}-{seen[base]}"
         else:
             seen[base] = 0
-        (bundle_root / f"{base}.md").write_text(render_conversation_markdown(conv), encoding="utf-8")
+        (bundle_root / f"{base}.md").write_text(
+            render_conversation_markdown(conv), encoding="utf-8"
+        )
         written += 1
     return written
 

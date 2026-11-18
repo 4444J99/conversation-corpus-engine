@@ -891,9 +891,7 @@ def _ingest_provider(
     # Coding-CLI families classify user turns by provenance; a plain-text harness template not
     # recognized by the rules stays human:typed, so their human count is an upper bound. The
     # manifest records the audit trail in author_basis and reader_counters (basis:*).
-    cli_provenance = any(
-        key.startswith("basis:") for key in tracker.counters
-    )
+    cli_provenance = any(key.startswith("basis:") for key in tracker.counters)
     # A captured identity remains protected after a newer account export absorbs it.
     # An explicit allow-loss merge releases only identities absent from the new store.
     live_capture_uids.update(
