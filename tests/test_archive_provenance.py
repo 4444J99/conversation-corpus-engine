@@ -59,7 +59,7 @@ def test_plain_text_templates_the_harness_writes_are_machine() -> None:
         "Another Claude session sent a message while you were working:\n<agent-message />",
         "The coordinator sent a message while you were working:\nThe verifier passed",
         "Background (from the session that started this one):\nThis is a one-shot probe.",
-        "A session-scoped Stop hook is now active with condition: \"get it all done\"",
+        'A session-scoped Stop hook is now active with condition: "get it all done"',
         "Goal check-in: «Complete everything in this work stream.» is still active",
         "Your response above was cut off mid-stream. Resume directly from where it stops",
         "Your response above was stopped by a safety classifier — this is not a tool or API error.",
