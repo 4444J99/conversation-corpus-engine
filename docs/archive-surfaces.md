@@ -216,6 +216,13 @@ Antigravity's text is recovered from protobuf leaves with no role, so all of it 
 `session_kind` and `parent_session_id` disagree (a `subagent` with no parent recorded, or a
 `root`/`unknown` with one) the manifest counts the disagreement per family under
 `diagnostic:kind-parent-disagreement` in `reader_counters`; the parent signal wins either way.
+The 2026-11-19 audit of the finished store (grouping the `typed`-channel user turns by first
+words) added 17 plain-text templates to `HARNESS_PREFIXES` — the limen dispatcher's
+quote-wrapped `Complete task <ID>: … [auto-generated …]` prompt (885 turns) and its quoted
+`# FLAME — the Continuity Kernel` preamble (819 turns), plus skill bodies and one-shot harness
+prompts — flipping 2,024 turns from human to machine on the next ingest. Slash commands, image
+attachment markers (`[Image #1]`, `[Image: source: …]`) and short person-typed prompts stay
+human. The finished store itself is not rebuilt; the flip applies to newly ingested data.
 
 **Known imprecision, recorded (issue #95).** The residual questions the structural fields cannot
 settle are recorded here so they are not re-litigated as defects later:

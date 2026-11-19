@@ -140,6 +140,30 @@ HARNESS_PREFIXES: tuple[str, ...] = (
     "# Autonomous loop check",
     "## Context Usage",
     "# Pull Request Creation",
+    # Found by grouping the `typed`-channel user turns of the finished store
+    # (session-corpus-archive-20261030-families, 2026-11-19 audit) by first words. All are
+    # automation-dispatch preambles or harness bodies, not person-typed text:
+    #   the limen dispatcher wraps its whole prompt in quotes and prefixes it with either
+    #   `Complete task <ID>: … [auto-generated …]` (885 turns, Context:/[auto-generated in every one)
+    #   or the `# FLAME — the Continuity Kernel` preamble (819 quoted, 212 bare);
+    # the rest are skill bodies and one-shot harness prompts the person never typed.
+    '"# FLAME — the Continuity Kernel',
+    "Complete task ",
+    '"Complete task ',
+    "Run a disciplined session closeout for this working directory.",
+    "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+    "Audit git parity for this lane.",
+    "## Referenced ChatGPT conversation:",
+    "Create or update `AGENTS.md` for this repository.",
+    "[external_agent_tool_result]",
+    "your task is to complete all the incomplete work in your stream",
+    "The user just ran /insights to generate a usage report",
+    "Continue from where you left off.",
+    'Run the "deep-research" workflow.',
+    "Provide an instruction describing the batch change you want to make.",
+    "Run exactly this one shell command and report its first line of output",
+    "Act as the senior maintainer for the existing local checkout of:",
+    "You are the repository steward for THIS repo only.",
 )
 _LOOP_WAKEUP = re.compile(r"^\[\d+ prior /loop wakeups?")
 
