@@ -258,16 +258,25 @@ def test_discover_chatgpt_local_session_returns_summary(
             device_id="dev-1",
         ),
     )
+    def fake_fetch_json(session: module.ChatGPTHttpSession, url: str) -> object:
+        if "conversations?" in url:
+            if "is_archived=true" in url:
+                return {"total": 3, "items": []}
+            return {"total": 42, "items": []}
+        raise AssertionError(f"unexpected url: {url}")
+
     monkeypatch.setattr(
         module,
         "fetch_json",
-        lambda session, url: {"total": 42, "items": []},
+        fake_fetch_json,
     )
 
     payload = module.discover_chatgpt_local_session(jar)
 
     assert payload["session_state"] == "ready"
-    assert payload["conversation_count"] == 42
+    assert payload["conversation_count"] == 45
+    assert payload["active_count"] == 42
+    assert payload["archived_count"] == 3
     assert payload["account_email"] == "user@example.com"
 
 
@@ -296,6 +305,8 @@ def test_fetch_chatgpt_local_session_bundle_returns_conversations(
 
     def fake_fetch_json(session: module.ChatGPTHttpSession, url: str) -> object:
         if "conversations?" in url:
+            if "is_archived=true" in url:
+                return {"total": 1, "items": [{"id": "conv-old", "title": "Archived Chat"}]}
             return {
                 "total": 1,
                 "items": [{"id": "conv-1", "title": "Test Chat"}],
@@ -309,17 +320,101 @@ def test_fetch_chatgpt_local_session_bundle_returns_conversations(
                 "mapping": {"node-1": {"id": "node-1"}},
                 "current_node": "node-1",
             }
+        if "conversation/conv-old" in url:
+            return {
+                "conversation_id": "conv-old",
+                "title": "Archived Chat",
+                "create_time": 1711800000,
+                "update_time": 1711800100,
+                "mapping": {"node-2": {"id": "node-2"}},
+                "current_node": "node-2",
+            }
         raise AssertionError(f"unexpected url: {url}")
 
     monkeypatch.setattr(module, "fetch_json", fake_fetch_json)
 
     bundle = module.fetch_chatgpt_local_session_bundle(jar, limit=10)
 
-    assert bundle["fetched_count"] == 1
-    assert bundle["total_count"] == 1
-    assert bundle["conversations"][0]["conversation_id"] == "conv-1"
-    assert bundle["conversations"][0]["mapping"]["node-1"]["id"] == "node-1"
+    assert bundle["fetched_count"] == 2
+    assert bundle["total_count"] == 2
+    assert bundle["active_count"] == 1
+    assert bundle["archived_count"] == 1
+    assert bundle["acquisition_report"]["active_listed"] == 1
+    assert bundle["acquisition_report"]["archived_listed"] == 1
+    assert {c["conversation_id"] for c in bundle["conversations"]} == {"conv-1", "conv-old"}
+    archived = next(c for c in bundle["conversations"] if c["conversation_id"] == "conv-old")
+    assert archived["is_archived"] is True
+    active = next(c for c in bundle["conversations"] if c["conversation_id"] == "conv-1")
+    assert active["is_archived"] is False
+    assert bundle["conversations"][0]["mapping"]
     assert bundle["conversation_detail_failures"] == []
+
+
+def test_render_discovery_text_shows_archived_breakdown() -> None:
+    text = module.render_discovery_text(
+        {
+            "cookie_jar": "/tmp/cookies",
+            "generated_at": "2026-03-25T00:00:00+00:00",
+            "session_state": "ready",
+            "account_email": "user@example.com",
+            "account_id": "acct-1",
+            "conversation_count": 4,
+            "active_count": 2,
+            "archived_count": 2,
+            "calibration_only": True,
+            "recommended_command": "cce provider import --provider chatgpt --mode local-session",
+        }
+    )
+
+    assert "Conversations: 4 (active: 2, archived: 2)" in text
+
+
+def test_fetch_bundle_dedupes_ids_seen_in_both_buckets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    jar = tmp_path / "test.binarycookies"
+    jar.write_bytes(
+        build_binary_cookie_jar([{"domain": ".chatgpt.com", "name": "x", "value": "y"}])
+    )
+
+    monkeypatch.setattr(
+        module,
+        "build_chatgpt_session",
+        lambda cookie_jar: module.ChatGPTHttpSession(
+            cookies=[],
+            session_payload={
+                "account": {"id": "acct-1"},
+                "user": {"email": "user@example.com"},
+            },
+            access_token="tok",  # allow-secret
+            account_id="acct-1",
+            device_id="dev-1",
+        ),
+    )
+
+    def fake_fetch_json(session: module.ChatGPTHttpSession, url: str) -> object:
+        if "conversations?" in url:
+            return {
+                "total": 1,
+                "items": [{"id": "conv-1", "title": "Same", "update_time": 1}],
+            }
+        if "conversation/conv-1" in url:
+            return {
+                "conversation_id": "conv-1",
+                "title": "Same",
+                "update_time": 1,
+                "mapping": {"n": {}},
+            }
+        raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr(module, "fetch_json", fake_fetch_json)
+
+    bundle = module.fetch_chatgpt_local_session_bundle(jar, limit=10)
+
+    # The same id in both buckets is fetched once; totals reflect the API.
+    assert bundle["total_count"] == 2
+    assert len(bundle["conversations"]) == 1
+    assert bundle["conversations"][0]["conversation_id"] == "conv-1"
 
 
 def test_render_discovery_text_includes_key_fields() -> None:
@@ -777,6 +872,8 @@ def test_delta_aware_fetch_reuses_cached_conversations(
 
     def fake_fetch_json(session: module.ChatGPTHttpSession, url: str) -> object:
         if "conversations?" in url:
+            if "is_archived=true" in url:
+                return {"total": 0, "items": []}
             return {
                 "total": 2,
                 "items": [

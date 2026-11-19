@@ -180,6 +180,8 @@ def import_chatgpt_local_session_corpus(
                 "fetched_count": bundle.get("fetched_count", 0),
                 "reused_count": bundle.get("reused_count", 0),
                 "total_count": bundle.get("total_count", 0),
+                "active_count": bundle.get("active_count", 0),
+                "archived_count": bundle.get("archived_count", 0),
                 "acquisition_report": bundle.get("acquisition_report"),
             },
         )
