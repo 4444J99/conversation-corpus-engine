@@ -23,7 +23,7 @@ Authorship is decided here, per turn, from provenance:
 * a coding CLI's user turns go through `archive_provenance`: a subagent prompt or text the
   harness injected is machine, what the person typed is human;
 * an authored document is the person's own text (channel `written`);
-* notes and Drive documents already arrive as typed user turns;
+* notes arrive as typed user turns (Drive documents are put on channel `written`, the channel the contract names for text the person authored outside a chat);
 * agent memory and agent plans keep the channels the library gave them and are machine.
 
 The counts the library publishes for each family are read alongside the records and stored in
@@ -64,6 +64,9 @@ class Family:
     cli: bool = False
     # The text is the person's own writing (channel `written`).
     authored: bool = False
+    # Force human-channel user turns onto channel `written` (the channel the contract names
+    # for text the person authored outside a chat). Author is unaffected; counts do not move.
+    written_channel: bool = False
     # The text is another party's, kept as a source (a captured web page): the authorship engine
     # labels all of it `third_party` from the provider alone, never `owner`.
     third_party: bool = False
@@ -86,7 +89,15 @@ FAMILIES: tuple[Family, ...] = (
     # A note's body arrives as typed turns and its table cells as `project` turns; both are the
     # person's own writing, so every user turn of the family is human.
     Family("applenotes", "applenotes", "Apple Notes", kind="note", authored=True),
-    Family("googledrive", "googledrive", "Google Drive", kind="document", authored=True),
+    Family(
+        "googledrive",
+        "googledrive",
+        "Google Drive",
+        kind="document",
+        authored=True,
+        # A Drive document is `written` by contract (#95); the library hands it to us as `typed`.
+        written_channel=True,
+    ),
     Family(
         "documents",
         "documents",
@@ -262,6 +273,13 @@ def _convert(row: dict[str, Any], payload: dict[str, Any], family: Family) -> Co
         for message in conversation.messages:
             if message.role != "user":
                 continue
+            if (
+                family.written_channel
+                and message.channel in HUMAN_CHANNELS
+                and message.channel != WRITTEN
+            ):
+                # A Drive document is `written`, not `typed` (#95); author unchanged.
+                message.channel = WRITTEN
             # A turn already on a human channel keeps its channel as the library wrote it.
             if message.channel not in HUMAN_CHANNELS:
                 message.channel = WRITTEN
@@ -277,7 +295,9 @@ def iter_family(root: Path, tracker: SourceTracker, family: Family) -> Iterator[
     """Stream a family's records, one conversation at a time, in uid order.
 
     Reader counters carry the library's own counts for the family (`library_*`) beside what was
-    read (`bridge_*`), and the basis of every coding-CLI user turn (`basis:<author>:<basis>`).
+    read (`bridge_*`), the basis of every coding-CLI user turn (`basis:<author>:<basis>`), and a
+    `diagnostic:kind-parent-disagreement` count when `session_kind` and `parent_session_id`
+    disagree about whether the session is a spawned child.
     """
     database, pointer = locate(root)
     database_input = tracker.provenance(database, origin="library_generation")
@@ -310,7 +330,12 @@ def iter_family(root: Path, tracker: SourceTracker, family: Family) -> Iterator[
             del payload
             if family.cli:
                 for key, amount in reclassify_typed_turns(conversation).items():
-                    tracker.note(f"basis:{key}", amount)
+                    if key.startswith("diagnostic:"):
+                        # Not a basis count: surfaced in reader_counters only, so
+                        # author_basis sums stay exact (human:* sums == authors.human).
+                        tracker.note(key, amount)
+                    else:
+                        tracker.note(f"basis:{key}", amount)
             tracker.note("bridge_records")
             tracker.note("bridge_messages", len(conversation.messages))
             yield conversation

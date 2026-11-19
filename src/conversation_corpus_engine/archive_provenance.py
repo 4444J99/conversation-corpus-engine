@@ -135,7 +135,7 @@ HARNESS_PREFIXES: tuple[str, ...] = (
     "Independently review a docs-only change in the git worktree",
     "Evaluate only these comments on merged PR",
     "Name this chat from the user's first request.",
-    "The user explicitly invoked the \"/closeout\" skill. Follow its instructions now.",
+    'The user explicitly invoked the "/closeout" skill. Follow its instructions now.',
     "# Autonomous loop tick (dynamic pacing)",
     "# Autonomous loop check",
     "## Context Usage",

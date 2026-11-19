@@ -203,15 +203,39 @@ beyond the account export join `chatgpt` (an id the export already has is folded
 version staying).
 
 **Who typed a CLI turn.** A coding CLI writes everything the model sees as a user turn
-(`archive_provenance.py`). A turn is human only in a root session and only when its text is not a
-harness wrapper: every user turn of a `subagent` session is a prompt the parent agent wrote, and
-a turn that opens with a known injected tag (`system-reminder`, `task-notification`,
-`environment_context`, `session_context`, …) or a known harness template (a compaction summary, a
-skill body, hook feedback) is machine. A slash command, a shell command and pasted text are the
-person's. A tag the rules do not know is machine and counted as `unclassified-tag:<name>`; a
-plain-text template the rules do not list stays human, so a CLI family's human count is an upper
-bound that the manifest's `author_basis` lets a reader audit. Antigravity's text is recovered from
-protobuf leaves with no role, so all of it is machine.
+(`archive_provenance.py`). A turn is human only in a session with no parent and only when its text
+is not a harness wrapper: every user turn of a `subagent` session — and every user turn of a
+session that names a `parent_session_id`, even one whose `session_kind` reads `root` — is a prompt
+the parent agent wrote, and a turn that opens with a known injected tag (`system-reminder`,
+`task-notification`, `environment_context`, `session_context`, …) or a known harness template (a
+compaction summary, a skill body, hook feedback) is machine. A slash command, a shell command and
+pasted text are the person's. A tag the rules do not know is machine and counted as
+`unclassified-tag:<name>`; a plain-text template the rules do not list stays human, so a CLI
+family's human count is an upper bound that the manifest's `author_basis` lets a reader audit.
+Antigravity's text is recovered from protobuf leaves with no role, so all of it is machine. When
+`session_kind` and `parent_session_id` disagree (a `subagent` with no parent recorded, or a
+`root`/`unknown` with one) the manifest counts the disagreement per family under
+`diagnostic:kind-parent-disagreement` in `reader_counters`; the parent signal wins either way.
+
+**Known imprecision, recorded (issue #95).** The residual questions the structural fields cannot
+settle are recorded here so they are not re-litigated as defects later:
+
+- **Copilot CLI's human count is an upper bound.** The events payload (`session.start`, `tool.*`,
+  `user.message`, `assistant.message`, `system.message`) carries no spawn/parent field, so every
+  Copilot CLI session has `session_kind` `unknown` and the subagent rule cannot fire; its human
+  turns rest on leading-text classification alone. The manifest says so under `authorship_caveats`.
+  No spawn signal exists to wire in; do not reclassify on invented evidence.
+- **Uploaded source documents stay human.** Claude notebook (463) and NotebookLM (279)
+  `user`/`written` rows for uploaded sources are counted human by the contract — third-party
+  material inside an uploaded source is the account holder's upload. Changing that is a contract
+  change, not a code fix; it is out of scope.
+- **Empty human rows stay as the contract allows.** Apple Notes 447, ChatGPT 110, Gemini 15,
+  Claude 10, NotebookLM 1 text-less rows.
+- **Google Drive documents are channel `written`.** The bridge puts a Drive document's user turns
+  on `written` (author unaffected; both channels are human), matching the contract's naming.
+- **`unclassified-tag:<name>` turns are machine** (precision-first); a person who types a message
+  opening with an HTML-like tag is counted machine. **Slash and shell commands count as human**,
+  and one invocation can produce two turns. **Subagent sessions are all machine.**
 
 **Antigravity wire findings (issue #98).** The native `steps.step_payload` blobs of an Antigravity
 conversation database are protobuf, not JSON, and the message type recovered from the wire reads

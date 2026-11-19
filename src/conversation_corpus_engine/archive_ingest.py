@@ -892,6 +892,23 @@ def _ingest_provider(
     # recognized by the rules stays human:typed, so their human count is an upper bound. The
     # manifest records the audit trail in author_basis and reader_counters (basis:*).
     cli_provenance = any(key.startswith("basis:") for key in tracker.counters)
+    authorship_caveats: list[str] = []
+    if cli_provenance:
+        authorship_caveats.append(
+            "human count is an upper bound: unrecognized plain-text harness "
+            "templates remain human:typed (audit author_basis/reader_counters "
+            "basis:* and add repeated templates to HARNESS_PREFIXES)"
+        )
+    if spec.name == "copilotcli":
+        # GH#95: the Copilot events payload carries no spawn/parent field (session.start
+        # exposes only sessionId, startTime and context), so every Copilot CLI session has
+        # session_kind `unknown` and the subagent rule cannot fire. Its human turns rest on
+        # leading-text classification alone.
+        authorship_caveats.append(
+            "copilotcli human count is an upper bound: session_kind is unknown for every "
+            "Copilot CLI session (the events payload carries no spawn/parent field), so "
+            "agent-spawned sessions are not separable from typed turns by structure"
+        )
     # A captured identity remains protected after a newer account export absorbs it.
     # An explicit allow-loss merge releases only identities absent from the new store.
     live_capture_uids.update(
@@ -922,17 +939,7 @@ def _ingest_provider(
         "turn_channels": dict(sorted(turn_channels.items())),
         "authors": {author: authors[author] for author in AUTHORS},
         **({"author_basis": basis} if any(basis.values()) else {}),
-        **(
-            {
-                "authorship_caveats": [
-                    "human count is an upper bound: unrecognized plain-text harness "
-                    "templates remain human:typed (audit author_basis/reader_counters "
-                    "basis:* and add repeated templates to HARNESS_PREFIXES)"
-                ]
-            }
-            if cli_provenance
-            else {}
-        ),
+        **({"authorship_caveats": authorship_caveats} if authorship_caveats else {}),
         "created_min": min(created) if created else "",
         "last_activity_max": max(activity) if activity else "",
         "reader": spec.module.READER,

@@ -242,6 +242,9 @@ class RecordInfo:
     kind: str = ""
     wing: str = ""
     session_kind: str = ""
+    # The id of the session that spawned this one, when the source recorded it; a session that
+    # names a parent is agent-spawned even when `session_kind` reads `root`.
+    parent_session_id: str = ""
     # The record belongs to a family of the person's own writing (notes, Drive, authored files).
     authored_family: bool = False
     # Why the record as a whole is machine-made ('' when nothing says so).
@@ -328,6 +331,7 @@ def record_info(payload: Mapping[str, Any], origin_hints: OriginHints | None = N
         kind=kind,
         wing=wing,
         session_kind=str(extra.get("session_kind") or ""),
+        parent_session_id=str(extra.get("parent_session_id") or ""),
         authored_family=authored,
         agent_origin=origin,
         ai_marker=ai_marker,
@@ -436,10 +440,12 @@ def rule_agent_family(context: MessageContext) -> list[Claim]:
         return [(0, length, f"meta={marker}")]
     record = context.record
     if record.provider in CLI_PROVIDERS:
-        if record.session_kind == "subagent":
+        if record.session_kind == "subagent" or record.parent_session_id:
             return [(0, length, "basis=subagent-prompt")]
         if channel == "typed":
-            human, basis = classify_user_turn(context.text, record.session_kind)
+            human, basis = classify_user_turn(
+                context.text, record.session_kind, record.parent_session_id
+            )
             if not human:
                 return [(0, length, f"basis={basis}")]
     return []
