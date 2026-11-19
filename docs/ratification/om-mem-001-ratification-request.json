@@ -1,0 +1,78 @@
+{
+  "schema_version": "1.0",
+  "record": "om-mem-001-ratification-request",
+  "irf": "IRF-CCE-015",
+  "issue": 14,
+  "requested": "2026-11-19",
+  "status": "proposed-decision-requested",
+  "resolution": null,
+  "criterion": {
+    "id": "OM-MEM-001",
+    "proposed_number": 21,
+    "name": "Autopoietic Memory",
+    "statement": "The conversation corpus engine must be capable of ingesting transcripts from its own operational sessions as corpus artifacts, closing the self-referential feedback loop.",
+    "horizon": "H3",
+    "evidence": [
+      {
+        "id": "a",
+        "requirement": "Functional Adapter \u2014 import adapter exists for at least one AI session transcript format (e.g., SpecStory, Claude Code)."
+      },
+      {
+        "id": "b",
+        "requirement": "Self-Referential Corpus \u2014 at least one corpus consisting of engine development sessions exists in the system registry."
+      },
+      {
+        "id": "c",
+        "requirement": "Quality Gate Compliance \u2014 the self-referential corpus passes all 8 CCE evaluation gates (stability, retrieval, answer accuracy)."
+      }
+    ],
+    "measurement": "Run `cce evaluation run --root /path/to/self-referential-corpus`; all 8 regression gates must return PASS status.",
+    "gap": "SpecStory import adapter (import_specstory_session_corpus.py) does not exist. No self-referential corpus currently registered. Criterion enters the scorecard as NOT_MET if ratified."
+  },
+  "spec_path": "docs/ratification/OM-MEM-001-specification.md",
+  "source_artifacts": [
+    "docs/ratification/OM-MEM-001-specification.md",
+    "docs/ratification/omega-evidence-map.md",
+    "docs/ratification/irf-cce-015-status.md",
+    "playbooks/handoffs/gh-14-omega-ratification.md",
+    "inquiry-log.yaml"
+  ],
+  "amendment_route": {
+    "canonical_owner": "meta-organvm/organvm-engine",
+    "decision_request_issue": "https://github.com/4444J99/organvm-engine/issues/239",
+    "canonical_definition_doc": "meta-organvm/organvm-corpvs-testamentvm \u2014 docs/strategy/there+back-again.md",
+    "canonical_evidence_map": "meta-organvm/organvm-corpvs-testamentvm \u2014 docs/evaluation/omega-evidence-map.md",
+    "scorecard_implementation": "src/organvm_engine/omega/scorecard.py (organvm-engine)",
+    "human_gate": "Omega amendments require (1) documented rationale with source citation, (2) human approval by @4444j99, (3) propagation to all affected documents (per docs/memory/constitution.md, Amendments). Agents may prepare and route but may not attest ratification."
+  },
+  "impact_if_ratified": {
+    "criteria_count": "20 -> 21",
+    "met_count": "9 -> 9 (unchanged)",
+    "new_criterion_status": "NOT_MET",
+    "numbering": "assign the next free id (proposed",
+    "propagation_surfaces": [
+      {
+        "organvm-engine": "src/organvm_engine/omega/scorecard.py (add OmegaCriterion)"
+      },
+      {
+        "organvm-corpvs-testamentvm": "docs/strategy/there+back-again.md (criterion definition)"
+      },
+      {
+        "organvm-corpvs-testamentvm": "docs/evaluation/omega-evidence-map.md (summary, detail, revision log)"
+      },
+      {
+        "conversation-corpus-engine": "playbooks/handoffs/gh-14-omega-ratification.md"
+      },
+      {
+        "conversation-corpus-engine": "docs/ratification/irf-cce-015-status.md"
+      },
+      {
+        "conversation-corpus-engine": "docs/ratification/omega-evidence-map.md"
+      },
+      {
+        "conversation-corpus-engine": "inquiry-log.yaml (INQ-CCE-001)"
+      }
+    ]
+  },
+  "decision_record": null
+}
