@@ -11,18 +11,25 @@
 > flat and legacy gizmo-wrapped entries (mocked unit tests in
 > `tests/test_chatgpt_local_session.py`).
 >
-> **Still open — live verification and possible endpoint correction:** the exact
-> Projects list/detail/chat/file endpoints and response shapes could not be
-> observed from this environment (no valid session — see GH#15). GH#16 issue
-> comments report browser-reverse-engineered findings (e.g.
-> `/backend-api/gizmos/snorlax/sidebar` for listing, project-scoped
-> conversation/file routes, and a silent no-op trap for
-> `/backend-api/conversations?gizmo_id=...`) that must be confirmed on an
-> authorized session before treating the API contract as correct. `fetch_chatgpt_project()`
-> may also under-cover chats if it only derives conversations from saved-file
-> metadata; validate and fix with observed evidence. Keep tokens/private project
-> data out of GitHub; attach only sanitized receipts. The registry/routing/status
-> machinery is endpoint-agnostic.
+> **2026-11-19 update:** `fetch_chatgpt_project()` now enumerates project
+> conversations from the project-scoped endpoint reported in the owner's
+> 2026-07-05 browser-capture comment on GH#16
+> (`backend-api/gizmos/{project_id}/conversations`, cursor-paginated,
+> `limit=28`), independent of saved-file metadata (the silent under-coverage
+> bug), falling back to file-derived conversation ids if the listing fails.
+> Project files with `location: "fs"` are now downloaded by `file_id` via the
+> two-step `backend-api/files/download/{file_id}` → estuary-content flow
+> (the project-file wrapper `id` does not work); files whose download fails
+> fall back to the saved-message text extraction. All of this is unit-tested
+> with mocked responses; the `backend-api/conversations?gizmo_id=` trap is
+> deliberately unused.
+>
+> **Still open — live verification:** the Projects-list path (`backend-api/projects`)
+> is not yet live-verified; the conversations/download paths are the owner's
+> observed evidence but still lack an authorized-session integration run.
+> Nothing may be treated as a confirmed API contract until that run happens
+> (GH#15). Keep tokens/private project data out of GitHub; attach only
+> sanitized receipts. The registry/routing/status machinery is endpoint-agnostic.
 
 ## Current State
 
@@ -82,8 +89,9 @@ API discovery endpoint is wrong.
 - [x] Remove GPT Store gizmos discovery usage from project discovery path
 - [x] Point discovery/detail to Projects-style path constants + tolerant parsing (pending live verification)
 - [x] Unit tests for discovery endpoint + parsing (mocked, including pagination/error cases where added)
+- [x] Project chat enumeration via `backend-api/gizmos/{project_id}/conversations` (2026-11-19, mocked tests; replaces saved-file-derived enumeration)
+- [x] Project `fs` file download via `file_id` + estuary content URL (2026-11-19, mocked tests)
 - [ ] Live-verify correct Projects endpoints/shapes on an authorized session (GH#15)
-- [ ] Confirm/fix project chat enumeration and file download coverage in `fetch_chatgpt_project()`
 - [ ] GH#16 closed with sanitized integration evidence
 
 ## Key Decisions

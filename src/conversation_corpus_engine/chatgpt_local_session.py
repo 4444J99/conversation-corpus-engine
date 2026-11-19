@@ -302,6 +302,35 @@ def _request_json(
         raise ChatGPTLocalSessionError(f"Network error while fetching {url}: {error}") from error
 
 
+def _request_bytes(
+    cookies: list[Cookie],
+    url: str,
+    *,
+    extra_headers: dict[str, str] | None = None,
+    timeout: int = 60,
+) -> bytes:
+    headers: dict[str, str] = {
+        "Cookie": build_cookie_header(cookies, url),
+        "User-Agent": CHATGPT_USER_AGENT,
+        "Accept": "*/*",
+        "Referer": f"https://{CHATGPT_HOST}/",
+        "Origin": f"https://{CHATGPT_HOST}",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+    request = Request(url, headers=headers, method="GET")
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return bytes(response.read())
+    except HTTPError as error:
+        body = error.read().decode("utf-8", "replace")
+        raise ChatGPTLocalSessionError(
+            f"{error.code} while fetching {url}: {body[:500]}"
+        ) from error
+    except URLError as error:
+        raise ChatGPTLocalSessionError(f"Network error while fetching {url}: {error}") from error
+
+
 def _fetch_session(cookies: list[Cookie]) -> dict[str, Any]:
     url = f"https://{CHATGPT_HOST}/api/auth/session"
     payload = _request_json(cookies, url)
@@ -378,6 +407,10 @@ def _auth_headers(session: ChatGPTHttpSession) -> dict[str, str]:
 
 def fetch_json(session: ChatGPTHttpSession, url: str) -> Any:
     return _request_json(session.cookies, url, extra_headers=_auth_headers(session))
+
+
+def fetch_bytes(session: ChatGPTHttpSession, url: str) -> bytes:
+    return _request_bytes(session.cookies, url, extra_headers=_auth_headers(session))
 
 
 # ---------------------------------------------------------------------------
@@ -651,13 +684,15 @@ def fetch_chatgpt_project(
     """Extract a ChatGPT Project's files and conversations to a local directory.
 
     Notes (GH#16 / IRF-CCE-027): endpoint paths, response shapes, and source-file
-    download mechanics require live verification on an authorized session. Current
-    implementation derives conversation exports from saved-file metadata in the
-    project detail payload; issue discussion reports this may under-cover project
-    chats (missing conversations that produced no saved source files) and suggests
-    project-scoped conversation listing endpoints to confirm. Do not guess API
-    contracts; validate with observed network evidence and keep private data out of
-    the repo.
+    download mechanics are based on the browser network capture reported in the issue
+    (2026-07-05) and still require live verification on an authorized session.
+    Conversations are enumerated from the project-scoped conversations endpoint
+    (``backend-api/gizmos/{project_id}/conversations``), independent of which chats
+    produced a saved source file; if that listing fails the extraction falls back to
+    the conversations referenced by saved-file metadata and says so in the output.
+    Project files with ``location: "fs"`` are downloaded by ``file_id`` (the
+    project-file wrapper id does not work); files whose download fails fall back to
+    feeding the text parts of their saved message. Keep private data out of the repo.
     """
     session = build_chatgpt_session(cookie_jar)
     output_root = output_root.resolve()
@@ -676,42 +711,89 @@ def fetch_chatgpt_project(
     convos_dir = output_root / "conversations"
     convos_dir.mkdir(parents=True, exist_ok=True)
 
+    def _slugify(text: str) -> str:
+        s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+        return s[:60] if s else "untitled"
+
+    seen_names: dict[str, int] = {}
+
+    def _out_name(name: str) -> str:
+        if name not in seen_names:
+            seen_names[name] = 0
+            return name
+        seen_names[name] += 1
+        base, ext = name.rsplit(".", 1) if "." in name else (name, "txt")
+        return f"{base}-{seen_names[name]}.{ext}"
+
     conv_groups: dict[str, list[dict[str, Any]]] = {}
     for f in files:
+        if not isinstance(f, dict):
+            continue
         meta = (f.get("metadata") or {}).get("project_save") or {}
         cid = meta.get("conversation_id", "")
         if cid:
             conv_groups.setdefault(cid, []).append(f)
 
-    def _slugify(text: str) -> str:
-        s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
-        return s[:60] if s else "untitled"
+    # GH#16: enumerate the project's conversations from the Chats-tab endpoint, not
+    # from saved-file metadata (which silently missed every chat without a save).
+    listing_error: str | None = None
+    listed_ids: list[str] = []
+    try:
+        listing = fetch_project_conversations(session, project_id)
+        listed_ids = [str(item["id"]) for item in listing if item.get("id")]
+    except ChatGPTLocalSessionError as exc:
+        listing_error = str(exc)
+    ordered_ids = list(dict.fromkeys([*listed_ids, *conv_groups]))
+    conversation_listing = (
+        "project-conversations-endpoint"
+        if listing_error is None
+        else f"saved-file-metadata-fallback ({listing_error})"
+    )
 
-    extracted_files = 0
-    seen_names: dict[str, int] = {}
+    # GH#16: project files carry location "fs" and a file_id; the project-file wrapper
+    # id does not download. Fall back to text extraction when a download fails.
+    downloaded_file_ids: set[str] = set()
+    file_failures: list[dict[str, str]] = []
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        file_id = f.get("file_id")
+        if f.get("location") != "fs" or not file_id:
+            continue
+        name = f.get("name", "unnamed.bin")
+        try:
+            payload = fetch_project_file_bytes(session, project_id, str(file_id))
+            (files_dir / _out_name(name)).write_bytes(payload)
+            downloaded_file_ids.add(str(file_id))
+        except Exception as exc:
+            file_failures.append({"name": name, "error": str(exc)})
+
     conv_mappings: dict[str, dict[str, Any]] = {}
-
-    for cid, file_group in conv_groups.items():
+    detail_failures: list[dict[str, str]] = []
+    for cid in ordered_ids:
         try:
             time.sleep(3)
             detail = fetch_json(session, f"https://{CHATGPT_HOST}/backend-api/conversation/{cid}")
-            mapping = detail.get("mapping") or {}
             conv_mappings[cid] = detail
-        except Exception:
+        except Exception as exc:
+            detail_failures.append({"id": cid, "error": str(exc)})
+
+    extracted_files = 0
+
+    for cid, file_group in conv_groups.items():
+        detail = conv_mappings.get(cid)
+        if detail is None:
             continue
+        mapping = detail.get("mapping") or {}
 
         for f in file_group:
+            file_id = str(f.get("file_id") or "")
+            if file_id and file_id in downloaded_file_ids:
+                continue
             meta = (f.get("metadata") or {}).get("project_save") or {}
             msg_id = meta.get("message_id", "")
             name = f.get("name", "unnamed.txt")
-
-            if name in seen_names:
-                seen_names[name] += 1
-                base, ext = name.rsplit(".", 1) if "." in name else (name, "txt")
-                out_name = f"{base}-{seen_names[name]}.{ext}"
-            else:
-                seen_names[name] = 0
-                out_name = name
+            out_name = _out_name(name)
 
             node = mapping.get(msg_id, {})
             parts = (node.get("message") or {}).get("content", {}).get("parts", [])
@@ -758,6 +840,10 @@ def fetch_chatgpt_project(
         "project_name": project_name,
         "output_root": str(output_root),
         "file_count": extracted_files,
+        "downloaded_files": len(downloaded_file_ids),
+        "file_download_failures": file_failures,
+        "conversation_detail_failures": detail_failures,
+        "conversation_listing": conversation_listing,
         "total_files": len(files),
         "conversation_count": extracted_convos,
         "conversation_ids": list(conv_mappings.keys()),
@@ -790,12 +876,22 @@ def render_discovery_text(payload: dict[str, Any]) -> str:
 #
 # Current implementation targets the Projects-style paths below. Endpoint paths
 # and JSON shapes MUST be live-verified against an authorized session (browser
-# DevTools): issue discussion reports ``backend-api/gizmos/snorlax/sidebar`` and
-# project-scoped gizmo routes as alternatives. Parsing helpers are kept tolerant
-# of flat and legacy gizmo-wrapped entries; adjust path constants only with
-# observed evidence. See playbooks/handoffs/gh-16-chatgpt-projects-endpoint.md.
+# DevTools). The conversations-listing and file-download paths ARE the owner's
+# 2026-07-05 browser-capture evidence (see issue #16); the Projects-list path
+# itself is not yet live-verified. See playbooks/handoffs/gh-16-chatgpt-projects-endpoint.md.
 PROJECTS_LIST_PATH = "backend-api/projects"
 PROJECT_DETAIL_PATH = "backend-api/projects/{project_id}"
+# Project chats (the "Chats" tab). Observed 2026-07-05 via browser network capture: cursor-
+# paginated, `limit` maxes out low (28 worked; 100 errors). The tempting
+# ``backend-api/conversations?gizmo_id={project_id}`` is a silent no-op that returns the
+# account's general recent conversations and must never be used (GH#16 / IRF-CCE-027).
+PROJECT_CONVERSATIONS_PATH = "backend-api/gizmos/{project_id}/conversations"
+PROJECT_CONVERSATIONS_LIMIT = 28
+# Project source files (the "Sources" tab). Project files carry ``location: "fs"`` and a
+# ``file_id`` of the form ``file_000000...``; the project-file wrapper ``id`` does NOT work
+# for downloads (``file_not_found``). The estuary URL the download call returns must be
+# fetched with the same session headers.
+PROJECT_FILE_DOWNLOAD_PATH = "backend-api/files/download/{file_id}"
 
 EXTRACTION_STATES = (
     "discovered",
@@ -975,6 +1071,71 @@ def discover_chatgpt_projects(
         offset += limit
         time.sleep(1)
     return projects
+
+
+def fetch_project_conversations(
+    session: ChatGPTHttpSession, project_id: str
+) -> list[dict[str, Any]]:
+    """List a project's conversations (the Chats tab), cursor-paginated.
+
+    Uses the project-scoped conversations endpoint, independent of which chats produced a
+    saved source file (GH#16: deriving conversations from saved-file metadata silently
+    under-covered project chats). Raises ChatGPTLocalSessionError when the listing fails;
+    callers that want a best-effort result fall back to file-derived conversation ids.
+    """
+    conversations: list[dict[str, Any]] = []
+    cursor: str | None = None
+    while True:
+        params: dict[str, Any] = {"limit": PROJECT_CONVERSATIONS_LIMIT}
+        if cursor:
+            params["cursor"] = cursor
+        url = (
+            f"https://{CHATGPT_HOST}/"
+            f"{PROJECT_CONVERSATIONS_PATH.format(project_id=project_id)}?{urlencode(params)}"
+        )
+        page = fetch_json(session, url)
+        items = page.get("items") if isinstance(page, dict) else None
+        if not isinstance(items, list):
+            raise ChatGPTLocalSessionError(
+                f"Project conversations listing for {project_id} carried no items list."
+            )
+        next_cursor = page.get("cursor")
+        if next_cursor and next_cursor == cursor:
+            # Not advancing: do not re-read the same page forever.
+            break
+        conversations.extend(item for item in items if isinstance(item, dict))
+        if not next_cursor:
+            break
+        cursor = str(next_cursor)
+        time.sleep(1)
+    return conversations
+
+
+def fetch_project_file_download(
+    session: ChatGPTHttpSession, project_id: str, file_id: str
+) -> dict[str, Any]:
+    """Step 1 of the project source-file download: resolve the estuary download URL."""
+    params = {"gizmo_id": project_id, "inline": "false", "download_intent": "false"}
+    url = (
+        f"https://{CHATGPT_HOST}/"
+        f"{PROJECT_FILE_DOWNLOAD_PATH.format(file_id=file_id)}?{urlencode(params)}"
+    )
+    payload = fetch_json(session, url)
+    if not isinstance(payload, dict) or not payload.get("download_url"):
+        raise ChatGPTLocalSessionError(
+            f"Download resolution for file {file_id} carried no download_url."
+        )
+    return payload
+
+
+def fetch_project_file_bytes(session: ChatGPTHttpSession, project_id: str, file_id: str) -> bytes:
+    """Step 2 of the project source-file download: fetch the estuary content bytes.
+
+    The URL points at ``/backend-api/estuary/content?...`` and 404s without the same
+    session headers, so it goes through ``fetch_bytes`` rather than a plain GET.
+    """
+    payload = fetch_project_file_download(session, project_id, file_id)
+    return fetch_bytes(session, str(payload["download_url"]))
 
 
 def set_project_route(

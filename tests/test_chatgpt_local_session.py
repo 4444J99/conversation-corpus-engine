@@ -796,3 +796,213 @@ def test_delta_aware_fetch_reuses_cached_conversations(
     assert bundle["acquisition_report"]["fetched_count"] == 1
     assert fetch_calls == ["conv-2"]
     assert len(bundle["conversations"]) == 2
+
+
+def _project_jar(tmp_path: Path, name: str = "test.binarycookies") -> Path:
+    jar = tmp_path / name
+    jar.write_bytes(
+        build_binary_cookie_jar([{"domain": ".chatgpt.com", "name": "x", "value": "y"}])
+    )
+    return jar
+
+
+def test_fetch_project_conversations_paginates_until_cursor_null(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_urls: list[str] = []
+
+    def fake_fetch_json(session: object, url: str) -> object:
+        seen_urls.append(url)
+        if "cursor=" not in url:
+            return {"items": [{"id": "conv-1"}], "cursor": "page-2"}
+        if "cursor=page-2" in url:
+            return {"items": [{"id": "conv-2"}], "cursor": None}
+        raise AssertionError(f"unexpected url {url}")
+
+    monkeypatch.setattr(module, "fetch_json", fake_fetch_json)
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+
+    listing = module.fetch_project_conversations(_fake_project_session(), "g-p-x")
+
+    assert [item["id"] for item in listing] == ["conv-1", "conv-2"]
+    # Project-scoped conversations endpoint, never the silent gizmo_id no-op.
+    assert all("gizmos/g-p-x/conversations" in url for url in seen_urls)
+    assert all("gizmo_id=" not in url for url in seen_urls)
+    assert any("limit=28" in url for url in seen_urls)
+
+
+def test_fetch_project_conversations_stops_on_repeated_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(
+        module,
+        "fetch_json",
+        lambda session, url: {"items": [{"id": "conv-1"}], "cursor": "same"},
+    )
+    assert module.fetch_project_conversations(_fake_project_session(), "g-p-x") == [
+        {"id": "conv-1"}
+    ]
+
+
+def test_fetch_project_conversations_raises_without_items_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module, "fetch_json", lambda session, url: {"nope": True})
+    with pytest.raises(ChatGPTLocalSessionError):
+        module.fetch_project_conversations(_fake_project_session(), "g-p-x")
+
+
+def test_fetch_project_file_download_resolves_estuary_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen_urls: list[str] = []
+
+    def fake_fetch_json(session: object, url: str) -> object:
+        seen_urls.append(url)
+        return {
+            "status": "success",
+            "download_url": "https://chatgpt.com/backend-api/estuary/content?id=file_000&sig=abc",
+            "mime_type": "text/plain",
+        }
+
+    def fake_fetch_bytes(session: object, url: str) -> bytes:
+        seen_urls.append(url)
+        return b"file-bytes"
+
+    monkeypatch.setattr(module, "fetch_json", fake_fetch_json)
+    monkeypatch.setattr(module, "fetch_bytes", fake_fetch_bytes)
+
+    payload = module.fetch_project_file_bytes(_fake_project_session(), "g-p-x", "file_000")
+
+    assert payload == b"file-bytes"
+    assert seen_urls[0].startswith(
+        f"https://{module.CHATGPT_HOST}/backend-api/files/download/file_000?"
+    )
+    assert "gizmo_id=g-p-x" in seen_urls[0]
+    assert seen_urls[1] == "https://chatgpt.com/backend-api/estuary/content?id=file_000&sig=abc"
+
+
+def test_fetch_project_file_download_requires_download_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module, "fetch_json", lambda session, url: {"status": "success"})
+    with pytest.raises(ChatGPTLocalSessionError, match="download_url"):
+        module.fetch_project_file_bytes(_fake_project_session(), "g-p-x", "file_000")
+
+
+def test_fetch_chatgpt_project_enumerates_chats_independent_of_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    jar = _project_jar(tmp_path)
+    monkeypatch.setattr(module, "build_chatgpt_session", lambda cookie_jar: _fake_project_session())
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+
+    detail = {
+        "mapping": {
+            "n1": {
+                "message": {
+                    "id": "n1",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["hello from chat"]},
+                }
+            }
+        },
+        "title": "Chat title",
+    }
+
+    def fake_fetch_json(session: object, url: str) -> object:
+        if url.endswith("backend-api/projects/g-p-x"):
+            # One fs file whose saved message produced no conversation (the under-coverage trap)
+            # and no file_id of its own points at conv-save.
+            return {
+                "id": "g-p-x",
+                "name": "Project X",
+                "files": [
+                    {
+                        "id": "wrapper-1",
+                        "file_id": "file_000abc",
+                        "location": "fs",
+                        "name": "notes.md",
+                        "metadata": {"project_save": {"conversation_id": "conv-save"}},
+                    }
+                ],
+            }
+        if "gizmos/g-p-x/conversations" in url:
+            return {"items": [{"id": "conv-listed"}], "cursor": None}
+        if url.endswith("backend-api/conversation/conv-listed"):
+            return {**detail, "conversation_id": "conv-listed"}
+        if url.endswith("backend-api/conversation/conv-save"):
+            return {**detail, "conversation_id": "conv-save"}
+        if "files/download/file_000abc" in url:
+            return {
+                "status": "success",
+                "download_url": "https://chatgpt.com/backend-api/estuary/content?id=file_000abc&sig=s",
+            }
+        raise AssertionError(f"unexpected fetch: {url}")
+
+    monkeypatch.setattr(module, "fetch_json", fake_fetch_json)
+    monkeypatch.setattr(module, "fetch_bytes", lambda session, url: b"raw-notes")
+
+    result = module.fetch_chatgpt_project("g-p-x", tmp_path / "out", cookie_jar=jar)
+
+    # The listed chat that produced no saved file is still extracted.
+    assert set(result["conversation_ids"]) == {"conv-listed", "conv-save"}
+    assert result["conversation_listing"] == "project-conversations-endpoint"
+    assert result["downloaded_files"] == 1
+    assert (tmp_path / "out" / "files" / "notes.md").read_bytes() == b"raw-notes"
+    assert (tmp_path / "out" / "conversations" / "chat-title--conv-lis.md").is_file()
+    assert (tmp_path / "out" / "conversations" / "chat-title--conv-sav.md").is_file()
+
+
+def test_fetch_chatgpt_project_falls_back_to_file_derived_conversations(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    jar = _project_jar(tmp_path, "test2.binarycookies")
+    monkeypatch.setattr(module, "build_chatgpt_session", lambda cookie_jar: _fake_project_session())
+    monkeypatch.setattr(module.time, "sleep", lambda _s: None)
+
+    detail = {
+        "mapping": {
+            "n1": {
+                "message": {
+                    "id": "n1",
+                    "author": {"role": "user"},
+                    "content": {"content_type": "text", "parts": ["saved text"]},
+                }
+            }
+        },
+        "title": "Saved",
+    }
+
+    def fake_fetch_json(session: object, url: str) -> object:
+        if url.endswith("backend-api/projects/g-p-y"):
+            return {
+                "id": "g-p-y",
+                "name": "Project Y",
+                "files": [
+                    {
+                        "id": "wrapper-1",
+                        "name": "saved.txt",
+                        "metadata": {
+                            "project_save": {
+                                "conversation_id": "conv-save",
+                                "message_id": "n1",
+                            }
+                        },
+                    }
+                ],
+            }
+        if "gizmos/g-p-y/conversations" in url:
+            raise module.ChatGPTLocalSessionError("403 while fetching gizmos")
+        if url.endswith("backend-api/conversation/conv-save"):
+            return detail
+        raise AssertionError(f"unexpected fetch: {url}")
+
+    monkeypatch.setattr(module, "fetch_json", fake_fetch_json)
+
+    result = module.fetch_chatgpt_project("g-p-y", tmp_path / "out", cookie_jar=jar)
+
+    assert result["conversation_ids"] == ["conv-save"]
+    assert result["conversation_listing"].startswith("saved-file-metadata-fallback")
+    assert (tmp_path / "out" / "files" / "saved.txt").read_text(encoding="utf-8") == "saved text"
