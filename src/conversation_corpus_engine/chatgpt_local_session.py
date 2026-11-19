@@ -418,6 +418,25 @@ def fetch_bytes(session: ChatGPTHttpSession, url: str) -> bytes:
 # ---------------------------------------------------------------------------
 
 
+# ChatGPT's conversation list is scoped by the ``is_archived`` flag. A session
+# that only queries the default (active) view silently undercounts the account
+# — observed in GH#15 where 2 active + 2 archived were visible but discovery
+# reported 2. Both lists must be queried and summed.
+CONVERSATION_LIST_ARCHIVED_FLAGS = ("false", "true")
+
+
+def _list_conversations_total(session: ChatGPTHttpSession, is_archived: str) -> int:
+    url = (
+        f"https://{CHATGPT_HOST}/backend-api/conversations?"
+        f"{urlencode({'offset': 0, 'limit': 1, 'is_archived': is_archived})}"
+    )
+    page = fetch_json(session, url)
+    try:
+        return int(page.get("total", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def discover_chatgpt_local_session(
     cookie_jar: Path = DEFAULT_CHATGPT_COOKIE_JAR,
 ) -> dict[str, Any]:
@@ -425,9 +444,9 @@ def discover_chatgpt_local_session(
     account = session.session_payload.get("account") or {}
     user = session.session_payload.get("user") or {}
 
-    url = f"https://{CHATGPT_HOST}/backend-api/conversations?{urlencode({'offset': 0, 'limit': 1})}"
-    conversations_page = fetch_json(session, url)
-    total_count = conversations_page.get("total", 0)
+    active_total = _list_conversations_total(session, "false")
+    archived_total = _list_conversations_total(session, "true")
+    total_count = active_total + archived_total
 
     return {
         "generated_at": now_iso(),
@@ -439,6 +458,8 @@ def discover_chatgpt_local_session(
         "account_email": user.get("email") or account.get("email") or "",
         "account_name": user.get("name") or "",
         "conversation_count": total_count,
+        "active_count": active_total,
+        "archived_count": archived_total,
         "recommended_command": (
             "cce provider import --provider chatgpt --mode local-session --register --build"
         ),
@@ -578,22 +599,51 @@ def fetch_chatgpt_local_session_bundle(
     account = session.session_payload.get("account") or {}
     user = session.session_payload.get("user") or {}
 
-    # Paginate all conversations
+    # Paginate all conversations across both the active and archived lists.
+    # Querying only ``is_archived=false`` silently drops archived conversations
+    # (GH#15). Items are tagged with the bucket they came from and de-duplicated
+    # by id (active wins) in case the API ever returns an id in both lists.
     all_items: list[dict[str, Any]] = []
-    current_offset = offset
-    while True:
-        url = (
-            f"https://{CHATGPT_HOST}/backend-api/conversations?"
-            f"{urlencode({'offset': current_offset, 'limit': limit, 'is_archived': 'false'})}"
-        )
-        conversations_page = fetch_json(session, url)
-        items = conversations_page.get("items") or []
-        all_items.extend(items)
-        if len(items) < limit:
-            break
-        current_offset += limit
-
-    total_count = conversations_page.get("total", len(all_items)) if all_items else 0
+    seen_ids: set[str] = set()
+    total_count = 0
+    active_listed = 0
+    archived_listed = 0
+    for flag in CONVERSATION_LIST_ARCHIVED_FLAGS:
+        archived = flag == "true"
+        current_offset = offset
+        bucket_total: int | None = None
+        bucket_count = 0
+        while True:
+            url = (
+                f"https://{CHATGPT_HOST}/backend-api/conversations?"
+                f"{urlencode({'offset': current_offset, 'limit': limit, 'is_archived': flag})}"
+            )
+            conversations_page = fetch_json(session, url)
+            if bucket_total is None and "total" in conversations_page:
+                try:
+                    bucket_total = int(conversations_page.get("total") or 0)
+                except (TypeError, ValueError):
+                    bucket_total = 0
+            items = conversations_page.get("items") or []
+            for item in items:
+                tagged = dict(item)
+                tagged.setdefault("is_archived", archived)
+                conversation_id = tagged.get("id")
+                if conversation_id:
+                    if conversation_id in seen_ids:
+                        continue
+                    seen_ids.add(conversation_id)
+                all_items.append(tagged)
+                bucket_count += 1
+            if len(items) < limit:
+                break
+            current_offset += limit
+        # Fall back to the listed count when the API omits ``total``.
+        total_count += bucket_total if bucket_total is not None else bucket_count
+        if archived:
+            archived_listed = bucket_count
+        else:
+            active_listed = bucket_count
     prior = prior_state or {}
     full_refresh = not prior
 
@@ -630,6 +680,9 @@ def fetch_chatgpt_local_session_bundle(
             detail_url = f"https://{CHATGPT_HOST}/backend-api/conversation/{conversation_id}"
             detail = fetch_json(session, detail_url)
             normalized = _normalize_conversation_detail(detail)
+            if "is_archived" not in detail and "is_archived" in item:
+                # The list bucket is authoritative when the detail payload omits it.
+                normalized["is_archived"] = item["is_archived"]
             conversations_json.append(normalized)
             fetched_count += 1
             if output_root is not None:
@@ -646,6 +699,8 @@ def fetch_chatgpt_local_session_bundle(
     acquisition_report = {
         "generated_at": now_iso(),
         "total_listed": len(all_items),
+        "active_listed": active_listed,
+        "archived_listed": archived_listed,
         "fetched_count": fetched_count,
         "reused_count": reused_count,
         "skipped_count": skipped_count,
@@ -664,6 +719,8 @@ def fetch_chatgpt_local_session_bundle(
         "conversations": conversations_json,
         "conversation_detail_failures": detail_failures,
         "total_count": total_count,
+        "active_count": active_listed,
+        "archived_count": archived_listed,
         "fetched_count": fetched_count,
         "reused_count": reused_count,
         "acquisition_report": acquisition_report,
@@ -856,7 +913,12 @@ def render_discovery_text(payload: dict[str, Any]) -> str:
         f"Generated: {payload['generated_at']}",
         f"Session state: {payload['session_state']}",
         f"Account: {payload.get('account_email') or payload.get('account_id') or 'unknown'}",
-        f"Conversations: {payload['conversation_count']}",
+        f"Conversations: {payload['conversation_count']}"
+        + (
+            f" (active: {payload['active_count']}, archived: {payload['archived_count']})"
+            if "active_count" in payload and "archived_count" in payload
+            else ""
+        ),
         f"Calibration only: {payload['calibration_only']}",
         f"Recommended command: {payload['recommended_command']}",
     ]

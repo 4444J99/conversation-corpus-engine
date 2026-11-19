@@ -6,7 +6,7 @@ This project follows semantic versioning as reflected in git tags and GitHub Rel
 
 ## [Unreleased]
 
-- None — all tracked items released in v0.3.1.
+- IRF-CCE-026 (#15): ChatGPT local-session adapter now queries both the active and archived conversation lists (`is_archived=false|true`). Discovery sums both buckets and reports `active_count`/`archived_count`; the bundle importer paginates, tags, and de-duplicates both lists so archived conversations are no longer silently invisible to discovery, import, or the acquisition report. The 633→4 degradation itself remains server-side (session scope) and still requires operator re-auth or the official data export per `playbooks/scope-recovery.md`; `scope_preflight_check()` continues to fail closed.
 
 ## [0.3.1] - 2026-11-18
 
