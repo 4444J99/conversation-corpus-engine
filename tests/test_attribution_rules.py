@@ -249,6 +249,10 @@ def test_subagent_prompts_and_harness_templates_are_agent() -> None:
     assert [s.rule for s in run(injected, record=CLI)] == ["agent_family"]
     typed = "Please rename the module."
     assert view(typed, run(typed, record=CLI)) == [("typed_prefix", "owner", typed)]
+    spawned = RecordInfo(
+        provider="codex", kind="session", session_kind="root", parent_session_id="p-1"
+    )
+    assert view(typed, run(typed, record=spawned)) == [("agent_family", "agent", typed)]
 
 
 def test_message_metadata_marking_agent_origin_makes_the_turn_agent() -> None:

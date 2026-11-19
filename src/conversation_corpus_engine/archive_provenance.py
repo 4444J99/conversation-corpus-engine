@@ -122,13 +122,37 @@ HARNESS_PREFIXES: tuple[str, ...] = (
     "You are a worker in the autonomous development team.",
     "[Scheduled prompt #",
     "[PR COMMENT FIX REQUEST",
+    "[PR CHECK FIX REQUEST",
+    "[structured-output-enforce]",
+    "[handback-send-enforce]",
+    "[Cross-session idle notice]",
+    "You are an independent code reviewer.",
+    "You are a subagent handling",
+    "You are working in a local workspace for a pull request this project opened.",
+    "You are working in a git worktree at:",
+    "You are working in PR ",
+    "Read-only web verification.",
+    "Independently review a docs-only change in the git worktree",
+    "Evaluate only these comments on merged PR",
+    "Name this chat from the user's first request.",
+    'The user explicitly invoked the "/closeout" skill. Follow its instructions now.',
+    "# Autonomous loop tick (dynamic pacing)",
+    "# Autonomous loop check",
+    "## Context Usage",
+    "# Pull Request Creation",
 )
 _LOOP_WAKEUP = re.compile(r"^\[\d+ prior /loop wakeups?")
 
 
-def classify_user_turn(text: str, session_kind: str) -> tuple[bool, str]:
-    """(typed by the person, basis) for one user-role turn of a coding CLI transcript."""
-    if session_kind == SUBAGENT:
+def classify_user_turn(
+    text: str, session_kind: str, parent_session_id: str = ""
+) -> tuple[bool, str]:
+    """(typed by the person, basis) for one user-role turn of a coding CLI transcript.
+
+    A session that names a parent is a child the parent agent spawned, even when its
+    ``session_kind`` reads ``root``: the parent wrote every prompt of that transcript.
+    """
+    if session_kind == SUBAGENT or parent_session_id:
         return False, BASIS_SUBAGENT
     stripped = text.lstrip()
     if stripped.startswith(HARNESS_PREFIXES) or _LOOP_WAKEUP.match(stripped):
@@ -152,11 +176,18 @@ def reclassify_typed_turns(conversation: Conversation) -> Counter[str]:
     channel gets `meta.author_basis`. The counter is keyed `human:<basis>` or `machine:<basis>`.
     """
     session_kind = str(conversation.extra.get("session_kind") or "")
+    parent = str(conversation.extra.get("parent_session_id") or "")
     counts: Counter[str] = Counter()
+    # The two spawn signals disagree when exactly one of them fires: a `subagent` with no
+    # parent recorded, or a `root`/`unknown` with one. Count the disagreements per family
+    # (`diagnostic:kind-parent-disagreement`) so a future audit can see the fields are
+    # unreliable for that family; the parent signal wins either way.
+    if (session_kind == SUBAGENT) != bool(parent):
+        counts["diagnostic:kind-parent-disagreement"] += 1
     for message in conversation.messages:
         if message.role != "user" or message.channel != "typed":
             continue
-        human, basis = classify_user_turn(message.text, session_kind)
+        human, basis = classify_user_turn(message.text, session_kind, parent)
         message.meta[BASIS_KEY] = basis
         if not human:
             message.channel = SYSTEM_CHANNEL

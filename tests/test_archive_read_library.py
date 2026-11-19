@@ -287,6 +287,8 @@ def test_notes_and_drive_are_the_persons_including_table_cells(
     assert notes["turn_channels"] == {"typed": 1, "written": 1}
     drive = manifest["providers"]["googledrive"]
     assert (drive["kinds"], drive["authors"]) == ({"document": 1}, {HUMAN: 1, MACHINE: 0})
+    # A Drive document is `written` by contract, not `typed` (#95); author unchanged.
+    assert drive["turn_channels"] == {"written": 1}
 
 
 def test_the_librarys_documents_split_by_who_wrote_them(archive_env, library_root: Path) -> None:
@@ -667,6 +669,54 @@ def test_library_family_bodies_are_found_by_body_search(
     assert [m.author for m in stored.messages] == [HUMAN]
 
 
+def test_a_root_session_with_a_parent_reads_as_the_parents_prompts(
+    archive_env, tmp_path: Path
+) -> None:
+    record = _conversation(
+        "codex",
+        "cx-parent",
+        [_turn("user", "the parent agent wrote this", "typed", 1)],
+        kind="session",
+        session_kind="root",
+        parent_session_id="parent-9",
+    )
+    root = _single_record_library(tmp_path, record)
+    manifest = _ingest(archive_env, root, ["codex"])
+    codex = manifest["providers"]["codex"]
+    assert codex["authors"] == {HUMAN: 0, MACHINE: 1}
+    assert codex["author_basis"]["machine"] == {"subagent-prompt": 1}
+    assert codex["reader_counters"]["diagnostic:kind-parent-disagreement"] == 1
+
+
+def test_a_subagent_without_a_parent_counts_a_disagreement(archive_env, tmp_path: Path) -> None:
+    record = _conversation(
+        "geminicli",
+        "gc-disagree",
+        [_turn("user", "no parent recorded but kind says subagent", "typed", 1)],
+        kind="session",
+        session_kind="subagent",
+    )
+    root = _single_record_library(tmp_path, record)
+    manifest = _ingest(archive_env, root, ["geminicli"])
+    gemini = manifest["providers"]["geminicli"]
+    assert gemini["authors"] == {HUMAN: 0, MACHINE: 1}
+    assert gemini["reader_counters"]["diagnostic:kind-parent-disagreement"] == 1
+
+
+def test_copilotcli_manifest_records_the_upper_bound_caveat(archive_env, tmp_path: Path) -> None:
+    record = _conversation(
+        "copilotcli",
+        "cp-1",
+        [_turn("user", "explain this repository please", "typed", 1)],
+        kind="session",
+        session_kind="unknown",
+    )
+    root = _single_record_library(tmp_path, record)
+    manifest = _ingest(archive_env, root, ["copilotcli"])
+    caveats = manifest["providers"]["copilotcli"].get("authorship_caveats") or []
+    assert any("copilotcli" in caveat for caveat in caveats)
+
+
 def test_googledrive_body_fts(archive_env, tmp_path: Path) -> None:
     """Pins the cause: a typed Drive turn whose capture left `typed_chars` at 0 was never indexed."""
     record = _conversation(
@@ -690,7 +740,7 @@ def test_googledrive_body_fts(archive_env, tmp_path: Path) -> None:
     _ingest(archive_env, _single_record_library(tmp_path, record), ["googledrive"])
     stored = next(iter_store(archive_env.paths, ["googledrive"]))
     assert [(m.channel, m.author, m.typed_chars) for m in stored.messages] == [
-        ("typed", HUMAN, len(stored.messages[0].text))
+        ("written", HUMAN, len(stored.messages[0].text))
     ]
     build_search_store(archive_env.paths, archive_env.auth)
     assert [h["uid"] for h in search_archive(archive_env.paths, BODY_TERM)] == [

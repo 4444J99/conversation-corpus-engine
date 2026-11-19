@@ -70,6 +70,24 @@ def test_plain_text_templates_the_harness_writes_are_machine() -> None:
         "# FLAME — the Continuity Kernel\n\n> This file is the portable *self* of VLTIMA.",
         "[Scheduled prompt #1]\nRun the next bounded slice of the github-universe mission",
         "[PR COMMENT FIX REQUEST - BATCH]\nYou must use task subagents to perform this request.",
+        "[PR CHECK FIX REQUEST]\nYou must use a task subagent to perform this request.",
+        "[structured-output-enforce] You MUST call the StructuredOutput tool to complete this request. Call this tool now.",
+        "[handback-send-enforce] Your report has not been delivered. Call SubagentHandback({message: <your full report>}).",
+        '[Cross-session idle notice] "resume external ssd work", which you asked to be notified about, is idle now.',
+        "You are an independent code reviewer. You did not write this change and have no stake in it.",
+        "You are a subagent handling one PR comment only. PR organvm-iii-ergon/public-record-data-scrapper#422 is already merged.",
+        "You are working in a local workspace for a pull request this project opened. If you cannot push to its branch, report that.",
+        "You are working in a git worktree at: /Users/4jp/Workspace/organvm/copilot-worktrees/peer-audited--behavioral-blockchain",
+        "You are working in PR 422 workspace /Users/4jp/Workspace/organvm/copilot-worktrees/public-record-data-scrapper/4444j99-fantastic-telegram.",
+        "Read-only web verification. Never send mail, never apply, never log in, never enter credentials.",
+        "Independently review a docs-only change in the git worktree /Volumes/Archive4T/Runtime/tmp/claude-501/-Volumes-Archive4T",
+        "Evaluate only these comments on merged PR organvm-iii-ergon/public-record-data-scrapper#422. Do not edit, commit, push.",
+        "Name this chat from the user's first request.",
+        'The user explicitly invoked the "/closeout" skill. Follow its instructions now.',
+        "# Autonomous loop tick (dynamic pacing)\nRun the autonomous check using the loop instructions.",
+        "# Autonomous loop check\nYou're being invoked on a timer.",
+        "## Context Usage\n\n**Model:** claude-sonnet-5-5",
+        "# Pull Request Creation\n\nThe user wants to open a pull request for the current session.",
     ):
         assert classify_user_turn(text, "root") == (False, "harness-text")
 
@@ -79,6 +97,48 @@ def test_a_tag_nobody_classified_is_machine_and_named_not_guessed() -> None:
         False,
         "unclassified-tag:brand_new_wrapper",
     )
+
+
+def test_a_root_session_with_a_parent_is_the_parents_prompts() -> None:
+    # A spawned child can record session_kind=root; the parent wrote its prompts (#95).
+    assert classify_user_turn("do the task", "root", "parent-1") == (False, "subagent-prompt")
+    assert classify_user_turn("do the task", "", "parent-1") == (False, "subagent-prompt")
+    assert classify_user_turn("do the task", "unknown", "parent-1") == (False, "subagent-prompt")
+    # Without a parent, a root session stays the person's.
+    assert classify_user_turn("do the task", "root") == (True, "typed")
+    assert classify_user_turn("do the task", "root", "") == (True, "typed")
+
+
+def test_reclassify_counts_a_kind_parent_disagreement_without_moving_basis_sums() -> None:
+    disagreeing = Conversation(
+        provider="geminicli",
+        source_id="s3",
+        title="t",
+        extra={"session_kind": "subagent"},  # no parent recorded
+        messages=[Message(role="user", text="do the thing", channel="typed")],
+    )
+    counts = reclassify_typed_turns(disagreeing)
+    assert counts["diagnostic:kind-parent-disagreement"] == 1
+    assert counts["machine:subagent-prompt"] == 1
+    spawned = Conversation(
+        provider="codex",
+        source_id="s4",
+        title="t",
+        extra={"session_kind": "root", "parent_session_id": "parent-1"},
+        messages=[Message(role="user", text="do the thing", channel="typed")],
+    )
+    counts = reclassify_typed_turns(spawned)
+    assert counts["diagnostic:kind-parent-disagreement"] == 1
+    assert counts["machine:subagent-prompt"] == 1
+    assert spawned.messages[0].channel == "system"
+    agreeing = Conversation(
+        provider="codex",
+        source_id="s5",
+        title="t",
+        extra={"session_kind": "subagent", "parent_session_id": "parent-1"},
+        messages=[Message(role="user", text="do the thing", channel="typed")],
+    )
+    assert "diagnostic:kind-parent-disagreement" not in reclassify_typed_turns(agreeing)
 
 
 def test_reclassify_moves_the_machine_turns_off_the_typed_channel_and_counts_bases() -> None:
@@ -114,7 +174,7 @@ def test_a_subagent_session_has_no_human_turn() -> None:
         provider="claudecode",
         source_id="s2",
         title="t",
-        extra={"session_kind": "subagent"},
+        extra={"session_kind": "subagent", "parent_session_id": "p"},
         messages=[Message(role="user", text="research the thing", channel="typed")],
     )
     assert dict(reclassify_typed_turns(conversation)) == {"machine:subagent-prompt": 1}
