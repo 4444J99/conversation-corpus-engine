@@ -89,8 +89,7 @@ def test_measure_embeds_sha256_when_requested(tool: ModuleType, source_tree: Pat
 
 def test_pack_respects_cap_and_numbers_shards(tool: ModuleType) -> None:
     entries = [
-        tool.Entry(rel=f"f{i}.bin", size=size)
-        for i, size in enumerate([40, 30, 25, 25, 10, 10, 5])
+        tool.Entry(rel=f"f{i}.bin", size=size) for i, size in enumerate([40, 30, 25, 25, 10, 10, 5])
     ]
     shards, oversize = tool.pack(entries, max_bytes=64)
     assert oversize == []
