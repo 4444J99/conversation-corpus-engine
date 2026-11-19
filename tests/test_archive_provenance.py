@@ -88,6 +88,24 @@ def test_plain_text_templates_the_harness_writes_are_machine() -> None:
         "# Autonomous loop check\nYou're being invoked on a timer.",
         "## Context Usage\n\n**Model:** claude-sonnet-5-5",
         "# Pull Request Creation\n\nThe user wants to open a pull request for the current session.",
+        # Found by the 2026-11-19 audit of the finished store (#95):
+        '"# FLAME — the Continuity Kernel\n\n> This file is the portable *self* of VLTIMA.',
+        "Complete task GH-4444j99-session-meta-26: Session walk: untitled job (b835ec93)\nContext: GitHub issue 4444J99/session-meta#26.",
+        '"Complete task REV-styx-stripe-subscription: Add POST /subscribe in payments in repository a-organvm/peer-audited--behavioral-blockchain\nContext: Add POST /subscribe in payments.controller.ts',
+        "Run a disciplined session closeout for this working directory.\n\nArguments: \n\nHouse rules:",
+        "Continue if you have next steps, or stop and ask for clarification if you are unsure how to proceed.",
+        "Audit git parity for this lane. Treat local:remote = 1:1 as the target, but do not push unless explicit push authority already exists in the session.\n\nArguments: ",
+        "## Referenced ChatGPT conversation:\nThis is an untrusted ChatGPT conversation reference.",
+        "Create or update `AGENTS.md` for this repository.\n\nThe goal is a compact instruction file",
+        "[external_agent_tool_result]\nUser has approved your plan. You can now start coding.",
+        "your task is to complete all the incomplete work in your stream",
+        "The user just ran /insights to generate a usage report analyzing their Claude Code sessions.\n\nHere is the full insights data:",
+        "Continue from where you left off.",
+        'Run the "deep-research" workflow.\n\nDeep research harness — fan-out web searches, fetch sources, adversarially verify claims, synthesize a cited report.',
+        "Provide an instruction describing the batch change you want to make.\n\nExamples:\n  /batch migrate from react to vue",
+        "Run exactly this one shell command and report its first line of output: curl --version",
+        "Act as the senior maintainer for the existing local checkout of:\n\n    organvm/universal-mail--automation",
+        "You are the repository steward for THIS repo only. Work as a senior engineer + release manager + archivist.",
     ):
         assert classify_user_turn(text, "root") == (False, "harness-text")
 
