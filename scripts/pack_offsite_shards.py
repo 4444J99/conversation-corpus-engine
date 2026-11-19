@@ -7,11 +7,14 @@ directories) so owners can review sizes before running `cce sealed ...`.
 
 Default shard cap is 48 MiB to align with sealed storage v2's maximum signed,
 padded encrypted shard (see docs/encrypted-packing-v2.md and SHARD_LIMIT).
+Pass --hash to embed per-file SHA-256 digests in the plan so a materialized or
+restored tree can be compared against the plan byte-for-byte.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -26,6 +29,7 @@ DEFAULT_MAX_BYTES = 48 * 1024 * 1024
 class Entry:
     rel: str
     size: int
+    sha256: str | None = None
 
 
 def load_selection(path: Path) -> list[str]:
@@ -45,21 +49,33 @@ def scan_source(source: Path) -> list[str]:
             if full.is_symlink():
                 continue
             rels.append(full.relative_to(source).as_posix())
-    return rels
+    # Filesystem walk order is not guaranteed; sort for a deterministic plan.
+    return sorted(rels)
 
 
-def measure(source: Path, rels: list[str]) -> list[Entry]:
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def measure(source: Path, rels: list[str], hash_files: bool = False) -> list[Entry]:
     entries: list[Entry] = []
+    source_resolved = source.resolve()
     for rel in rels:
         full = (source / rel).resolve()
-        source_resolved = source.resolve()
         try:
             full.relative_to(source_resolved)
         except ValueError as exc:
             raise ValueError(f"path escapes source: {rel}") from exc
         if full.is_symlink() or not full.is_file():
             raise ValueError(f"not a regular file: {rel}")
-        entries.append(Entry(rel=rel, size=full.stat().st_size))
+        entry = Entry(rel=rel, size=full.stat().st_size)
+        if hash_files:
+            entry.sha256 = _sha256_file(full)
+        entries.append(entry)
     return entries
 
 
@@ -68,10 +84,13 @@ def pack(entries: list[Entry], max_bytes: int) -> tuple[list[dict], list[dict]]:
     ordered = sorted(entries, key=lambda e: (-e.size, e.rel))
     shards: list[dict] = []
     for entry in ordered:
+        file_item = {"path": entry.rel, "bytes": entry.size}
+        if entry.sha256 is not None:
+            file_item["sha256"] = entry.sha256
         placed = False
         for shard in shards:
             if shard["bytes"] + entry.size <= max_bytes:
-                shard["files"].append({"path": entry.rel, "bytes": entry.size})
+                shard["files"].append(file_item)
                 shard["bytes"] += entry.size
                 placed = True
                 break
@@ -80,7 +99,7 @@ def pack(entries: list[Entry], max_bytes: int) -> tuple[list[dict], list[dict]]:
                 {
                     "shard": len(shards) + 1,
                     "bytes": entry.size,
-                    "files": [{"path": entry.rel, "bytes": entry.size}],
+                    "files": [file_item],
                 }
             )
     oversize = [s for s in shards if s["bytes"] > max_bytes or any(f["bytes"] > max_bytes for f in s["files"])]
@@ -92,12 +111,18 @@ def pack(entries: list[Entry], max_bytes: int) -> tuple[list[dict], list[dict]]:
     return shards, oversize
 
 
-def materialize(source: Path, out_dir: Path, shards: list[dict], overwrite: bool) -> None:
+def materialize(source: Path, out_dir: Path, shards: list[dict]) -> None:
     if out_dir.exists():
-        if not overwrite:
-            raise ValueError(f"output exists (use --overwrite): {out_dir}")
-        # Only remove known shard dirs/files created by this layout? safer: require empty/new.
-        raise ValueError(f"output exists: {out_dir}")
+        # Never clobber an existing tree: the caller must pick a fresh destination.
+        raise ValueError(f"output exists (choose a fresh destination): {out_dir}")
+    required = sum(shard["bytes"] for shard in shards)
+    probe = out_dir.parent
+    probe.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(probe).free
+    if free < required:
+        raise ValueError(
+            f"insufficient disk space at {probe}: need {required} bytes, have {free} free"
+        )
     out_dir.mkdir(parents=True, exist_ok=False)
     for shard in shards:
         sdir = out_dir / shard["name"]
@@ -123,6 +148,11 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_MAX_BYTES,
         help=f"Maximum bytes per shard (default {DEFAULT_MAX_BYTES}, 48 MiB)",
     )
+    parser.add_argument(
+        "--hash",
+        action="store_true",
+        help="Embed the SHA-256 of every file in the plan (enables content comparison after materialize/restore)",
+    )
     parser.add_argument("--plan-out", type=Path, help="Write packing plan JSON to this path")
     parser.add_argument(
         "--materialize",
@@ -146,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         rels = load_selection(args.selection) if args.selection else scan_source(source)
-        entries = measure(source, rels)
+        entries = measure(source, rels, hash_files=args.hash)
         shards, oversize = pack(entries, args.max_bytes)
         plan = {
             "schema": "cce.offsite-shard-pack.v1",
@@ -175,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
                     "cannot materialize: shard(s) exceed max bytes: "
                     + ", ".join(s["name"] for s in oversize)
                 )
-            materialize(source, args.materialize.resolve(), shards, overwrite=False)
+            materialize(source, args.materialize.resolve(), shards)
         print(json.dumps({k: v for k, v in plan.items() if k != "shards"}, indent=2))
         if oversize and not args.allow_oversize:
             print(
