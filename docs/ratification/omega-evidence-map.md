@@ -92,8 +92,13 @@ evidence map; they are not the subject of IRF-CCE-035.
 
 - **#16 — Self-documentation:** CCE ships `CLAUDE.md`, `seed.yaml`, and a
   per-module test suite. Evidence is in-repo.
-- **#18 / OM-MEM-001 — Autopoietic Memory:** proposed, not ratified. Spec:
+- **#18 / OM-MEM-001 — Autopoietic Memory:** proposed, not ratified; amendment
+  routed to the canonical owner as a decision request
+  ([organvm-engine#239](https://github.com/4444J99/organvm-engine/issues/239),
+  2026-11-19). Spec:
   [`docs/ratification/OM-MEM-001-specification.md`](OM-MEM-001-specification.md);
+  ratification request packet:
+  [`docs/ratification/om-mem-001-ratification-request.json`](om-mem-001-ratification-request.json);
   in-repo status/receipt:
   [`docs/ratification/irf-cce-015-status.md`](irf-cce-015-status.md);
   tracking [Issue #14](https://github.com/organvm-i-theoria/conversation-corpus-engine/issues/14).

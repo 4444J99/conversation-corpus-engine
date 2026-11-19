@@ -6,7 +6,7 @@
 ## Current State
 
 OM-MEM-001 is **proposed but not ratified**. The criterion states: "the system must
-ingest its own session transcripts." A formal specification has been drafted in `docs/ratification/OM-MEM-001-specification.md` and posted to [GH#14](https://github.com/organvm-i-theoria/conversation-corpus-engine/issues/14) (S40 issue comment). In-repo status receipt: `docs/ratification/irf-cce-015-status.md`. Formal acceptance, upstream amendment tooling, and live omega scorecard propagation remain pending.
+ingest its own session transcripts." A formal specification has been drafted in `docs/ratification/OM-MEM-001-specification.md` and posted to [GH#14](https://github.com/organvm-i-theoria/conversation-corpus-engine/issues/14) (S40 issue comment). In-repo status receipt: `docs/ratification/irf-cce-015-status.md`. On 2026-11-19 the amendment packet was routed to the canonical amendment owner as a decision request: [organvm-engine#239](https://github.com/4444J99/organvm-engine/issues/239) (packaged in `docs/ratification/om-mem-001-ratification-request.json`). Formal acceptance, live omega scorecard propagation, and the IRF receipt remain pending; ratification is a human governance decision.
 
 ### References
 
@@ -38,10 +38,10 @@ existing omega criteria in `meta-organvm/organvm-corpvs-testamentvm/`.
 - [x] Draft OM-MEM-001 specification in `docs/ratification/OM-MEM-001-specification.md`
 - [x] Post specification as GH#14 comment (S40)
 - [x] Record in-repo IRF-CCE-015 status/remaining work (`docs/ratification/irf-cce-015-status.md`)
-- [ ] Route amendment to canonical meta-organvm/engine owner and obtain criterion-authoring/amendment path
-- [ ] Ratification (formal acceptance / governance decision)
+- [x] Route amendment to canonical meta-organvm/engine owner with an explicit decision request — [organvm-engine#239](https://github.com/4444J99/organvm-engine/issues/239) (2026-11-19); packet: `docs/ratification/om-mem-001-ratification-request.json`. Numbering conflict flagged: draft spec's #18 collides with live omega #18; next free id proposed (#21)
+- [ ] Ratification (formal acceptance / governance decision — human gate)
 - [ ] Propagate into live omega scorecard and update omega state tracking
-- [ ] Record upstream decision and exact scorecard/evidence commits back into IRF-CCE-015 tracking surfaces
+- [ ] Record upstream decision and exact scorecard/evidence commits back into IRF-CCE-015 tracking surfaces and into `om-mem-001-ratification-request.json` (`resolution`, `decision_record`)
 
 ## Key Decisions
 
@@ -90,7 +90,7 @@ The established format for an Omega Criterion is as follows, extracted from exis
 
 ## Next Actions
 
-1. Route the prepared OM-MEM-001 specification and CCE evidence to the canonical `meta-organvm/organvm-engine` amendment owner with an explicit decision request (criterion-authoring/amendment path is external to this repo).
+1. ~~Route the prepared OM-MEM-001 specification~~ — done 2026-11-19 as [organvm-engine#239](https://github.com/4444J99/organvm-engine/issues/239).
 2. After governance review, capture the accept/revise/reject decision and, if ratified, the live scorecard propagation details.
 3. Record the resulting scorecard/evidence impact and exact upstream commits/receipts back into IRF-CCE-015 tracking surfaces (GH#14, this handoff, `docs/ratification/irf-cce-015-status.md`, and `docs/ratification/omega-evidence-map.md` as applicable). Do not assert ratification until the upstream decision and scorecard update exist.
 
@@ -101,6 +101,8 @@ The established format for an Omega Criterion is as follows, extracted from exis
   `import_specstory_session_corpus.py`) is a separate task.
 - The omega governance process may require changes in `meta-organvm` that this
   session cannot make unilaterally. The handoff recipient should check the
-  current governance rules before posting.
+  current governance rules before posting. (Checked 2026-11-19: constitution
+  requires human approval by @4444j99 for amendments; decision request routed as
+  [organvm-engine#239](https://github.com/4444J99/organvm-engine/issues/239).)
 - If existing omega criteria have evolved since the roadmap was written (2026-03-24),
   the format may have changed. Always read current state, not memory.
