@@ -867,19 +867,22 @@ def render_discovery_text(payload: dict[str, Any]) -> str:
 # Project registry (The Post Office)
 # ---------------------------------------------------------------------------
 
-# ChatGPT Projects API (distinct from the GPT Store "gizmos" API).
+# ChatGPT Projects listing API (distinct from the GPT Store "gizmos" API).
 #
-# ChatGPT Projects and custom GPTs ("gizmos") are separate features served by
-# different backend routes. The gizmos discovery API returns custom GPTs, NOT
-# Projects, so the Post Office must not use ``backend-api/gizmos/discovery/mine``
-# (GH#16 / IRF-CCE-027). Project IDs are prefixed "g-p-" (gizmo-project).
+# ChatGPT Projects and custom GPTs ("gizmos") are separate features, but the
+# Projects list is served from the gizmos-namespaced sidebar route. The GPT
+# Store route ``backend-api/gizmos/discovery/mine`` returns custom GPTs, NOT
+# Projects, and must never be used here (GH#16 / IRF-CCE-027).
 #
-# Current implementation targets the Projects-style paths below. Endpoint paths
-# and JSON shapes MUST be live-verified against an authorized session (browser
-# DevTools). The conversations-listing and file-download paths ARE the owner's
-# 2026-07-05 browser-capture evidence (see issue #16); the Projects-list path
-# itself is not yet live-verified. See playbooks/handoffs/gh-16-chatgpt-projects-endpoint.md.
-PROJECTS_LIST_PATH = "backend-api/projects"
+# The owner's 2026-07-05 browser network capture on GH#16 confirmed the listing
+# route below: ``backend-api/gizmos/snorlax/sidebar`` returns ``{items, cursor}``
+# where each ``items[i].gizmo`` carries ``id`` (``g-p-...``), ``short_url``,
+# ``instructions``, and ``files[]``. Project IDs are prefixed "g-p-".
+#
+# The project-detail path is still unverified: the capture recorded no detail
+# route, so ``backend-api/projects/{id}`` is only a candidate. Change it only
+# with observed evidence. See playbooks/handoffs/gh-16-chatgpt-projects-endpoint.md.
+PROJECTS_LIST_PATH = "backend-api/gizmos/snorlax/sidebar"
 PROJECT_DETAIL_PATH = "backend-api/projects/{project_id}"
 # Project chats (the "Chats" tab). Observed 2026-07-05 via browser network capture: cursor-
 # paginated, `limit` maxes out low (28 worked; 100 errors). The tempting
@@ -999,22 +1002,23 @@ def _parse_project_item(item: dict[str, Any]) -> tuple[str, dict[str, Any]] | No
     Reads the flat Projects shape (``id``/``name``) first and falls back to a
     legacy gizmo-wrapped entry. Returns ``None`` when no project id is present.
     """
-    pid = item.get("id") or ""
-    if not pid:
-        gizmo = item.get("gizmo") or item.get("resource") or {}
-        pid = gizmo.get("id") or ""
+    wrapped = item.get("gizmo") or item.get("resource") or {}
+    pid = item.get("id") or wrapped.get("id") or ""
     if not pid:
         return None
     interactions = (
         item.get("num_conversations")
         or item.get("conversation_count")
         or (item.get("vanity_metrics") or {}).get("num_conversations")
+        or (wrapped.get("vanity_metrics") or {}).get("num_conversations")
         or 0
     )
+    # The sidebar listing nests the project (and its files) under ``gizmo``.
+    files = item.get("files") or wrapped.get("files") or []
     info = {
         "name": _project_display_name(item),
         "interactions": interactions,
-        "file_count": len(item.get("files") or []),
+        "file_count": len(files),
     }
     return pid, info
 
@@ -1022,53 +1026,42 @@ def _parse_project_item(item: dict[str, Any]) -> tuple[str, dict[str, Any]] | No
 def discover_chatgpt_projects(
     cookie_jar: Path = DEFAULT_CHATGPT_COOKIE_JAR,
 ) -> dict[str, dict[str, Any]]:
-    """Fetch all ChatGPT Project metadata from the Projects API.
+    """Fetch all ChatGPT Project metadata from the confirmed Projects listing route.
 
-    Uses the ChatGPT Projects API (``backend-api/projects``), NOT the GPT Store
-    "gizmos" discovery API. Projects and custom GPTs are distinct ChatGPT
-    features served by different backend routes; the gizmos endpoint returns
-    custom GPTs, not Projects (GH#16 / IRF-CCE-027). Returns ``{project_id: info}``.
-
-    Endpoint paths and response shapes require live verification against an
-    authorized ChatGPT session (browser DevTools). Issue discussion has also
-    reported ``backend-api/gizmos/snorlax/sidebar`` as a candidate Projects
-    listing source; this implementation keeps the configured Projects path and
-    tolerates both offset-style pages and cursor-bearing responses for safety.
+    Uses ``backend-api/gizmos/snorlax/sidebar``, the owner-confirmed Projects
+    listing endpoint captured on 2026-07-05 (GH#16). This is NOT the GPT Store
+    ``backend-api/gizmos/discovery/mine`` endpoint, which returns custom GPTs
+    rather than Projects (GH#16 / IRF-CCE-027). The response is cursor-paginated
+    (``{items, cursor}``) and each item wraps the project under ``item.gizmo``.
+    Returns ``{project_id: info}``.
     """
 
     session = build_chatgpt_session(cookie_jar)
     projects: dict[str, dict[str, Any]] = {}
-    offset = 0
-    limit = 100
     cursor: str | None = None
     while True:
-        params: dict[str, Any] = {"offset": offset, "limit": limit}
-        if cursor:
-            params["cursor"] = cursor
-        url = f"https://{CHATGPT_HOST}/{PROJECTS_LIST_PATH}?{urlencode(params)}"
+        # Cursor-only pagination: the capture documented ``{items, cursor}`` and
+        # no verified page size, so no limit/offset is sent.
+        query = urlencode({"cursor": cursor}) if cursor else ""
+        url = f"https://{CHATGPT_HOST}/{PROJECTS_LIST_PATH}" + (f"?{query}" if query else "")
         try:
             page = fetch_json(session, url)
         except ChatGPTLocalSessionError:
             break
-        items = page.get("items") or page.get("list", {}).get("items") or []
-        if not items:
+        items = page.get("items") if isinstance(page, dict) else None
+        if not isinstance(items, list):
             break
         for item in items:
-            parsed = _parse_project_item(item)
+            parsed = _parse_project_item(item if isinstance(item, dict) else {})
             if parsed is not None:
                 pid, info = parsed
                 projects[pid] = info
 
-        next_cursor = page.get("cursor")
-        if next_cursor:
-            if next_cursor == cursor:
-                break
-            cursor = str(next_cursor)
-            time.sleep(1)
-            continue
-        if len(items) < limit:
+        next_cursor = page.get("cursor") if isinstance(page, dict) else None
+        if not next_cursor or next_cursor == cursor:
+            # No cursor (last page) or a repeated cursor (non-advancing): stop.
             break
-        offset += limit
+        cursor = str(next_cursor)
         time.sleep(1)
     return projects
 

@@ -487,17 +487,29 @@ def test_parse_project_item_tolerates_legacy_gizmo_entry() -> None:
     assert info["interactions"] == 3
 
 
+def test_parse_project_item_counts_sidebar_gizmo_files() -> None:
+    item = {
+        "gizmo": {
+            "id": "g-p-ccc",
+            "display": {"name": "Gamma"},
+            "files": [{"id": "f1"}, {"id": "f2"}],
+        },
+    }
+    parsed = module._parse_project_item(item)
+    assert parsed is not None
+    pid, info = parsed
+    assert pid == "g-p-ccc"
+    assert info == {"name": "Gamma", "interactions": 0, "file_count": 2}
+
+
 def test_parse_project_item_returns_none_without_id() -> None:
     assert module._parse_project_item({"name": "no-id"}) is None
 
 
-def test_discover_chatgpt_projects_uses_projects_api(
+def test_discover_chatgpt_projects_uses_confirmed_sidebar_endpoint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    jar = tmp_path / "test.binarycookies"
-    jar.write_bytes(
-        build_binary_cookie_jar([{"domain": ".chatgpt.com", "name": "x", "value": "y"}])
-    )
+    jar = _project_jar(tmp_path)
     monkeypatch.setattr(module, "build_chatgpt_session", lambda cookie_jar: _fake_project_session())
     monkeypatch.setattr(module.time, "sleep", lambda _s: None)
 
@@ -507,8 +519,15 @@ def test_discover_chatgpt_projects_uses_projects_api(
         seen_urls.append(url)
         return {
             "items": [
-                {"id": "g-p-aaa", "name": "Alpha", "num_conversations": 2},
-                {"id": "g-p-bbb", "name": "Beta", "files": [{"id": "f"}]},
+                {
+                    "gizmo": {
+                        "id": "g-p-aaa",
+                        "display": {"name": "Alpha"},
+                        "files": [{"id": "f1"}],
+                    },
+                    "vanity_metrics": {"num_conversations": 2},
+                },
+                {"gizmo": {"id": "g-p-bbb", "display": {"name": "Beta"}}},
             ]
         }
 
@@ -516,12 +535,13 @@ def test_discover_chatgpt_projects_uses_projects_api(
 
     projects = module.discover_chatgpt_projects(jar)
 
-    # Hits the Projects API, NOT the gizmos discovery API.
+    # Owner-confirmed Projects listing route (2026-07-05 capture), never the GPT
+    # Store gizmos discovery endpoint.
     assert seen_urls
-    assert "backend-api/projects?" in seen_urls[0]
-    assert all("gizmos" not in url for url in seen_urls)
-    assert projects["g-p-aaa"] == {"name": "Alpha", "interactions": 2, "file_count": 0}
-    assert projects["g-p-bbb"]["file_count"] == 1
+    assert "backend-api/gizmos/snorlax/sidebar" in seen_urls[0]
+    assert all("gizmos/discovery/mine" not in url for url in seen_urls)
+    assert projects["g-p-aaa"] == {"name": "Alpha", "interactions": 2, "file_count": 1}
+    assert projects["g-p-bbb"]["file_count"] == 0
 
 
 def test_discover_chatgpt_projects_stops_on_empty_page(
@@ -538,35 +558,29 @@ def test_discover_chatgpt_projects_stops_on_empty_page(
     assert module.discover_chatgpt_projects(jar) == {}
 
 
-def test_discover_chatgpt_projects_paginates_offset_pages(
+def test_discover_chatgpt_projects_stops_on_repeated_cursor(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    jar = tmp_path / "test.binarycookies"
-    jar.write_bytes(
-        build_binary_cookie_jar([{"domain": ".chatgpt.com", "name": "x", "value": "y"}])
-    )
+    jar = _project_jar(tmp_path)
     monkeypatch.setattr(module, "build_chatgpt_session", lambda cookie_jar: _fake_project_session())
     monkeypatch.setattr(module.time, "sleep", lambda _s: None)
 
-    seen_urls: list[str] = []
-    full_page = [{"id": f"g-p-{i}", "name": f"Project {i}"} for i in range(100)]
+    calls = {"n": 0}
 
     def fake_fetch_json(session: object, url: str) -> object:
-        seen_urls.append(url)
-        if "offset=0" in url:
-            return {"items": full_page}
-        if "offset=100" in url:
-            return {"items": [{"id": "g-p-last", "name": "Last"}]}
-        return {"items": []}
+        calls["n"] += 1
+        return {
+            "items": [{"gizmo": {"id": "g-p-aaa", "display": {"name": "Alpha"}}}],
+            "cursor": "same-cursor",
+        }
 
     monkeypatch.setattr(module, "fetch_json", fake_fetch_json)
 
     projects = module.discover_chatgpt_projects(jar)
 
-    assert len(projects) == 101
-    assert "g-p-0" in projects and "g-p-last" in projects
-    assert any("offset=0" in u for u in seen_urls)
-    assert any("offset=100" in u for u in seen_urls)
+    assert set(projects) == {"g-p-aaa"}
+    # The repeated cursor must not loop forever.
+    assert calls["n"] == 2
 
 
 def test_discover_chatgpt_projects_follows_cursor_pagination(
