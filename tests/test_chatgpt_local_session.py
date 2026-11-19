@@ -258,6 +258,7 @@ def test_discover_chatgpt_local_session_returns_summary(
             device_id="dev-1",
         ),
     )
+
     def fake_fetch_json(session: module.ChatGPTHttpSession, url: str) -> object:
         if "conversations?" in url:
             if "is_archived=true" in url:
