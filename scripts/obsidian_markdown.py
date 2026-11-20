@@ -16,7 +16,7 @@ from markdown_it import MarkdownIt
 from markdown_it.rules_block.state_block import StateBlock
 from markdown_it.rules_inline.backticks import backtick
 
-VERSION = "4.2.0"
+VERSION = "4.3.0"
 LINES = re.compile(rb"[^\r\n]*(?:\r\n|\r|\n|$)")
 
 
@@ -104,7 +104,7 @@ class MappedState(StateBlock):
         value = super().getLines(begin, end, indent, keepLastLF)
         if self.parentType != "paragraph" or begin >= end:
             return value
-        # Trace the indentation walk of markdown-it-py 4.2.0 getLines (MIT).
+        # Trace the indentation walk of markdown-it-py 4.3.0 getLines (MIT).
         # The parser's own result remains authoritative and its length is checked.
         rows = []
         output = 0
