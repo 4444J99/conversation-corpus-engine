@@ -42,3 +42,9 @@ Repository-side investigation and in-repo follow-through for issue #20 ("Execute
 3. Deploy `docs/commercial/h1/landing-page/`, verify form submissions, and update launch links.
 4. Post using `docs/commercial/h1/launch-posts.md` and record public receipts back into issue/docs.
 
+## Addendum (2026-11-23): remaining three deliverables executed
+
+- HN/social launch copy is now a dedicated launch artifact at `docs/launch/hn-post.md`, with a canonical GitHub-tagged install command (the PyPI project is not published yet).
+- A self-contained landing page is staged at `docs/launch/landing-page.html` and published in the new ORGAN-II bridge repo: https://github.com/4444J99/conversation-corpus--surfaces (public, `main` pushed). Its `apps/landing/` directory carries the page and a GitHub Pages workflow; the interface contract, SDK scaffold, MCP docs, and product brief are bootstrapped there.
+- External actions that cannot be verified from here remain: GitHub Pages activation/form sink, PyPI publish, and authenticated HN/social posting. Live links and receipts should be recorded in issue #20 after those actions.
+
