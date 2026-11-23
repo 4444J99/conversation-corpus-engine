@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Conversation Corpus Engine — search your AI conversations from one place</title>
+  <meta name="description" content="Conversation Corpus Engine turns AI chat exports into a local, validated, federated corpus with cited retrieval and a read-only MCP server.">
+  <style>
+    :root { color-scheme: light; --ink:#17202a; --muted:#5d6773; --line:#d9dee5; --paper:#f7f8fa; --panel:#fff; --accent:#0f766e; --accent-strong:#115e59; --mark:#f2c94c; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--paper); color:var(--ink); font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif; line-height:1.55; }
+    a { color:var(--accent-strong); }
+    .wrap { width:min(1120px,calc(100% - 32px)); margin:0 auto; }
+    header { border-bottom:1px solid var(--line); background:rgba(255,255,255,.92); }
+    .nav { min-height:64px; display:flex; align-items:center; justify-content:space-between; gap:16px; }
+    .brand { display:flex; align-items:center; gap:10px; font-weight:750; }
+    .mark { width:28px; height:28px; display:grid; place-items:center; border:1px solid var(--ink); background:var(--mark); font-size:12px; font-weight:800; }
+    .nav a { font-size:14px; font-weight:650; text-decoration:none; }
+    .hero { padding:56px 0 32px; }
+    .hero-grid { display:grid; grid-template-columns:minmax(0,1.05fr) minmax(320px,.75fr); gap:28px; align-items:stretch; }
+    h1 { margin:0; font-size:clamp(40px,6.6vw,72px); line-height:1.0; letter-spacing:-.02em; }
+    .eyebrow { margin:0 0 14px; color:var(--accent-strong); font-size:13px; font-weight:750; text-transform:uppercase; letter-spacing:.08em; }
+    .lede { max-width:640px; margin:20px 0 0; color:var(--muted); font-size:19px; }
+    .terminal { margin-top:26px; overflow:hidden; border:1px solid #202833; background:#101820; color:#e9eef4; box-shadow:0 18px 42px rgba(23,32,42,.16); }
+    .terminal-head { padding:10px 14px; border-bottom:1px solid rgba(255,255,255,.12); color:#b8c3cf; font-size:13px; }
+    pre { margin:0; padding:18px; overflow-x:auto; font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+    .capture { border:1px solid var(--line); background:var(--panel); padding:24px; display:flex; flex-direction:column; justify-content:space-between; }
+    .capture h2 { margin:0; font-size:25px; line-height:1.15; }
+    .capture p { margin:12px 0 0; color:var(--muted); }
+    form { margin-top:20px; display:grid; gap:12px; }
+    label { display:grid; gap:7px; color:#33404f; font-size:13px; font-weight:700; }
+    input,select { width:100%; min-height:44px; border:1px solid #b9c2cc; background:#fff; color:var(--ink); padding:10px 12px; font:inherit; }
+    button { min-height:46px; border:0; background:var(--accent); color:#fff; padding:11px 16px; font:inherit; font-weight:750; cursor:pointer; }
+    button:hover { background:var(--accent-strong); }
+    .fine { font-size:12px; }
+    .bot-field { display:none; }
+    .metrics { padding:16px 0 40px; }
+    .metric-grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+    .metric { border:1px solid var(--line); background:var(--panel); padding:18px; }
+    .metric strong { display:block; font-size:24px; line-height:1; }
+    .metric span { display:block; margin-top:8px; color:var(--muted); font-size:14px; }
+    .flow { border-top:1px solid var(--line); background:#fff; padding:38px 0 54px; }
+    .flow h2 { margin:0 0 18px; font-size:28px; }
+    .flow-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:14px; }
+    .flow-item { border-left:4px solid var(--accent); padding:6px 0 6px 14px; }
+    .flow-item span { display:block; color:var(--muted); }
+    footer { border-top:1px solid var(--line); padding:20px 0; color:var(--muted); font-size:14px; }
+    @media (max-width:860px) { .hero-grid,.metric-grid,.flow-grid { grid-template-columns:1fr; } }
+    @media (max-width:520px) { .nav { align-items:flex-start; flex-direction:column; padding:14px 0; } .lede { font-size:17px; } }
+  </style>
+</head>
+<body>
+  <div>
+    <header>
+      <nav class="wrap nav" aria-label="Primary">
+        <div class="brand"><span class="mark">CCE</span><span>Conversation Corpus Engine</span></div>
+        <a href="https://github.com/4444J99/conversation-corpus-engine">GitHub</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="wrap hero">
+        <div class="hero-grid">
+          <div>
+            <p class="eyebrow">Local AI memory infrastructure</p>
+            <h1>Search your AI conversations from one governed corpus.</h1>
+            <p class="lede">CCE turns provider exports into validated, federated, cited retrieval surfaces for builders, researchers, consultants, and small teams. Your data stays on your machine.</p>
+            <div class="terminal" aria-label="CCE command preview">
+              <div class="terminal-head">cce-mcp (read-only stdio server)</div>
+              <pre><code>$ pipx install "conversation-corpus-engine[mcp] @ \
+    git+https://github.com/4444J99/conversation-corpus-engine.git@v0.3.1"
+$ cce-mcp --project-root ~/work/memory
+
+tools/list
+  cce_search
+  cce_list_corpora
+  cce_surface_context</code></pre>
+            </div>
+          </div>
+
+          <aside class="capture" aria-label="Waitlist signup">
+            <div>
+              <h2>Join the early access list.</h2>
+              <p>Get release notes for the MCP server, the hosted search prototype, and the first Ring 1 web app build.</p>
+            </div>
+            <!-- Set data-endpoint to "netlify" (or a form endpoint URL) only after the sink is wired and tested. -->
+            <form name="cce-waitlist" method="POST" action="./thanks.html" data-endpoint="" data-netlify="true" netlify-honeypot="bot-field">
+              <input type="hidden" name="form-name" value="cce-waitlist">
+              <p class="bot-field"><label>Do not fill this out <input name="bot-field"></label></p>
+              <label>Email<input name="email" type="email" autocomplete="email" required></label>
+              <label>Role
+                <select name="role" required>
+                  <option value="">Select one</option>
+                  <option>Builder</option><option>Researcher</option><option>Consultant</option><option>Team lead</option>
+                </select>
+              </label>
+              <button type="submit">Request early access</button>
+              <p class="fine" id="form-status" role="status">No conversation exports are collected by this form.</p>
+            </form>
+          </aside>
+        </div>
+      </section>
+
+      <section class="wrap metrics" aria-label="Product scope">
+        <div class="metric-grid">
+          <div class="metric"><strong>6+</strong><span>Provider import lanes</span></div>
+          <div class="metric"><strong>3</strong><span>Default read-only MCP tools</span></div>
+          <div class="metric"><strong>0</strong><span>Required MCP runtime dependencies</span></div>
+          <div class="metric"><strong>$29</strong><span>Planned professional tier</span></div>
+        </div>
+      </section>
+
+      <section class="flow">
+        <div class="wrap">
+          <h2>From scattered chats to governed memory.</h2>
+          <div class="flow-grid">
+            <div class="flow-item"><strong>Import</strong><span>Provider exports become canonical, redacted corpus artifacts.</span></div>
+            <div class="flow-item"><strong>Govern</strong><span>Freshness, validation, policy replay, and candidate review.</span></div>
+            <div class="flow-item"><strong>Retrieve</strong><span>Cited answers through CLI, surface bundles, or an MCP host.</span></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer><div class="wrap">Conversation Corpus Engine — ORGAN-I memory surface · <a href="https://github.com/4444J99/conversation-corpus--surfaces">Surfaces repo</a></div></footer>
+  </div>
+  <script>
+    // Fail closed until a waitlist sink is configured; never silently drop an email.
+    const waitlistForm = document.querySelector('form[name="cce-waitlist"]');
+    waitlistForm.addEventListener('submit', (event) => {
+      if (!waitlistForm.dataset.endpoint) {
+        event.preventDefault();
+        document.getElementById('form-status').textContent =
+          'Waitlist is not open yet. Please check back soon.';
+      }
+    });
+  </script>
+</body>
+</html>
