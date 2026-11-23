@@ -106,6 +106,10 @@ def test_plain_text_templates_the_harness_writes_are_machine() -> None:
         "Run exactly this one shell command and report its first line of output: curl --version",
         "Act as the senior maintainer for the existing local checkout of:\n\n    organvm/universal-mail--automation",
         "You are the repository steward for THIS repo only. Work as a senior engineer + release manager + archivist.",
+        # Found by the 2026-11-22 sample of the live Runtime/agents transcripts (#95):
+        "You are working inside Orca, a multi-agent IDE. You are a dispatched worker.\nYour task ID is: task_1",
+        "──── From: ORCA_SESSION_ID:ANTIGRAVITY_85EA5319_B9E5_4A89_9367_FE1966A70316 (status) ────\nSubject: Stop the check",
+        "<external_codex_apps_selected_page_part_1_of_1>Companion Page snapshot part 1 of 1:\n{}</external_codex_apps_selected_page_part_1_of_1>",
     ):
         assert classify_user_turn(text, "root") == (False, "harness-text")
 

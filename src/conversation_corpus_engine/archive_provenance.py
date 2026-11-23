@@ -164,6 +164,13 @@ HARNESS_PREFIXES: tuple[str, ...] = (
     "Run exactly this one shell command and report its first line of output",
     "Act as the senior maintainer for the existing local checkout of:",
     "You are the repository steward for THIS repo only.",
+    # Found by sampling the live CLI transcripts under Runtime/agents (2026-11-22). The Orca
+    # dispatcher writes its worker preamble and cross-session status notes as plain user turns,
+    # and a Codex external-apps snapshot tag is longer than the 40-char _LEADING_TAG limit, so
+    # it falls through to plain text here instead of being caught by the tag rules.
+    "You are working inside Orca, a multi-agent IDE. You are a dispatched worker.",
+    "──── From: ORCA_SESSION_ID:",
+    "<external_codex_apps_selected_page_part",
 )
 _LOOP_WAKEUP = re.compile(r"^\[\d+ prior /loop wakeups?")
 
