@@ -83,7 +83,8 @@ tools/list
               <h2>Join the early access list.</h2>
               <p>Get release notes for the MCP server, the hosted search prototype, and the first Ring 1 web app build.</p>
             </div>
-            <form name="cce-waitlist" method="POST" action="/thanks.html" data-netlify="true" netlify-honeypot="bot-field">
+            <!-- Set data-endpoint to "netlify" (or a form endpoint URL) only after the sink is wired and tested. -->
+            <form name="cce-waitlist" method="POST" action="./thanks.html" data-endpoint="" data-netlify="true" netlify-honeypot="bot-field">
               <input type="hidden" name="form-name" value="cce-waitlist">
               <p class="bot-field"><label>Do not fill this out <input name="bot-field"></label></p>
               <label>Email<input name="email" type="email" autocomplete="email" required></label>
@@ -94,7 +95,7 @@ tools/list
                 </select>
               </label>
               <button type="submit">Request early access</button>
-              <p class="fine">No conversation exports are collected by this form.</p>
+              <p class="fine" id="form-status" role="status">No conversation exports are collected by this form.</p>
             </form>
           </aside>
         </div>
@@ -103,7 +104,7 @@ tools/list
       <section class="wrap metrics" aria-label="Product scope">
         <div class="metric-grid">
           <div class="metric"><strong>6+</strong><span>Provider import lanes</span></div>
-          <div class="metric"><strong>3</strong><span>Read-only MCP tools</span></div>
+          <div class="metric"><strong>3</strong><span>Default read-only MCP tools</span></div>
           <div class="metric"><strong>0</strong><span>Required MCP runtime dependencies</span></div>
           <div class="metric"><strong>$29</strong><span>Planned professional tier</span></div>
         </div>
@@ -123,5 +124,16 @@ tools/list
 
     <footer><div class="wrap">Conversation Corpus Engine — ORGAN-I memory surface · <a href="https://github.com/4444J99/conversation-corpus--surfaces">Surfaces repo</a></div></footer>
   </div>
+  <script>
+    // Fail closed until a waitlist sink is configured; never silently drop an email.
+    const waitlistForm = document.querySelector('form[name="cce-waitlist"]');
+    waitlistForm.addEventListener('submit', (event) => {
+      if (!waitlistForm.dataset.endpoint) {
+        event.preventDefault();
+        document.getElementById('form-status').textContent =
+          'Waitlist is not open yet. Please check back soon.';
+      }
+    });
+  </script>
 </body>
 </html>

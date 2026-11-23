@@ -16,10 +16,10 @@ The problem: after a few months, the useful conversations I had with ChatGPT, Cl
 
 What CCE does today:
 
-- Imports exports from ChatGPT, Claude, Gemini, Perplexity, Copilot, and Grok into a provider-neutral corpus (more adapters are pluggable).
+- Imports exports from ChatGPT, Claude, Gemini, Perplexity, and Grok, plus SingleFile captures of Copilot web research pages, into a provider-neutral corpus (more adapters are pluggable).
 - Validates and fingerprints sources, tracks freshness, and records which corpus is authoritative per provider.
 - Federates multiple corpora, replays promotion policies, and diffs candidate corpora before replacing a live one.
-- Answers questions from the corpus with citations instead of loose keyword hits, via CLI or a read-only stdio MCP server (`cce_search`, `cce_list_corpora`, `cce_surface_context`).
+- Answers questions from the corpus with citations instead of loose keyword hits, via CLI or a read-only stdio MCP server. The default tool set is `cce_search`, `cce_list_corpora`, `cce_surface_context`; archive/library configuration exposes additional read-only tools.
 - Emits versioned JSON schemas and surface bundles so other tools can consume the same artifacts.
 
 Everything runs locally against your own exports. The repo contains code, contracts, tests, and redacted fixtures only — no conversation data, browser profiles, or credentials.
@@ -48,7 +48,7 @@ I shipped a local-first Python CLI and stdio MCP server for searching AI convers
 
 2/ Conversation Corpus Engine imports chat exports into a local, provider-neutral corpus with validation, source freshness, federation, policy replay, and cited retrieval.
 
-3/ The MCP server is read-only and exposes three tools today: `cce_search`, `cce_list_corpora`, `cce_surface_context`.
+3/ The MCP server is read-only. Its default tools are `cce_search`, `cce_list_corpora`, `cce_surface_context`; archive/library options add more read-only tools.
 
 4/ Install from the tagged release: `pipx install "conversation-corpus-engine[mcp] @ git+https://github.com/4444J99/conversation-corpus-engine.git@v0.3.1"`
 
@@ -57,6 +57,7 @@ I shipped a local-first Python CLI and stdio MCP server for searching AI convers
 ## Posting checklist
 
 - [ ] Confirm the landing page is deployed at the URL above (or update it here).
-- [ ] Confirm the tagged `v0.3.1` install command still resolves.
+- [ ] Configure the waitlist form sink on the landing page and verify a test submission reaches it before posting.
+- [ ] Confirm the tagged `v0.3.1` install command still resolves (`git ls-remote --tags origin`; verified 2026-11-23).
 - [ ] Post the HN text from a human-owned account; answer comments directly.
 - [ ] Record the public post URL and notable feedback in issue #20.
