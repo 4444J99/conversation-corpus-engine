@@ -37,7 +37,7 @@ Changelog = "https://github.com/4444J99/conversation-corpus-engine/releases"
 # formatter or lint-rule changes silently breaks `ruff check` / `ruff format --check`
 # on every PR even though no source changed. Pinning keeps CI reproducible; bump
 # these deliberately.
-dev = ["pytest==9.2.0", "ruff==0.17.5", "mypy>=1.10.0", "markdown-it-py==4.3.0"]
+dev = ["pytest==9.2.0", "ruff==0.17.6", "mypy>=1.10.0", "markdown-it-py==4.3.0"]
 mcp = []
 obsidian = ["markdown-it-py==4.3.0"]
 sealed = ["cryptography>=46,<51"]
