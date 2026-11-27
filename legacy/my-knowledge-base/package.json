@@ -139,7 +139,7 @@
     "express": "^5.2.1",
     "fast-glob": "^3.3.3",
     "gray-matter": "^4.0.3",
-    "js-yaml": "^5.2.3",
+    "js-yaml": "^5.5.0",
     "jsdom": "^30.0.1",
     "jszip": "^3.10.1",
     "multer": "2.5.0",
